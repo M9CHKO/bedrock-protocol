@@ -107,55 +107,19 @@ void updatePositionFromPacket(ElytraFlyState& state, const bedrock::RelayPacketE
     state.hasPosition = true;
 }
 
-bedrock::PacketValue vec3(double x, double y, double z) {
-    return bedrock::object({
-        {"x", bedrock::f64(x)},
-        {"y", bedrock::f64(y)},
-        {"z", bedrock::f64(z)}
-    });
-}
-
-bedrock::PacketValue vec2(double x, double z) {
-    return bedrock::object({
-        {"x", bedrock::f64(x)},
-        {"z", bedrock::f64(z)}
-    });
-}
-
-void mirrorElytraToClient(
-    bedrock::RelayPlayer& player,
+bedrock::RelayMovementSync movementSyncFromElytra(
     const ElytraFlyState& state,
     uint64_t tick
 ) {
-    player.queue("correct_player_move_prediction", {
-        {"prediction_type", bedrock::str("player")},
-        {"position", vec3(state.x, state.y, state.z)},
-        {"delta", vec3(state.vx, state.vy, state.vz)},
-        {"rotation", vec2(state.pitch, state.yaw)},
-        {"angular_velocity", bedrock::nil()},
-        {"on_ground", bedrock::boolean(false)},
-        {"tick", bedrock::u64(tick)}
-    });
-
-    if (state.runtimeEntityId != 0) {
-        player.queue("move_player", {
-            {"runtime_id", bedrock::u64(state.runtimeEntityId)},
-            {"position", vec3(state.x, state.y, state.z)},
-            {"pitch", bedrock::f64(state.pitch)},
-            {"yaw", bedrock::f64(state.yaw)},
-            {"head_yaw", bedrock::f64(state.yaw)},
-            {"mode", bedrock::str("normal")},
-            {"on_ground", bedrock::boolean(false)},
-            {"ridden_runtime_id", bedrock::u64(0)},
-            {"tick", bedrock::u64(tick)}
-        });
-
-        player.queue("set_entity_motion", {
-            {"runtime_entity_id", bedrock::u64(state.runtimeEntityId)},
-            {"velocity", vec3(state.vx, state.vy, state.vz)},
-            {"tick", bedrock::u64(tick)}
-        });
-    }
+    return {
+        .runtimeEntityId = state.runtimeEntityId,
+        .position = {state.x, state.y, state.z},
+        .velocity = {state.vx, state.vy, state.vz},
+        .rotation = {state.pitch, state.yaw},
+        .tick = tick,
+        .onGround = false,
+        .interceptServerCorrections = true
+    };
 }
 
 bool applyElytraAuthInput(bedrock::RelayPacketEvent& packet, ElytraFlyState& state) {
@@ -306,7 +270,7 @@ int main() {
                         packet.set("delta.y", 0.0);
                         packet.set("delta.z", 0.0);
                         startedGlidingThisTick = true;
-                        mirrorElytraToClient(player, *elytra, tick);
+                        player.syncMovement(movementSyncFromElytra(*elytra, tick));
                         std::cout << "[elytra-fly] start_gliding velocity_reset\n";
                     } else {
                         std::cout << "[elytra-fly] start_gliding\n";
@@ -315,12 +279,13 @@ int main() {
                 if (packet.getBool("input_data.stop_gliding")) {
                     elytra->gliding = false;
                     resetElytraVelocity(*elytra);
+                    player.clearMovementSync();
                     std::cout << "[elytra-fly] stop_gliding\n";
                 }
 
                 if (!startedGlidingThisTick) {
                     if (applyElytraAuthInput(packet, *elytra)) {
-                        mirrorElytraToClient(player, *elytra, tick);
+                        player.syncMovement(movementSyncFromElytra(*elytra, tick));
                     }
                 }
             }
