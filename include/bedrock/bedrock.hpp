@@ -290,7 +290,6 @@ struct RelayOptions {
     std::string username = "RelayBot";
     bool offline = false;
     int maxPlayers = 3;
-    bool autoSyncMovementMutations = false;
     RelayDestination destination;
 };
 
@@ -1264,9 +1263,7 @@ public:
                     wrapped.cancel();
                 }
             }
-            if (options_.autoSyncMovementMutations) {
-                player_.syncChangedMovementToClient(wrapped);
-            }
+            player_.syncChangedMovementToClient(wrapped);
             wrapped.apply(event);
         });
 

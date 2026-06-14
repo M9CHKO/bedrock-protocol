@@ -279,9 +279,9 @@ int main() {
                     "runtime_entity_id",
                     "entity_id_self"
                 });
-                if (runtimeId != 0 &&
-                    (elytra->runtimeEntityId == 0 ||
-                     runtimeId == elytra->runtimeEntityId)) {
+                if (runtimeId == 0 ||
+                    elytra->runtimeEntityId == 0 ||
+                    runtimeId == elytra->runtimeEntityId) {
                     if (elytra->runtimeEntityId == 0 && runtimeId != 0) {
                         elytra->runtimeEntityId = runtimeId;
                     }
