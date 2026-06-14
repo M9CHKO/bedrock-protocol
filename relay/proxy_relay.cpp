@@ -107,21 +107,6 @@ void updatePositionFromPacket(ElytraFlyState& state, const bedrock::RelayPacketE
     state.hasPosition = true;
 }
 
-bedrock::RelayMovementSync movementSyncFromElytra(
-    const ElytraFlyState& state,
-    uint64_t tick
-) {
-    return {
-        .runtimeEntityId = state.runtimeEntityId,
-        .position = {state.x, state.y, state.z},
-        .velocity = {state.vx, state.vy, state.vz},
-        .rotation = {state.pitch, state.yaw},
-        .tick = tick,
-        .onGround = false,
-        .interceptServerCorrections = true
-    };
-}
-
 bool applyElytraAuthInput(bedrock::RelayPacketEvent& packet, ElytraFlyState& state) {
     if (!state.enabled || !state.gliding || !state.hasPosition) {
         return false;
@@ -244,7 +229,7 @@ int main() {
             // });
         });
 
-        player.on("serverbound", [elytra, &player](bedrock::RelayPacketEvent& packet, bedrock::RelayPacketDestination& des) {
+        player.on("serverbound", [elytra](bedrock::RelayPacketEvent& packet, bedrock::RelayPacketDestination& des) {
             if (packet.name == "player_auth_input") {
                 bool startedGlidingThisTick = false;
                 if (!elytra->gliding) {
@@ -256,7 +241,6 @@ int main() {
                 elytra->down = packet.getBool("input_data.down", false);
                 elytra->left = packet.getBool("input_data.left", false);
                 elytra->right = packet.getBool("input_data.right", false);
-                const auto tick = packet.getUInt("tick", 0);
 
                 if (packet.getBool("input_data.start_gliding")) {
                     const bool wasGliding = elytra->gliding;
@@ -270,7 +254,6 @@ int main() {
                         packet.set("delta.y", 0.0);
                         packet.set("delta.z", 0.0);
                         startedGlidingThisTick = true;
-                        player.syncMovement(movementSyncFromElytra(*elytra, tick));
                         std::cout << "[elytra-fly] start_gliding velocity_reset\n";
                     } else {
                         std::cout << "[elytra-fly] start_gliding\n";
@@ -279,14 +262,11 @@ int main() {
                 if (packet.getBool("input_data.stop_gliding")) {
                     elytra->gliding = false;
                     resetElytraVelocity(*elytra);
-                    player.clearMovementSync();
                     std::cout << "[elytra-fly] stop_gliding\n";
                 }
 
                 if (!startedGlidingThisTick) {
-                    if (applyElytraAuthInput(packet, *elytra)) {
-                        player.syncMovement(movementSyncFromElytra(*elytra, tick));
-                    }
+                    applyElytraAuthInput(packet, *elytra);
                 }
             }
 

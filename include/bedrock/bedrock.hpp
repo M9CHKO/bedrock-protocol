@@ -489,11 +489,22 @@ public:
 
 private:
     friend class Relay;
+    friend class RelayPlayer;
     std::string version_;
     mutable bool decoded_ = false;
     bool mutated_ = false;
     mutable PacketObject originalParams_;
     std::vector<VersionedGamePacket> replacements_;
+
+    bool changed() const {
+        if (canceled || !replacements_.empty()) {
+            return true;
+        }
+        if (!decoded_) {
+            return false;
+        }
+        return mutated_ || !objectEqual(params, originalParams_);
+    }
 
     void ensureDecoded() const {
         if (decoded_) {
@@ -1097,6 +1108,67 @@ private:
         }
     }
 
+    bool movementSyncFromMutation(const RelayPacketEvent& event, RelayMovementSync& sync) const {
+        if (!event.changed() || event.canceled ||
+            event.direction != BedrockRelayDirection::Serverbound) {
+            return false;
+        }
+
+        if (event.name != "player_auth_input" && event.name != "move_player") {
+            return false;
+        }
+
+        if (!event.has("position.x") ||
+            !event.has("position.y") ||
+            !event.has("position.z")) {
+            return false;
+        }
+
+        sync.runtimeEntityId = 0;
+        for (const auto* key : {
+            "runtime_id",
+            "runtime_entity_id",
+            "entity_runtime_id",
+            "entity_id_self"
+        }) {
+            if (event.has(key)) {
+                sync.runtimeEntityId = event.getUInt(key);
+                break;
+            }
+        }
+
+        sync.position = {
+            event.getDouble("position.x"),
+            event.getDouble("position.y"),
+            event.getDouble("position.z")
+        };
+
+        sync.velocity = {
+            event.getDouble("delta.x", 0.0),
+            event.getDouble("delta.y", 0.0),
+            event.getDouble("delta.z", 0.0)
+        };
+
+        sync.rotation = {
+            event.getDouble("pitch", 0.0),
+            event.getDouble("yaw", 0.0)
+        };
+        sync.tick = event.getUInt("tick", 0);
+        sync.onGround = event.getBool("on_ground", false);
+        sync.interceptServerCorrections = false;
+        sync.sendCorrectPlayerMovePrediction = true;
+        sync.sendMotionPredictionHints = true;
+        sync.sendEntityMotion = false;
+        return true;
+    }
+
+    void syncChangedMovementToClient(const RelayPacketEvent& event) {
+        RelayMovementSync sync;
+        if (movementSyncFromMutation(event, sync)) {
+            syncMovement(sync);
+        }
+    }
+
     void dispatch(RelayPacketEvent& event) {
         applyMovementSync(event);
 
@@ -1191,6 +1263,7 @@ public:
                     wrapped.cancel();
                 }
             }
+            player_.syncChangedMovementToClient(wrapped);
             wrapped.apply(event);
         });
 
