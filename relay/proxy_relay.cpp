@@ -26,7 +26,8 @@ struct ElytraFlyState {
     double vz = 0.0;
     uint64_t runtimeEntityId = 0;
     double speed = 1.0;
-    int correctionCooldownTicks = 0;
+    bool awaitingCorrectionAck = false;
+    int correctionWaitTicks = 0;
 };
 
 double degToRad(double value) {
@@ -118,7 +119,8 @@ void acceptServerCorrection(ElytraFlyState& state, const bedrock::RelayPacketEve
     updatePositionFromPacket(state, packet);
     resetElytraVelocity(state);
     if (state.gliding) {
-        state.correctionCooldownTicks = 1;
+        state.awaitingCorrectionAck = true;
+        state.correctionWaitTicks = 12;
     }
 }
 
@@ -127,8 +129,25 @@ bool applyElytraAuthInput(bedrock::RelayPacketEvent& packet, ElytraFlyState& sta
         return false;
     }
 
-    if (state.correctionCooldownTicks > 0) {
-        --state.correctionCooldownTicks;
+    if (state.awaitingCorrectionAck) {
+        const double clientX = packet.getDouble("position.x", state.x);
+        const double clientY = packet.getDouble("position.y", state.y);
+        const double clientZ = packet.getDouble("position.z", state.z);
+        const double dx = clientX - state.x;
+        const double dy = clientY - state.y;
+        const double dz = clientZ - state.z;
+        const double distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+        if (distance < 0.75) {
+            state.awaitingCorrectionAck = false;
+        } else if (--state.correctionWaitTicks <= 0) {
+            state.awaitingCorrectionAck = false;
+            state.gliding = false;
+            resetElytraVelocity(state);
+            std::cout << "[elytra-fly] correction timeout, pausing movement patch\n";
+            return false;
+        }
+
         packet.set("position.x", state.x);
         packet.set("position.y", state.y);
         packet.set("position.z", state.z);
@@ -277,7 +296,8 @@ int main() {
                     elytra->gliding = true;
                     if (!wasGliding) {
                         resetElytraVelocity(*elytra);
-                        elytra->correctionCooldownTicks = 0;
+                        elytra->awaitingCorrectionAck = false;
+                        elytra->correctionWaitTicks = 0;
                         packet.set("position.x", elytra->x);
                         packet.set("position.y", elytra->y);
                         packet.set("position.z", elytra->z);
@@ -293,7 +313,8 @@ int main() {
                 if (packet.getBool("input_data.stop_gliding")) {
                     elytra->gliding = false;
                     resetElytraVelocity(*elytra);
-                    elytra->correctionCooldownTicks = 0;
+                    elytra->awaitingCorrectionAck = false;
+                    elytra->correctionWaitTicks = 0;
                     std::cout << "[elytra-fly] stop_gliding\n";
                 }
 
