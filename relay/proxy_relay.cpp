@@ -25,8 +25,9 @@ struct ElytraFlyState {
     double vy = 0.0;
     double vz = 0.0;
     uint64_t runtimeEntityId = 0;
-    double speed = 0.55;
-    double smoothing = 0.22;
+    double acceleration = 0.075;
+    double maxSpeed = 0.85;
+    double drag = 0.985;
 };
 
 double degToRad(double value) {
@@ -79,9 +80,34 @@ void computeElytraDelta(const ElytraFlyState& state, double& dx, double& dy, dou
     if (!isFinite(dy)) dy = 0.0;
     if (!isFinite(dz)) dz = 0.0;
 
-    dx *= state.speed;
-    dy *= state.speed;
-    dz *= state.speed;
+    const double length = std::sqrt(dx * dx + dy * dy + dz * dz);
+    if (length > 0.000001) {
+        dx /= length;
+        dy /= length;
+        dz /= length;
+    }
+}
+
+void resetElytraVelocity(ElytraFlyState& state) {
+    state.vx = 0.0;
+    state.vy = 0.0;
+    state.vz = 0.0;
+}
+
+void clampElytraVelocity(ElytraFlyState& state) {
+    const double speed = std::sqrt(
+        state.vx * state.vx +
+        state.vy * state.vy +
+        state.vz * state.vz
+    );
+    if (speed <= state.maxSpeed || speed <= 0.000001) {
+        return;
+    }
+
+    const double scale = state.maxSpeed / speed;
+    state.vx *= scale;
+    state.vy *= scale;
+    state.vz *= scale;
 }
 
 void updatePositionFromPacket(ElytraFlyState& state, const bedrock::RelayPacketEvent& packet) {
@@ -107,9 +133,10 @@ void applyElytraAuthInput(bedrock::RelayPacketEvent& packet, ElytraFlyState& sta
     double dz = 0.0;
     computeElytraDelta(state, dx, dy, dz);
 
-    state.vx += (dx - state.vx) * state.smoothing;
-    state.vy += (dy - state.vy) * state.smoothing;
-    state.vz += (dz - state.vz) * state.smoothing;
+    state.vx = (state.vx + dx * state.acceleration) * state.drag;
+    state.vy = (state.vy + dy * state.acceleration) * state.drag;
+    state.vz = (state.vz + dz * state.acceleration) * state.drag;
+    clampElytraVelocity(state);
 
     state.x += state.vx;
     state.y += state.vy;
@@ -219,6 +246,7 @@ int main() {
 
         player.on("serverbound", [elytra](bedrock::RelayPacketEvent& packet, bedrock::RelayPacketDestination& des) {
             if (packet.name == "player_auth_input") {
+                bool startedGlidingThisTick = false;
                 updatePositionFromPacket(*elytra, packet);
                 elytra->pitch = packet.getDouble("pitch", elytra->pitch);
                 elytra->yaw = packet.getDouble("yaw", elytra->yaw);
@@ -228,18 +256,28 @@ int main() {
                 elytra->right = packet.getBool("input_data.right", elytra->right);
 
                 if (packet.getBool("input_data.start_gliding")) {
+                    const bool wasGliding = elytra->gliding;
                     elytra->gliding = true;
-                    std::cout << "[elytra-fly] start_gliding\n";
+                    if (!wasGliding) {
+                        resetElytraVelocity(*elytra);
+                        packet.set("delta.x", 0.0);
+                        packet.set("delta.y", 0.0);
+                        packet.set("delta.z", 0.0);
+                        startedGlidingThisTick = true;
+                        std::cout << "[elytra-fly] start_gliding velocity_reset\n";
+                    } else {
+                        std::cout << "[elytra-fly] start_gliding\n";
+                    }
                 }
                 if (packet.getBool("input_data.stop_gliding")) {
                     elytra->gliding = false;
-                    elytra->vx = 0.0;
-                    elytra->vy = 0.0;
-                    elytra->vz = 0.0;
+                    resetElytraVelocity(*elytra);
                     std::cout << "[elytra-fly] stop_gliding\n";
                 }
 
-                applyElytraAuthInput(packet, *elytra);
+                if (!startedGlidingThisTick) {
+                    applyElytraAuthInput(packet, *elytra);
+                }
             }
 
             if (packet.name == "text") {
