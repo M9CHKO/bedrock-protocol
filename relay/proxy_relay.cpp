@@ -26,6 +26,11 @@ struct ElytraFlyState {
     double vz = 0.0;
     uint64_t runtimeEntityId = 0;
     double speed = 1.0;
+    bool hasPredictedPosition = false;
+    double predictedX = 0.0;
+    double predictedY = 0.0;
+    double predictedZ = 0.0;
+    int correctionCooldownTicks = 0;
 };
 
 double degToRad(double value) {
@@ -88,6 +93,10 @@ void computeElytraDelta(const ElytraFlyState& state, double& dx, double& dy, dou
     dz *= state.speed;
 }
 
+bool hasElytraDirectionInput(const ElytraFlyState& state) {
+    return state.up || state.down || state.left || state.right;
+}
+
 void resetElytraVelocity(ElytraFlyState& state) {
     state.vx = 0.0;
     state.vy = 0.0;
@@ -107,9 +116,69 @@ void updatePositionFromPacket(ElytraFlyState& state, const bedrock::RelayPacketE
     state.hasPosition = true;
 }
 
+void acceptElytraCorrection(ElytraFlyState& state, const bedrock::RelayPacketEvent& packet) {
+    if (!state.gliding) {
+        updatePositionFromPacket(state, packet);
+        return;
+    }
+
+    if (!packet.has("position.x") ||
+        !packet.has("position.y") ||
+        !packet.has("position.z")) {
+        return;
+    }
+
+    const double oldX = state.x;
+    const double oldY = state.y;
+    const double oldZ = state.z;
+    updatePositionFromPacket(state, packet);
+    resetElytraVelocity(state);
+    state.predictedX = state.x;
+    state.predictedY = state.y;
+    state.predictedZ = state.z;
+    state.hasPredictedPosition = true;
+    state.correctionCooldownTicks = 2;
+
+    const double dx = state.x - oldX;
+    const double dy = state.y - oldY;
+    const double dz = state.z - oldZ;
+    const double correctionDistance = std::sqrt(dx * dx + dy * dy + dz * dz);
+    if (correctionDistance > 0.25) {
+        std::cout << "[elytra-fly] correction reset base distance="
+                  << correctionDistance << "\n";
+    }
+}
+
 bool applyElytraAuthInput(bedrock::RelayPacketEvent& packet, ElytraFlyState& state) {
     if (!state.enabled || !state.gliding || !state.hasPosition) {
         return false;
+    }
+
+    if (state.correctionCooldownTicks > 0) {
+        --state.correctionCooldownTicks;
+        packet.set("position.x", state.x);
+        packet.set("position.y", state.y);
+        packet.set("position.z", state.z);
+        packet.set("delta.x", 0.0);
+        packet.set("delta.y", 0.0);
+        packet.set("delta.z", 0.0);
+        return true;
+    }
+
+    if (!hasElytraDirectionInput(state)) {
+        resetElytraVelocity(state);
+        state.predictedX = state.x;
+        state.predictedY = state.y;
+        state.predictedZ = state.z;
+        state.hasPredictedPosition = true;
+
+        packet.set("position.x", state.x);
+        packet.set("position.y", state.y);
+        packet.set("position.z", state.z);
+        packet.set("delta.x", 0.0);
+        packet.set("delta.y", 0.0);
+        packet.set("delta.z", 0.0);
+        return true;
     }
 
     double dx = 0.0;
@@ -124,6 +193,10 @@ bool applyElytraAuthInput(bedrock::RelayPacketEvent& packet, ElytraFlyState& sta
     state.x += state.vx;
     state.y += state.vy;
     state.z += state.vz;
+    state.predictedX = state.x;
+    state.predictedY = state.y;
+    state.predictedZ = state.z;
+    state.hasPredictedPosition = true;
 
     packet.set("position.x", state.x);
     packet.set("position.y", state.y);
@@ -131,8 +204,6 @@ bool applyElytraAuthInput(bedrock::RelayPacketEvent& packet, ElytraFlyState& sta
     packet.set("delta.x", state.vx);
     packet.set("delta.y", state.vy);
     packet.set("delta.z", state.vz);
-    packet.set("input_data.jumping", true);
-    packet.set("input_data.sprint_down", true);
 
     static uint64_t patchedPackets = 0;
     ++patchedPackets;
@@ -196,6 +267,12 @@ int main() {
                           << elytra->runtimeEntityId << "\n";
             }
 
+            if (packet.name == "correct_player_move_prediction") {
+                acceptElytraCorrection(*elytra, packet);
+                elytra->pitch = packet.getDouble("rotation.x", elytra->pitch);
+                elytra->yaw = packet.getDouble("rotation.z", elytra->yaw);
+            }
+
             if (packet.name == "move_player") {
                 const auto runtimeId = firstUInt(packet, {
                     "runtime_id",
@@ -208,7 +285,7 @@ int main() {
                     if (elytra->runtimeEntityId == 0 && runtimeId != 0) {
                         elytra->runtimeEntityId = runtimeId;
                     }
-                    updatePositionFromPacket(*elytra, packet);
+                    acceptElytraCorrection(*elytra, packet);
                     elytra->pitch = packet.getDouble("pitch", elytra->pitch);
                     elytra->yaw = packet.getDouble("yaw", elytra->yaw);
                 }
@@ -247,6 +324,8 @@ int main() {
                     elytra->gliding = true;
                     if (!wasGliding) {
                         resetElytraVelocity(*elytra);
+                        elytra->hasPredictedPosition = false;
+                        elytra->correctionCooldownTicks = 0;
                         packet.set("position.x", elytra->x);
                         packet.set("position.y", elytra->y);
                         packet.set("position.z", elytra->z);
@@ -262,6 +341,8 @@ int main() {
                 if (packet.getBool("input_data.stop_gliding")) {
                     elytra->gliding = false;
                     resetElytraVelocity(*elytra);
+                    elytra->hasPredictedPosition = false;
+                    elytra->correctionCooldownTicks = 0;
                     std::cout << "[elytra-fly] stop_gliding\n";
                 }
 
