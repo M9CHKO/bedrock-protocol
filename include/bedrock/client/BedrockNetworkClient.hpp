@@ -124,6 +124,7 @@ private:
     std::vector<StatusHandler> statusHandlers_;
     std::vector<VersionedGamePacket> queuedPackets_;
 
+    std::mutex sendMutex_;
     bool compressionReady_ = false;
     std::string compressionAlgorithm_ = "none";
     uint16_t compressionThreshold_ = 512;

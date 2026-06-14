@@ -143,7 +143,13 @@ bool BedrockNetworkClient::connect() {
         try {
             handleRakNetPayload(payload);
         } catch (const std::exception& e) {
-            emitError(e.what());
+            const std::string message = e.what();
+            emitError(message);
+            if (message.find("encrypted payload checksum mismatch") != std::string::npos ||
+                message.find("decrypt") != std::string::npos ||
+                message.find("decrypted payload") != std::string::npos) {
+                close(message);
+            }
         }
     });
     raknet_->onClose([this](const std::string& reason) {
@@ -174,9 +180,14 @@ int BedrockNetworkClient::run() {
 }
 
 void BedrockNetworkClient::close(const std::string& reason) {
-    if (raknet_) {
-        raknet_->close(reason);
-        raknet_.reset();
+    std::unique_ptr<RakNetClient> raknet;
+    {
+        std::lock_guard<std::mutex> lock(sendMutex_);
+        raknet = std::move(raknet_);
+    }
+
+    if (raknet) {
+        raknet->close(reason);
     } else {
         emitClose(reason);
     }
@@ -225,12 +236,17 @@ void BedrockNetworkClient::write(const std::string& packetName, const ProtoDefVa
 
 void BedrockNetworkClient::queue(const std::string& packetName, const ProtoDefValue& value) {
     auto payload = packetEncoder_.encodePacket(packetName, value);
+    std::lock_guard<std::mutex> lock(sendMutex_);
     queuedPackets_.push_back(session_.packetCodec().makePacketByName(packetName, payload));
 }
 
 void BedrockNetworkClient::sendQueued() {
-    auto packets = std::move(queuedPackets_);
-    queuedPackets_.clear();
+    std::vector<VersionedGamePacket> packets;
+    {
+        std::lock_guard<std::mutex> lock(sendMutex_);
+        packets = std::move(queuedPackets_);
+        queuedPackets_.clear();
+    }
     sendPackets(packets, encryptionEnabled_);
 }
 
@@ -621,6 +637,8 @@ void BedrockNetworkClient::sendPackets(
     const std::vector<VersionedGamePacket>& packets,
     bool encryptedCompression
 ) {
+    std::lock_guard<std::mutex> lock(sendMutex_);
+
     if (packets.empty() || !raknet_) {
         return;
     }

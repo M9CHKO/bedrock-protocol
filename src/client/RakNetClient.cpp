@@ -12,6 +12,7 @@
 #include <cstring>
 #include <random>
 #include <stdexcept>
+#include <thread>
 
 namespace bedrock {
 
@@ -466,7 +467,13 @@ void RakNetClient::close(const std::string& reason) {
         ::close(socket_);
         socket_ = -1;
     }
-    if (thread_.joinable()) thread_.join();
+    if (thread_.joinable()) {
+        if (thread_.get_id() == std::this_thread::get_id()) {
+            thread_.detach();
+        } else {
+            thread_.join();
+        }
+    }
     if ((wasRunning || wasConnected) && closeHandler_) closeHandler_(reason);
 }
 
