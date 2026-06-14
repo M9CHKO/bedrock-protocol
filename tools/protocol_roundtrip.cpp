@@ -1,4 +1,5 @@
 #include <bedrock/BedrockFramer.hpp>
+#include <bedrock/bedrock.hpp>
 #include <bedrock/debug/PacketFieldDecoder.hpp>
 #include <bedrock/relay/BedrockRelay.hpp>
 #include <bedrock/protocol/ProtocolDefinition.hpp>
@@ -624,6 +625,62 @@ bool checkRelayPipeline(const std::string& version) {
     return ok;
 }
 
+bool checkRelayPacketApi() {
+    constexpr const char* version = "1.21.100";
+    bool ok = true;
+
+    try {
+        bedrock::ProtoDefPacketEncoder encoder(version);
+        auto payload = encoder.encodePacket("player_auth_input", object({
+            {"pitch", bedrock::ProtoDefValue::floating(0.0)},
+            {"yaw", bedrock::ProtoDefValue::floating(90.0)},
+            {"position", vec3f(10.0, 70.0, 20.0)},
+            {"move_vector", vec2f(0.0, 1.0)},
+            {"head_yaw", bedrock::ProtoDefValue::floating(90.0)},
+            {"input_data", inputFlags({"start_gliding", "up"})},
+            {"input_mode", bedrock::ProtoDefValue::string("mouse")},
+            {"play_mode", bedrock::ProtoDefValue::string("normal")},
+            {"interaction_model", bedrock::ProtoDefValue::string("classic")},
+            {"interact_rotation", vec2f(0.0, 0.0)},
+            {"tick", bedrock::ProtoDefValue::uinteger(1)},
+            {"delta", vec3f(0.0, 0.0, 0.0)},
+            {"analogue_move_vector", vec2f(0.0, 1.0)},
+            {"camera_orientation", vec3f(0.0, 90.0, 0.0)},
+            {"raw_move_vector", vec2f(0.0, 1.0)}
+        }));
+
+        auto codec = bedrock::VersionedPacketCodec::forVersion(version);
+        bedrock::BedrockRelayPacketEvent event;
+        event.direction = bedrock::BedrockRelayDirection::Serverbound;
+        event.packet = codec.makePacketByName("player_auth_input", payload);
+
+        bedrock::RelayPacketEvent wrapped(version, event);
+        const bool startGliding = wrapped.getBool("input_data.start_gliding");
+        const bool up = wrapped.getBool("input_data.up");
+        const double x = wrapped.getDouble("position.x");
+        const double y = wrapped.getDouble("position.y");
+        const double z = wrapped.getDouble("position.z");
+        if (!startGliding || !up || x != 10.0 || y != 70.0 || z != 20.0) {
+            std::cerr << "[FAIL] relay api player_auth_input decoded params mismatch"
+                      << " start_gliding=" << startGliding
+                      << " up=" << up
+                      << " pos=(" << x << "," << y << "," << z << ")"
+                      << "\n";
+            ok = false;
+        }
+
+        wrapped.set("delta.x", 0.25);
+        wrapped.set("delta.y", 0.5);
+        wrapped.set("delta.z", 0.75);
+        (void) encoder.encodePacket("player_auth_input", bedrock::ProtoDefValue::object(wrapped.decodedParams()));
+    } catch (const std::exception& e) {
+        std::cerr << "[FAIL] relay api player_auth_input: " << e.what() << "\n";
+        ok = false;
+    }
+
+    return ok;
+}
+
 } // namespace
 
 int main() {
@@ -639,6 +696,9 @@ int main() {
     int failures = 0;
 
     if (!checkProtoDefNativeHelpers()) {
+        ++failures;
+    }
+    if (!checkRelayPacketApi()) {
         ++failures;
     }
 

@@ -1193,15 +1193,21 @@ private:
         } else if (typeName == "lf64") {
             field.value = std::to_string(reader.readF64LE());
         } else if (typeName == "vec3i") {
+            const auto x = reader.zigzag32();
+            const auto y = reader.zigzag32();
+            const auto z = reader.zigzag32();
             field.value =
-                std::to_string(reader.zigzag32()) + "," +
-                std::to_string(reader.zigzag32()) + "," +
-                std::to_string(reader.zigzag32());
+                std::to_string(x) + "," +
+                std::to_string(y) + "," +
+                std::to_string(z);
         } else if (typeName == "vec3f") {
+            const auto x = reader.readF32LE();
+            const auto y = reader.readF32LE();
+            const auto z = reader.readF32LE();
             field.value =
-                std::to_string(reader.readF32LE()) + "," +
-                std::to_string(reader.readF32LE()) + "," +
-                std::to_string(reader.readF32LE());
+                std::to_string(x) + "," +
+                std::to_string(y) + "," +
+                std::to_string(z);
         } else if (typeName == "native") {
             skipNativeNbt(reader);
             field.value = "<native>";

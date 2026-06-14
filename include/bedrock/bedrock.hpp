@@ -478,7 +478,7 @@ private:
         auto* self = const_cast<RelayPacketEvent*>(this);
         ProtoDefPacketDecoder decoder(version_);
         for (const auto& field : decoder.decodePacket(packet.name, packet.payload)) {
-            setNestedParam(self->params, field.path, valueFromDecodedField(field));
+            setDecodedParam(self->params, field);
         }
         self->originalParams_ = self->params;
         self->decoded_ = true;
@@ -573,6 +573,28 @@ private:
         }
     }
 
+    static void setDecodedParam(PacketObject& root, const ProtoDefField& field) {
+        if (field.path.empty()) {
+            return;
+        }
+
+        if (field.type == "vec3f" || field.type == "vec3i") {
+            auto c1 = field.value.find(',');
+            auto c2 = c1 == std::string::npos
+                ? std::string::npos
+                : field.value.find(',', c1 + 1);
+
+            if (c1 != std::string::npos && c2 != std::string::npos) {
+                setNestedParam(root, field.path + ".x", decodedVectorValue(field, 0, c1));
+                setNestedParam(root, field.path + ".y", decodedVectorValue(field, c1 + 1, c2));
+                setNestedParam(root, field.path + ".z", decodedVectorValue(field, c2 + 1, field.value.size()));
+                return;
+            }
+        }
+
+        setNestedParam(root, field.path, valueFromDecodedField(field));
+    }
+
     static const PacketValue* findNestedParam(const PacketObject& root, const std::string& path) {
         const auto tokens = parsePath(path);
         if (tokens.empty()) {
@@ -660,6 +682,14 @@ private:
         }
 
         return PacketValue::string(field.value);
+    }
+
+    static PacketValue decodedVectorValue(const ProtoDefField& field, std::size_t begin, std::size_t end) {
+        const auto part = field.value.substr(begin, end - begin);
+        if (field.type == "vec3f") {
+            return PacketValue::floating(std::strtod(part.c_str(), nullptr));
+        }
+        return PacketValue::integer(static_cast<int64_t>(std::strtoll(part.c_str(), nullptr, 10)));
     }
 
     static PacketValue decodedUnsignedValue(const std::string& text) {

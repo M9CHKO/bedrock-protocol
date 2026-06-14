@@ -123,6 +123,15 @@ void applyElytraAuthInput(bedrock::RelayPacketEvent& packet, ElytraFlyState& sta
     packet.set("delta.z", state.vz);
     packet.set("input_data.jumping", true);
     packet.set("input_data.sprint_down", true);
+
+    static uint64_t patchedPackets = 0;
+    ++patchedPackets;
+    if (patchedPackets == 1 || (patchedPackets % 20) == 0) {
+        std::cout << "[elytra-fly] patched player_auth_input"
+                  << " pos=(" << state.x << "," << state.y << "," << state.z << ")"
+                  << " delta=(" << state.vx << "," << state.vy << "," << state.vz << ")"
+                  << "\n";
+    }
 }
 
 } // namespace
