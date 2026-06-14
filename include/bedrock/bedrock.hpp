@@ -323,12 +323,11 @@ public:
 
     bool has(const std::string& key) const {
         ensureDecoded();
-        return params.find(key) != params.end();
+        return findNestedParam(params, key) != nullptr;
     }
 
     PacketObject& decodedParams() {
         ensureDecoded();
-        mutated_ = true;
         return params;
     }
 
@@ -351,9 +350,19 @@ public:
         return params[key];
     }
 
+    const PacketValue* value(const std::string& key) const {
+        ensureDecoded();
+        return findNestedParam(params, key);
+    }
+
+    PacketValue* value(const std::string& key) {
+        ensureDecoded();
+        return findNestedParam(params, key);
+    }
+
     void set(const std::string& key, PacketValue value) {
         ensureDecoded();
-        params[key] = std::move(value);
+        setNestedParam(params, key, std::move(value));
         mutated_ = true;
     }
 
@@ -383,15 +392,61 @@ public:
 
     std::string get(const std::string& key) const {
         ensureDecoded();
-        auto it = params.find(key);
-        if (it == params.end()) return {};
-        const auto& value = it->second;
-        if (value.kind == PacketValue::Kind::String) return value.stringValue;
-        if (value.kind == PacketValue::Kind::Bool) return value.boolValue ? "true" : "false";
-        if (value.kind == PacketValue::Kind::Int) return std::to_string(value.intValue);
-        if (value.kind == PacketValue::Kind::UInt) return std::to_string(value.uintValue);
-        if (value.kind == PacketValue::Kind::Double) return std::to_string(value.doubleValue);
-        return {};
+        auto* found = findNestedParam(params, key);
+        return found ? valueToString(*found) : std::string();
+    }
+
+    std::string getString(const std::string& key, std::string fallback = {}) const {
+        auto* v = value(key);
+        return v ? valueToString(*v) : fallback;
+    }
+
+    int64_t getInt(const std::string& key, int64_t fallback = 0) const {
+        auto* v = value(key);
+        if (!v) return fallback;
+        if (v->kind == PacketValue::Kind::Int) return v->intValue;
+        if (v->kind == PacketValue::Kind::UInt) return static_cast<int64_t>(v->uintValue);
+        if (v->kind == PacketValue::Kind::Double) return static_cast<int64_t>(v->doubleValue);
+        if (v->kind == PacketValue::Kind::Bool) return v->boolValue ? 1 : 0;
+        if (v->kind == PacketValue::Kind::String && isIntegerText(v->stringValue)) {
+            return static_cast<int64_t>(std::strtoll(v->stringValue.c_str(), nullptr, 10));
+        }
+        return fallback;
+    }
+
+    uint64_t getUInt(const std::string& key, uint64_t fallback = 0) const {
+        auto* v = value(key);
+        if (!v) return fallback;
+        if (v->kind == PacketValue::Kind::UInt) return v->uintValue;
+        if (v->kind == PacketValue::Kind::Int) return static_cast<uint64_t>(v->intValue);
+        if (v->kind == PacketValue::Kind::Double) return static_cast<uint64_t>(v->doubleValue);
+        if (v->kind == PacketValue::Kind::Bool) return v->boolValue ? 1u : 0u;
+        if (v->kind == PacketValue::Kind::String && isIntegerText(v->stringValue)) {
+            return static_cast<uint64_t>(std::strtoull(v->stringValue.c_str(), nullptr, 10));
+        }
+        return fallback;
+    }
+
+    double getDouble(const std::string& key, double fallback = 0.0) const {
+        auto* v = value(key);
+        if (!v) return fallback;
+        if (v->kind == PacketValue::Kind::Double) return v->doubleValue;
+        if (v->kind == PacketValue::Kind::Int) return static_cast<double>(v->intValue);
+        if (v->kind == PacketValue::Kind::UInt) return static_cast<double>(v->uintValue);
+        if (v->kind == PacketValue::Kind::Bool) return v->boolValue ? 1.0 : 0.0;
+        if (v->kind == PacketValue::Kind::String) return std::strtod(v->stringValue.c_str(), nullptr);
+        return fallback;
+    }
+
+    bool getBool(const std::string& key, bool fallback = false) const {
+        auto* v = value(key);
+        if (!v) return fallback;
+        if (v->kind == PacketValue::Kind::Bool) return v->boolValue;
+        if (v->kind == PacketValue::Kind::Int) return v->intValue != 0;
+        if (v->kind == PacketValue::Kind::UInt) return v->uintValue != 0;
+        if (v->kind == PacketValue::Kind::Double) return v->doubleValue != 0.0;
+        if (v->kind == PacketValue::Kind::String) return v->stringValue == "true" || v->stringValue == "1";
+        return fallback;
     }
 
     void replace(VersionedGamePacket replacement) {
@@ -400,11 +455,19 @@ public:
         replacements_.push_back(std::move(replacement));
     }
 
+    void replace(const std::string& packetName, PacketValue value) {
+        ProtoDefPacketEncoder encoder(version_);
+        auto payload = encoder.encodePacket(packetName, value);
+        VersionedMcpeCodec codec = VersionedMcpeCodec::forVersion(version_);
+        replace(codec.packetCodec().makePacketByName(packetName, payload));
+    }
+
 private:
     friend class Relay;
     std::string version_;
     mutable bool decoded_ = false;
     bool mutated_ = false;
+    mutable PacketObject originalParams_;
     std::vector<VersionedGamePacket> replacements_;
 
     void ensureDecoded() const {
@@ -415,12 +478,150 @@ private:
         auto* self = const_cast<RelayPacketEvent*>(this);
         ProtoDefPacketDecoder decoder(version_);
         for (const auto& field : decoder.decodePacket(packet.name, packet.payload)) {
-            if (field.path.find('.') == std::string::npos &&
-                field.path.find('[') == std::string::npos) {
-                self->params[field.path] = valueFromDecodedField(field);
+            setNestedParam(self->params, field.path, valueFromDecodedField(field));
+        }
+        self->originalParams_ = self->params;
+        self->decoded_ = true;
+    }
+
+    struct PathToken {
+        std::string key;
+        std::vector<std::size_t> indexes;
+    };
+
+    static std::vector<PathToken> parsePath(const std::string& path) {
+        std::vector<PathToken> out;
+        PathToken token;
+
+        for (std::size_t i = 0; i < path.size();) {
+            const char ch = path[i];
+            if (ch == '.') {
+                if (!token.key.empty() || !token.indexes.empty()) {
+                    out.push_back(std::move(token));
+                    token = {};
+                }
+                ++i;
+                continue;
+            }
+
+            if (ch == '[') {
+                ++i;
+                std::size_t index = 0;
+                while (i < path.size() && path[i] >= '0' && path[i] <= '9') {
+                    index = (index * 10u) + static_cast<std::size_t>(path[i] - '0');
+                    ++i;
+                }
+                if (i < path.size() && path[i] == ']') {
+                    ++i;
+                }
+                token.indexes.push_back(index);
+                continue;
+            }
+
+            token.key.push_back(ch);
+            ++i;
+        }
+
+        if (!token.key.empty() || !token.indexes.empty()) {
+            out.push_back(std::move(token));
+        }
+        return out;
+    }
+
+    static PacketValue& asObjectSlot(PacketValue& value, const std::string& key) {
+        if (value.kind != PacketValue::Kind::Object) {
+            value = PacketValue::object({});
+        }
+        return value.objectValue[key];
+    }
+
+    static PacketValue& asArraySlot(PacketValue& value, std::size_t index) {
+        if (value.kind != PacketValue::Kind::Array) {
+            value = PacketValue::array({});
+        }
+        if (value.arrayValue.size() <= index) {
+            value.arrayValue.resize(index + 1);
+        }
+        return value.arrayValue[index];
+    }
+
+    static void setNestedParam(PacketObject& root, const std::string& path, PacketValue value) {
+        const auto tokens = parsePath(path);
+        if (tokens.empty()) {
+            return;
+        }
+
+        PacketValue* current = nullptr;
+        for (std::size_t i = 0; i < tokens.size(); ++i) {
+            const auto& token = tokens[i];
+            PacketValue* slot = nullptr;
+            if (current) {
+                slot = &asObjectSlot(*current, token.key);
+            } else {
+                slot = &root[token.key];
+            }
+
+            for (auto index : token.indexes) {
+                slot = &asArraySlot(*slot, index);
+            }
+
+            if (i + 1 == tokens.size()) {
+                *slot = std::move(value);
+                return;
+            }
+            current = slot;
+        }
+    }
+
+    static const PacketValue* findNestedParam(const PacketObject& root, const std::string& path) {
+        const auto tokens = parsePath(path);
+        if (tokens.empty()) {
+            return nullptr;
+        }
+
+        const PacketValue* current = nullptr;
+        for (const auto& token : tokens) {
+            if (current) {
+                if (current->kind != PacketValue::Kind::Object) {
+                    return nullptr;
+                }
+                auto it = current->objectValue.find(token.key);
+                if (it == current->objectValue.end()) {
+                    return nullptr;
+                }
+                current = &it->second;
+            } else {
+                auto it = root.find(token.key);
+                if (it == root.end()) {
+                    return nullptr;
+                }
+                current = &it->second;
+            }
+
+            for (auto index : token.indexes) {
+                if (!current || current->kind != PacketValue::Kind::Array ||
+                    current->arrayValue.size() <= index) {
+                    return nullptr;
+                }
+                current = &current->arrayValue[index];
             }
         }
-        self->decoded_ = true;
+        return current;
+    }
+
+    static PacketValue* findNestedParam(PacketObject& root, const std::string& path) {
+        return const_cast<PacketValue*>(
+            findNestedParam(static_cast<const PacketObject&>(root), path)
+        );
+    }
+
+    static std::string valueToString(const PacketValue& value) {
+        if (value.kind == PacketValue::Kind::String) return value.stringValue;
+        if (value.kind == PacketValue::Kind::Bool) return value.boolValue ? "true" : "false";
+        if (value.kind == PacketValue::Kind::Int) return std::to_string(value.intValue);
+        if (value.kind == PacketValue::Kind::UInt) return std::to_string(value.uintValue);
+        if (value.kind == PacketValue::Kind::Double) return std::to_string(value.doubleValue);
+        return {};
     }
 
     static PacketValue valueFromDecodedField(const ProtoDefField& field) {
@@ -487,6 +688,38 @@ private:
             type == "varuint64" || type == "varint128";
     }
 
+    static bool valueEqual(const PacketValue& a, const PacketValue& b) {
+        if (a.kind != b.kind) return false;
+        switch (a.kind) {
+            case PacketValue::Kind::Null: return true;
+            case PacketValue::Kind::Bool: return a.boolValue == b.boolValue;
+            case PacketValue::Kind::Int: return a.intValue == b.intValue;
+            case PacketValue::Kind::UInt: return a.uintValue == b.uintValue;
+            case PacketValue::Kind::Double: return a.doubleValue == b.doubleValue;
+            case PacketValue::Kind::String: return a.stringValue == b.stringValue;
+            case PacketValue::Kind::Bytes: return a.bytesValue == b.bytesValue;
+            case PacketValue::Kind::Array:
+                if (a.arrayValue.size() != b.arrayValue.size()) return false;
+                for (std::size_t i = 0; i < a.arrayValue.size(); ++i) {
+                    if (!valueEqual(a.arrayValue[i], b.arrayValue[i])) return false;
+                }
+                return true;
+            case PacketValue::Kind::Object:
+                return objectEqual(a.objectValue, b.objectValue);
+        }
+        return false;
+    }
+
+    static bool objectEqual(const PacketObject& a, const PacketObject& b) {
+        if (a.size() != b.size()) return false;
+        for (const auto& [key, value] : a) {
+            auto it = b.find(key);
+            if (it == b.end()) return false;
+            if (!valueEqual(value, it->second)) return false;
+        }
+        return true;
+    }
+
     void apply(BedrockRelayPacketEvent& event) {
         if (canceled) {
             event.cancel();
@@ -495,6 +728,9 @@ private:
         if (!replacements_.empty()) {
             event.replace(std::move(replacements_));
             return;
+        }
+        if (!mutated_ && decoded_ && !objectEqual(params, originalParams_)) {
+            mutated_ = true;
         }
         if (!mutated_) {
             return;
@@ -523,9 +759,37 @@ public:
             relay_->upstream()->queue(packetName, value);
         }
 
+        void queue(const std::string& packetName, PacketObject value) {
+            queue(packetName, PacketValue::object(std::move(value)));
+        }
+
+        void queue(const std::string& packetName, std::initializer_list<std::pair<const std::string, PacketValue>> value) {
+            queue(packetName, PacketValue::object(PacketObject(value)));
+        }
+
         void write(const std::string& packetName, PacketValue value) {
             if (!relay_ || !relay_->upstream()) return;
             relay_->upstream()->write(packetName, value);
+        }
+
+        void write(const std::string& packetName, PacketObject value) {
+            write(packetName, PacketValue::object(std::move(value)));
+        }
+
+        void write(const std::string& packetName, std::initializer_list<std::pair<const std::string, PacketValue>> value) {
+            write(packetName, PacketValue::object(PacketObject(value)));
+        }
+
+        void send(const std::string& packetName, PacketValue value) {
+            write(packetName, std::move(value));
+        }
+
+        void send(const std::string& packetName, PacketObject value) {
+            write(packetName, std::move(value));
+        }
+
+        void send(const std::string& packetName, std::initializer_list<std::pair<const std::string, PacketValue>> value) {
+            write(packetName, value);
         }
 
     private:
@@ -588,8 +852,36 @@ public:
         relay_->server().send(connection, packetName, value);
     }
 
+    void queue(const std::string& packetName, PacketObject value) {
+        queue(packetName, PacketValue::object(std::move(value)));
+    }
+
+    void queue(const std::string& packetName, std::initializer_list<std::pair<const std::string, PacketValue>> value) {
+        queue(packetName, PacketValue::object(PacketObject(value)));
+    }
+
     void write(const std::string& packetName, PacketValue value) {
         queue(packetName, std::move(value));
+    }
+
+    void write(const std::string& packetName, PacketObject value) {
+        queue(packetName, std::move(value));
+    }
+
+    void write(const std::string& packetName, std::initializer_list<std::pair<const std::string, PacketValue>> value) {
+        queue(packetName, value);
+    }
+
+    void send(const std::string& packetName, PacketValue value) {
+        queue(packetName, std::move(value));
+    }
+
+    void send(const std::string& packetName, PacketObject value) {
+        queue(packetName, std::move(value));
+    }
+
+    void send(const std::string& packetName, std::initializer_list<std::pair<const std::string, PacketValue>> value) {
+        queue(packetName, value);
     }
 
 private:
@@ -601,6 +893,13 @@ private:
     std::vector<PacketWithDestinationHandler> serverboundDestinationHandlers_;
 
     void dispatch(RelayPacketEvent& event) {
+        if (!clientboundHandlers_.empty() ||
+            !serverboundHandlers_.empty() ||
+            !clientboundDestinationHandlers_.empty() ||
+            !serverboundDestinationHandlers_.empty()) {
+            (void) event.decodedParams();
+        }
+
         auto& handlers = event.direction == BedrockRelayDirection::Clientbound
             ? clientboundHandlers_
             : serverboundHandlers_;
@@ -653,6 +952,9 @@ public:
         live_.on("clientbound", [this](BedrockRelayPacketEvent& event) {
             RelayPacketEvent wrapped(options_.version, event);
             player_.dispatch(wrapped);
+            if (!clientboundHandlers_.empty() || !clientboundDestinationHandlers_.empty()) {
+                (void) wrapped.decodedParams();
+            }
             for (auto& handler : clientboundHandlers_) {
                 handler(wrapped);
             }
@@ -669,6 +971,9 @@ public:
         live_.on("serverbound", [this](BedrockRelayPacketEvent& event) {
             RelayPacketEvent wrapped(options_.version, event);
             player_.dispatch(wrapped);
+            if (!serverboundHandlers_.empty() || !serverboundDestinationHandlers_.empty()) {
+                (void) wrapped.decodedParams();
+            }
             for (auto& handler : serverboundHandlers_) {
                 handler(wrapped);
             }
@@ -695,10 +1000,15 @@ public:
     }
 
     void on(const std::string& eventName, ConnectHandler handler) {
-        if (eventName != "connect") {
-            throw std::runtime_error("unknown relay event: " + eventName);
+        if (eventName == "connect") {
+            connectHandlers_.push_back(std::move(handler));
+            return;
         }
-        connectHandlers_.push_back(std::move(handler));
+        if (eventName == "disconnect") {
+            disconnectHandlers_.push_back(std::move(handler));
+            return;
+        }
+        throw std::runtime_error("unknown relay event: " + eventName);
     }
 
     void on(const std::string& direction, PacketHandler handler) {
@@ -755,6 +1065,20 @@ public:
 
     void onStatus(StatusHandler handler) {
         live_.onStatus(std::move(handler));
+    }
+
+    void on(const std::string& eventName, ErrorHandler handler) {
+        if (eventName != "error") {
+            throw std::runtime_error("unknown relay error event: " + eventName);
+        }
+        onError(std::move(handler));
+    }
+
+    void on(const std::string& eventName, StatusHandler handler) {
+        if (eventName != "status") {
+            throw std::runtime_error("unknown relay status event: " + eventName);
+        }
+        onStatus(std::move(handler));
     }
 
     BedrockLiveRelay& live() { return live_; }

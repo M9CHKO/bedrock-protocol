@@ -152,6 +152,8 @@ client.onText([](const bedrock::TextPacket& text) {});
 
 Packet examples for bots are in [documentation/BOT_PACKETS.md](documentation/BOT_PACKETS.md).
 
+Relay/proxy API documentation is in [docs/RELAY_API.md](docs/RELAY_API.md).
+
 Sending a schema-shaped packet:
 
 ```cpp
