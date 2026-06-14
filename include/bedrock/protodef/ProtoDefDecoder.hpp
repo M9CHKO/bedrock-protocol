@@ -925,6 +925,14 @@ private:
         context.set(path, field.value);
 
         for (const auto& [name, bit] : readBitflagValues(bitflagsJson)) {
+            ProtoDefField flagField;
+            flagField.path = path.empty() ? name : path + "." + name;
+            flagField.type = "bool";
+            flagField.value = (value & bit) != 0 ? "true" : "false";
+            flagField.offset = field.offset;
+            flagField.size = field.size;
+            out.push_back(std::move(flagField));
+
             context.set(path.empty() ? name : path + "." + name, (value & bit) != 0 ? "true" : "false");
         }
     }

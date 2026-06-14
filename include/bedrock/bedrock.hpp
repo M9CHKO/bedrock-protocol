@@ -625,6 +625,12 @@ private:
     }
 
     static PacketValue valueFromDecodedField(const ProtoDefField& field) {
+        if (field.type == "bitflags") {
+            PacketObject out;
+            out["_value"] = decodedUnsignedValue(field.value);
+            return PacketValue::object(std::move(out));
+        }
+
         if (field.type.rfind("mapper<", 0) == 0) {
             auto slash = field.value.find('/');
             if (slash != std::string::npos && slash + 1 < field.value.size()) {
@@ -654,6 +660,26 @@ private:
         }
 
         return PacketValue::string(field.value);
+    }
+
+    static PacketValue decodedUnsignedValue(const std::string& text) {
+        auto normalized = text;
+        while (normalized.size() > 1 && normalized.front() == '0') {
+            normalized.erase(normalized.begin());
+        }
+
+        static const std::string maxUInt64 = "18446744073709551615";
+        const bool fitsUInt64 =
+            normalized.size() < maxUInt64.size() ||
+            (normalized.size() == maxUInt64.size() && normalized <= maxUInt64);
+
+        if (fitsUInt64 && isIntegerText(normalized)) {
+            return PacketValue::uinteger(static_cast<uint64_t>(
+                std::strtoull(normalized.c_str(), nullptr, 10)
+            ));
+        }
+
+        return PacketValue::string(text);
     }
 
     static bool isIntegerText(const std::string& value) {

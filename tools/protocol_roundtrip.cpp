@@ -1,11 +1,15 @@
 #include <bedrock/BedrockFramer.hpp>
+#include <bedrock/debug/PacketFieldDecoder.hpp>
 #include <bedrock/relay/BedrockRelay.hpp>
 #include <bedrock/protocol/ProtocolDefinition.hpp>
 #include <bedrock/protocol/VersionedMcpeCodec.hpp>
 #include <bedrock/protocol/VersionedPacketCodec.hpp>
 #include <bedrock/protodef/ProtoDefEncoder.hpp>
+#include <bedrock/protodef/ProtoDefContext.hpp>
+#include <bedrock/protodef/ProtoDefDecoder.hpp>
 #include <bedrock/protodef/ProtoDefPacketEncoder.hpp>
 #include <bedrock/protodef/ProtoDefPacketDecoder.hpp>
+#include <bedrock/protodef/ProtoDefReader.hpp>
 #include <bedrock/protodef/ProtoDefValue.hpp>
 #include <bedrock/protodef/ProtoDefWriter.hpp>
 
@@ -179,6 +183,16 @@ bool checkProtoDefNativeHelpers() {
         }
     };
 
+    auto expectDecodedField = [&](const std::string& label, const std::vector<bedrock::ProtoDefField>& fields, const std::string& path, const std::string& value) {
+        const auto it = std::find_if(fields.begin(), fields.end(), [&](const bedrock::ProtoDefField& field) {
+            return field.path == path;
+        });
+        if (it == fields.end() || it->value != value) {
+            std::cerr << "[FAIL] protodef helper " << label << " missing " << path << "=" << value << "\n";
+            ok = false;
+        }
+    };
+
     expectBytes(
         "fixed-buffer",
         "[\"buffer\",{\"count\":4}]",
@@ -251,6 +265,29 @@ bool checkProtoDefNativeHelpers() {
         array({bedrock::ProtoDefValue::string("bl")}),
         {0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01}
     );
+
+    try {
+        bedrock::ProtoDefDecoder decoder;
+        const std::vector<uint8_t> encodedFlags {0x05};
+        bedrock::PacketFieldCursor cursor(encodedFlags);
+        bedrock::ProtoDefReader reader(cursor);
+        bedrock::ProtoDefContext context;
+        std::vector<bedrock::ProtoDefField> fields;
+        decoder.decode(
+            "[\"bitflags\",{\"type\":\"varint\",\"flags\":[\"a\",\"b\",\"c\"]}]",
+            reader,
+            "flags",
+            fields,
+            context
+        );
+        expectDecodedField("bitflags-decode", fields, "flags", "5");
+        expectDecodedField("bitflags-decode", fields, "flags.a", "true");
+        expectDecodedField("bitflags-decode", fields, "flags.b", "false");
+        expectDecodedField("bitflags-decode", fields, "flags.c", "true");
+    } catch (const std::exception& e) {
+        std::cerr << "[FAIL] protodef helper bitflags-decode: " << e.what() << "\n";
+        ok = false;
+    }
 
     return ok;
 }

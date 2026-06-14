@@ -132,7 +132,7 @@ int main() {
     std::cerr.setf(std::ios::unitbuf);
 
     bedrock::Relay relay({
-        .version = "1.21.2",
+        .version = "1.21.100",
         .host = "0.0.0.0",
         .port = 19132,
         .motd = "Bedrock Protocol C++ Relay",

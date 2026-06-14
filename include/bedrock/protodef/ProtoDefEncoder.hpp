@@ -965,6 +965,7 @@ private:
         if (v.kind == ProtoDefValue::Kind::Int) return v.intValue != 0;
         if (v.kind == ProtoDefValue::Kind::UInt) return v.uintValue != 0;
         if (v.kind == ProtoDefValue::Kind::Double) return v.doubleValue != 0.0;
+        if (v.kind == ProtoDefValue::Kind::String) return v.stringValue == "true" || v.stringValue == "1";
         throw std::runtime_error("expected bool-compatible value");
     }
 
@@ -982,6 +983,11 @@ private:
         if (v.kind == ProtoDefValue::Kind::Bool) return v.boolValue ? 1 : 0;
         if (v.kind == ProtoDefValue::Kind::Double) return static_cast<uint64_t>(v.doubleValue);
         throw std::runtime_error("expected uint-compatible value");
+    }
+
+    static unsigned __int128 asUInt128(const ProtoDefValue& v) {
+        if (v.kind == ProtoDefValue::Kind::String) return parseUint128(v.stringValue);
+        return static_cast<unsigned __int128>(asUInt(v));
     }
 
     static double asDouble(const ProtoDefValue& v) {
@@ -1085,7 +1091,7 @@ private:
         unsigned __int128 mask = 0;
         if (value.kind == ProtoDefValue::Kind::Object) {
             if (const ProtoDefValue* raw = value.get("_value")) {
-                mask = asUInt(*raw);
+                mask = asUInt128(*raw);
             }
         }
 
@@ -1093,9 +1099,10 @@ private:
             value.kind == ProtoDefValue::Kind::UInt ||
             value.kind == ProtoDefValue::Kind::Int ||
             value.kind == ProtoDefValue::Kind::Bool ||
-            value.kind == ProtoDefValue::Kind::Double
+            value.kind == ProtoDefValue::Kind::Double ||
+            value.kind == ProtoDefValue::Kind::String
         ) {
-            mask = asUInt(value);
+            mask = asUInt128(value);
         } else if (value.kind == ProtoDefValue::Kind::Array) {
             auto flags = readBitflagValues128(bitflagsJson);
             for (const auto& item : value.arrayValue) {
@@ -1110,12 +1117,19 @@ private:
             auto flags = readBitflagValues128(bitflagsJson);
             for (const auto& [name, enabled] : value.objectValue) {
                 if (name == "_value" || name == ".." || name == "$value") continue;
-                if (!asBool(enabled)) continue;
+                const bool enabledFlag = asBool(enabled);
                 auto it = flags.find(name);
                 if (it == flags.end()) {
+                    if (!enabledFlag) {
+                        continue;
+                    }
                     throw std::runtime_error("unknown bitflag: " + name);
                 }
-                mask |= it->second;
+                if (enabledFlag) {
+                    mask |= it->second;
+                } else {
+                    mask &= ~it->second;
+                }
             }
         } else {
             throw std::runtime_error("bitflags encode expects number, array, or object");
