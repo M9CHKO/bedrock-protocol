@@ -15,10 +15,14 @@ struct ElytraFlyState {
     bool down = false;
     bool left = false;
     bool right = false;
+    bool hasPosition = false;
+    double x = 0.0;
+    double y = 0.0;
+    double z = 0.0;
     double pitch = 0.0;
     double yaw = 0.0;
     uint64_t runtimeEntityId = 0;
-    double speed = 2.2;
+    double speed = 1.15;
 };
 
 double degToRad(double value) {
@@ -41,14 +45,10 @@ uint64_t firstUInt(
     return 0;
 }
 
-void sendElytraMotion(bedrock::RelayPlayer& player, const ElytraFlyState& state) {
-    if (!state.enabled || !state.gliding || state.runtimeEntityId == 0) {
-        return;
-    }
-
-    double dx = 0.0;
-    double dy = 0.0;
-    double dz = 0.0;
+void computeElytraDelta(const ElytraFlyState& state, double& dx, double& dy, double& dz) {
+    dx = 0.0;
+    dy = 0.0;
+    dz = 0.0;
 
     if (state.up || (!state.down && !state.left && !state.right)) {
         dx = -std::sin(degToRad(state.yaw));
@@ -75,19 +75,46 @@ void sendElytraMotion(bedrock::RelayPlayer& player, const ElytraFlyState& state)
     if (!isFinite(dy)) dy = 0.0;
     if (!isFinite(dz)) dz = 0.0;
 
-    try {
-        player.queue("set_entity_motion", {
-            {"runtime_entity_id", bedrock::u64(state.runtimeEntityId)},
-            {"velocity", bedrock::object({
-                {"x", bedrock::f32(static_cast<float>(dx * state.speed))},
-                {"y", bedrock::f32(static_cast<float>(dy * state.speed))},
-                {"z", bedrock::f32(static_cast<float>(dz * state.speed))}
-            })}
-        });
-    } catch (const std::exception& e) {
-        std::cerr << "[elytra-fly] failed to send set_entity_motion: "
-                  << e.what() << "\n";
+    dx *= state.speed;
+    dy *= state.speed;
+    dz *= state.speed;
+}
+
+void updatePositionFromPacket(ElytraFlyState& state, const bedrock::RelayPacketEvent& packet) {
+    if (!packet.has("position.x") ||
+        !packet.has("position.y") ||
+        !packet.has("position.z")) {
+        return;
     }
+
+    state.x = packet.getDouble("position.x", state.x);
+    state.y = packet.getDouble("position.y", state.y);
+    state.z = packet.getDouble("position.z", state.z);
+    state.hasPosition = true;
+}
+
+void applyElytraAuthInput(bedrock::RelayPacketEvent& packet, ElytraFlyState& state) {
+    if (!state.enabled || !state.gliding || !state.hasPosition) {
+        return;
+    }
+
+    double dx = 0.0;
+    double dy = 0.0;
+    double dz = 0.0;
+    computeElytraDelta(state, dx, dy, dz);
+
+    state.x += dx;
+    state.y += dy;
+    state.z += dz;
+
+    packet.set("position.x", state.x);
+    packet.set("position.y", state.y);
+    packet.set("position.z", state.z);
+    packet.set("delta.x", dx);
+    packet.set("delta.y", dy);
+    packet.set("delta.z", dz);
+    packet.set("input_data.jumping", true);
+    packet.set("input_data.sprint_down", true);
 }
 
 } // namespace
@@ -129,8 +156,6 @@ int main() {
                   << player.connection.port << "\n";
 
         auto elytra = std::make_shared<ElytraFlyState>();
-        auto* relayPlayer = &player;
-
         player.on("clientbound", [elytra](bedrock::RelayPacketEvent& packet) {
             if (packet.name == "start_game") {
                 elytra->runtimeEntityId = firstUInt(packet, {
@@ -140,6 +165,24 @@ int main() {
                 });
                 std::cout << "[elytra-fly] runtime_entity_id="
                           << elytra->runtimeEntityId << "\n";
+            }
+
+            if (packet.name == "move_player") {
+                const auto runtimeId = firstUInt(packet, {
+                    "runtime_id",
+                    "runtime_entity_id",
+                    "entity_id_self"
+                });
+                if (runtimeId == 0 ||
+                    elytra->runtimeEntityId == 0 ||
+                    runtimeId == elytra->runtimeEntityId) {
+                    if (elytra->runtimeEntityId == 0 && runtimeId != 0) {
+                        elytra->runtimeEntityId = runtimeId;
+                    }
+                    updatePositionFromPacket(*elytra, packet);
+                    elytra->pitch = packet.getDouble("pitch", elytra->pitch);
+                    elytra->yaw = packet.getDouble("yaw", elytra->yaw);
+                }
             }
 
             if (packet.name == "text") {
@@ -157,8 +200,9 @@ int main() {
             // });
         });
 
-        player.on("serverbound", [elytra, relayPlayer](bedrock::RelayPacketEvent& packet, bedrock::RelayPacketDestination& des) {
+        player.on("serverbound", [elytra](bedrock::RelayPacketEvent& packet, bedrock::RelayPacketDestination& des) {
             if (packet.name == "player_auth_input") {
+                updatePositionFromPacket(*elytra, packet);
                 elytra->pitch = packet.getDouble("pitch", elytra->pitch);
                 elytra->yaw = packet.getDouble("yaw", elytra->yaw);
                 elytra->up = packet.getBool("input_data.up", elytra->up);
@@ -175,10 +219,11 @@ int main() {
                     std::cout << "[elytra-fly] stop_gliding\n";
                 }
 
-                sendElytraMotion(*relayPlayer, *elytra);
+                applyElytraAuthInput(packet, *elytra);
             }
 
             if (packet.name == "move_player") {
+                updatePositionFromPacket(*elytra, packet);
                 elytra->pitch = packet.getDouble("pitch", elytra->pitch);
                 elytra->yaw = packet.getDouble("yaw", elytra->yaw);
                 const auto runtimeId = firstUInt(packet, {
@@ -210,8 +255,6 @@ int main() {
                     elytra->gliding = false;
                     std::cout << "[elytra-fly] stop_glide\n";
                 }
-
-                sendElytraMotion(*relayPlayer, *elytra);
             }
 
             if (packet.name == "text") {
