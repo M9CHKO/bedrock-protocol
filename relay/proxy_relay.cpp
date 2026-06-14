@@ -230,7 +230,6 @@ int main() {
         .motd = "Bedrock Protocol C++ Relay",
         .username = "RelayBot",
         .offline = false,
-        .autoSyncMovementMutations = true,
         .destination = {
             .host = "cpe.ign.gg",
             .port = 19132
