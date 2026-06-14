@@ -21,8 +21,12 @@ struct ElytraFlyState {
     double z = 0.0;
     double pitch = 0.0;
     double yaw = 0.0;
+    double vx = 0.0;
+    double vy = 0.0;
+    double vz = 0.0;
     uint64_t runtimeEntityId = 0;
-    double speed = 1.15;
+    double speed = 0.55;
+    double smoothing = 0.22;
 };
 
 double degToRad(double value) {
@@ -103,16 +107,20 @@ void applyElytraAuthInput(bedrock::RelayPacketEvent& packet, ElytraFlyState& sta
     double dz = 0.0;
     computeElytraDelta(state, dx, dy, dz);
 
-    state.x += dx;
-    state.y += dy;
-    state.z += dz;
+    state.vx += (dx - state.vx) * state.smoothing;
+    state.vy += (dy - state.vy) * state.smoothing;
+    state.vz += (dz - state.vz) * state.smoothing;
+
+    state.x += state.vx;
+    state.y += state.vy;
+    state.z += state.vz;
 
     packet.set("position.x", state.x);
     packet.set("position.y", state.y);
     packet.set("position.z", state.z);
-    packet.set("delta.x", dx);
-    packet.set("delta.y", dy);
-    packet.set("delta.z", dz);
+    packet.set("delta.x", state.vx);
+    packet.set("delta.y", state.vy);
+    packet.set("delta.z", state.vz);
     packet.set("input_data.jumping", true);
     packet.set("input_data.sprint_down", true);
 }
@@ -216,45 +224,13 @@ int main() {
                 }
                 if (packet.getBool("input_data.stop_gliding")) {
                     elytra->gliding = false;
+                    elytra->vx = 0.0;
+                    elytra->vy = 0.0;
+                    elytra->vz = 0.0;
                     std::cout << "[elytra-fly] stop_gliding\n";
                 }
 
                 applyElytraAuthInput(packet, *elytra);
-            }
-
-            if (packet.name == "move_player") {
-                updatePositionFromPacket(*elytra, packet);
-                elytra->pitch = packet.getDouble("pitch", elytra->pitch);
-                elytra->yaw = packet.getDouble("yaw", elytra->yaw);
-                const auto runtimeId = firstUInt(packet, {
-                    "runtime_id",
-                    "runtime_entity_id",
-                    "entity_id_self"
-                });
-                if (elytra->runtimeEntityId == 0 && runtimeId != 0) {
-                    elytra->runtimeEntityId = runtimeId;
-                }
-            }
-
-            if (packet.name == "player_action") {
-                const auto runtimeId = firstUInt(packet, {
-                    "runtime_entity_id",
-                    "runtime_id",
-                    "entity_id_self"
-                });
-                if (elytra->runtimeEntityId == 0 && runtimeId != 0) {
-                    elytra->runtimeEntityId = runtimeId;
-                }
-
-                const auto action = packet.get("action");
-                if (action == "start_glide") {
-                    elytra->gliding = true;
-                    std::cout << "[elytra-fly] start_glide\n";
-                }
-                if (action == "stop_glide") {
-                    elytra->gliding = false;
-                    std::cout << "[elytra-fly] stop_glide\n";
-                }
             }
 
             if (packet.name == "text") {
