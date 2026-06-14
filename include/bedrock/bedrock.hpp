@@ -1027,6 +1027,14 @@ private:
     std::vector<PacketWithDestinationHandler> clientboundDestinationHandlers_;
     std::vector<PacketWithDestinationHandler> serverboundDestinationHandlers_;
 
+    void resetSessionHandlers() {
+        movementOverride_.reset();
+        clientboundHandlers_.clear();
+        serverboundHandlers_.clear();
+        clientboundDestinationHandlers_.clear();
+        serverboundDestinationHandlers_.clear();
+    }
+
     static PacketValue vec2(const RelayVec2& value) {
         return PacketValue::object(PacketObject{
             {"x", PacketValue::floating(value.x)},
@@ -1215,6 +1223,7 @@ public:
 
     void listen() {
         live_.onConnect([this](const BedrockServerConnection& connection) {
+            player_.resetSessionHandlers();
             player_.connection = connection;
             for (auto& handler : connectHandlers_) {
                 handler(player_);
@@ -1226,6 +1235,7 @@ public:
             for (auto& handler : disconnectHandlers_) {
                 handler(player_);
             }
+            player_.resetSessionHandlers();
         });
 
         live_.on("clientbound", [this](BedrockRelayPacketEvent& event) {
