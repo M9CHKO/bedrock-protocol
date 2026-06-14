@@ -25,9 +25,7 @@ struct ElytraFlyState {
     double vy = 0.0;
     double vz = 0.0;
     uint64_t runtimeEntityId = 0;
-    double acceleration = 0.075;
-    double maxSpeed = 0.85;
-    double drag = 0.985;
+    double speed = 1.0;
 };
 
 double degToRad(double value) {
@@ -55,25 +53,23 @@ void computeElytraDelta(const ElytraFlyState& state, double& dx, double& dy, dou
     dy = 0.0;
     dz = 0.0;
 
-    if (state.up || (!state.down && !state.left && !state.right)) {
-        dx = -std::sin(degToRad(state.yaw));
-        dy = -std::sin(degToRad(state.pitch));
-        dz = std::cos(degToRad(state.yaw));
+    if (state.up) {
+        dx += -std::sin(degToRad(state.yaw));
+        dy += -std::sin(degToRad(state.pitch));
+        dz += std::cos(degToRad(state.yaw));
     }
     if (state.down) {
-        dx = std::sin(degToRad(state.yaw));
-        dy = std::sin(degToRad(state.pitch));
-        dz = -std::cos(degToRad(state.yaw));
+        dx += std::sin(degToRad(state.yaw));
+        dy += std::sin(degToRad(state.pitch));
+        dz += -std::cos(degToRad(state.yaw));
     }
     if (state.left) {
-        dx = -std::sin(degToRad(state.yaw - 90.0));
-        dy = 0.0;
-        dz = std::cos(degToRad(state.yaw - 90.0));
+        dx += -std::sin(degToRad(state.yaw - 90.0));
+        dz += std::cos(degToRad(state.yaw - 90.0));
     }
     if (state.right) {
-        dx = -std::sin(degToRad(state.yaw + 90.0));
-        dy = 0.0;
-        dz = std::cos(degToRad(state.yaw + 90.0));
+        dx += -std::sin(degToRad(state.yaw + 90.0));
+        dz += std::cos(degToRad(state.yaw + 90.0));
     }
 
     if (!isFinite(dx)) dx = 0.0;
@@ -86,28 +82,16 @@ void computeElytraDelta(const ElytraFlyState& state, double& dx, double& dy, dou
         dy /= length;
         dz /= length;
     }
+
+    dx *= state.speed;
+    dy *= state.speed;
+    dz *= state.speed;
 }
 
 void resetElytraVelocity(ElytraFlyState& state) {
     state.vx = 0.0;
     state.vy = 0.0;
     state.vz = 0.0;
-}
-
-void clampElytraVelocity(ElytraFlyState& state) {
-    const double speed = std::sqrt(
-        state.vx * state.vx +
-        state.vy * state.vy +
-        state.vz * state.vz
-    );
-    if (speed <= state.maxSpeed || speed <= 0.000001) {
-        return;
-    }
-
-    const double scale = state.maxSpeed / speed;
-    state.vx *= scale;
-    state.vy *= scale;
-    state.vz *= scale;
 }
 
 void updatePositionFromPacket(ElytraFlyState& state, const bedrock::RelayPacketEvent& packet) {
@@ -133,10 +117,9 @@ void applyElytraAuthInput(bedrock::RelayPacketEvent& packet, ElytraFlyState& sta
     double dz = 0.0;
     computeElytraDelta(state, dx, dy, dz);
 
-    state.vx = (state.vx + dx * state.acceleration) * state.drag;
-    state.vy = (state.vy + dy * state.acceleration) * state.drag;
-    state.vz = (state.vz + dz * state.acceleration) * state.drag;
-    clampElytraVelocity(state);
+    state.vx = dx;
+    state.vy = dy;
+    state.vz = dz;
 
     state.x += state.vx;
     state.y += state.vy;
@@ -247,19 +230,24 @@ int main() {
         player.on("serverbound", [elytra](bedrock::RelayPacketEvent& packet, bedrock::RelayPacketDestination& des) {
             if (packet.name == "player_auth_input") {
                 bool startedGlidingThisTick = false;
-                updatePositionFromPacket(*elytra, packet);
+                if (!elytra->gliding) {
+                    updatePositionFromPacket(*elytra, packet);
+                }
                 elytra->pitch = packet.getDouble("pitch", elytra->pitch);
                 elytra->yaw = packet.getDouble("yaw", elytra->yaw);
-                elytra->up = packet.getBool("input_data.up", elytra->up);
-                elytra->down = packet.getBool("input_data.down", elytra->down);
-                elytra->left = packet.getBool("input_data.left", elytra->left);
-                elytra->right = packet.getBool("input_data.right", elytra->right);
+                elytra->up = packet.getBool("input_data.up", false);
+                elytra->down = packet.getBool("input_data.down", false);
+                elytra->left = packet.getBool("input_data.left", false);
+                elytra->right = packet.getBool("input_data.right", false);
 
                 if (packet.getBool("input_data.start_gliding")) {
                     const bool wasGliding = elytra->gliding;
                     elytra->gliding = true;
                     if (!wasGliding) {
                         resetElytraVelocity(*elytra);
+                        packet.set("position.x", elytra->x);
+                        packet.set("position.y", elytra->y);
+                        packet.set("position.z", elytra->z);
                         packet.set("delta.x", 0.0);
                         packet.set("delta.y", 0.0);
                         packet.set("delta.z", 0.0);
