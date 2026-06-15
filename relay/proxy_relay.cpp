@@ -25,6 +25,7 @@ struct ElytraFlyState {
     double vy = 0.0;
     double vz = 0.0;
     uint64_t runtimeEntityId = 0;
+    uint64_t tick = 0;
     double speed = 1.0;
 };
 
@@ -92,6 +93,22 @@ void resetElytraVelocity(ElytraFlyState& state) {
     state.vx = 0.0;
     state.vy = 0.0;
     state.vz = 0.0;
+}
+
+void pushClientMotion(bedrock::RelayPlayer& player, const ElytraFlyState& state) {
+    if (state.runtimeEntityId == 0) {
+        return;
+    }
+
+    player.queue("set_entity_motion", {
+        {"runtime_entity_id", bedrock::u64(state.runtimeEntityId)},
+        {"velocity", bedrock::object({
+            {"x", bedrock::f64(state.vx)},
+            {"y", bedrock::f64(state.vy)},
+            {"z", bedrock::f64(state.vz)}
+        })},
+        {"tick", bedrock::u64(state.tick)}
+    });
 }
 
 void updatePositionFromPacket(ElytraFlyState& state, const bedrock::RelayPacketEvent& packet) {
@@ -208,12 +225,6 @@ int main() {
                           << elytra->runtimeEntityId << "\n";
             }
 
-            if (packet.name == "correct_player_move_prediction") {
-                acceptServerCorrection(*elytra, packet);
-                elytra->pitch = packet.getDouble("rotation.x", elytra->pitch);
-                elytra->yaw = packet.getDouble("rotation.z", elytra->yaw);
-            }
-
             if (packet.name == "move_player") {
                 const auto runtimeId = firstUInt(packet, {
                     "runtime_id",
@@ -247,9 +258,10 @@ int main() {
             // });
         });
 
-        player.on("serverbound", [elytra](bedrock::RelayPacketEvent& packet, bedrock::RelayPacketDestination& des) {
+        player.on("serverbound", [elytra, &player](bedrock::RelayPacketEvent& packet, bedrock::RelayPacketDestination& des) {
             if (packet.name == "player_auth_input") {
                 bool startedGlidingThisTick = false;
+                elytra->tick = packet.getUInt("tick", elytra->tick);
                 if (!elytra->gliding) {
                     updatePositionFromPacket(*elytra, packet);
                 }
@@ -273,6 +285,7 @@ int main() {
                         packet.set("delta.z", 0.0);
                         startedGlidingThisTick = true;
                         std::cout << "[elytra-fly] start_gliding velocity_reset\n";
+                        pushClientMotion(player, *elytra);
                     } else {
                         std::cout << "[elytra-fly] start_gliding\n";
                     }
@@ -281,10 +294,13 @@ int main() {
                     elytra->gliding = false;
                     resetElytraVelocity(*elytra);
                     std::cout << "[elytra-fly] stop_gliding\n";
+                    pushClientMotion(player, *elytra);
                 }
 
                 if (!startedGlidingThisTick) {
-                    applyElytraAuthInput(packet, *elytra);
+                    if (applyElytraAuthInput(packet, *elytra)) {
+                        pushClientMotion(player, *elytra);
+                    }
                 }
             }
 

@@ -20,7 +20,6 @@
 #include <initializer_list>
 #include <iostream>
 #include <memory>
-#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -301,30 +300,6 @@ struct RelayPacketDestination {
     }
 };
 
-struct RelayVec2 {
-    double x = 0.0;
-    double z = 0.0;
-};
-
-struct RelayVec3 {
-    double x = 0.0;
-    double y = 0.0;
-    double z = 0.0;
-};
-
-struct RelayMovementSync {
-    uint64_t runtimeEntityId = 0;
-    RelayVec3 position;
-    RelayVec3 velocity;
-    RelayVec2 rotation;
-    uint64_t tick = 0;
-    bool onGround = false;
-    bool interceptServerCorrections = true;
-    bool sendCorrectPlayerMovePrediction = true;
-    bool sendMotionPredictionHints = true;
-    bool sendEntityMotion = false;
-};
-
 class RelayPacketEvent {
 public:
     BedrockRelayDirection direction = BedrockRelayDirection::Clientbound;
@@ -489,22 +464,11 @@ public:
 
 private:
     friend class Relay;
-    friend class RelayPlayer;
     std::string version_;
     mutable bool decoded_ = false;
     bool mutated_ = false;
     mutable PacketObject originalParams_;
     std::vector<VersionedGamePacket> replacements_;
-
-    bool changed() const {
-        if (canceled || !replacements_.empty()) {
-            return true;
-        }
-        if (!decoded_) {
-            return false;
-        }
-        return mutated_ || !objectEqual(params, originalParams_);
-    }
 
     void ensureDecoded() const {
         if (decoded_) {
@@ -976,210 +940,22 @@ public:
         queue(packetName, value);
     }
 
-    void syncMovement(RelayMovementSync sync) {
-        if (sync.interceptServerCorrections) {
-            movementOverride_ = sync;
-        }
-
-        if (sync.sendCorrectPlayerMovePrediction) {
-            queue("correct_player_move_prediction", {
-                {"prediction_type", PacketValue::string("player")},
-                {"position", vec3(sync.position)},
-                {"delta", vec3(sync.velocity)},
-                {"rotation", vec2(sync.rotation)},
-                {"angular_velocity", PacketValue::null()},
-                {"on_ground", PacketValue::boolean(sync.onGround)},
-                {"tick", PacketValue::uinteger(sync.tick)}
-            });
-        }
-
-        if (sync.runtimeEntityId != 0 && sync.sendMotionPredictionHints) {
-            queue("motion_prediction_hints", {
-                {"entity_runtime_id", PacketValue::uinteger(sync.runtimeEntityId)},
-                {"velocity", vec3(sync.velocity)},
-                {"on_ground", PacketValue::boolean(sync.onGround)}
-            });
-        }
-
-        if (sync.runtimeEntityId != 0 && sync.sendEntityMotion) {
-            queue("set_entity_motion", {
-                {"runtime_entity_id", PacketValue::uinteger(sync.runtimeEntityId)},
-                {"velocity", vec3(sync.velocity)},
-                {"tick", PacketValue::uinteger(sync.tick)}
-            });
-        }
-    }
-
-    void setMovementSync(RelayMovementSync sync) {
-        movementOverride_ = std::move(sync);
-    }
-
-    void clearMovementSync() {
-        movementOverride_.reset();
-    }
-
 private:
     friend class Relay;
     BedrockLiveRelay* relay_ = nullptr;
-    std::optional<RelayMovementSync> movementOverride_;
     std::vector<PacketHandler> clientboundHandlers_;
     std::vector<PacketHandler> serverboundHandlers_;
     std::vector<PacketWithDestinationHandler> clientboundDestinationHandlers_;
     std::vector<PacketWithDestinationHandler> serverboundDestinationHandlers_;
 
     void resetSessionHandlers() {
-        movementOverride_.reset();
         clientboundHandlers_.clear();
         serverboundHandlers_.clear();
         clientboundDestinationHandlers_.clear();
         serverboundDestinationHandlers_.clear();
     }
 
-    static PacketValue vec2(const RelayVec2& value) {
-        return PacketValue::object(PacketObject{
-            {"x", PacketValue::floating(value.x)},
-            {"z", PacketValue::floating(value.z)}
-        });
-    }
-
-    static PacketValue vec3(const RelayVec3& value) {
-        return PacketValue::object(PacketObject{
-            {"x", PacketValue::floating(value.x)},
-            {"y", PacketValue::floating(value.y)},
-            {"z", PacketValue::floating(value.z)}
-        });
-    }
-
-    static bool packetTargetsRuntime(const RelayPacketEvent& event, uint64_t runtimeEntityId) {
-        if (runtimeEntityId == 0) {
-            return true;
-        }
-
-        for (const auto* key : {
-            "runtime_id",
-            "runtime_entity_id",
-            "entity_runtime_id",
-            "entity_id_self"
-        }) {
-            if (event.has(key)) {
-                const auto found = event.getUInt(key);
-                return found == 0 || found == runtimeEntityId;
-            }
-        }
-        return true;
-    }
-
-    void applyMovementSync(RelayPacketEvent& event) {
-        if (!movementOverride_ ||
-            !movementOverride_->interceptServerCorrections ||
-            event.direction != BedrockRelayDirection::Clientbound) {
-            return;
-        }
-
-        const auto& sync = *movementOverride_;
-        if (event.name == "correct_player_move_prediction") {
-            event.set("position.x", sync.position.x);
-            event.set("position.y", sync.position.y);
-            event.set("position.z", sync.position.z);
-            event.set("delta.x", sync.velocity.x);
-            event.set("delta.y", sync.velocity.y);
-            event.set("delta.z", sync.velocity.z);
-            event.set("rotation.x", sync.rotation.x);
-            event.set("rotation.z", sync.rotation.z);
-            event.set("angular_velocity", PacketValue::null());
-            event.set("on_ground", sync.onGround);
-            return;
-        }
-
-        if ((event.name == "motion_prediction_hints" ||
-             event.name == "set_entity_motion") &&
-            packetTargetsRuntime(event, sync.runtimeEntityId)) {
-            event.set("velocity.x", sync.velocity.x);
-            event.set("velocity.y", sync.velocity.y);
-            event.set("velocity.z", sync.velocity.z);
-            if (event.name == "motion_prediction_hints") {
-                event.set("on_ground", sync.onGround);
-            }
-            return;
-        }
-
-        if (event.name == "move_player" &&
-            packetTargetsRuntime(event, sync.runtimeEntityId)) {
-            event.set("position.x", sync.position.x);
-            event.set("position.y", sync.position.y);
-            event.set("position.z", sync.position.z);
-            event.set("pitch", sync.rotation.x);
-            event.set("yaw", sync.rotation.z);
-            event.set("head_yaw", sync.rotation.z);
-            event.set("mode", "normal");
-            event.set("on_ground", sync.onGround);
-        }
-    }
-
-    bool movementSyncFromMutation(const RelayPacketEvent& event, RelayMovementSync& sync) const {
-        if (!event.changed() || event.canceled ||
-            event.direction != BedrockRelayDirection::Serverbound) {
-            return false;
-        }
-
-        if (event.name != "player_auth_input" && event.name != "move_player") {
-            return false;
-        }
-
-        if (!event.has("position.x") ||
-            !event.has("position.y") ||
-            !event.has("position.z")) {
-            return false;
-        }
-
-        sync.runtimeEntityId = 0;
-        for (const auto* key : {
-            "runtime_id",
-            "runtime_entity_id",
-            "entity_runtime_id",
-            "entity_id_self"
-        }) {
-            if (event.has(key)) {
-                sync.runtimeEntityId = event.getUInt(key);
-                break;
-            }
-        }
-
-        sync.position = {
-            event.getDouble("position.x"),
-            event.getDouble("position.y"),
-            event.getDouble("position.z")
-        };
-
-        sync.velocity = {
-            event.getDouble("delta.x", 0.0),
-            event.getDouble("delta.y", 0.0),
-            event.getDouble("delta.z", 0.0)
-        };
-
-        sync.rotation = {
-            event.getDouble("pitch", 0.0),
-            event.getDouble("yaw", 0.0)
-        };
-        sync.tick = event.getUInt("tick", 0);
-        sync.onGround = event.getBool("on_ground", false);
-        sync.interceptServerCorrections = false;
-        sync.sendCorrectPlayerMovePrediction = true;
-        sync.sendMotionPredictionHints = true;
-        sync.sendEntityMotion = false;
-        return true;
-    }
-
-    void syncChangedMovementToClient(const RelayPacketEvent& event) {
-        RelayMovementSync sync;
-        if (movementSyncFromMutation(event, sync)) {
-            syncMovement(sync);
-        }
-    }
-
     void dispatch(RelayPacketEvent& event) {
-        applyMovementSync(event);
-
         if (!clientboundHandlers_.empty() ||
             !serverboundHandlers_.empty() ||
             !clientboundDestinationHandlers_.empty() ||
@@ -1273,7 +1049,6 @@ public:
                     wrapped.cancel();
                 }
             }
-            player_.syncChangedMovementToClient(wrapped);
             wrapped.apply(event);
         });
 
