@@ -1,4 +1,4 @@
-# bedrock-protocol-cpp
+# bedrock-protocol
 
 Minecraft Bedrock Protocol Client Library for C++20
 
