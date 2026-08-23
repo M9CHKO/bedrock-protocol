@@ -50,7 +50,7 @@ bedrock::BedrockLiveRelayOptions options;
 options.server.host = "0.0.0.0";
 options.server.port = 19132;
 options.server.version = "1.20.40";
-options.server.motd = "Bedrock Protocol C++ Relay";
+options.server.motd = {{"motd", "Bedrock Protocol C++ Relay"}};
 
 options.upstream.host = "localhost";
 options.upstream.port = 19132;

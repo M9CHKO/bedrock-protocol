@@ -30,6 +30,10 @@ const ProtocolDefinition& VersionedMcpeCodec::definition() const {
     return batchCodec_.definition();
 }
 
+bool VersionedMcpeCodec::compressorInPacketHeader() const noexcept {
+    return compressorInPacketHeader_;
+}
+
 VersionedMcpePayload VersionedMcpeCodec::decodeMcpePayload(const std::vector<uint8_t>& mcpePayload) const {
     if (mcpePayload.empty()) {
         throw std::runtime_error("empty mcpe payload");
@@ -77,23 +81,91 @@ VersionedMcpePayload VersionedMcpeCodec::decodeCompressionPacket(
         payload.framedBatch = std::move(body);
     } else if (payload.compressionHeader == static_cast<uint8_t>(VersionedMcpeCompression::DeflateRaw)) {
         payload.framedBatch = inflateRaw(body);
+    } else if (payload.compressionHeader == static_cast<uint8_t>(VersionedMcpeCompression::Snappy)) {
+        throw std::runtime_error("Snappy compression not implemented");
     } else {
-        // Some newer Bedrock versions/servers may send the framed batch without
-        // the extra compression header. In that case the first byte is actually
-        // the first framed packet byte, not a compression mode.
-        payload.compressionHeader = static_cast<uint8_t>(VersionedMcpeCompression::Uncompressed);
-        payload.framedBatch = compressionPacket;
+        throw std::runtime_error(
+            "Unknown compression type " + std::to_string(payload.compressionHeader)
+        );
     }
 
     payload.batch = batchCodec_.decodeFramedBatch(payload.framedBatch);
     return payload;
 }
 
+VersionedMcpePayload VersionedMcpeCodec::decodeEncryptedCompressionPacket(
+    const std::vector<uint8_t>& compressionPacket
+) const {
+    if (compressorInPacketHeader_) {
+        return decodeCompressionPacket(compressionPacket);
+    }
+    if (compressionPacket.empty()) {
+        throw std::runtime_error("empty encrypted compression packet");
+    }
+
+    VersionedMcpePayload payload;
+    payload.compressionHeader =
+        static_cast<uint8_t>(VersionedMcpeCompression::DeflateRaw);
+    payload.compressionPacket = compressionPacket;
+    payload.framedBatch = inflateRaw(compressionPacket);
+    payload.batch = batchCodec_.decodeFramedBatch(payload.framedBatch);
+    return payload;
+}
+
+VersionedMcpePayload VersionedMcpeCodec::decodeUncompressedMcpePayload(
+    const std::vector<uint8_t>& mcpePayload
+) const {
+    if (mcpePayload.empty()) {
+        throw std::runtime_error("empty mcpe payload");
+    }
+    if (mcpePayload[0] != 0xfe) {
+        throw std::runtime_error("mcpe payload missing 0xfe prefix");
+    }
+
+    return decodeUncompressedCompressionPacket(std::vector<uint8_t>(
+        mcpePayload.begin() + 1,
+        mcpePayload.end()
+    ));
+}
+
+VersionedMcpePayload VersionedMcpeCodec::decodeUncompressedCompressionPacket(
+    const std::vector<uint8_t>& compressionPacket
+) const {
+    VersionedMcpePayload payload;
+    payload.compressionHeader =
+        static_cast<uint8_t>(VersionedMcpeCompression::Uncompressed);
+    payload.compressionPacket = compressionPacket;
+    payload.framedBatch = compressionPacket;
+    payload.batch = batchCodec_.decodeFramedBatch(payload.framedBatch);
+    return payload;
+}
+
 std::vector<uint8_t> VersionedMcpeCodec::encodeMcpePayload(
     const std::vector<VersionedGamePacket>& packets,
-    VersionedMcpeCompression compression
+    VersionedMcpeCompression compression,
+    int compressionLevel
 ) const {
-    auto compressionPacket = encodeCompressionPacket(packets, compression);
+    auto compressionPacket = encodeCompressionPacket(packets, compression, compressionLevel);
+
+    std::vector<uint8_t> out;
+    out.reserve(1 + compressionPacket.size());
+    out.push_back(0xfe);
+    out.insert(out.end(), compressionPacket.begin(), compressionPacket.end());
+    return out;
+}
+
+std::vector<uint8_t> VersionedMcpeCodec::encodeMcpePayload(
+    const std::vector<VersionedGamePacket>& packets,
+    const std::string& compressionAlgorithm,
+    int compressionLevel,
+    std::size_t compressionThreshold
+) const {
+    auto compressionPacket = encodeCompressionPacket(
+        packets,
+        compressionAlgorithm,
+        compressionLevel,
+        compressionThreshold
+    );
 
     std::vector<uint8_t> out;
     out.reserve(1 + compressionPacket.size());
@@ -104,9 +176,30 @@ std::vector<uint8_t> VersionedMcpeCodec::encodeMcpePayload(
 
 std::vector<uint8_t> VersionedMcpeCodec::encodeMcpePayloadByNames(
     const std::vector<std::pair<std::string, std::vector<uint8_t>>>& packets,
-    VersionedMcpeCompression compression
+    VersionedMcpeCompression compression,
+    int compressionLevel
 ) const {
-    auto compressionPacket = encodeCompressionPacketByNames(packets, compression);
+    auto compressionPacket = encodeCompressionPacketByNames(packets, compression, compressionLevel);
+
+    std::vector<uint8_t> out;
+    out.reserve(1 + compressionPacket.size());
+    out.push_back(0xfe);
+    out.insert(out.end(), compressionPacket.begin(), compressionPacket.end());
+    return out;
+}
+
+std::vector<uint8_t> VersionedMcpeCodec::encodeMcpePayloadByNames(
+    const std::vector<std::pair<std::string, std::vector<uint8_t>>>& packets,
+    const std::string& compressionAlgorithm,
+    int compressionLevel,
+    std::size_t compressionThreshold
+) const {
+    auto compressionPacket = encodeCompressionPacketByNames(
+        packets,
+        compressionAlgorithm,
+        compressionLevel,
+        compressionThreshold
+    );
 
     std::vector<uint8_t> out;
     out.reserve(1 + compressionPacket.size());
@@ -117,9 +210,55 @@ std::vector<uint8_t> VersionedMcpeCodec::encodeMcpePayloadByNames(
 
 std::vector<uint8_t> VersionedMcpeCodec::encodeCompressionPacket(
     const std::vector<VersionedGamePacket>& packets,
-    VersionedMcpeCompression compression
+    VersionedMcpeCompression compression,
+    int compressionLevel
 ) const {
     auto framedBatch = batchCodec_.encodeFramedBatch(packets);
+    return encodeFramedBatch(framedBatch, compression, compressionLevel);
+}
+
+std::vector<uint8_t> VersionedMcpeCodec::encodeCompressionPacket(
+    const std::vector<VersionedGamePacket>& packets,
+    const std::string& compressionAlgorithm,
+    int compressionLevel,
+    std::size_t compressionThreshold
+) const {
+    auto framedBatch = batchCodec_.encodeFramedBatch(packets);
+    const bool shouldCompress = framedBatch.size() > compressionThreshold;
+    return encodeFramedBatch(
+        framedBatch,
+        chooseCompression(compressionAlgorithm, shouldCompress),
+        compressionLevel
+    );
+}
+
+std::vector<uint8_t> VersionedMcpeCodec::encodeEncryptedCompressionPacket(
+    const std::vector<VersionedGamePacket>& packets,
+    int compressionLevel
+) const {
+    auto compressed = deflateRaw(
+        batchCodec_.encodeFramedBatch(packets),
+        compressionLevel
+    );
+    if (!compressorInPacketHeader_) {
+        return compressed;
+    }
+
+    std::vector<uint8_t> out;
+    out.reserve(1 + compressed.size());
+    out.push_back(static_cast<uint8_t>(VersionedMcpeCompression::DeflateRaw));
+    out.insert(out.end(), compressed.begin(), compressed.end());
+    return out;
+}
+
+std::vector<uint8_t> VersionedMcpeCodec::encodeFramedBatch(
+    const std::vector<uint8_t>& framedBatch,
+    VersionedMcpeCompression compression,
+    int compressionLevel
+) const {
+    if (compression == VersionedMcpeCompression::Automatic) {
+        throw std::runtime_error("unsupported compression mode");
+    }
 
     std::vector<uint8_t> out;
 
@@ -129,7 +268,11 @@ std::vector<uint8_t> VersionedMcpeCodec::encodeCompressionPacket(
         }
 
         if (compression == VersionedMcpeCompression::DeflateRaw) {
-            return deflateRaw(framedBatch);
+            return deflateRaw(framedBatch, compressionLevel);
+        }
+
+        if (compression == VersionedMcpeCompression::Snappy) {
+            throw std::runtime_error("Snappy compression not implemented");
         }
 
         throw std::runtime_error("unsupported compression mode");
@@ -143,9 +286,13 @@ std::vector<uint8_t> VersionedMcpeCodec::encodeCompressionPacket(
     }
 
     if (compression == VersionedMcpeCompression::DeflateRaw) {
-        auto compressed = deflateRaw(framedBatch);
+        auto compressed = deflateRaw(framedBatch, compressionLevel);
         out.insert(out.end(), compressed.begin(), compressed.end());
         return out;
+    }
+
+    if (compression == VersionedMcpeCompression::Snappy) {
+        throw std::runtime_error("Snappy compression not implemented");
     }
 
     throw std::runtime_error("unsupported compression mode");
@@ -153,7 +300,8 @@ std::vector<uint8_t> VersionedMcpeCodec::encodeCompressionPacket(
 
 std::vector<uint8_t> VersionedMcpeCodec::encodeCompressionPacketByNames(
     const std::vector<std::pair<std::string, std::vector<uint8_t>>>& packets,
-    VersionedMcpeCompression compression
+    VersionedMcpeCompression compression,
+    int compressionLevel
 ) const {
     std::vector<VersionedGamePacket> made;
     made.reserve(packets.size());
@@ -162,15 +310,60 @@ std::vector<uint8_t> VersionedMcpeCodec::encodeCompressionPacketByNames(
         made.push_back(packetCodec().makePacketByName(item.first, item.second));
     }
 
-    return encodeCompressionPacket(made, compression);
+    return encodeCompressionPacket(made, compression, compressionLevel);
 }
 
-std::vector<uint8_t> VersionedMcpeCodec::deflateRaw(const std::vector<uint8_t>& input) {
+std::vector<uint8_t> VersionedMcpeCodec::encodeCompressionPacketByNames(
+    const std::vector<std::pair<std::string, std::vector<uint8_t>>>& packets,
+    const std::string& compressionAlgorithm,
+    int compressionLevel,
+    std::size_t compressionThreshold
+) const {
+    std::vector<VersionedGamePacket> made;
+    made.reserve(packets.size());
+
+    for (const auto& item : packets) {
+        made.push_back(packetCodec().makePacketByName(item.first, item.second));
+    }
+
+    return encodeCompressionPacket(
+        made,
+        compressionAlgorithm,
+        compressionLevel,
+        compressionThreshold
+    );
+}
+
+VersionedMcpeCompression VersionedMcpeCodec::chooseCompression(
+    const std::string& compressionAlgorithm,
+    bool shouldCompress
+) {
+    if (compressionAlgorithm == "none") {
+        return VersionedMcpeCompression::Uncompressed;
+    }
+    if (compressionAlgorithm == "deflate") {
+        return shouldCompress
+            ? VersionedMcpeCompression::DeflateRaw
+            : VersionedMcpeCompression::Uncompressed;
+    }
+    if (compressionAlgorithm == "snappy") {
+        return shouldCompress
+            ? VersionedMcpeCompression::Snappy
+            : VersionedMcpeCompression::Uncompressed;
+    }
+
+    throw std::runtime_error("Unknown compression algorithm: " + compressionAlgorithm);
+}
+
+std::vector<uint8_t> VersionedMcpeCodec::deflateRaw(
+    const std::vector<uint8_t>& input,
+    int compressionLevel
+) {
     z_stream stream{};
 
     int init = deflateInit2(
         &stream,
-        Z_DEFAULT_COMPRESSION,
+        compressionLevel,
         Z_DEFLATED,
         -MAX_WBITS,
         8,

@@ -122,7 +122,7 @@ For another version, change only this line:
 .version = "1.21.100",
 ```
 
-Use `"latest"` if you want the newest bundled version.
+Omit `version` to use the JavaScript package default, `"1.26.0"`, or pass another exact supported release. `"latest"` and `"auto"` are not valid JavaScript `Versions` keys and are rejected.
 
 ## 4. Add CMake
 

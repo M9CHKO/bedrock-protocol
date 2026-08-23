@@ -11,11 +11,11 @@ int main() {
     std::atomic<bool> connected {false};
     std::atomic<bool> gotNetworkSettings {false};
 
-    auto server = bedrock::createServer({
+    bedrock::BedrockServer server({
         .host = "127.0.0.1",
         .port = 0,
         .version = "1.20.40",
-        .motd = "RakNet Client Smoke",
+        .motd = {{"motd", "RakNet Client Smoke"}},
         .maxPlayers = 3
     });
     server.listen();

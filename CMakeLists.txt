@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
 project(bedrock-protocol-cpp VERSION 0.1.0 LANGUAGES CXX)
 
+include(CTest)
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -25,6 +27,7 @@ add_library(bedrock_protocol
     src/auth/BedrockAuthJwt.cpp
     src/auth/BedrockClientDataBuilder.cpp
     src/auth/XboxLiveAuth.cpp
+    src/auth/XboxProofKey.cpp
     src/client/BedrockNetworkClient.cpp
     src/client/RakNetClient.cpp
     src/events/BedrockPacketEventAdapter.cpp
@@ -39,6 +42,8 @@ add_library(bedrock_protocol
     src/protocol/TypedPacketDispatcher.cpp
     src/protocol/VersionedMcpeCodec.cpp
     src/relay/BedrockLiveRelay.cpp
+    src/server/BedrockLoginVerifier.cpp
+    src/server/ServerAdvertisement.cpp
     src/server/RakNetServer.cpp
     src/util/BinaryStream.cpp
     src/util/VarInt.cpp
@@ -80,8 +85,26 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
     add_executable(protocol-roundtrip tools/protocol_roundtrip.cpp)
     target_link_libraries(protocol-roundtrip PRIVATE BedrockProtocol::bedrock_protocol)
 
+    add_executable(ping-api-smoke tools/ping_api_smoke.cpp)
+    target_link_libraries(ping-api-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
+    add_executable(create-server-factory-smoke tools/create_server_factory_smoke.cpp)
+    target_link_libraries(create-server-factory-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
+    add_executable(create-client-factory-smoke tools/create_client_factory_smoke.cpp)
+    target_link_libraries(create-client-factory-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
+    add_executable(legacy-encryption-smoke tools/legacy_encryption_smoke.cpp)
+    target_link_libraries(legacy-encryption-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
     add_executable(raknet-server-smoke tools/raknet_server_smoke.cpp)
     target_link_libraries(raknet-server-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
+    add_executable(raknet-connection-lifecycle-smoke tools/raknet_connection_lifecycle_smoke.cpp)
+    target_link_libraries(raknet-connection-lifecycle-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
+    add_executable(server-login-verifier-smoke tools/server_login_verifier_smoke.cpp)
+    target_link_libraries(server-login-verifier-smoke PRIVATE BedrockProtocol::bedrock_protocol)
 
     add_executable(raknet-client-smoke tools/raknet_client_smoke.cpp)
     target_link_libraries(raknet-client-smoke PRIVATE BedrockProtocol::bedrock_protocol)
@@ -94,6 +117,53 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
 
     add_executable(chunk-smoke tools/chunk_smoke.cpp)
     target_link_libraries(chunk-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
+    add_executable(public-header-smoke tools/public_header_smoke.cpp)
+    target_link_libraries(public-header-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
+    add_executable(public-header-reverse-smoke tools/public_header_reverse_smoke.cpp)
+    target_link_libraries(public-header-reverse-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
+    add_executable(xbox-proof-key-smoke tools/xbox_proof_key_smoke.cpp)
+    target_link_libraries(xbox-proof-key-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
+    if(BUILD_TESTING)
+        add_test(NAME protocol-roundtrip COMMAND protocol-roundtrip)
+        add_test(NAME ping-api-smoke COMMAND ping-api-smoke)
+        add_test(NAME create-server-factory-smoke COMMAND create-server-factory-smoke)
+        add_test(NAME create-client-factory-smoke COMMAND create-client-factory-smoke)
+        add_test(NAME legacy-encryption-smoke COMMAND legacy-encryption-smoke)
+        add_test(NAME chunk-smoke COMMAND chunk-smoke)
+        add_test(NAME raknet-server-smoke COMMAND raknet-server-smoke)
+        add_test(NAME raknet-connection-lifecycle-smoke COMMAND raknet-connection-lifecycle-smoke)
+        add_test(NAME server-login-verifier-smoke COMMAND server-login-verifier-smoke)
+        add_test(NAME raknet-client-smoke COMMAND raknet-client-smoke)
+        add_test(NAME network-client-smoke COMMAND network-client-smoke)
+        add_test(NAME live-relay-smoke COMMAND live-relay-smoke)
+        add_test(NAME public-header-smoke COMMAND public-header-smoke)
+        add_test(NAME public-header-reverse-smoke COMMAND public-header-reverse-smoke)
+        add_test(NAME xbox-proof-key-smoke COMMAND xbox-proof-key-smoke)
+        set_tests_properties(
+            protocol-roundtrip
+            ping-api-smoke
+            create-server-factory-smoke
+            create-client-factory-smoke
+            legacy-encryption-smoke
+            chunk-smoke
+            raknet-server-smoke
+            raknet-connection-lifecycle-smoke
+            server-login-verifier-smoke
+            raknet-client-smoke
+            network-client-smoke
+            live-relay-smoke
+            public-header-smoke
+            public-header-reverse-smoke
+            xbox-proof-key-smoke
+            PROPERTIES
+                WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+                TIMEOUT 120
+        )
+    endif()
 
     # Runtime helper used by the public API and the bedrock launcher.
     add_executable(bedrock-session tools/session.cpp)
@@ -141,7 +211,7 @@ if(BEDROCK_PROTOCOL_CPP_INSTALL)
     )
 
     if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
-        install(TARGETS bedrock bedrock-session login xbox-login ping protocol-roundtrip raknet-server-smoke raknet-client-smoke network-client-smoke live-relay-smoke chunk-smoke
+        install(TARGETS bedrock bedrock-session login xbox-login ping protocol-roundtrip ping-api-smoke create-server-factory-smoke create-client-factory-smoke legacy-encryption-smoke raknet-server-smoke raknet-connection-lifecycle-smoke server-login-verifier-smoke raknet-client-smoke network-client-smoke live-relay-smoke chunk-smoke
             RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
         )
     endif()

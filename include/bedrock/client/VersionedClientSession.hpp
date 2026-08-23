@@ -15,7 +15,7 @@
 namespace bedrock {
 
 struct VersionedClientSessionOptions {
-    std::string minecraftVersion;
+    std::string minecraftVersion = "1.26.0";
     VersionedMcpeCompression outgoingCompression = VersionedMcpeCompression::DeflateRaw;
 
     bool autoResourcePackResponses = true;

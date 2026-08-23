@@ -3722,6 +3722,15 @@ static const ProtocolVersionInfo VERSION_1_19_62 = {
     sizeof(PACKETS_1_19_62) / sizeof(PACKETS_1_19_62[0])
 };
 
+// minecraft-data 3.105.0 maps this release to the 1.19.62 protocol schema,
+// while retaining its distinct wire protocol id.
+static const ProtocolVersionInfo VERSION_1_19_63 = {
+    "1.19.63",
+    568u,
+    PACKETS_1_19_62,
+    sizeof(PACKETS_1_19_62) / sizeof(PACKETS_1_19_62[0])
+};
+
 static const ProtocolPacketInfo PACKETS_1_19_70[] = {
     { 1u, "login", "packet_login" },
     { 2u, "play_status", "packet_play_status" },
@@ -4555,6 +4564,14 @@ static const ProtocolPacketInfo PACKETS_1_20_10[] = {
 
 static const ProtocolVersionInfo VERSION_1_20_10 = {
     "1.20.10",
+    594u,
+    PACKETS_1_20_10,
+    sizeof(PACKETS_1_20_10) / sizeof(PACKETS_1_20_10[0])
+};
+
+// minecraft-data 3.105.0 maps this release to the 1.20.10 protocol schema.
+static const ProtocolVersionInfo VERSION_1_20_15 = {
+    "1.20.15",
     594u,
     PACKETS_1_20_10,
     sizeof(PACKETS_1_20_10) / sizeof(PACKETS_1_20_10[0])
@@ -10239,10 +10256,12 @@ static const ProtocolVersionInfo* const ALL_VERSIONS[] = {
     &VERSION_1_19_50,
     &VERSION_1_19_60,
     &VERSION_1_19_62,
+    &VERSION_1_19_63,
     &VERSION_1_19_70,
     &VERSION_1_19_80,
     &VERSION_1_20_0,
     &VERSION_1_20_10,
+    &VERSION_1_20_15,
     &VERSION_1_20_30,
     &VERSION_1_20_40,
     &VERSION_1_20_50,

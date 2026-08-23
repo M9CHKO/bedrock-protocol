@@ -13,7 +13,7 @@ auto client = bedrock::createClient({
 });
 ```
 
-Use `"latest"` to select the newest bundled version.
+The default is the JavaScript package's exact `CURRENT_VERSION`, `"1.26.0"`. Pass another exact key from the table below when needed. Values such as `"latest"`, `"auto"`, and an empty string are rejected, matching `Options.validateOptions()`.
 
 ## Version Notes
 
@@ -31,9 +31,6 @@ Server MOTD protocol numbers are not always reliable. Some servers advertise an 
 
 | Library version string | Minecraft version in data | Protocol |
 |---:|---:|---:|
-| `0.14` | 0.14.3 | 70 |
-| `0.15` | 0.15.6 | 82 |
-| `1.0` | 1.0.0 | 100 |
 | `1.16.201` | 1.16.201 | 422 |
 | `1.16.210` | 1.16.210 | 428 |
 | `1.16.220` | 1.16.220 | 431 |
@@ -82,8 +79,6 @@ Server MOTD protocol numbers are not always reliable. Some servers advertise an 
 | `1.21.124` | 1.21.124 | 860 |
 | `1.21.130` | 1.21.130 | 898 |
 | `1.26.0` | 1.26.0 | 924 |
-| `1.26.10` | 26.10 | 944 |
-| `1.26.20` | 1.26.20 | 975 |
 
 ## How To Check Locally
 

@@ -173,15 +173,15 @@ PlayStatusPacket PacketPayloadReader::readPlayStatus(const std::vector<uint8_t>&
     return out;
 }
 
-TextPacket PacketPayloadReader::readText(const GamePacket& packet) {
+PayloadTextPacket PacketPayloadReader::readText(const GamePacket& packet) {
     return readText(payloadFromGamePacket(packet));
 }
 
-TextPacket PacketPayloadReader::readText(const std::vector<uint8_t>& packetOrPayload) {
+PayloadTextPacket PacketPayloadReader::readText(const std::vector<uint8_t>& packetOrPayload) {
     auto payload = payloadFromPacketOrPayload(packetOrPayload, 9);
     Reader r(payload);
 
-    TextPacket out;
+    PayloadTextPacket out;
     out.type = r.u8();
     out.needsTranslation = r.boolean();
 

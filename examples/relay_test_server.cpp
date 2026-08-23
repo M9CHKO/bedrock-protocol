@@ -59,7 +59,7 @@ int main() {
     options.server.host = settings.listenHost;
     options.server.port = settings.listenPort;
     options.server.version = settings.version;
-    options.server.motd = settings.motd;
+    options.server.motd = {{"motd", settings.motd}};
     options.server.maxPlayers = settings.maxPlayers;
 
     options.upstream.host = settings.upstreamHost;

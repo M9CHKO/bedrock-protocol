@@ -1,12 +1,12 @@
 #pragma once
 
-#include <bedrock/Packet.hpp>
+#include <bedrock/legacy/Packet.hpp>
 #include <bedrock/events/BedrockPacketEvent.hpp>
 
 namespace bedrock {
 
-inline Packet packetFromEvent(const BedrockPacketEvent& event) {
-    Packet packet;
+inline legacy::Packet packetFromEvent(const BedrockPacketEvent& event) {
+    legacy::Packet packet;
 
     packet.name = event.packetName;
     packet.size = event.rawPacket.size();

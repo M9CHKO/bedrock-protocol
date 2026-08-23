@@ -2,6 +2,7 @@
 
 #include <bedrock/BedrockKeyExchange.hpp>
 #include <bedrock/LoginPacket.hpp>
+#include <bedrock/Options.hpp>
 #include <bedrock/protocol/ProtocolDefinition.hpp>
 #include <bedrock/protocol/VersionedPayloadReader.hpp>
 #include <bedrock/protodef/ProtoDefPacketDecoder.hpp>
@@ -354,6 +355,16 @@ std::string packetSummary(const std::string& version, const VersionedGamePacket&
 
 } // namespace
 
+void detail::applyRelayDownstreamIdentity(
+    BedrockLiveRelayOptions& options,
+    const BedrockRelayDownstreamProfile& profile
+) {
+    options.upstream.username = options.useDownstreamDisplayNameForUpstreamUsername
+        ? profile.displayName
+        : profile.xuid;
+    options.upstream.profile = options.upstream.username;
+}
+
 BedrockLiveRelay::BedrockLiveRelay(BedrockLiveRelayOptions options)
     : options_(normalizeOptions(std::move(options))),
       server_(std::make_unique<BedrockServer>(options_.server)) {}
@@ -404,6 +415,14 @@ void BedrockLiveRelay::listen() {
         }
         resetRelaySession("downstream disconnected");
         emitStatus();
+    });
+
+    server_->onLogin([this](const BedrockServerPacketEvent& event) {
+        if (upstreamStarted_.load() || upstream_ || downstreamJoined_.load()) {
+            resetRelaySession("downstream reconnect");
+        }
+        captureDownstreamClientData(event.packet);
+        startUpstream();
     });
 
     server_->onAny([this](const BedrockServerPacketEvent& event) {
@@ -507,6 +526,10 @@ uint16_t BedrockLiveRelay::boundPort() const {
     return server_ ? server_->boundPort() : 0;
 }
 
+const BedrockLiveRelayOptions& BedrockLiveRelay::options() const {
+    return options_;
+}
+
 BedrockServer& BedrockLiveRelay::server() {
     return *server_;
 }
@@ -516,19 +539,14 @@ BedrockNetworkClient* BedrockLiveRelay::upstream() {
 }
 
 BedrockLiveRelayOptions BedrockLiveRelay::normalizeOptions(BedrockLiveRelayOptions options) {
-    if (options.server.version.empty() ||
-        options.server.version == "auto" ||
-        options.server.version == "latest") {
-        auto versions = ProtocolDefinition::versions();
-        if (!versions.empty()) {
-            options.server.version = versions.back();
-        }
-    }
+    (void) validateVersion(options.server.version);
 
-    if (options.upstream.version.empty() ||
-        options.upstream.version == "auto" ||
-        options.upstream.version == "latest") {
+    // An omitted destination version inherits the relay server version. An
+    // explicit pseudo-version is not part of options.Versions and is rejected.
+    if (options.upstream.version.empty()) {
         options.upstream.version = options.server.version;
+    } else {
+        (void) validateVersion(options.upstream.version);
     }
     if (options.upstream.version != options.server.version) {
         throw std::runtime_error("live relay currently requires matching server/upstream versions");
@@ -577,12 +595,7 @@ bool BedrockLiveRelay::isPlayStatusLoginSuccess(const VersionedGamePacket& packe
         return false;
     }
 
-    const int32_t status =
-        static_cast<int32_t>(packet.payload[0]) |
-        (static_cast<int32_t>(packet.payload[1]) << 8) |
-        (static_cast<int32_t>(packet.payload[2]) << 16) |
-        (static_cast<int32_t>(packet.payload[3]) << 24);
-    return status == 0;
+    return VersionedPayloadReader::readPlayStatus(packet).status == 0;
 }
 
 bool BedrockLiveRelay::isPlayStatusPlayerSpawn(
@@ -598,12 +611,7 @@ bool BedrockLiveRelay::isPlayStatusPlayerSpawn(
         return false;
     }
 
-    const int32_t status =
-        static_cast<int32_t>(packet.payload[0]) |
-        (static_cast<int32_t>(packet.payload[1]) << 8) |
-        (static_cast<int32_t>(packet.payload[2]) << 16) |
-        (static_cast<int32_t>(packet.payload[3]) << 24);
-    return status == 3;
+    return VersionedPayloadReader::readPlayStatus(packet).status == 3;
 }
 
 void BedrockLiveRelay::emitError(const std::string& message) {
@@ -638,13 +646,9 @@ void BedrockLiveRelay::captureDownstreamClientData(const VersionedGamePacket& pa
             BedrockKeyExchange::extractJwtPayloadJson(login.client);
         downstreamProfile_ = downstreamProfileFromLogin(login);
 
-        if (!options_.upstream.offline && !downstreamProfile_.xuid.empty()) {
-            // bedrock-protocol Relay connects upstream as the downstream
-            // player's XUID in online mode while forwarding the skin/clientData.
-            options_.upstream.username = downstreamProfile_.xuid;
-        } else if (options_.upstream.offline && !downstreamProfile_.displayName.empty()) {
-            options_.upstream.username = downstreamProfile_.displayName;
-        }
+        // relay.js assigns this ternary result unconditionally. Keep an empty
+        // string rather than falling back to the prior RelayBot identity.
+        detail::applyRelayDownstreamIdentity(options_, downstreamProfile_);
 
         if (options_.logging) {
             std::ostringstream out;
@@ -796,14 +800,6 @@ void BedrockLiveRelay::handleDownstreamPacket(const BedrockServerPacketEvent& ev
         out << "* Client -> Proxy " << event.packet.name
             << packetSummary(options_.upstream.version, event.packet);
         relayLogLine(out.str());
-    }
-
-    if (event.packet.name == "login") {
-        if (upstreamStarted_.load() || upstream_ || downstreamJoined_.load()) {
-            resetRelaySession("downstream reconnect");
-        }
-        captureDownstreamClientData(event.packet);
-        startUpstream();
     }
 
     if (options_.filterDownstreamHandshakePackets &&

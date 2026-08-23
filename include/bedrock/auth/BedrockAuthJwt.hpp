@@ -12,6 +12,11 @@ struct BedrockClientKeyPair {
     std::string publicKeyDerBase64;
 };
 
+struct BedrockVerifiedJwt {
+    std::string headerJson;
+    std::string payloadJson;
+};
+
 class BedrockAuthJwt {
 public:
     static BedrockClientKeyPair generateP384KeyPair();
@@ -31,6 +36,12 @@ public:
         const std::string& privateKeyPem,
         const std::string& publicKeyDerBase64,
         const std::string& payloadJson
+    );
+
+    static BedrockVerifiedJwt verifyEs384Jwt(
+        const std::string& jwt,
+        const std::string& publicKeyDerBase64,
+        int64_t clockTimestamp = -1
     );
 
     static std::string base64(const std::vector<uint8_t>& data);

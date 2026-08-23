@@ -5,18 +5,77 @@
 #include <bedrock/protocol/ProtocolDefinition.hpp>
 #include <bedrock/protodef/ProtoDefPacketDecoder.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cctype>
+#include <cstdlib>
 #include <iostream>
 #include <random>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 #include <utility>
 
 namespace bedrock {
 
 namespace {
+
+template <typename Function>
+class NetworkScopeExit {
+public:
+    explicit NetworkScopeExit(Function function)
+        : function_(std::move(function)) {}
+
+    NetworkScopeExit(const NetworkScopeExit&) = delete;
+    NetworkScopeExit& operator=(const NetworkScopeExit&) = delete;
+
+    ~NetworkScopeExit() {
+        function_();
+    }
+
+private:
+    Function function_;
+};
+
+template <typename Function>
+NetworkScopeExit<Function> networkScopeExit(Function function) {
+    return NetworkScopeExit<Function>(std::move(function));
+}
+
+bool isObjectPrototypeVersionName(std::string_view version) {
+    for (const std::string_view inherited : {
+             "constructor",
+             "__defineGetter__",
+             "__defineSetter__",
+             "hasOwnProperty",
+             "__lookupGetter__",
+             "__lookupSetter__",
+             "isPrototypeOf",
+             "propertyIsEnumerable",
+             "toString",
+             "valueOf",
+             "__proto__",
+             "toLocaleString"
+         }) {
+        if (version == inherited) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::optional<uint32_t> connectionComparisonProtocolVersion(
+    const std::string& version
+) {
+    if (const auto* entry = findVersion(version)) {
+        return entry->protocolVersion;
+    }
+    if (isObjectPrototypeVersionName(version)) {
+        return std::nullopt;
+    }
+    throw std::runtime_error("Unknown version: " + version);
+}
 
 std::string escapeJson(const std::string& s) {
     std::string out;
@@ -83,10 +142,126 @@ int32_t playStatusCode(const VersionedGamePacket& packet) {
         return -1;
     }
 
-    return static_cast<int32_t>(packet.payload[0]) |
-        (static_cast<int32_t>(packet.payload[1]) << 8) |
-        (static_cast<int32_t>(packet.payload[2]) << 16) |
-        (static_cast<int32_t>(packet.payload[3]) << 24);
+    return (static_cast<int32_t>(packet.payload[0]) << 24) |
+        (static_cast<int32_t>(packet.payload[1]) << 16) |
+        (static_cast<int32_t>(packet.payload[2]) << 8) |
+        static_cast<int32_t>(packet.payload[3]);
+}
+
+int64_t readI64LE(const std::vector<uint8_t>& data, std::size_t offset) {
+    if (offset + 8 > data.size()) {
+        throw std::runtime_error("not enough bytes for li64");
+    }
+
+    uint64_t raw = 0;
+    for (int i = 0; i < 8; ++i) {
+        raw |= static_cast<uint64_t>(data[offset + static_cast<std::size_t>(i)]) << (i * 8);
+    }
+    return static_cast<int64_t>(raw);
+}
+
+int64_t unixTimeMillis() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()
+    ).count();
+}
+
+std::filesystem::path defaultProfilesFolder() {
+#if defined(_WIN32)
+    std::filesystem::path root;
+    if (const char* appData = std::getenv("APPDATA")) {
+        if (*appData) root = appData;
+    }
+    if (root.empty()) {
+        if (const char* userProfile = std::getenv("USERPROFILE")) {
+            if (*userProfile) {
+                root = std::filesystem::path(userProfile) /
+                    "AppData" / "Roaming";
+            }
+        }
+    }
+    if (!root.empty()) return root / ".minecraft" / "nmp-cache";
+#elif defined(__APPLE__)
+    if (const char* home = std::getenv("HOME")) {
+        if (*home) {
+            return std::filesystem::path(home) / "Library" /
+                "Application Support" / "minecraft" / "nmp-cache";
+        }
+    }
+#else
+    if (const char* home = std::getenv("HOME")) {
+        if (*home) {
+            return std::filesystem::path(home) / ".minecraft" / "nmp-cache";
+        }
+    }
+#endif
+    // os.homedir() always supplies a directory in the supported Node
+    // environments.  This fallback is only for a native process with no home
+    // environment at all and deliberately stays local and deterministic.
+    return std::filesystem::current_path() / ".minecraft" / "nmp-cache";
+}
+
+std::filesystem::path prismarineAuthSourceDirectory() {
+    const auto findFrom = [](std::filesystem::path cursor)
+        -> std::optional<std::filesystem::path> {
+        std::error_code error;
+        if (!std::filesystem::is_directory(cursor, error)) {
+            cursor = cursor.parent_path();
+        }
+        for (int depth = 0; depth < 12 && !cursor.empty(); ++depth) {
+            auto candidate = cursor / "node_modules" /
+                "prismarine-auth" / "src";
+            error.clear();
+            if (std::filesystem::is_directory(candidate, error) && !error) {
+                return candidate.lexically_normal();
+            }
+            const auto parent = cursor.parent_path();
+            if (parent == cursor) break;
+            cursor = parent;
+        }
+        return std::nullopt;
+    };
+
+    std::error_code error;
+    auto source = std::filesystem::absolute(
+        std::filesystem::path(__FILE__),
+        error
+    );
+    if (!error) {
+        if (auto located = findFrom(std::move(source))) return *located;
+    }
+    error.clear();
+    auto current = std::filesystem::current_path(error);
+    if (!error) {
+        if (auto located = findFrom(std::move(current))) return *located;
+    }
+
+    // prismarine-auth uses its own `src` (__dirname) as this fallback.  Keep
+    // the same semantic target even when the dependency tree is unavailable
+    // at runtime (for example after moving a native installation).
+    return std::filesystem::path("node_modules") /
+        "prismarine-auth" / "src";
+}
+
+std::filesystem::path initializePrismarineAuthCacheRoot(
+    const ProfilesFolderOption& profilesFolder,
+    const std::filesystem::path& selectedRoot
+) {
+    // fs.existsSync(true) throws ERR_INVALID_ARG_TYPE. MicrosoftAuthFlow
+    // catches that error and switches its private cachePath to __dirname;
+    // auth.js's public options.profilesFolder remains Boolean(true).
+    if (profilesFolder.isBoolean() && profilesFolder.booleanValue()) {
+        return prismarineAuthSourceDirectory();
+    }
+
+    std::error_code error;
+    const bool exists = std::filesystem::exists(selectedRoot, error);
+    if (error) return prismarineAuthSourceDirectory();
+    if (!exists) {
+        std::filesystem::create_directories(selectedRoot, error);
+        if (error) return prismarineAuthSourceDirectory();
+    }
+    return selectedRoot;
 }
 
 } // namespace
@@ -96,8 +271,8 @@ BedrockNetworkClient::BedrockNetworkClient(BedrockNetworkClientOptions options)
       session_(VersionedClientSessionOptions{
           .minecraftVersion = options_.version,
           .outgoingCompression = VersionedMcpeCompression::DeflateRaw,
-          .autoResourcePackResponses = options_.autoResourcePackResponses,
-          .autoStartGameInit = options_.autoInitPlayer,
+          .autoResourcePackResponses = false,
+          .autoStartGameInit = false,
           .clientCacheEnabled = options_.clientCacheEnabled,
           .chunkRadius = options_.chunkRadius
       }),
@@ -105,24 +280,146 @@ BedrockNetworkClient::BedrockNetworkClient(BedrockNetworkClientOptions options)
     compressionAlgorithm_ = versionAtLeast(options_.version, 1, 19, 30) ? "none" : "deflate";
 }
 
-BedrockNetworkClient::~BedrockNetworkClient() {
-    close();
+BedrockNetworkClient::~BedrockNetworkClient() noexcept {
+    // A C++ destructor cannot propagate EventEmitter-style listener
+    // exceptions. Remove user callbacks before the final close so a listener
+    // that aborted an earlier explicit close is not invoked again from this
+    // noexcept boundary.
+    try {
+        clearEventHandlers();
+        close();
+        return;
+    } catch (...) {
+        // Fall through to callback-free best-effort teardown. No exception may
+        // cross the destructor boundary.
+    }
+
+    rakNetStopRequested_.store(true);
+    try { stopQueue(); } catch (...) {}
+
+    std::shared_ptr<RakNetClient> transport;
+    try {
+        std::lock_guard<std::mutex> lock(sendMutex_);
+        transport = std::move(raknet_);
+    } catch (...) {}
+    if (transport) {
+        try { transport->close("closed"); } catch (...) {}
+    }
+    try {
+        std::lock_guard<std::mutex> lock(mutex_);
+        status_ = BedrockNetworkClientStatus::Disconnected;
+    } catch (...) {}
+    closed_.store(true);
+    closedCv_.notify_all();
+}
+
+BedrockNetworkClient::RakNetCallbackScope::RakNetCallbackScope(
+    BedrockNetworkClient& owner
+) : owner_(owner) {
+    owner_.enterRakNetCallback();
+}
+
+BedrockNetworkClient::RakNetCallbackScope::~RakNetCallbackScope() {
+    owner_.leaveRakNetCallback();
 }
 
 bool BedrockNetworkClient::connect() {
-    if (!closed_.load()) {
-        return true;
+    bool authenticationRejected = false;
+    for (;;) {
+        std::unique_lock<std::mutex> lock(connectLifecycleMutex_);
+        if (rakNetStopRequested_.load()) return false;
+
+        if (connectLifecyclePhase_ == ConnectLifecyclePhase::Active) {
+            return true;
+        }
+        if (connectLifecyclePhase_ == ConnectLifecyclePhase::Connecting) {
+            if (connectLifecycleOwnerThreadId_ ==
+                std::this_thread::get_id()) {
+                // A live error/status callback may synchronously retry
+                // connect() on the thread that owns this very attempt. Waiting
+                // for ourselves would deadlock; the in-flight attempt has not
+                // become Active and the reentrant call observes false.
+                return false;
+            }
+            connectLifecycleCv_.wait(lock, [this]() {
+                return connectLifecyclePhase_ !=
+                    ConnectLifecyclePhase::Connecting;
+            });
+            return connectLifecyclePhase_ == ConnectLifecyclePhase::Active;
+        }
+        if (connectLifecyclePhase_ == ConnectLifecyclePhase::Preparing) {
+            connectLifecycleCv_.wait(lock, [this]() {
+                return connectLifecyclePhase_ !=
+                    ConnectLifecyclePhase::Preparing;
+            });
+            continue;
+        }
+        if (connectLifecyclePhase_ == ConnectLifecyclePhase::Idle) {
+            lock.unlock();
+            if (!prepareConnectLifecycle(false)) return false;
+            continue;
+        }
+
+        connectLifecyclePhase_ = ConnectLifecyclePhase::Connecting;
+        connectLifecycleOwnerThreadId_ = std::this_thread::get_id();
+        authenticationRejected = authenticationRejected_;
+        break;
     }
 
+    bool connectedSuccessfully = false;
+    auto phaseCompletion = networkScopeExit(
+        [this, &connectedSuccessfully]() {
+            {
+                std::lock_guard<std::mutex> lock(connectLifecycleMutex_);
+                // Read terminal state while holding the same phase lock used
+                // by emitClose(). A close racing successful transport return
+                // must not be overwritten by a stale pre-lock `true` value.
+                const bool remainActive = connectedSuccessfully &&
+                    !rakNetStopRequested_.load() && !closed_.load();
+                connectLifecyclePhase_ = remainActive
+                    ? ConnectLifecyclePhase::Active
+                    : ConnectLifecyclePhase::Idle;
+                connectLifecycleOwnerThreadId_ = std::thread::id{};
+            }
+            connectLifecycleCv_.notify_all();
+        }
+    );
+
+    // The JavaScript timer becomes runnable only after the current
+    // connect_allowed EventEmitter stack returns. Factory initialization
+    // prepares a paused queue; the single connect owner admits it here.
+    resumeQueuePump();
+    if (rakNetStopRequested_.load()) {
+        stopQueue();
+        return false;
+    }
+
+    // auth.authenticate() catches a rejected Authflow constructor and never
+    // emits `session`. Client.connect() has already called startQueue(), but
+    // _connect/transport is therefore never reached.
+    if (authenticationRejected) {
+        return false;
+    }
+
+    // Online authentication is promise-driven in JavaScript and therefore
+    // cannot delay later connect_allowed listeners. Native authentication may
+    // block, so it belongs to this tracked connect worker, never the listener
+    // snapshot's synchronous preparation phase.
     try {
         prepareLoginPacket();
     } catch (const std::exception& e) {
+        stopQueue();
+        closed_.store(true);
         emitError(e.what());
         return false;
     }
 
+    if (rakNetStopRequested_.load()) {
+        stopQueue();
+        closed_.store(true);
+        return false;
+    }
     closed_.store(false);
-    setStatus(BedrockNetworkClientStatus::Connecting);
 
     RakNetClientOptions rakOptions;
     rakOptions.host = options_.host;
@@ -131,39 +428,270 @@ bool BedrockNetworkClient::connect() {
     rakOptions.timeoutMs = options_.connectTimeoutMs;
     rakOptions.protocolVersion = session_.definition().protocolVersion() >= 589 ? 11 : 10;
 
-    raknet_ = std::make_unique<RakNetClient>(rakOptions);
-    raknet_->onConnected([this]() {
-        try {
-            handleRakNetConnected();
-        } catch (const std::exception& e) {
-            emitError(e.what());
-        }
+    auto raknet = std::make_shared<RakNetClient>(rakOptions);
+    raknet->setCallbackLifetimeProvider(callbackLifetimeProviderSnapshot());
+    raknet->onConnected([this]() {
+        RakNetCallbackScope callbackScope(*this);
+        handleRakNetConnected();
     });
-    raknet_->onEncapsulated([this](const std::vector<uint8_t>& payload) {
-        try {
-            handleRakNetPayload(payload);
-        } catch (const std::exception& e) {
-            const std::string message = e.what();
-            emitError(message);
-            if (message.find("encrypted payload checksum mismatch") != std::string::npos ||
-                message.find("decrypt") != std::string::npos ||
-                message.find("decrypted payload") != std::string::npos) {
-                close(message);
-            }
-        }
+    raknet->onEncapsulated([this](const std::vector<uint8_t>& payload) {
+        RakNetCallbackScope callbackScope(*this);
+        dispatchRakNetPayload(payload);
     });
-    raknet_->onClose([this](const std::string& reason) {
-        emitClose(reason);
+    raknet->onClose([this](const std::string& reason) {
+        RakNetCallbackScope callbackScope(*this);
+        // RakNetClient clears running/connected before this callback. For a
+        // remote disconnect the worker-tail closes the still-allocated fd
+        // after this callback returns. Client.close() calls connection.close()
+        // again in JS, but that second transport close is observationally
+        // idempotent; skip it here to avoid re-entering the transport callback.
+        emitClose(reason, false, CloseOrigin::Transport);
     });
 
-    if (!raknet_->connect()) {
-        auto error = raknet_->error();
+    std::function<void()> beforeTransportInstallTestHook;
+    {
+        std::lock_guard<std::mutex> lock(eventHandlersMutex_);
+        beforeTransportInstallTestHook = beforeTransportInstallTestHook_;
+    }
+    if (beforeTransportInstallTestHook) beforeTransportInstallTestHook();
+
+    std::shared_ptr<RakNetClient> transport;
+    {
+        std::lock_guard<std::mutex> lock(sendMutex_);
+        // This lock orders installation against emitClose()'s transport move.
+        // A close that already published its stop cannot be followed by a new
+        // member transport after close() returns.
+        if (!rakNetStopRequested_.load()) {
+            raknet_ = std::move(raknet);
+            transport = raknet_;
+        }
+    }
+    if (!transport) {
+        stopQueueIfRunning();
         closed_.store(true);
+        return false;
+    }
+
+    std::function<void()> afterTransportInstallTestHook;
+    {
+        std::lock_guard<std::mutex> lock(eventHandlersMutex_);
+        afterTransportInstallTestHook = afterTransportInstallTestHook_;
+    }
+    if (afterTransportInstallTestHook) afterTransportInstallTestHook();
+
+    if (rakNetStopRequested_.load()) {
+        transport->requestStop();
+        {
+            std::lock_guard<std::mutex> lock(sendMutex_);
+            if (raknet_ == transport) raknet_.reset();
+        }
+        stopQueue();
+        closed_.store(true);
+        return false;
+    }
+
+    if (!transport->connect()) {
+        auto error = transport->error();
+        stopQueue();
+        closed_.store(true);
+        if (rakNetStopRequested_.load()) {
+            return false;
+        }
         setStatus(BedrockNetworkClientStatus::Disconnected);
         emitError(error);
         return false;
     }
 
+    std::function<void()> beforePhaseCommitTestHook;
+    {
+        std::lock_guard<std::mutex> lock(eventHandlersMutex_);
+        beforePhaseCommitTestHook = beforeConnectPhaseCommitTestHook_;
+    }
+    if (beforePhaseCommitTestHook) beforePhaseCommitTestHook();
+
+    connectedSuccessfully = true;
+    return true;
+}
+
+bool BedrockNetworkClient::prepareConnectLifecycle(bool deferQueuePump) {
+    for (;;) {
+        std::unique_lock<std::mutex> lock(connectLifecycleMutex_);
+        if (rakNetStopRequested_.load()) return false;
+        if (connectLifecyclePhase_ == ConnectLifecyclePhase::Preparing) {
+            connectLifecycleCv_.wait(lock, [this]() {
+                return connectLifecyclePhase_ !=
+                    ConnectLifecyclePhase::Preparing;
+            });
+            continue;
+        }
+        if (connectLifecyclePhase_ == ConnectLifecyclePhase::Prepared) {
+            lock.unlock();
+            if (!deferQueuePump) resumeQueuePump();
+            return true;
+        }
+        if (connectLifecyclePhase_ == ConnectLifecyclePhase::Connecting ||
+            connectLifecyclePhase_ == ConnectLifecyclePhase::Active) {
+            return true;
+        }
+        connectLifecyclePhase_ = ConnectLifecyclePhase::Preparing;
+        break;
+    }
+
+    bool authenticationRejected = false;
+    std::string authenticationError;
+    std::optional<std::string> authenticationUnhandledRejection;
+    try {
+        // Client.connect() performs authentication setup before startQueue().
+        // Offline auth validates only the username and does not run auth.js's
+        // online option normalizer.
+        if (options_.offline) {
+            if (options_.username.empty()) {
+                throw std::runtime_error("Must specify a valid username");
+            }
+        } else {
+            auto authOptionsSnapshot = options();
+
+            // auth.js validateOptions mutates profilesFolder first. The
+            // canonical JS field wins over the older native cache alias even
+            // when it is omitted/falsy.
+            if (!authOptionsSnapshot.profilesFolder.truthy()) {
+                const auto folder = defaultProfilesFolder();
+                authOptionsSnapshot.profilesFolder.setResolved(folder);
+                authOptionsSnapshot.authCacheRoot = folder;
+            } else if (!authOptionsSnapshot.profilesFolder.isBoolean()) {
+                authOptionsSnapshot.authCacheRoot =
+                    authOptionsSnapshot.profilesFolder.path();
+            }
+
+            // auth.js keys solely on undefined authTitle. Unknown extension
+            // fields (including the legacy xboxClientId alias) cannot prevent
+            // these three conditional assignments.
+            if (!authOptionsSnapshot.authTitle.has_value()) {
+                authOptionsSnapshot.authTitle =
+                    std::string(Titles::MinecraftNintendoSwitch);
+                authOptionsSnapshot.deviceType = "Nintendo";
+                authOptionsSnapshot.flow = "live";
+            }
+
+            const XboxLiveAuthFlowOptions authFlow {
+                .authTitle = *authOptionsSnapshot.authTitle,
+                .deviceType = authOptionsSnapshot.deviceType,
+                .flow = authOptionsSnapshot.flow
+            };
+
+            try {
+                // MicrosoftAuthFlow checks flow before touching its cache.
+                XboxLiveAuth::validatePrismarineAuthFlowPresence(authFlow);
+                authOptionsSnapshot.authCacheRoot =
+                    initializePrismarineAuthCacheRoot(
+                        authOptionsSnapshot.profilesFolder,
+                        authOptionsSnapshot.authCacheRoot
+                    );
+                XboxLiveAuth::validatePrismarineAuthFlow(authFlow);
+            } catch (const std::exception& error) {
+                authenticationRejected = true;
+                authenticationError = error.what();
+            }
+
+            // Publish the JS-visible mutations atomically. The full owned
+            // snapshot handed to the facade is taken while they are stable,
+            // then invoked outside every native mutex and before error emit,
+            // queue hooks, or lifecycle phase publication.
+            {
+                std::lock_guard<std::mutex> lock(optionsMutex_);
+                options_.authTitle = authOptionsSnapshot.authTitle;
+                options_.deviceType = authOptionsSnapshot.deviceType;
+                options_.flow = authOptionsSnapshot.flow;
+                options_.profilesFolder = authOptionsSnapshot.profilesFolder;
+                options_.authCacheRoot = authOptionsSnapshot.authCacheRoot;
+                authOptionsSnapshot = options_;
+            }
+
+            AuthenticationOptionsResolvedHandler resolvedHandler;
+            {
+                std::lock_guard<std::mutex> lock(eventHandlersMutex_);
+                resolvedHandler = authenticationOptionsResolvedHandler_;
+            }
+            if (resolvedHandler) {
+                resolvedHandler(std::move(authOptionsSnapshot));
+            }
+
+            if (authenticationRejected) {
+                // authenticate() is async: even an unhandled error event or a
+                // throwing listener rejects that ignored Promise rather than
+                // aborting Client.connect(). Its synchronous listener snapshot
+                // still runs here, before startQueue().
+                try {
+                    emitError(authenticationError);
+                } catch (const std::exception& error) {
+                    authenticationUnhandledRejection = error.what();
+                } catch (...) {
+                    authenticationUnhandledRejection =
+                        "Unknown asynchronous error";
+                }
+            }
+        }
+
+        std::function<void()> beforeQueueStartTestHook;
+        {
+            std::lock_guard<std::mutex> lock(eventHandlersMutex_);
+            beforeQueueStartTestHook = beforeQueueStartTestHook_;
+        }
+        if (beforeQueueStartTestHook) beforeQueueStartTestHook();
+        if (!startQueue(!deferQueuePump)) {
+            std::lock_guard<std::mutex> lock(connectLifecycleMutex_);
+            authenticationRejected_ = false;
+            connectLifecyclePhase_ = ConnectLifecyclePhase::Idle;
+            connectLifecycleCv_.notify_all();
+            return false;
+        }
+
+        if (authenticationUnhandledRejection.has_value()) {
+            AuthenticationUnhandledRejectionHandler rejectionHandler;
+            {
+                std::lock_guard<std::mutex> lock(eventHandlersMutex_);
+                rejectionHandler =
+                    authenticationUnhandledRejectionHandler_;
+            }
+            if (rejectionHandler) {
+                try {
+                    rejectionHandler(*authenticationUnhandledRejection);
+                } catch (...) {
+                    // This is an internal Promise-rejection reporting seam;
+                    // a reporting sink cannot retroactively abort JS's
+                    // already completed startQueue() call.
+                }
+            }
+        }
+        resetLifecycle();
+    } catch (...) {
+        {
+            std::lock_guard<std::mutex> lock(connectLifecycleMutex_);
+            authenticationRejected_ = false;
+            connectLifecyclePhase_ = ConnectLifecyclePhase::Idle;
+        }
+        connectLifecycleCv_.notify_all();
+        throw;
+    }
+
+    bool stopped = false;
+    {
+        std::lock_guard<std::mutex> lock(connectLifecycleMutex_);
+        stopped = rakNetStopRequested_.load();
+        authenticationRejected_ = authenticationRejected;
+        connectLifecyclePhase_ = stopped
+            ? ConnectLifecyclePhase::Idle
+            : ConnectLifecyclePhase::Prepared;
+    }
+    connectLifecycleCv_.notify_all();
+    if (stopped) {
+        // A full close may already have stopped the pump and returned before
+        // this preparation owner observes the stop bit. Do not clear packets
+        // queued by the caller after that close; only cancel a pump that is
+        // still running (for example after requestRakNetStop()).
+        stopQueueIfRunning();
+        return false;
+    }
     return true;
 }
 
@@ -180,17 +708,39 @@ int BedrockNetworkClient::run() {
 }
 
 void BedrockNetworkClient::close(const std::string& reason) {
-    std::unique_ptr<RakNetClient> raknet;
-    {
-        std::lock_guard<std::mutex> lock(sendMutex_);
-        raknet = std::move(raknet_);
+    emitClose(reason, true, CloseOrigin::Public);
+}
+
+void BedrockNetworkClient::beginDeferredClose(const std::string& reason) {
+    emitClose(reason, false, CloseOrigin::Public);
+}
+
+void BedrockNetworkClient::disconnect(const std::string& reason, bool hide) {
+    if (!sendDisconnectPacket(reason, hide)) return;
+    close(reason);
+}
+
+bool BedrockNetworkClient::sendDisconnectPacket(
+    const std::string& reason,
+    bool hide
+) {
+    if (status() == BedrockNetworkClientStatus::Disconnected) {
+        return false;
     }
 
-    if (raknet) {
-        raknet->close(reason);
-    } else {
-        emitClose(reason);
-    }
+    (void)hide;
+    write("disconnect", ProtoDefValue::object({
+        // Node ProtoDef supplies the mapper's first/default value when the JS
+        // object omits this schema-only telemetry field.
+        {"reason", ProtoDefValue::string("unknown")},
+        // Match bedrock-protocol's observable field-name bug. client.js writes
+        // hide_disconnect_screen, which ProtoDef ignores; the schema field
+        // hide_disconnect_reason therefore remains false for either argument.
+        {"hide_disconnect_reason", ProtoDefValue::boolean(false)},
+        {"message", ProtoDefValue::string(reason)},
+        {"filtered_message", ProtoDefValue::string("")}
+    }));
+    return true;
 }
 
 void BedrockNetworkClient::on(const std::string& packetName, PacketHandler handler) {
@@ -198,31 +748,144 @@ void BedrockNetworkClient::on(const std::string& packetName, PacketHandler handl
         onAny(std::move(handler));
         return;
     }
+    std::lock_guard<std::mutex> lock(eventHandlersMutex_);
     namedHandlers_[packetName].push_back(std::move(handler));
 }
 
 void BedrockNetworkClient::onAny(PacketHandler handler) {
+    std::lock_guard<std::mutex> lock(eventHandlersMutex_);
     anyHandlers_.push_back(std::move(handler));
 }
 
 void BedrockNetworkClient::onJoin(std::function<void()> handler) {
+    std::lock_guard<std::mutex> lock(eventHandlersMutex_);
     joinHandlers_.push_back(std::move(handler));
 }
 
+void BedrockNetworkClient::onSpawn(std::function<void()> handler) {
+    std::lock_guard<std::mutex> lock(eventHandlersMutex_);
+    spawnHandlers_.push_back(std::move(handler));
+}
+
+void BedrockNetworkClient::onHeartbeat(HeartbeatHandler handler) {
+    std::lock_guard<std::mutex> lock(eventHandlersMutex_);
+    heartbeatHandlers_.push_back(std::move(handler));
+}
+
 void BedrockNetworkClient::onClose(ErrorHandler handler) {
+    std::lock_guard<std::mutex> lock(eventHandlersMutex_);
     closeHandlers_.push_back(std::move(handler));
 }
 
+void BedrockNetworkClient::onClose(std::function<void()> handler) {
+    onClose([handler = std::move(handler)](const std::string&) {
+        handler();
+    });
+}
+
 void BedrockNetworkClient::onError(ErrorHandler handler) {
+    std::lock_guard<std::mutex> lock(eventHandlersMutex_);
     errorHandlers_.push_back(std::move(handler));
 }
 
 void BedrockNetworkClient::onStatus(StatusHandler handler) {
+    std::lock_guard<std::mutex> lock(eventHandlersMutex_);
     statusHandlers_.push_back(std::move(handler));
 }
 
+void BedrockNetworkClient::setCallbackLifetimeProvider(
+    CallbackLifetimeProvider provider
+) {
+    CallbackLifetimeProvider snapshot;
+    {
+        std::lock_guard<std::mutex> lock(eventHandlersMutex_);
+        callbackLifetimeProvider_ = std::move(provider);
+        snapshot = callbackLifetimeProvider_;
+    }
+    std::lock_guard<std::mutex> lock(sendMutex_);
+    if (raknet_) {
+        raknet_->setCallbackLifetimeProvider(std::move(snapshot));
+    }
+}
+
+void BedrockNetworkClient::setAuthenticationOptionsResolvedHandler(
+    AuthenticationOptionsResolvedHandler handler
+) {
+    std::lock_guard<std::mutex> lock(eventHandlersMutex_);
+    authenticationOptionsResolvedHandler_ = std::move(handler);
+}
+
+void BedrockNetworkClient::setAuthenticationUnhandledRejectionHandler(
+    AuthenticationUnhandledRejectionHandler handler
+) {
+    std::lock_guard<std::mutex> lock(eventHandlersMutex_);
+    authenticationUnhandledRejectionHandler_ = std::move(handler);
+}
+
+bool BedrockNetworkClient::onRakNetCallbackThread() const {
+    std::lock_guard<std::mutex> lock(rakNetCallbackMutex_);
+    return rakNetCallbackDepth_ != 0 &&
+        rakNetCallbackThreadId_ == std::this_thread::get_id();
+}
+
+bool BedrockNetworkClient::onCloseEmissionThread() const {
+    std::lock_guard<std::mutex> lock(closingMutex_);
+    return closing_.load() &&
+        closingThreadId_ == std::this_thread::get_id();
+}
+
+void BedrockNetworkClient::requestRakNetStop() noexcept {
+    rakNetStopRequested_.store(true);
+    std::shared_ptr<RakNetClient> transport;
+    {
+        std::lock_guard<std::mutex> lock(sendMutex_);
+        transport = raknet_;
+    }
+    if (transport) transport->requestStop();
+}
+
+void BedrockNetworkClient::enterRakNetCallback() {
+    std::lock_guard<std::mutex> lock(rakNetCallbackMutex_);
+    const auto current = std::this_thread::get_id();
+    if (rakNetCallbackDepth_ == 0) {
+        rakNetCallbackThreadId_ = current;
+    } else if (rakNetCallbackThreadId_ != current) {
+        throw std::logic_error("concurrent RakNet callback scopes");
+    }
+    ++rakNetCallbackDepth_;
+}
+
+void BedrockNetworkClient::leaveRakNetCallback() noexcept {
+    std::lock_guard<std::mutex> lock(rakNetCallbackMutex_);
+    if (rakNetCallbackDepth_ == 0 ||
+        rakNetCallbackThreadId_ != std::this_thread::get_id()) {
+        return;
+    }
+    --rakNetCallbackDepth_;
+    if (rakNetCallbackDepth_ == 0) {
+        rakNetCallbackThreadId_ = std::thread::id{};
+    }
+}
+
+BedrockNetworkClient::CallbackLifetimeProvider
+BedrockNetworkClient::callbackLifetimeProviderSnapshot() const {
+    std::lock_guard<std::mutex> lock(eventHandlersMutex_);
+    return callbackLifetimeProvider_;
+}
+
 void BedrockNetworkClient::sendPacket(const VersionedGamePacket& packet) {
-    sendPackets({packet}, encryptionEnabled_);
+    sendPackets({packet});
+}
+
+void BedrockNetworkClient::sendBuffer(const std::vector<uint8_t>& buffer, bool immediate) {
+    auto packet = session_.packetCodec().decodeFullPacket(buffer);
+    if (immediate) {
+        sendPacket(packet);
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(queueMutex_);
+    queuedPackets_.push_back(std::move(packet));
 }
 
 void BedrockNetworkClient::send(const std::string& packetName, const ProtoDefValue& value) {
@@ -236,18 +899,18 @@ void BedrockNetworkClient::write(const std::string& packetName, const ProtoDefVa
 
 void BedrockNetworkClient::queue(const std::string& packetName, const ProtoDefValue& value) {
     auto payload = packetEncoder_.encodePacket(packetName, value);
-    std::lock_guard<std::mutex> lock(sendMutex_);
+    std::lock_guard<std::mutex> lock(queueMutex_);
     queuedPackets_.push_back(session_.packetCodec().makePacketByName(packetName, payload));
 }
 
 void BedrockNetworkClient::sendQueued() {
     std::vector<VersionedGamePacket> packets;
     {
-        std::lock_guard<std::mutex> lock(sendMutex_);
+        std::lock_guard<std::mutex> lock(queueMutex_);
         packets = std::move(queuedPackets_);
         queuedPackets_.clear();
     }
-    sendPackets(packets, encryptionEnabled_);
+    sendPackets(packets);
 }
 
 BedrockNetworkClientStatus BedrockNetworkClient::status() const {
@@ -255,7 +918,53 @@ BedrockNetworkClientStatus BedrockNetworkClient::status() const {
     return status_;
 }
 
-const BedrockNetworkClientOptions& BedrockNetworkClient::options() const {
+std::optional<uint64_t> BedrockNetworkClient::entityId() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return runtimeEntityId_;
+}
+
+uint32_t BedrockNetworkClient::protocolVersion() const {
+    return options_.protocolVersion;
+}
+
+bool BedrockNetworkClient::versionLessThan(const std::string& version) const {
+    const auto target = connectionComparisonProtocolVersion(version);
+    return target && versionLessThan(*target);
+}
+
+bool BedrockNetworkClient::versionLessThan(uint32_t protocolVersion) const noexcept {
+    return options_.protocolVersion < protocolVersion;
+}
+
+bool BedrockNetworkClient::versionGreaterThan(const std::string& version) const {
+    const auto target = connectionComparisonProtocolVersion(version);
+    return target && versionGreaterThan(*target);
+}
+
+bool BedrockNetworkClient::versionGreaterThan(uint32_t protocolVersion) const noexcept {
+    return options_.protocolVersion > protocolVersion;
+}
+
+bool BedrockNetworkClient::versionGreaterThanOrEqualTo(const std::string& version) const {
+    const auto target = connectionComparisonProtocolVersion(version);
+    return target && versionGreaterThanOrEqualTo(*target);
+}
+
+bool BedrockNetworkClient::versionGreaterThanOrEqualTo(uint32_t protocolVersion) const noexcept {
+    return options_.protocolVersion >= protocolVersion;
+}
+
+bool BedrockNetworkClient::versionLessThanOrEqualTo(const std::string& version) const {
+    const auto target = connectionComparisonProtocolVersion(version);
+    return target && versionLessThanOrEqualTo(*target);
+}
+
+bool BedrockNetworkClient::versionLessThanOrEqualTo(uint32_t protocolVersion) const noexcept {
+    return options_.protocolVersion <= protocolVersion;
+}
+
+BedrockNetworkClientOptions BedrockNetworkClient::options() const {
+    std::lock_guard<std::mutex> lock(optionsMutex_);
     return options_;
 }
 
@@ -284,20 +993,30 @@ BedrockBlobStore& BedrockNetworkClient::blobStore() {
 }
 
 BedrockNetworkClientOptions BedrockNetworkClient::normalizeOptions(BedrockNetworkClientOptions options) {
-    if (options.version.empty() || options.version == "auto" || options.version == "latest") {
-        auto versions = ProtocolDefinition::versions();
-        if (!versions.empty()) {
-            options.version = versions.back();
-        }
+    options.protocolVersion = validateVersion(options.version);
+    if (options.profile.empty() && !options.username.empty()) {
+        options.profile = options.username;
     }
-    if (!ProtocolDefinition::supportsVersion(options.version)) {
-        throw std::runtime_error("unsupported Bedrock client version: " + options.version);
+
+    if (options.connectTimeout.has_value()) {
+        const int value = *options.connectTimeout;
+        options.connectTimeoutMs = value == 0 ? 9000 : std::max(value, 1);
     }
-    if (options.username.empty()) {
-        options.username = "Bot";
+    if (options.batchingInterval.has_value()) {
+        const int value = *options.batchingInterval;
+        options.batchingIntervalMs = value == 0 ? 20 : std::max(value, 1);
     }
-    if (options.profile.empty()) {
-        options.profile = options.username.empty() ? std::string("Bot") : options.username;
+    if (options.useNativeRaknet.has_value()) {
+        options.raknetBackend = *options.useNativeRaknet
+            ? "raknet-native"
+            : "jsp-raknet";
+    }
+    if (!options.raknetBackend.empty() &&
+        options.raknetBackend != "raknet-native") {
+        throw std::runtime_error(
+            "RakNet backend is not implemented in C++: " +
+            options.raknetBackend
+        );
     }
     return options;
 }
@@ -321,64 +1040,366 @@ bool BedrockNetworkClient::versionAtLeast(const std::string& version, int major,
     return parts[2] >= patch;
 }
 
+bool BedrockNetworkClient::versionAtMost(
+    const std::string& version,
+    const std::string& maximum
+) {
+    return ProtocolDefinition::forVersion(version).protocolVersion() <=
+        ProtocolDefinition::forVersion(maximum).protocolVersion();
+}
+
 void BedrockNetworkClient::setStatus(BedrockNetworkClientStatus status) {
+    // Match Connection.status in bedrock-protocol: listeners observe the old
+    // value while handling the status event, then the new value is stored.
+    const auto provider = callbackLifetimeProviderSnapshot();
+    auto lifetimeLease = provider
+        ? provider()
+        : std::shared_ptr<void>();
+    if (!provider || lifetimeLease) {
+        std::vector<StatusHandler> handlers;
+        {
+            std::lock_guard<std::mutex> lock(eventHandlersMutex_);
+            handlers = statusHandlers_;
+        }
+        for (auto& handler : handlers) {
+            handler(status);
+        }
+    }
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        // A callback may synchronously destroy/close the factory facade. Its
+        // terminal cleanup wins over this outer status setter after the full
+        // listener snapshot has completed; otherwise a native callback frame
+        // would resurrect a closed network after its last owner is gone.
+        if (rakNetStopRequested_.load() &&
+            status_ == BedrockNetworkClientStatus::Disconnected &&
+            status != BedrockNetworkClientStatus::Disconnected) {
+            return;
+        }
         status_ = status;
-    }
-    for (auto& handler : statusHandlers_) {
-        handler(status);
     }
 }
 
 void BedrockNetworkClient::emitError(const std::string& message) {
-    for (auto& handler : errorHandlers_) {
+    const auto provider = callbackLifetimeProviderSnapshot();
+    auto lifetimeLease = provider
+        ? provider()
+        : std::shared_ptr<void>();
+    if (provider && !lifetimeLease) {
+        return;
+    }
+    std::vector<ErrorHandler> handlers;
+    {
+        std::lock_guard<std::mutex> lock(eventHandlersMutex_);
+        handlers = errorHandlers_;
+    }
+    if (handlers.empty()) {
+        // EventEmitter gives `error` special treatment: without a listener the
+        // Error itself is thrown, so the caller does not continue to its next
+        // statement (notably encryption.js's bad-packet disconnect).
+        throw BedrockNetworkClientUnhandledError(message);
+    }
+
+    // EventEmitter snapshots an array of listeners before invoking it. A
+    // listener may close the client and clear the member storage; the snapshot
+    // must still be safe and remaining listeners must retain their JS order.
+    for (auto& handler : handlers) {
         handler(message);
     }
 }
 
-void BedrockNetworkClient::emitClose(const std::string& reason) {
-    bool expected = false;
-    if (!closed_.compare_exchange_strong(expected, true)) {
-        return;
+void BedrockNetworkClient::emitClose(
+    const std::string& reason,
+    bool closeTransport,
+    CloseOrigin origin
+) {
+    {
+        std::unique_lock<std::mutex> lock(closingMutex_);
+        const auto current = std::this_thread::get_id();
+        if (origin == CloseOrigin::Transport && closing_.load()) {
+            if (closingThreadId_ == current) {
+                // Synchronous callback caused by this public close is the same
+                // native teardown, not a second JavaScript close.
+                return;
+            }
+            // A remote Rak worker cannot wait through the later transport
+            // join. Successful public listener completion publishes commit
+            // first, allowing this callback to unwind before that join. If a
+            // listener throws, the latch opens without commit and this remote
+            // close becomes the cleanup owner.
+            closingCv_.wait(lock, [this]() {
+                return !closing_.load() || closingCommitted_;
+            });
+            if (closingCommitted_) return;
+        }
+        if (closing_.load() && closingThreadId_ == current) {
+            // Public recursive close is legal EventEmitter recursion. Keep a
+            // depth count so the inner cleanup cannot release the outer
+            // serialization latch or invalidate its listener snapshot.
+            ++closingDepth_;
+        } else {
+            closingCv_.wait(lock, [this]() { return !closing_.load(); });
+            closing_.store(true);
+            closingThreadId_ = current;
+            closingDepth_ = 1;
+            closingCommitted_ = false;
+        }
     }
+
+    // This lease must outlive closingReset. A factory listener may destroy
+    // its Client through either Client::close() or client.network().close();
+    // reverse local destruction must release the close latch before the final
+    // State/network owner can disappear.
+    std::shared_ptr<void> lifetimeLease;
+    pauseQueuePump();
+    bool closeCommitted = false;
+    auto closingReset = networkScopeExit(
+        [this, &closeCommitted]() {
+            bool notify = false;
+            bool notifyQueue = false;
+            {
+                std::lock_guard<std::mutex> lock(closingMutex_);
+                if (closingDepth_ > 0) --closingDepth_;
+                if (closingDepth_ == 0) {
+                    // A failed recursive frame must not re-arm the pump while
+                    // its outer EventEmitter snapshot is still running. The
+                    // outermost frame alone owns the pre-emission pump state;
+                    // also preserve a factory queue that was intentionally
+                    // paused through connect_allowed.
+                    // Publish the rollback timer and the open close latch as
+                    // one queue-visible transition. resume/start either run
+                    // before admission and are caught by pauseQueuePump(), or
+                    // run after admission and leave only logical demand. They
+                    // cannot enable a native tick inside the listener stack.
+                    std::lock_guard<std::mutex> queueLock(queueMutex_);
+                    if (!closeCommitted && !closingCommitted_) {
+                        const auto interval = std::chrono::milliseconds(
+                            options_.batchingIntervalMs > 0
+                                ? options_.batchingIntervalMs
+                                : 20
+                        );
+                        queuePumpEnabled_ = false;
+                        queuePumpResumeDue_ =
+                            std::chrono::steady_clock::now() + interval;
+                        notifyQueue = true;
+                    }
+                    closingThreadId_ = std::thread::id{};
+                    closing_.store(false);
+                    closingCommitted_ = false;
+                    notify = true;
+                }
+            }
+            if (notifyQueue) queueCv_.notify_all();
+            if (notify) closingCv_.notify_all();
+        }
+    );
+
+    const auto provider = callbackLifetimeProviderSnapshot();
+    lifetimeLease = provider
+        ? provider()
+        : std::shared_ptr<void>();
+    const bool callbacksAdmitted = !provider || lifetimeLease;
+
+    // Client.close emits first. The callback intentionally observes the old
+    // status and a still-live queue/transport, just like EventEmitter.emit.
+    if (callbacksAdmitted &&
+        status() != BedrockNetworkClientStatus::Disconnected) {
+        std::vector<ErrorHandler> handlers;
+        {
+            std::lock_guard<std::mutex> lock(eventHandlersMutex_);
+            handlers = closeHandlers_;
+        }
+        for (auto& handler : handlers) {
+            handler(reason);
+        }
+    }
+
+    // In JavaScript, a throwing close listener aborts close() before the
+    // queue/timer and transport cleanup. Keep the native pump paused on that
+    // exceptional path: immediately resuming it from this stack would let its
+    // independent thread run before the synchronous caller receives/catches
+    // the exception, unlike a Node timer. The queue loop re-arms itself at the
+    // next native interval, after preserving the immediate catch boundary; a
+    // later close() can also retry the emission and complete cleanup.
+    rakNetStopRequested_.store(true);
+    stopQueue();
+    closeCommitted = true;
+    {
+        std::lock_guard<std::mutex> lock(closingMutex_);
+        closingCommitted_ = true;
+    }
+    closingCv_.notify_all();
+
+    std::shared_ptr<RakNetClient> ownedRakNet;
+    RakNetClient* callbackThreadRakNet = nullptr;
+    if (closeTransport) {
+        std::lock_guard<std::mutex> lock(sendMutex_);
+        if (raknet_ && onRakNetCallbackThread()) {
+            // Do not destroy RakNetClient while its own callback stack is
+            // active. Its stopped instance remains owned until destruction or
+            // a later reconnect.
+            callbackThreadRakNet = raknet_.get();
+        } else {
+            ownedRakNet = std::move(raknet_);
+        }
+    }
+    if (callbackThreadRakNet) {
+        callbackThreadRakNet->close(reason);
+    } else if (ownedRakNet) {
+        ownedRakNet->close(reason);
+    }
+
+    // removeAllListeners precedes the final status assignment in client.js;
+    // consequently no previously registered status listener sees
+    // Disconnected.
+    clearEventHandlers();
     setStatus(BedrockNetworkClientStatus::Disconnected);
-    for (auto& handler : closeHandlers_) {
-        handler(reason);
+    closed_.store(true);
+    {
+        std::lock_guard<std::mutex> lock(connectLifecycleMutex_);
+        if (connectLifecyclePhase_ != ConnectLifecyclePhase::Connecting) {
+            connectLifecyclePhase_ = ConnectLifecyclePhase::Idle;
+        }
     }
+    connectLifecycleCv_.notify_all();
     closedCv_.notify_all();
 }
 
-void BedrockNetworkClient::emitPacket(const VersionedGamePacket& packet) {
+void BedrockNetworkClient::clearEventHandlers() {
+    std::lock_guard<std::mutex> lock(eventHandlersMutex_);
+    anyHandlers_.clear();
+    namedHandlers_.clear();
+    joinHandlers_.clear();
+    spawnHandlers_.clear();
+    heartbeatHandlers_.clear();
+    closeHandlers_.clear();
+    errorHandlers_.clear();
+    statusHandlers_.clear();
+    authenticationOptionsResolvedHandler_ = {};
+    authenticationUnhandledRejectionHandler_ = {};
+}
+
+void BedrockNetworkClient::emitAnyPacket(const VersionedGamePacket& packet) {
+    const auto provider = callbackLifetimeProviderSnapshot();
+    auto lifetimeLease = provider
+        ? provider()
+        : std::shared_ptr<void>();
+    if (provider && !lifetimeLease) return;
     BedrockNetworkClientPacketEvent event;
     event.packet = packet;
 
-    for (auto& handler : anyHandlers_) {
+    std::vector<PacketHandler> handlers;
+    {
+        std::lock_guard<std::mutex> lock(eventHandlersMutex_);
+        handlers = anyHandlers_;
+    }
+    for (auto& handler : handlers) {
         handler(event);
     }
-    auto it = namedHandlers_.find(packet.name);
-    if (it != namedHandlers_.end()) {
-        for (auto& handler : it->second) {
+}
+
+void BedrockNetworkClient::emitNamedPacket(const VersionedGamePacket& packet) {
+    emitNamedEvent(packet.name, packet);
+}
+
+void BedrockNetworkClient::emitNamedEvent(
+    const std::string& eventName,
+    const VersionedGamePacket& packet
+) {
+    const auto provider = callbackLifetimeProviderSnapshot();
+    auto lifetimeLease = provider
+        ? provider()
+        : std::shared_ptr<void>();
+    if (provider && !lifetimeLease) return;
+    BedrockNetworkClientPacketEvent event;
+    event.packet = packet;
+
+    std::vector<PacketHandler> handlers;
+    {
+        std::lock_guard<std::mutex> lock(eventHandlersMutex_);
+        auto it = namedHandlers_.find(eventName);
+        if (it != namedHandlers_.end()) handlers = it->second;
+    }
+    if (!handlers.empty()) {
+        // EventEmitter snapshots its listeners for an emission.  A special
+        // event handler may close the client (and clear namedHandlers_), so do
+        // the same here instead of iterating storage that can be invalidated.
+        for (auto& handler : handlers) {
             handler(event);
         }
     }
 }
 
 void BedrockNetworkClient::emitJoin() {
-    for (auto& handler : joinHandlers_) {
+    const auto provider = callbackLifetimeProviderSnapshot();
+    auto lifetimeLease = provider
+        ? provider()
+        : std::shared_ptr<void>();
+    if (provider && !lifetimeLease) return;
+    std::vector<std::function<void()>> handlers;
+    {
+        std::lock_guard<std::mutex> lock(eventHandlersMutex_);
+        handlers = joinHandlers_;
+    }
+    for (auto& handler : handlers) {
         handler();
     }
 }
 
+void BedrockNetworkClient::emitSpawn() {
+    const auto provider = callbackLifetimeProviderSnapshot();
+    auto lifetimeLease = provider
+        ? provider()
+        : std::shared_ptr<void>();
+    if (provider && !lifetimeLease) return;
+    std::vector<std::function<void()>> handlers;
+    {
+        std::lock_guard<std::mutex> lock(eventHandlersMutex_);
+        handlers = spawnHandlers_;
+    }
+    for (auto& handler : handlers) {
+        handler();
+    }
+}
+
+void BedrockNetworkClient::emitHeartbeat(int64_t tick) {
+    const auto provider = callbackLifetimeProviderSnapshot();
+    auto lifetimeLease = provider
+        ? provider()
+        : std::shared_ptr<void>();
+    if (provider && !lifetimeLease) return;
+    std::vector<HeartbeatHandler> handlers;
+    {
+        std::lock_guard<std::mutex> lock(eventHandlersMutex_);
+        handlers = heartbeatHandlers_;
+    }
+    for (auto& handler : handlers) {
+        handler(tick);
+    }
+}
+
 void BedrockNetworkClient::handleRakNetConnected() {
+    setStatus(BedrockNetworkClientStatus::Connecting);
+
     if (versionAtLeast(options_.version, 1, 19, 30) && session_.definition().hasPacket("request_network_settings")) {
         auto request = session_.writeNetworkSettingsRequest(session_.definition().protocolVersion());
-        sendPackets({request}, false);
+        sendPackets({request});
         session_.takeOutgoingPackets();
         return;
     }
 
     sendLogin();
+}
+
+void BedrockNetworkClient::dispatchRakNetPayload(
+    const std::vector<uint8_t>& payload
+) {
+    // Connection.handle/Framer, encryption transforms and user listeners run
+    // inside raknet-native's live EventEmitter callback. Native packet parse
+    // failures are retained by RakNetClient, but exceptions from this live
+    // callback deliberately cross that boundary (the JS wrapper's unhandled
+    // low-level `error` event does the same); they are not Client `error`s.
+    handleRakNetPayload(payload);
 }
 
 void BedrockNetworkClient::handleRakNetPayload(const std::vector<uint8_t>& payload) {
@@ -392,41 +1413,54 @@ void BedrockNetworkClient::handleRakNetPayload(const std::vector<uint8_t>& paylo
             throw std::runtime_error("decrypt stream is not initialized");
         }
 
-        if (payload.empty() || payload[0] != 0xfe) {
+        if (payload[0] != 0xfe) {
             throw std::runtime_error("encrypted MCPE payload missing 0xfe header");
         }
 
         std::vector<uint8_t> encryptedOnly(payload.begin() + 1, payload.end());
-        auto aesPlaintext = decryptStream_->process(encryptedOnly);
-
-        if (aesPlaintext.size() < 8) {
-            throw std::runtime_error("decrypted payload too small for checksum");
-        }
-
-        std::vector<uint8_t> compressionPacket(
-            aesPlaintext.begin(),
-            aesPlaintext.end() - 8
-        );
-
-        std::vector<uint8_t> receivedChecksum(
-            aesPlaintext.end() - 8,
-            aesPlaintext.end()
-        );
-
-        auto expectedChecksum = BedrockEncryption::computeChecksum(
-            compressionPacket,
+        auto verification = BedrockEncryption::decryptAndVerify(
+            *decryptStream_,
+            encryptedOnly,
             receiveCounter_,
             encryptionKeys_.secretKeyBytes
         );
-
-        if (receivedChecksum != expectedChecksum) {
-            throw std::runtime_error("encrypted payload checksum mismatch");
+        if (!verification) {
+            return;
         }
 
-        receiveCounter_++;
-        decoded = session_.mcpeCodec().decodeCompressionPacket(compressionPacket);
+        if (!verification->matches()) {
+            const auto message = verification->mismatchMessage();
+            emitError(message);
+            disconnect("disconnectionScreen.badPacket");
+            return;
+        }
+
+        const auto& compressionPacket = verification->packetPlaintext;
+        if (session_.mcpeCodec().compressorInPacketHeader() &&
+            (compressionPacket.empty() ||
+             (compressionPacket[0] != 0x00 && compressionPacket[0] != 0xff))) {
+            const auto compressor = compressionPacket.empty()
+                ? std::string("undefined")
+                : std::to_string(compressionPacket[0]);
+            emitError("Unsupported compressor: " + compressor);
+
+            // JS continues with an undefined buffer after a handled error and
+            // then throws in onDecryptedPacket. C++ cannot represent undefined;
+            // use a transport-boundary failure with the same no-disconnect
+            // behavior after the exact error event.
+            throw std::runtime_error(
+                "unsupported compressor produced no decrypted buffer"
+            );
+        }
+
+        decoded = session_.mcpeCodec().decodeEncryptedCompressionPacket(
+            compressionPacket
+        );
     } else {
-        decoded = session_.mcpeCodec().decodeMcpePayload(payload);
+        const auto& codec = session_.mcpeCodec();
+        decoded = codec.compressorInPacketHeader() && !compressionReady_
+            ? codec.decodeUncompressedMcpePayload(payload)
+            : codec.decodeMcpePayload(payload);
     }
 
     for (const auto& packet : decoded.batch.packets) {
@@ -437,24 +1471,69 @@ void BedrockNetworkClient::handleRakNetPayload(const std::vector<uint8_t>& paylo
 }
 
 void BedrockNetworkClient::handlePacket(const VersionedGamePacket& packet) {
-    emitPacket(packet);
+    std::vector<ProtoDefField> decodedFields;
+    std::string serverHandshakeToken;
+    try {
+        // Client.readPacket catches only deserializer.parsePacketBuffer. Keep
+        // the C++ parsers used by built-in client handling in this narrow
+        // pre-dispatch region; framing, decompression, internal handlers, and
+        // user event callbacks remain uncaught at the transport boundary.
+        if (packet.name == "network_settings" ||
+            packet.name == "server_to_client_handshake") {
+            ProtoDefPacketDecoder decoder(options_.version);
+            decodedFields = decoder.decodePacket(packet.name, packet.payload);
+            if (packet.name == "server_to_client_handshake") {
+                serverHandshakeToken = findFieldValue(decodedFields, "token");
+            }
+        } else if (packet.name == "start_game") {
+            (void) VersionedPayloadReader::readStartGame(packet);
+        } else if (packet.name == "play_status") {
+            (void) VersionedPayloadReader::readPlayStatus(packet);
+        } else if (packet.name == "tick_sync") {
+            (void) readI64LE(packet.payload, 0);
+            (void) readI64LE(packet.payload, 8);
+        }
+    } catch (const std::exception& error) {
+        emitError(error.what());
+        return;
+    }
+
+    emitAnyPacket(packet);
 
     if (packet.name == "network_settings") {
-        ProtoDefPacketDecoder decoder(options_.version);
-        auto fields = decoder.decodePacket(packet.name, packet.payload);
-        compressionThreshold_ = parseU16Field(fields, "compression_threshold", compressionThreshold_);
-        auto algorithm = findFieldValue(fields, "compression_algorithm");
-        compressionAlgorithm_ = algorithm.empty() ? "deflate" : algorithm;
-        compressionReady_ = true;
+        {
+            std::lock_guard<std::mutex> lock(sendMutex_);
+            compressionThreshold_ = parseU16Field(
+                decodedFields,
+                "compression_threshold",
+                compressionThreshold_
+            );
+            auto algorithm = findFieldValue(decodedFields, "compression_algorithm");
+            compressionAlgorithm_ = algorithm.empty() ? "deflate" : algorithm;
+            compressionReady_ = true;
+        }
 
         if (status() == BedrockNetworkClientStatus::Connecting) {
             sendLogin();
         }
+        emitNamedPacket(packet);
         return;
     }
 
     if (packet.name == "server_to_client_handshake") {
-        startEncryptionFromServerHandshake(packet);
+        startEncryptionFromServerHandshake(serverHandshakeToken);
+        emitNamedPacket(packet);
+        return;
+    }
+
+    if (packet.name == "disconnect") {
+        emitNamedPacket(packet);
+        // client.js emits the protocol-level disconnect first, then the
+        // documented special `kick` event with those same decoded params.
+        // This is a named-only emission: the earlier `packet` event must not
+        // be repeated.
+        emitNamedEvent("kick", packet);
+        close("Server requested disconnect");
         return;
     }
 
@@ -468,17 +1547,128 @@ void BedrockNetworkClient::handlePacket(const VersionedGamePacket& packet) {
 
     session_.handlePacket(packet);
 
-    if (packet.name == "play_status") {
-        const int32_t code = playStatusCode(packet);
-        if (code == 0 &&
-            this->status() == BedrockNetworkClientStatus::Authenticating) {
-            setStatus(BedrockNetworkClientStatus::Initializing);
-            emitJoin();
-        }
-        if (code == 3) {
-            setStatus(BedrockNetworkClientStatus::Initialized);
+    if (packet.name == "resource_packs_info") handleResourcePacksInfo();
+    else if (packet.name == "resource_pack_stack") handleResourcePackStack();
+    else if (packet.name == "start_game") handleStartGame(packet);
+    else if (packet.name == "play_status") handlePlayStatus(packet);
+    else if (packet.name == "tick_sync") handleTickSync(packet);
+
+    emitNamedPacket(packet);
+}
+
+void BedrockNetworkClient::handleResourcePacksInfo() {
+    if (!options_.autoResourcePackResponses || resourcePacksInfoHandled_) {
+        return;
+    }
+
+    resourcePacksInfoHandled_ = true;
+    resourcePackStackHandlerArmed_ = true;
+
+    write("resource_pack_client_response", ProtoDefValue::object({
+        {"response_status", ProtoDefValue::string("completed")},
+        {"resourcepackids", ProtoDefValue::array({})}
+    }));
+
+    queue("client_cache_status", ProtoDefValue::object({
+        {"enabled", ProtoDefValue::boolean(false)}
+    }));
+
+    if (versionAtMost(options_.version, "1.20.80") &&
+        session_.definition().hasPacket("tick_sync")) {
+        queue("tick_sync", ProtoDefValue::object({
+            {"request_time", ProtoDefValue::integer(unixTimeMillis())},
+            {"response_time", ProtoDefValue::integer(0)}
+        }));
+    }
+
+    std::lock_guard<std::mutex> lock(queueMutex_);
+    chunkRadiusDue_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+}
+
+void BedrockNetworkClient::handleResourcePackStack() {
+    if (!options_.autoResourcePackResponses || !resourcePackStackHandlerArmed_) {
+        return;
+    }
+
+    resourcePackStackHandlerArmed_ = false;
+    write("resource_pack_client_response", ProtoDefValue::object({
+        {"response_status", ProtoDefValue::string("completed")},
+        {"resourcepackids", ProtoDefValue::array({})}
+    }));
+}
+
+void BedrockNetworkClient::handleStartGame(const VersionedGamePacket& packet) {
+    const auto startGame = VersionedPayloadReader::readStartGame(packet);
+    bool sendInitialized = false;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        runtimeEntityId_ = startGame.runtimeEntityId;
+        // JS installs a persistent `on("start_game")` handler for this race,
+        // so every later start_game writes the initialization packet.
+        sendInitialized = initializeOnNextStartGame_;
+    }
+
+    if (sendInitialized) {
+        sendLocalPlayerInitialized(startGame.runtimeEntityId);
+    }
+}
+
+void BedrockNetworkClient::handlePlayStatus(const VersionedGamePacket& packet) {
+    const int32_t code = playStatusCode(packet);
+    if (code == 0 && status() == BedrockNetworkClientStatus::Authenticating) {
+        emitJoin();
+        setStatus(BedrockNetworkClientStatus::Initializing);
+    }
+
+    if (code != 3 || status() != BedrockNetworkClientStatus::Initializing ||
+        !options_.autoInitPlayer) {
+        return;
+    }
+
+    setStatus(BedrockNetworkClientStatus::Initialized);
+
+    std::optional<uint64_t> runtimeId;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (runtimeEntityId_.has_value() && *runtimeEntityId_ != 0) {
+            runtimeId = runtimeEntityId_;
+        } else {
+            initializeOnNextStartGame_ = true;
         }
     }
+
+    if (runtimeId.has_value()) {
+        sendLocalPlayerInitialized(*runtimeId);
+    }
+
+    if (versionAtMost(options_.version, "1.20.80") &&
+        session_.definition().hasPacket("tick_sync")) {
+        std::lock_guard<std::mutex> lock(queueMutex_);
+        tick_ = 0;
+        keepAliveDue_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    }
+
+    emitSpawn();
+}
+
+void BedrockNetworkClient::handleTickSync(const VersionedGamePacket& packet) {
+    bool heartbeatArmed = false;
+    {
+        std::lock_guard<std::mutex> lock(queueMutex_);
+        heartbeatArmed = keepAliveDue_.has_value();
+    }
+    if (!heartbeatArmed) {
+        return;
+    }
+
+    const int64_t responseTime = readI64LE(packet.payload, 8);
+    emitHeartbeat(responseTime);
+
+    // Match JS ordering: heartbeat listeners observe the old tick value, then
+    // response_time becomes the next keepalive request_time.
+    std::lock_guard<std::mutex> lock(queueMutex_);
+    tick_ = responseTime;
 }
 
 void BedrockNetworkClient::handleLevelChunk(const VersionedGamePacket& packet) {
@@ -552,26 +1742,31 @@ bool BedrockNetworkClient::tryStoreLevelChunk(const BedrockLevelChunkPacket& lev
 }
 
 void BedrockNetworkClient::prepareLoginPacket() {
-    if (!options_.loginPacket.empty()) {
+    auto authOptions = options();
+    if (!authOptions.loginPacket.empty()) {
         if (clientKeys_.privateKeyPem.empty()) {
             clientKeys_ = XboxLiveAuth::loadOrCreateProfileKeyPair(
-                options_.profile,
-                options_.authCacheRoot
+                authOptions.profile,
+                authOptions.authCacheRoot
             );
         }
         return;
     }
 
     auto generated = XboxLiveAuth::makeLoginPacket({
-        .profileName = options_.profile,
-        .version = options_.version,
+        .profileName = authOptions.profile,
+        .version = authOptions.version,
         .protocolVersion = session_.definition().protocolVersion(),
-        .serverAddress = options_.host + ":" + std::to_string(options_.port),
-        .offline = options_.offline,
-        .interactiveAuth = options_.interactiveAuth,
-        .xboxClientId = options_.xboxClientId,
-        .cacheRoot = options_.authCacheRoot,
-        .clientDataJson = options_.clientDataJson,
+        .serverAddress = authOptions.host + ":" + std::to_string(authOptions.port),
+        .offline = authOptions.offline,
+        .interactiveAuth = authOptions.interactiveAuth,
+        .authTitle = authOptions.authTitle,
+        .deviceType = authOptions.deviceType,
+        .flow = authOptions.flow,
+        .xboxClientId = authOptions.xboxClientId,
+        .cacheRoot = authOptions.authCacheRoot,
+        .clientDataJson = authOptions.clientDataJson,
+        .onMsaCode = authOptions.onMsaCode,
         .onDeviceCode = [](const XboxDeviceCodeInfo& info) {
             std::cout << "[XBOX] Open: " << info.verificationUri << "\n";
             std::cout << "[XBOX] Code: " << info.userCode << "\n";
@@ -584,62 +1779,306 @@ void BedrockNetworkClient::prepareLoginPacket() {
         }
     });
 
-    options_.loginPacket = std::move(generated.loginPacket);
+    {
+        std::lock_guard<std::mutex> lock(optionsMutex_);
+        options_.loginPacket = std::move(generated.loginPacket);
+    }
     clientKeys_ = std::move(generated.keyPair);
 }
 
 void BedrockNetworkClient::sendLogin() {
     setStatus(BedrockNetworkClientStatus::Authenticating);
     prepareLoginPacket();
-    auto packet = session_.packetCodec().decodeFullPacket(options_.loginPacket);
-    sendPackets({packet}, false);
+    auto packet = session_.packetCodec().decodeFullPacket(
+        options().loginPacket
+    );
+    sendPackets({packet});
 }
 
-void BedrockNetworkClient::startEncryptionFromServerHandshake(const VersionedGamePacket& packet) {
-    ProtoDefPacketDecoder decoder(options_.version);
-    auto fields = decoder.decodePacket(packet.name, packet.payload);
-    auto token = findFieldValue(fields, "token");
+void BedrockNetworkClient::startEncryptionFromServerHandshake(const std::string& token) {
     if (token.empty()) {
         throw std::runtime_error("server_to_client_handshake has no token");
     }
 
-    encryptionKeys_ = BedrockKeyExchange::deriveFromServerHandshakeJwtAndPrivateKeyPem(
+    auto encryptionKeys = BedrockKeyExchange::deriveFromServerHandshakeJwtAndPrivateKeyPem(
         token,
         clientKeys_.privateKeyPem
     );
-    encryptionEnabled_ = true;
-    sendCounter_ = 0;
-    receiveCounter_ = 0;
-    encryptStream_ = std::make_unique<BedrockAesGcmStream>(
-        encryptionKeys_.secretKeyBytes,
-        encryptionKeys_.iv16,
-        BedrockAesGcmStream::Mode::Encrypt
+    auto encryptStream = BedrockEncryption::createCipherStream(
+        options_.protocolVersion,
+        encryptionKeys.secretKeyBytes,
+        encryptionKeys.iv16,
+        BedrockCipherMode::Encrypt
     );
-    decryptStream_ = std::make_unique<BedrockAesGcmStream>(
-        encryptionKeys_.secretKeyBytes,
-        encryptionKeys_.iv16,
-        BedrockAesGcmStream::Mode::Decrypt
+    auto decryptStream = BedrockEncryption::createCipherStream(
+        options_.protocolVersion,
+        encryptionKeys.secretKeyBytes,
+        encryptionKeys.iv16,
+        BedrockCipherMode::Decrypt
     );
 
     auto handshake = session_.writeClientToServerHandshake();
-    sendPackets({handshake}, true);
+    {
+        std::lock_guard<std::mutex> lock(sendMutex_);
+        encryptionKeys_ = std::move(encryptionKeys);
+        encryptStream_ = std::move(encryptStream);
+        decryptStream_ = std::move(decryptStream);
+        sendCounter_ = 0;
+        receiveCounter_ = 0;
+        encryptionEnabled_ = true;
+        // The handshake must be the first encrypted packet. Holding the same
+        // lock as the queue pump prevents an interval flush from overtaking it.
+        sendPacketsLocked({handshake});
+    }
     session_.takeOutgoingPackets();
+
+    emitJoin();
+    setStatus(BedrockNetworkClientStatus::Initializing);
 }
 
 void BedrockNetworkClient::drainSessionOutgoing() {
     auto outgoing = session_.takeOutgoingPackets();
     if (!outgoing.empty()) {
-        sendPackets(outgoing, encryptionEnabled_);
+        sendPackets(outgoing);
     }
 }
 
-void BedrockNetworkClient::sendPackets(
-    const std::vector<VersionedGamePacket>& packets,
-    bool encryptedCompression
-) {
-    std::lock_guard<std::mutex> lock(sendMutex_);
+bool BedrockNetworkClient::startQueue(bool pumpEnabled) {
+    std::lock_guard<std::mutex> lifecycleLock(queueLifecycleMutex_);
+    // Serialize start admission with stopQueue(). If close published its stop
+    // before this lock was acquired, no post-close queue thread is created. If
+    // start won first, close necessarily acquires this lock next and joins it.
+    if (rakNetStopRequested_.load()) return false;
+    // This is an internal lifecycle replacement, not a public stop. Preserve
+    // a failed-close catch-boundary deadline installed before or during the
+    // old worker's join; the fresh queue must not become runnable inside that
+    // synchronous exception handoff.
+    stopQueueLocked(true);
+    {
+        std::lock_guard<std::mutex> lock(queueMutex_);
+        if (rakNetStopRequested_.load()) return false;
+        const bool closeEmissionActive = closing_.load();
+        const bool rollbackBoundaryPending =
+            queuePumpResumeDue_.has_value();
+        stopQueue_ = false;
+        queuePumpRequested_ = pumpEnabled;
+        queuePumpEnabled_ = pumpEnabled && !closeEmissionActive &&
+            !rollbackBoundaryPending;
+        queuePumpInFlight_ = false;
+        if (closeEmissionActive) {
+            queuePumpResumeDue_.reset();
+        }
+        tick_ = 0;
+    }
+    const auto provider = callbackLifetimeProviderSnapshot();
+    try {
+        queueThread_ = std::thread([this, provider]() {
+            // A queue-thread callback (heartbeat/send seam/user listener) may
+            // destroy the last facade owner. Keep State -> network alive until
+            // queueLoop has observed stopQueue_ and returned from every `this`
+            // access, mirroring the RakNet worker's transport-wide lease.
+            auto threadLease = provider ? provider() : std::shared_ptr<void>();
+            if (provider && !threadLease) return;
+            queueLoop();
+        });
+    } catch (...) {
+        // Do not leave a logically running queue with no worker if native
+        // thread creation fails. The caller's lifecycle phase guard will roll
+        // the connect preparation back before propagating this exception.
+        std::lock_guard<std::mutex> lock(queueMutex_);
+        stopQueue_ = true;
+        queuePumpRequested_ = false;
+        queuePumpEnabled_ = false;
+        queuePumpInFlight_ = false;
+        throw;
+    }
+    return true;
+}
 
-    if (packets.empty() || !raknet_) {
+void BedrockNetworkClient::resumeQueuePump() {
+    {
+        std::lock_guard<std::mutex> lock(queueMutex_);
+        if (stopQueue_) return;
+        queuePumpRequested_ = true;
+        if (closing_.load() || queuePumpResumeDue_.has_value()) {
+            // A close listener is a synchronous JavaScript boundary. Retain
+            // demand, but do not arm the independent C++ timer within it. A
+            // rollback (or an already-published rollback due time) performs
+            // the later activation.
+            queuePumpEnabled_ = false;
+        } else {
+            queuePumpEnabled_ = true;
+        }
+    }
+    queueCv_.notify_all();
+}
+
+bool BedrockNetworkClient::pauseQueuePump() {
+    std::unique_lock<std::mutex> lock(queueMutex_);
+    // Logical demand survives physical suppression. This lets nested or
+    // back-to-back throwing close frames clear a prior due time without
+    // losing the timer that the outermost rollback must re-schedule; an
+    // intentionally paused factory queue has requested=false.
+    const bool wasEnabled = queuePumpRequested_;
+    queuePumpEnabled_ = false;
+    queuePumpResumeDue_.reset();
+    queueCv_.notify_all();
+    queueCv_.wait(lock, [this]() { return !queuePumpInFlight_; });
+    return wasEnabled;
+}
+
+void BedrockNetworkClient::stopQueue() {
+    std::lock_guard<std::mutex> lifecycleLock(queueLifecycleMutex_);
+    stopQueueLocked();
+}
+
+void BedrockNetworkClient::stopQueueIfRunning() {
+    std::lock_guard<std::mutex> lifecycleLock(queueLifecycleMutex_);
+    {
+        std::lock_guard<std::mutex> lock(queueMutex_);
+        if (stopQueue_) return;
+    }
+    stopQueueLocked();
+}
+
+void BedrockNetworkClient::stopQueueLocked(bool preserveRollbackDeadline) {
+    {
+        std::lock_guard<std::mutex> lock(queueMutex_);
+        stopQueue_ = true;
+        queuePumpRequested_ = false;
+        queuePumpEnabled_ = false;
+        if (!preserveRollbackDeadline) queuePumpResumeDue_.reset();
+        queuedPackets_.clear();
+        chunkRadiusDue_.reset();
+        keepAliveDue_.reset();
+    }
+    queueCv_.notify_all();
+
+    if (queueThread_.joinable()) {
+        if (queueThread_.get_id() == std::this_thread::get_id()) {
+            queueThread_.detach();
+        } else {
+            queueThread_.join();
+        }
+    }
+}
+
+void BedrockNetworkClient::queueLoop() {
+    const auto interval = std::chrono::milliseconds(
+        options_.batchingIntervalMs > 0 ? options_.batchingIntervalMs : 20
+    );
+    auto nextTick = std::chrono::steady_clock::now() + interval;
+
+    std::unique_lock<std::mutex> lock(queueMutex_);
+    while (!stopQueue_) {
+        if (!queuePumpEnabled_) {
+            if (!queuePumpResumeDue_.has_value()) {
+                queueCv_.wait(lock, [this]() {
+                    return stopQueue_ || queuePumpEnabled_ ||
+                        queuePumpResumeDue_.has_value();
+                });
+            } else {
+                const auto resumeDue = *queuePumpResumeDue_;
+                queueCv_.wait_until(lock, resumeDue, [this, resumeDue]() {
+                    return stopQueue_ || queuePumpEnabled_ ||
+                        !queuePumpResumeDue_.has_value() ||
+                        *queuePumpResumeDue_ != resumeDue;
+                });
+                if (!stopQueue_ && !queuePumpEnabled_ &&
+                    queuePumpResumeDue_.has_value() &&
+                    std::chrono::steady_clock::now() >=
+                        *queuePumpResumeDue_) {
+                    queuePumpEnabled_ = queuePumpRequested_ &&
+                        !closing_.load();
+                    queuePumpResumeDue_.reset();
+                }
+            }
+            continue;
+        }
+        if (std::chrono::steady_clock::now() < nextTick) {
+            queueCv_.wait_until(lock, nextTick, [this]() {
+                return stopQueue_ || !queuePumpEnabled_;
+            });
+            continue;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        nextTick = now + interval;
+        if (chunkRadiusDue_.has_value() && now >= *chunkRadiusDue_) {
+            auto payload = packetEncoder_.encodePacket(
+                "request_chunk_radius",
+                ProtoDefValue::object({
+                    {"chunk_radius", ProtoDefValue::integer(options_.chunkRadius)},
+                    // JS leaves this field undefined; protodef's u8 writer
+                    // coerces that value to the same wire byte 0x00.
+                    {"max_radius", ProtoDefValue::uinteger(0)}
+                })
+            );
+            queuedPackets_.push_back(
+                session_.packetCodec().makePacketByName("request_chunk_radius", payload)
+            );
+            chunkRadiusDue_.reset();
+        }
+
+        if (keepAliveDue_.has_value() && now >= *keepAliveDue_) {
+            auto payload = packetEncoder_.encodePacket(
+                "tick_sync",
+                ProtoDefValue::object({
+                    {"request_time", ProtoDefValue::integer(tick_)},
+                    {"response_time", ProtoDefValue::integer(0)}
+                })
+            );
+            queuedPackets_.push_back(
+                session_.packetCodec().makePacketByName("tick_sync", payload)
+            );
+            tick_ += 10;
+            keepAliveDue_ = now + std::chrono::milliseconds(500);
+        }
+
+        auto packets = std::move(queuedPackets_);
+        queuedPackets_.clear();
+        queuePumpInFlight_ = true;
+        lock.unlock();
+        try {
+            sendPackets(packets);
+        } catch (...) {
+            lock.lock();
+            queuePumpInFlight_ = false;
+            queueCv_.notify_all();
+            throw;
+        }
+        lock.lock();
+        queuePumpInFlight_ = false;
+        queueCv_.notify_all();
+    }
+}
+
+void BedrockNetworkClient::resetLifecycle() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        runtimeEntityId_.reset();
+        initializeOnNextStartGame_ = false;
+    }
+    resourcePacksInfoHandled_ = false;
+    resourcePackStackHandlerArmed_ = false;
+    compressionReady_ = false;
+}
+
+void BedrockNetworkClient::sendLocalPlayerInitialized(uint64_t runtimeEntityId) {
+    write("set_local_player_as_initialized", ProtoDefValue::object({
+        {"runtime_entity_id", ProtoDefValue::uinteger(runtimeEntityId)}
+    }));
+}
+
+void BedrockNetworkClient::sendPackets(const std::vector<VersionedGamePacket>& packets) {
+    std::lock_guard<std::mutex> lock(sendMutex_);
+    sendPacketsLocked(packets);
+}
+
+void BedrockNetworkClient::sendPacketsLocked(
+    const std::vector<VersionedGamePacket>& packets
+) {
+    if (packets.empty() || (!raknet_ && !reliableSendOverride_)) {
         return;
     }
 
@@ -648,13 +2087,12 @@ void BedrockNetworkClient::sendPackets(
             throw std::runtime_error("encrypt stream is not initialized");
         }
 
-        // Match bedrock-protocol's Framer: encrypted packets are still only
-        // compressed when the framed batch is larger than the negotiated
-        // threshold. Small control packets such as client_cache_status must
-        // remain uncompressed.
-        auto compressionPacket = session_.mcpeCodec().encodeCompressionPacket(
+        // encryption.js receives Framer#getBuffer and always raw-deflates it;
+        // neither the ordinary Framer threshold nor its compressor selection
+        // participates in the encrypted wire format.
+        auto compressionPacket = session_.mcpeCodec().encodeEncryptedCompressionPacket(
             packets,
-            choosePlainCompression(packets)
+            options_.compressionLevel
         );
 
         auto aesPlaintext = BedrockEncryption::makeAesPlaintext(
@@ -670,13 +2108,42 @@ void BedrockNetworkClient::sendPackets(
         encrypted.push_back(0xfe);
         encrypted.insert(encrypted.end(), encryptedOnly.begin(), encryptedOnly.end());
 
-        raknet_->sendReliable(encrypted);
+        sendReliablePayload(encrypted);
+        return;
+    }
+
+    if (session_.mcpeCodec().compressorInPacketHeader() && !compressionReady_) {
+        // Framer writes no compressor byte at all before network_settings.
+        // Passing Uncompressed to the negotiated codec would instead prepend
+        // 0xff, which the peer correctly interprets as the first batch varint.
+        auto framed = session_.batchCodec().encodeFramedBatch(packets);
+        std::vector<uint8_t> mcpe;
+        mcpe.reserve(1 + framed.size());
+        mcpe.push_back(0xfe);
+        mcpe.insert(mcpe.end(), framed.begin(), framed.end());
+        sendReliablePayload(mcpe);
         return;
     }
 
     auto compression = choosePlainCompression(packets);
-    auto mcpe = session_.mcpeCodec().encodeMcpePayload(packets, compression);
-    raknet_->sendReliable(mcpe);
+    auto mcpe = session_.mcpeCodec().encodeMcpePayload(
+        packets,
+        compression,
+        options_.compressionLevel
+    );
+    sendReliablePayload(mcpe);
+}
+
+void BedrockNetworkClient::sendReliablePayload(
+    const std::vector<uint8_t>& payload
+) {
+    if (reliableSendOverride_) {
+        reliableSendOverride_(payload);
+        return;
+    }
+    if (raknet_) {
+        raknet_->sendReliable(payload);
+    }
 }
 
 VersionedMcpeCompression BedrockNetworkClient::choosePlainCompression(

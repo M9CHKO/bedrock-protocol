@@ -30,8 +30,11 @@ constexpr uint8_t ID_CONNECTED_PING = 0x00;
 constexpr uint8_t ID_CONNECTED_PONG = 0x03;
 constexpr uint8_t ID_CONNECTION_REQUEST = 0x09;
 constexpr uint8_t ID_CONNECTION_REQUEST_ACCEPTED = 0x10;
+constexpr uint8_t ID_NEW_INCOMING_CONNECTION = 0x13;
+constexpr uint8_t ID_NO_FREE_INCOMING_CONNECTIONS = 0x14;
 constexpr uint8_t ID_DISCONNECTION_NOTIFICATION = 0x15;
 constexpr uint8_t ID_CONNECTION_LOST = 0x16;
+constexpr uint8_t ID_INCOMPATIBLE_PROTOCOL_VERSION = 0x19;
 constexpr uint8_t ID_UNCONNECTED_PONG = 0x1c;
 constexpr uint8_t ID_NACK = 0xa0;
 constexpr uint8_t ID_ACK = 0xc0;
@@ -119,6 +122,37 @@ bool hasMagic(const std::vector<uint8_t>& data, std::size_t offset) {
     }
 
     return std::equal(std::begin(RAKNET_MAGIC), std::end(RAKNET_MAGIC), data.begin() + static_cast<std::ptrdiff_t>(offset));
+}
+
+bool isRecognizedOfflinePacket(const std::vector<uint8_t>& packet) {
+    if (packet.empty()) {
+        return false;
+    }
+    switch (packet[0]) {
+    case ID_UNCONNECTED_PING:
+    case 0x02: // ID_UNCONNECTED_PING_OPEN_CONNECTIONS
+    case 0x0d: // ID_OUT_OF_BAND_INTERNAL
+        return packet.size() >= 25 && hasMagic(packet, 9);
+    case ID_UNCONNECTED_PONG:
+        // Native gates this case at 29 bytes and then compares 16 bytes at
+        // offset 17. Require the full 33 bytes rather than reproduce its
+        // out-of-bounds read for lengths 29..32.
+        return packet.size() >= 33 && hasMagic(packet, 17);
+    case ID_OPEN_CONNECTION_REQUEST_1:
+    case ID_OPEN_CONNECTION_REPLY_1:
+    case ID_OPEN_CONNECTION_REQUEST_2:
+    case ID_OPEN_CONNECTION_REPLY_2:
+    case 0x11: // ID_CONNECTION_ATTEMPT_FAILED
+    case 0x12: // ID_ALREADY_CONNECTED
+    case ID_NO_FREE_INCOMING_CONNECTIONS:
+    case 0x17: // ID_CONNECTION_BANNED
+    case 0x1a: // ID_IP_RECENTLY_CONNECTED
+        return packet.size() >= 25 && hasMagic(packet, 1);
+    case ID_INCOMPATIBLE_PROTOCOL_VERSION:
+        return packet.size() == 26 && hasMagic(packet, 2);
+    default:
+        return false;
+    }
 }
 
 void appendMagic(std::vector<uint8_t>& out) {
@@ -209,6 +243,26 @@ std::vector<uint8_t> buildOpenConnectionReply1(uint64_t serverGuid, uint16_t mtu
     return out;
 }
 
+std::vector<uint8_t> buildIncompatibleProtocolVersion(
+    uint8_t protocol,
+    uint64_t serverGuid
+) {
+    std::vector<uint8_t> out;
+    out.push_back(ID_INCOMPATIBLE_PROTOCOL_VERSION);
+    out.push_back(protocol);
+    appendMagic(out);
+    writeU64BE(out, serverGuid);
+    return out;
+}
+
+std::vector<uint8_t> buildNoFreeIncomingConnections(uint64_t serverGuid) {
+    std::vector<uint8_t> out;
+    out.push_back(ID_NO_FREE_INCOMING_CONNECTIONS);
+    appendMagic(out);
+    writeU64BE(out, serverGuid);
+    return out;
+}
+
 std::vector<uint8_t> buildOpenConnectionReply2(
     uint64_t serverGuid,
     const sockaddr_in& clientAddress,
@@ -258,6 +312,38 @@ std::vector<uint8_t> buildConnectionRequestAccepted(
     writeU64BE(out, static_cast<uint64_t>(requestTimestamp));
     writeU64BE(out, static_cast<uint64_t>(acceptedTimestamp));
     return out;
+}
+
+uint16_t readRakNetAddressPort(
+    const std::vector<uint8_t>& data,
+    std::size_t& offset
+) {
+    if (offset >= data.size()) {
+        throw std::runtime_error("RakNet address version out of range");
+    }
+
+    const uint8_t version = data[offset++];
+    if (version == 4) {
+        if (offset + 4 > data.size()) {
+            throw std::runtime_error("RakNet IPv4 address out of range");
+        }
+        offset += 4;
+        return readU16BE(data, offset);
+    }
+
+    if (version == 6) {
+        if (offset + 28 > data.size()) {
+            throw std::runtime_error("RakNet IPv6 address out of range");
+        }
+        offset += 2; // address family
+        const uint16_t port = readU16BE(data, offset);
+        offset += 4;  // flow info
+        offset += 16; // address
+        offset += 4;  // scope id
+        return port;
+    }
+
+    throw std::runtime_error("unsupported RakNet address version");
 }
 
 int64_t nowMillis() {
@@ -425,34 +511,14 @@ RakNetServer::~RakNetServer() {
     close();
 }
 
-RakNetServer::RakNetServer(RakNetServer&& other) noexcept {
-    *this = std::move(other);
-}
-
-RakNetServer& RakNetServer::operator=(RakNetServer&& other) noexcept {
-    if (this == &other) {
-        return *this;
-    }
-
-    close();
-    options_ = std::move(other.options_);
-    socket_ = other.socket_;
-    other.socket_ = -1;
-    boundPort_ = other.boundPort_;
-    running_.store(other.running_.load());
-    openConnectionHandler_ = std::move(other.openConnectionHandler_);
-    closeConnectionHandler_ = std::move(other.closeConnectionHandler_);
-    rawPacketHandler_ = std::move(other.rawPacketHandler_);
-    if (other.thread_.joinable()) {
-        thread_ = std::move(other.thread_);
-    }
-    return *this;
-}
-
 void RakNetServer::listen() {
     if (running_) {
         return;
     }
+
+    // A close requested from the former worker cannot join itself.  Reap that
+    // completed worker before assigning a new std::thread on relisten.
+    joinWorkerIfExternal();
 
     addrinfo hints {};
     hints.ai_family = AF_INET;
@@ -497,6 +563,15 @@ void RakNetServer::listen() {
 
     freeaddrinfo(res);
 
+    {
+        std::lock_guard<std::mutex> lock(lifecycleMutex_);
+        scheduledPeerCloses_.clear();
+        shutdownScheduled_ = false;
+        advertisementUpdatesEnabled_ = true;
+        nextAdvertisementUpdate_ = std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(1000);
+        scheduledCloseOrder_ = 0;
+    }
     running_ = true;
     thread_ = std::thread([this]() {
         runLoop();
@@ -504,20 +579,67 @@ void RakNetServer::listen() {
 }
 
 void RakNetServer::close() {
-    if (!running_ && socket_ < 0) {
-        if (thread_.joinable()) {
-            thread_.join();
+    closeAfter(std::chrono::milliseconds(0));
+}
+
+void RakNetServer::closeAfter(std::chrono::milliseconds delay) {
+    if (delay.count() < 0) {
+        delay = std::chrono::milliseconds(0);
+    }
+
+    if (running_) {
+        const auto requestedDeadline = std::chrono::steady_clock::now() + delay;
+        std::lock_guard<std::mutex> lock(lifecycleMutex_);
+        if (!shutdownScheduled_ || requestedDeadline < shutdownDeadline_) {
+            shutdownScheduled_ = true;
+            shutdownDeadline_ = requestedDeadline;
         }
+        // server.js clears serverTimer before its 60 ms backend grace.
+        advertisementUpdatesEnabled_ = false;
+    }
+
+    joinWorkerIfExternal();
+}
+
+void RakNetServer::closePeer(const RakNetServerPeer& peer, bool silent) {
+    if (!running_) {
+        return;
+    }
+    closePeerNow(
+        peer.address + ":" + std::to_string(peer.port),
+        peer.clientGuid,
+        silent
+    );
+}
+
+void RakNetServer::closePeerAfter(
+    const RakNetServerPeer& peer,
+    std::chrono::milliseconds delay,
+    bool silent
+) {
+    if (!running_) {
+        return;
+    }
+    if (delay.count() < 0) {
+        delay = std::chrono::milliseconds(0);
+    }
+
+    std::lock_guard<std::mutex> lock(lifecycleMutex_);
+    scheduledPeerCloses_.push_back({
+        std::chrono::steady_clock::now() + delay,
+        peer.address + ":" + std::to_string(peer.port),
+        peer.clientGuid,
+        silent,
+        scheduledCloseOrder_++
+    });
+}
+
+void RakNetServer::joinWorkerIfExternal() {
+    if (onWorkerThread()) {
         return;
     }
 
-    running_ = false;
-    if (socket_ >= 0) {
-        ::shutdown(socket_, SHUT_RDWR);
-        ::close(socket_);
-        socket_ = -1;
-    }
-
+    std::lock_guard<std::mutex> lock(joinMutex_);
     if (thread_.joinable()) {
         thread_.join();
     }
@@ -525,13 +647,19 @@ void RakNetServer::close() {
 
 void RakNetServer::runLoop() {
     while (running_) {
+        if (!processLifecycleDeadlines()) {
+            break;
+        }
+
         fd_set readfds;
         FD_ZERO(&readfds);
         FD_SET(socket_, &readfds);
 
         timeval timeout {};
         timeout.tv_sec = 0;
-        timeout.tv_usec = 100000;
+        // Timers in serverPlayer.js are millisecond timers.  A short poll keeps
+        // the 60/100 ms lifecycle deadlines accurate without blocking sends.
+        timeout.tv_usec = 5000;
 
         int ready = select(socket_ + 1, &readfds, nullptr, nullptr, &timeout);
         if (!running_) {
@@ -562,6 +690,230 @@ void RakNetServer::runLoop() {
     }
 }
 
+bool RakNetServer::processLifecycleDeadlines() {
+    const auto now = std::chrono::steady_clock::now();
+    struct PeerWireTarget {
+        RakNetServerPeer peer;
+        std::array<uint8_t, 128> endpoint {};
+        int endpointLen = 0;
+    };
+
+    std::vector<ScheduledPeerClose> duePeerCloses;
+    std::vector<PeerWireTarget> heartbeatTargets;
+    std::vector<RakNetServerPeer> timedOutPeers;
+    bool shutdownDue = false;
+    bool advertisementUpdateDue = false;
+    {
+        std::lock_guard<std::mutex> lock(lifecycleMutex_);
+        shutdownDue = shutdownScheduled_ && shutdownDeadline_ <= now;
+        if (shutdownDue) {
+            shutdownScheduled_ = false;
+            scheduledPeerCloses_.clear();
+        } else {
+            auto it = scheduledPeerCloses_.begin();
+            while (it != scheduledPeerCloses_.end()) {
+                if (it->deadline <= now) {
+                    duePeerCloses.push_back(*it);
+                    it = scheduledPeerCloses_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+
+            if (advertisementUpdatesEnabled_ &&
+                nextAdvertisementUpdate_ <= now) {
+                advertisementUpdateDue = true;
+                do {
+                    nextAdvertisementUpdate_ += std::chrono::milliseconds(1000);
+                } while (nextAdvertisementUpdate_ <= now);
+            }
+        }
+    }
+
+    if (shutdownDue) {
+        finishShutdown();
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(peersMutex_);
+        auto it = peers_.begin();
+        while (it != peers_.end()) {
+            const auto& state = it->second;
+            // RakPeer expires both UNVERIFIED_SENDER and
+            // HANDLING_CONNECTION_REQUEST from the original Request2
+            // allocation time.  The comparison is strictly greater than
+            // 10,000 ms and the removal is silent.
+            if (!state.connected &&
+                state.request2AssignedAt != std::chrono::steady_clock::time_point {} &&
+                now > state.request2AssignedAt &&
+                now - state.request2AssignedAt > std::chrono::milliseconds(10000)) {
+                it = peers_.erase(it);
+            } else {
+                // RakPeer injects a RELIABLE connected ping after half the
+                // configured 30 second delivery timeout, but only when no
+                // reliable datagram is already awaiting an ACK.
+                if (state.connected && state.endpointLen > 0 &&
+                    state.sentReliableDatagrams.empty() &&
+                    state.lastReliableSend != std::chrono::steady_clock::time_point {} &&
+                    now > state.lastReliableSend &&
+                    now - state.lastReliableSend > std::chrono::milliseconds(15000)) {
+                    heartbeatTargets.push_back({
+                        state.peer,
+                        state.endpoint,
+                        state.endpointLen
+                    });
+                }
+                ++it;
+            }
+        }
+    }
+
+    for (const auto& target : heartbeatTargets) {
+        std::vector<uint8_t> ping {ID_CONNECTED_PING};
+        writeU64BE(ping, static_cast<uint64_t>(nowMillis()));
+        sendConnectedFrame(
+            target.peer,
+            target.endpoint.data(),
+            target.endpointLen,
+            ping,
+            2
+        );
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(peersMutex_);
+        auto it = peers_.begin();
+        while (it != peers_.end()) {
+            const auto& state = it->second;
+            // ReliabilityLayer declares a peer dead only while a reliable
+            // datagram is pending and no datagram has arrived for strictly
+            // more than the configured 30,000 ms timeout.
+            if (state.connected && !state.sentReliableDatagrams.empty() &&
+                state.timeLastDatagramArrived != std::chrono::steady_clock::time_point {} &&
+                now > state.timeLastDatagramArrived &&
+                now - state.timeLastDatagramArrived > std::chrono::milliseconds(30000)) {
+                timedOutPeers.push_back(state.peer);
+                // Native CloseConnectionInternal removes the transport before
+                // its locally generated ID_CONNECTION_LOST reaches JS.
+                it = peers_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    // The native producer packet is local only: no 0x15/0x16 is put on the
+    // wire. Invoke callbacks after transport erasure and outside peersMutex_,
+    // so an attempted send from the callback is a no-op.
+    for (const auto& peer : timedOutPeers) {
+        if (closeConnectionHandler_) {
+            closeConnectionHandler_(peer);
+        }
+    }
+
+    if (advertisementUpdateDue && advertisementProvider_) {
+        options_.advertisement = advertisementProvider_();
+    }
+
+    std::sort(
+        duePeerCloses.begin(),
+        duePeerCloses.end(),
+        [](const ScheduledPeerClose& lhs, const ScheduledPeerClose& rhs) {
+            if (lhs.deadline != rhs.deadline) {
+                return lhs.deadline < rhs.deadline;
+            }
+            return lhs.order < rhs.order;
+        }
+    );
+    for (const auto& scheduled : duePeerCloses) {
+        closePeerNow(scheduled.key, scheduled.clientGuid, scheduled.silent);
+    }
+    return running_;
+}
+
+void RakNetServer::closePeerNow(
+    const std::string& key,
+    uint64_t clientGuid,
+    bool silent
+) {
+    RakNetServerPeer peer;
+    std::array<uint8_t, 128> endpoint {};
+    int endpointLen = 0;
+    {
+        std::lock_guard<std::mutex> lock(peersMutex_);
+        auto it = peers_.find(key);
+        if (it == peers_.end() || !it->second.connected ||
+            it->second.peer.clientGuid != clientGuid) {
+            return;
+        }
+        peer = it->second.peer;
+        endpoint = it->second.endpoint;
+        endpointLen = it->second.endpointLen;
+    }
+
+    // Player.close emits close before connection.close.  Deliver the local
+    // close callback while the RakNet peer is still usable, then perform the
+    // native-style transport close.
+    if (closeConnectionHandler_) {
+        closeConnectionHandler_(peer);
+    }
+    if (!silent && endpointLen > 0) {
+        sendReliableOrdered(
+            peer,
+            endpoint.data(),
+            endpointLen,
+            std::vector<uint8_t>{ID_DISCONNECTION_NOTIFICATION}
+        );
+    }
+
+    std::lock_guard<std::mutex> lock(peersMutex_);
+    auto it = peers_.find(key);
+    if (it != peers_.end() && it->second.peer.clientGuid == clientGuid) {
+        peers_.erase(it);
+    }
+}
+
+void RakNetServer::finishShutdown() {
+    std::vector<std::pair<RakNetServerPeer, std::pair<std::array<uint8_t, 128>, int>>> peers;
+    {
+        std::lock_guard<std::mutex> lock(peersMutex_);
+        peers.reserve(peers_.size());
+        for (const auto& entry : peers_) {
+            if (!entry.second.connected || entry.second.endpointLen <= 0) {
+                continue;
+            }
+            peers.push_back({
+                entry.second.peer,
+                {entry.second.endpoint, entry.second.endpointLen}
+            });
+        }
+    }
+
+    // RakPeer::Shutdown(blockDuration) notifies every active peer but the
+    // native addon stops its JS delivery loop before Shutdown, so no local
+    // closeConnection callbacks are emitted for this path.
+    for (const auto& entry : peers) {
+        sendReliableOrdered(
+            entry.first,
+            entry.second.first.data(),
+            entry.second.second,
+            std::vector<uint8_t>{ID_DISCONNECTION_NOTIFICATION}
+        );
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(peersMutex_);
+        peers_.clear();
+    }
+    if (socket_ >= 0) {
+        ::shutdown(socket_, SHUT_RDWR);
+        ::close(socket_);
+        socket_ = -1;
+    }
+    running_ = false;
+}
+
 void RakNetServer::handlePacket(
     const std::vector<uint8_t>& packet,
     const void* sender,
@@ -573,6 +925,30 @@ void RakNetServer::handlePacket(
 
     const auto& senderAddr = *reinterpret_cast<const sockaddr_in*>(sender);
     const uint8_t packetId = packet[0];
+    bool liveCallbackThrew = false;
+    auto invokeLiveCallback = [&](auto&& callback) {
+        try {
+            callback();
+        } catch (...) {
+            // RakNet-native drops malformed transport input, but exceptions
+            // raised after it has surfaced a live event belong to the JS
+            // EventEmitter boundary and must escape the networking callback.
+            liveCallbackThrew = true;
+            throw;
+        }
+    };
+
+    // ProcessOfflineNetworkPacket consumes valid magic-bearing offline
+    // packets before they reach ReliabilityLayer. Every other UDP datagram
+    // longer than two bytes refreshes the assigned endpoint before parsing or
+    // duplicate filtering, including unknown and malformed packet IDs.
+    if (packet.size() > 2 && !isRecognizedOfflinePacket(packet)) {
+        std::lock_guard<std::mutex> lock(peersMutex_);
+        auto it = peers_.find(peerKey(senderAddr));
+        if (it != peers_.end()) {
+            it->second.timeLastDatagramArrived = std::chrono::steady_clock::now();
+        }
+    }
 
     try {
         if (packetId == ID_UNCONNECTED_PING) {
@@ -602,15 +978,26 @@ void RakNetServer::handlePacket(
             }
 
             const uint8_t clientProtocol = packet[offset];
-            if (clientProtocol != static_cast<uint8_t>(options_.protocolVersion)) {
-                // JavaScript rak backends reject incompatible RakNet protocol here.
+            // raknet-native 1.2.3 sets
+            // RakPeer::allowClientsWithOlderVersion = true when listening.
+            // Older RakNet protocols therefore continue through the handshake;
+            // only a protocol newer than the server is rejected.
+            if (clientProtocol > static_cast<uint8_t>(options_.protocolVersion)) {
+                sendTo(
+                    sender,
+                    senderLen,
+                    buildIncompatibleProtocolVersion(
+                        static_cast<uint8_t>(options_.protocolVersion),
+                        options_.serverGuid
+                    )
+                );
                 return;
             }
 
             const int mtu = static_cast<int>(packet.size()) + UDP_IPV4_HEADER_SIZE;
             auto reply = buildOpenConnectionReply1(
                 options_.serverGuid,
-                static_cast<uint16_t>(std::max(576, std::min(1492, mtu)))
+                static_cast<uint16_t>(std::min(1400, mtu))
             );
             sendTo(sender, senderLen, reply);
             return;
@@ -631,32 +1018,74 @@ void RakNetServer::handlePacket(
             const uint16_t mtu = readU16BE(packet, offset);
             const uint64_t clientGuid = readU64BE(packet, offset);
 
-            auto reply = buildOpenConnectionReply2(options_.serverGuid, senderAddr, mtu);
-            sendTo(sender, senderLen, reply);
-
             RakNetServerPeer peer;
             peer.address = sockaddrToIp(senderAddr);
             peer.port = sockaddrToPort(senderAddr);
             peer.clientGuid = clientGuid;
             peer.mtu = mtu;
+
+            // RakNativeServer passes `options.maxPlayers || 3` as both
+            // Startup(maxConnections) and maximum incoming connections.
+            // RakPeer's full check counts only fully connected remote peers,
+            // while its fixed remote-system table is occupied from Request2.
+            // When that table is exhausted by half-open peers RakPeer still
+            // sends Reply2, but does not allocate state for the extra peer.
+            // Request1 continues to be answered in both cases.
+            const auto maximumIncomingConnections = static_cast<std::size_t>(
+                options_.maxPlayers != 0 ? options_.maxPlayers : 3
+            );
+            bool noFreeIncomingConnections = false;
             {
                 std::lock_guard<std::mutex> lock(peersMutex_);
-                auto& state = peers_[peerKey(senderAddr)];
-                state.peer = peer;
-                state.endpointLen = senderLen;
-                std::memcpy(state.endpoint.data(), sender, static_cast<std::size_t>(senderLen));
-                state.splits.clear();
-                state.sentReliableDatagrams.clear();
-                state.receivedDatagramOrder.clear();
-                state.receivedDatagramSequences.clear();
-                state.expectedOrderedIndex = {};
-                state.expectedOrderedIndexInitialized = {};
-                state.pendingOrderedPayloads = {};
+                const auto connectedPeers = static_cast<std::size_t>(std::count_if(
+                    peers_.begin(),
+                    peers_.end(),
+                    [](const auto& entry) {
+                        return entry.second.connected;
+                    }
+                ));
+                noFreeIncomingConnections =
+                    connectedPeers >= maximumIncomingConnections;
+
+                const auto key = peerKey(senderAddr);
+                if (!noFreeIncomingConnections &&
+                    peers_.find(key) == peers_.end() &&
+                    peers_.size() < maximumIncomingConnections) {
+                    PeerState state;
+                    state.peer = peer;
+                    // RakPeer::AssignSystemAddressToRemoteSystemList records
+                    // connectionTime once. Duplicate Request2 and the later
+                    // ConnectionRequest transition do not refresh it.
+                    const auto assignedAt = std::chrono::steady_clock::now();
+                    state.request2AssignedAt = assignedAt;
+                    // ReliabilityLayer::Reset initializes both liveness clocks
+                    // for the newly assigned RemoteSystem.
+                    state.timeLastDatagramArrived = assignedAt;
+                    state.lastReliableSend = assignedAt;
+                    state.endpointLen = senderLen;
+                    std::memcpy(
+                        state.endpoint.data(),
+                        sender,
+                        static_cast<std::size_t>(senderLen)
+                    );
+                    peers_.emplace(key, std::move(state));
+                }
+            }
+            if (noFreeIncomingConnections) {
+                sendTo(
+                    sender,
+                    senderLen,
+                    buildNoFreeIncomingConnections(options_.serverGuid)
+                );
+                return;
             }
 
-            if (openConnectionHandler_) {
-                openConnectionHandler_(peer);
-            }
+            auto reply = buildOpenConnectionReply2(
+                options_.serverGuid,
+                senderAddr,
+                std::min<uint16_t>(mtu, 1400)
+            );
+            sendTo(sender, senderLen, reply);
             return;
         }
 
@@ -665,7 +1094,11 @@ void RakNetServer::handlePacket(
             std::vector<std::vector<uint8_t>> resend;
             {
                 std::lock_guard<std::mutex> lock(peersMutex_);
-                auto& state = peers_[peerKey(senderAddr)];
+                auto it = peers_.find(peerKey(senderAddr));
+                if (it == peers_.end()) {
+                    return;
+                }
+                auto& state = it->second;
                 if (packetId == ID_ACK) {
                     for (uint32_t sequence : sequences) {
                         state.sentReliableDatagrams.erase(sequence);
@@ -689,18 +1122,16 @@ void RakNetServer::handlePacket(
         if (packetId >= 0x80 && packetId <= 0x8f) {
             uint32_t sequence = 0;
             auto frames = parseConnectedDatagram(packet, sequence);
-            sendTo(sender, senderLen, buildAck(sequence));
 
             RakNetServerPeer peer;
             bool duplicateDatagram = false;
             {
                 std::lock_guard<std::mutex> lock(peersMutex_);
-                auto& state = peers_[peerKey(senderAddr)];
-                if (state.peer.address.empty()) {
-                    state.peer.address = sockaddrToIp(senderAddr);
-                    state.peer.port = sockaddrToPort(senderAddr);
-                    state.peer.mtu = 1400;
+                auto it = peers_.find(peerKey(senderAddr));
+                if (it == peers_.end()) {
+                    return;
                 }
+                auto& state = it->second;
                 state.endpointLen = senderLen;
                 std::memcpy(state.endpoint.data(), sender, static_cast<std::size_t>(senderLen));
                 peer = state.peer;
@@ -717,6 +1148,8 @@ void RakNetServer::handlePacket(
                 }
             }
 
+            sendTo(sender, senderLen, buildAck(sequence));
+
             if (duplicateDatagram) {
                 return;
             }
@@ -726,46 +1159,137 @@ void RakNetServer::handlePacket(
                     return;
                 }
 
-                if (payload[0] == ID_CONNECTED_PING) {
-                    std::size_t offset = 1;
-                    const int64_t pingTime = static_cast<int64_t>(readU64BE(payload, offset));
-                    sendReliableOrdered(
-                        peer,
-                        sender,
-                        senderLen,
-                        buildConnectedPong(pingTime, nowMillis())
-                    );
-                    return;
-                }
-
-                if (payload[0] == ID_CONNECTION_REQUEST) {
-                    std::size_t offset = 1;
-                    const uint64_t clientGuid = readU64BE(payload, offset);
-                    const int64_t requestTimestamp = static_cast<int64_t>(readU64BE(payload, offset));
-                    (void) clientGuid;
-                    sendReliableOrdered(
-                        peer,
-                        sender,
-                        senderLen,
-                        buildConnectionRequestAccepted(senderAddr, requestTimestamp, nowMillis())
-                    );
-                    return;
-                }
-
-                if (payload[0] == ID_DISCONNECTION_NOTIFICATION ||
-                    payload[0] == ID_CONNECTION_LOST) {
-                    {
-                        std::lock_guard<std::mutex> lock(peersMutex_);
-                        peers_.erase(peerKey(senderAddr));
+                bool connected = false;
+                bool connectionRequestAccepted = false;
+                {
+                    std::lock_guard<std::mutex> lock(peersMutex_);
+                    auto it = peers_.find(peerKey(senderAddr));
+                    if (it == peers_.end()) {
+                        return;
                     }
-                    if (closeConnectionHandler_) {
-                        closeConnectionHandler_(peer);
+                    connected = it->second.connected;
+                    connectionRequestAccepted = it->second.connectionRequestAccepted;
+                }
+
+                if (!connected) {
+                    if (payload[0] == ID_CONNECTION_REQUEST) {
+                        std::size_t offset = 1;
+                        (void) readU64BE(payload, offset); // client GUID
+                        const int64_t requestTimestamp = static_cast<int64_t>(readU64BE(payload, offset));
+                        if (offset >= payload.size()) {
+                            throw std::runtime_error("connection request secure flag out of range");
+                        }
+                        ++offset; // secure flag
+
+                        {
+                            std::lock_guard<std::mutex> lock(peersMutex_);
+                            auto it = peers_.find(peerKey(senderAddr));
+                            if (it == peers_.end() || it->second.connected) {
+                                return;
+                            }
+                            it->second.connectionRequestAccepted = true;
+                        }
+
+                        sendReliableOrdered(
+                            peer,
+                            sender,
+                            senderLen,
+                            buildConnectionRequestAccepted(senderAddr, requestTimestamp, nowMillis())
+                        );
+                        return;
+                    }
+
+                    if (payload[0] == ID_NEW_INCOMING_CONNECTION) {
+                        if (!connectionRequestAccepted) {
+                            return;
+                        }
+
+                        std::size_t offset = 1;
+                        const uint16_t serverPort = readRakNetAddressPort(payload, offset);
+                        if (serverPort != boundPort_) {
+                            return;
+                        }
+                        for (int i = 0; i < 20; ++i) {
+                            (void) readRakNetAddressPort(payload, offset);
+                            if (payload.size() - offset == 16) {
+                                break;
+                            }
+                        }
+                        (void) readU64BE(payload, offset); // request timestamp
+                        (void) readU64BE(payload, offset); // accepted timestamp
+
+                        RakNetServerPeer openedPeer;
+                        bool emitOpen = false;
+                        {
+                            std::lock_guard<std::mutex> lock(peersMutex_);
+                            auto it = peers_.find(peerKey(senderAddr));
+                            if (it != peers_.end() &&
+                                it->second.connectionRequestAccepted &&
+                                !it->second.connected) {
+                                it->second.connected = true;
+                                openedPeer = it->second.peer;
+                                emitOpen = true;
+                            }
+                        }
+
+                        if (emitOpen) {
+                            // RakPeer sends one immediate UNRELIABLE ping when
+                            // HANDLING_CONNECTION_REQUEST becomes CONNECTED,
+                            // before surfacing ID_NEW_INCOMING_CONNECTION.
+                            std::vector<uint8_t> ping {ID_CONNECTED_PING};
+                            writeU64BE(ping, static_cast<uint64_t>(nowMillis()));
+                            sendConnectedFrame(
+                                openedPeer,
+                                sender,
+                                senderLen,
+                                ping,
+                                0
+                            );
+                            if (openConnectionHandler_) {
+                                invokeLiveCallback([&]() {
+                                    openConnectionHandler_(openedPeer);
+                                });
+                            }
+                        }
+                    }
+                    return;
+                }
+
+                if (payload[0] < 0x80) {
+                    if (payload[0] == ID_CONNECTED_PING) {
+                        std::size_t offset = 1;
+                        const int64_t pingTime = static_cast<int64_t>(readU64BE(payload, offset));
+                        // RakPeer answers ID_CONNECTED_PING with an
+                        // UNRELIABLE ID_CONNECTED_PONG.
+                        sendConnectedFrame(
+                            peer,
+                            sender,
+                            senderLen,
+                            buildConnectedPong(pingTime, nowMillis()),
+                            0
+                        );
+                        return;
+                    }
+
+                    if (payload[0] == ID_DISCONNECTION_NOTIFICATION ||
+                        payload[0] == ID_CONNECTION_LOST) {
+                        if (closeConnectionHandler_) {
+                            invokeLiveCallback([&]() {
+                                closeConnectionHandler_(peer);
+                            });
+                        }
+                        {
+                            std::lock_guard<std::mutex> lock(peersMutex_);
+                            peers_.erase(peerKey(senderAddr));
+                        }
                     }
                     return;
                 }
 
                 if (encapsulatedHandler_) {
-                    encapsulatedHandler_(peer, payload);
+                    invokeLiveCallback([&]() {
+                        encapsulatedHandler_(peer, payload);
+                    });
                 }
             };
 
@@ -779,7 +1303,12 @@ void RakNetServer::handlePacket(
                     bool complete = false;
                     {
                         std::lock_guard<std::mutex> lock(peersMutex_);
-                        auto& state = peers_[peerKey(senderAddr)];
+                        auto peerIt = peers_.find(peerKey(senderAddr));
+                        if (peerIt == peers_.end() ||
+                            peerIt->second.peer.clientGuid != peer.clientGuid) {
+                            continue;
+                        }
+                        auto& state = peerIt->second;
                         auto& split = state.splits[frame.splitId];
                         if (split.count == 0) {
                             split.count = frame.splitCount;
@@ -817,7 +1346,12 @@ void RakNetServer::handlePacket(
                 if (frame.ordered) {
                     const uint8_t channel = frame.orderedChannel < 32 ? frame.orderedChannel : 0;
                     std::lock_guard<std::mutex> lock(peersMutex_);
-                    auto& state = peers_[peerKey(senderAddr)];
+                    auto peerIt = peers_.find(peerKey(senderAddr));
+                    if (peerIt == peers_.end() ||
+                        peerIt->second.peer.clientGuid != peer.clientGuid) {
+                        continue;
+                    }
+                    auto& state = peerIt->second;
                     uint32_t& expected = state.expectedOrderedIndex[channel];
                     bool& initialized = state.expectedOrderedIndexInitialized[channel];
 
@@ -863,9 +1397,14 @@ void RakNetServer::handlePacket(
             RakNetServerPeer peer;
             peer.address = sockaddrToIp(senderAddr);
             peer.port = sockaddrToPort(senderAddr);
-            rawPacketHandler_(peer, packet);
+            invokeLiveCallback([&]() {
+                rawPacketHandler_(peer, packet);
+            });
         }
     } catch (const std::exception& e) {
+        if (liveCallbackThrew) {
+            throw;
+        }
         if (shouldLogDroppedPacket(senderAddr, packetId, e.what())) {
             std::cerr << "[raknet-server] dropped packet from "
                       << sockaddrToIp(senderAddr) << ":"
@@ -875,6 +1414,9 @@ void RakNetServer::handlePacket(
         }
         return;
     } catch (...) {
+        if (liveCallbackThrew) {
+            throw;
+        }
         if (shouldLogDroppedPacket(senderAddr, packetId, "unknown")) {
             std::cerr << "[raknet-server] dropped packet from "
                       << sockaddrToIp(senderAddr) << ":"
@@ -917,6 +1459,57 @@ void RakNetServer::sendReliable(const RakNetServerPeer& peer, const std::vector<
     sendReliableOrdered(peer, endpoint.data(), endpointLen, payload);
 }
 
+void RakNetServer::sendConnectedFrame(
+    const RakNetServerPeer& peer,
+    const void* target,
+    int targetLen,
+    const std::vector<uint8_t>& payload,
+    uint8_t reliability
+) {
+    if (payload.empty() || (reliability != 0 && reliability != 2)) {
+        return;
+    }
+
+    const auto key = peer.address + ":" + std::to_string(peer.port);
+    uint32_t sequence = 0;
+    uint32_t reliableIndex = 0;
+    {
+        std::lock_guard<std::mutex> lock(peersMutex_);
+        auto it = peers_.find(key);
+        if (it == peers_.end() || !it->second.connected ||
+            it->second.peer.clientGuid != peer.clientGuid) {
+            return;
+        }
+        sequence = it->second.outgoingSequence++;
+        if (reliability == 2) {
+            reliableIndex = it->second.reliableIndex++;
+        }
+    }
+
+    std::vector<uint8_t> out;
+    out.push_back(0x80);
+    writeTriadLE(out, sequence);
+    out.push_back(static_cast<uint8_t>(reliability << 5u));
+    writeU16BE(out, static_cast<uint16_t>(payload.size() * 8u));
+    if (reliability == 2) {
+        writeTriadLE(out, reliableIndex);
+    }
+    out.insert(out.end(), payload.begin(), payload.end());
+
+    if (reliability == 2) {
+        std::lock_guard<std::mutex> lock(peersMutex_);
+        auto it = peers_.find(key);
+        if (it == peers_.end() || !it->second.connected ||
+            it->second.peer.clientGuid != peer.clientGuid) {
+            return;
+        }
+        it->second.sentReliableDatagrams[sequence] = out;
+        it->second.lastReliableSend = std::chrono::steady_clock::now();
+    }
+
+    sendTo(target, targetLen, out);
+}
+
 void RakNetServer::sendReliableOrdered(
     const RakNetServerPeer& peer,
     const void* target,
@@ -940,9 +1533,13 @@ void RakNetServer::sendReliableOrdered(
         uint16_t splitId = 0;
         {
             std::lock_guard<std::mutex> lock(peersMutex_);
-            auto& state = peers_[peer.address + ":" + std::to_string(peer.port)];
-            sharedOrderedIndex = state.orderedIndex++;
-            splitId = state.outgoingSplitId++;
+            auto it = peers_.find(peer.address + ":" + std::to_string(peer.port));
+            if (it == peers_.end() ||
+                it->second.peer.clientGuid != peer.clientGuid) {
+                return;
+            }
+            sharedOrderedIndex = it->second.orderedIndex++;
+            splitId = it->second.outgoingSplitId++;
         }
 
         for (uint32_t splitIndex = 0; splitIndex < splitCount; ++splitIndex) {
@@ -958,9 +1555,13 @@ void RakNetServer::sendReliableOrdered(
             uint32_t reliableIndex = 0;
             {
                 std::lock_guard<std::mutex> lock(peersMutex_);
-                auto& state = peers_[peer.address + ":" + std::to_string(peer.port)];
-                sequence = state.outgoingSequence++;
-                reliableIndex = state.reliableIndex++;
+                auto it = peers_.find(peer.address + ":" + std::to_string(peer.port));
+                if (it == peers_.end() ||
+                    it->second.peer.clientGuid != peer.clientGuid) {
+                    return;
+                }
+                sequence = it->second.outgoingSequence++;
+                reliableIndex = it->second.reliableIndex++;
             }
 
             std::vector<uint8_t> out;
@@ -978,12 +1579,17 @@ void RakNetServer::sendReliableOrdered(
             writeU32BE(out, splitIndex);
             out.insert(out.end(), chunk.begin(), chunk.end());
 
-            sendTo(target, targetLen, out);
             {
                 std::lock_guard<std::mutex> lock(peersMutex_);
-                auto& state = peers_[peer.address + ":" + std::to_string(peer.port)];
-                state.sentReliableDatagrams[sequence] = out;
+                auto it = peers_.find(peer.address + ":" + std::to_string(peer.port));
+                if (it == peers_.end() ||
+                    it->second.peer.clientGuid != peer.clientGuid) {
+                    return;
+                }
+                it->second.sentReliableDatagrams[sequence] = out;
+                it->second.lastReliableSend = std::chrono::steady_clock::now();
             }
+            sendTo(target, targetLen, out);
         }
         return;
     }
@@ -993,10 +1599,14 @@ void RakNetServer::sendReliableOrdered(
     uint32_t orderedIndex = 0;
     {
         std::lock_guard<std::mutex> lock(peersMutex_);
-        auto& state = peers_[peer.address + ":" + std::to_string(peer.port)];
-        sequence = state.outgoingSequence++;
-        reliableIndex = state.reliableIndex++;
-        orderedIndex = state.orderedIndex++;
+        auto it = peers_.find(peer.address + ":" + std::to_string(peer.port));
+        if (it == peers_.end() ||
+            it->second.peer.clientGuid != peer.clientGuid) {
+            return;
+        }
+        sequence = it->second.outgoingSequence++;
+        reliableIndex = it->second.reliableIndex++;
+        orderedIndex = it->second.orderedIndex++;
     }
 
     std::vector<uint8_t> out;
@@ -1011,12 +1621,17 @@ void RakNetServer::sendReliableOrdered(
     out.push_back(0);
     out.insert(out.end(), payload.begin(), payload.end());
 
-    sendTo(target, targetLen, out);
     {
         std::lock_guard<std::mutex> lock(peersMutex_);
-        auto& state = peers_[peer.address + ":" + std::to_string(peer.port)];
-        state.sentReliableDatagrams[sequence] = out;
+        auto it = peers_.find(peer.address + ":" + std::to_string(peer.port));
+        if (it == peers_.end() ||
+            it->second.peer.clientGuid != peer.clientGuid) {
+            return;
+        }
+        it->second.sentReliableDatagrams[sequence] = out;
+        it->second.lastReliableSend = std::chrono::steady_clock::now();
     }
+    sendTo(target, targetLen, out);
 }
 
 } // namespace bedrock

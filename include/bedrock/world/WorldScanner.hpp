@@ -1,5 +1,6 @@
 #pragma once
 
+#include <bedrock/world/BedrockChunk.hpp>
 #include <bedrock/world/WorldView.hpp>
 #include <bedrock/world/BlockRuntimeRegistry.hpp>
 
@@ -8,12 +9,6 @@
 #include <optional>
 
 namespace bedrock {
-
-struct BlockPosition {
-    int32_t x = 0;
-    int32_t y = 0;
-    int32_t z = 0;
-};
 
 class WorldScanner {
 public:

@@ -1,11 +1,42 @@
 #include <bedrock/client/BedrockNetworkClient.hpp>
+#include <bedrock/protocol/VersionedPayloadReader.hpp>
 #include <bedrock/relay/BedrockLiveRelay.hpp>
 #include <bedrock/server/BedrockServer.hpp>
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <iostream>
 #include <thread>
+#include <vector>
+
+static bool checkPlayStatusEndianRegression() {
+    const auto codec = bedrock::VersionedPacketCodec::forVersion("1.21.100");
+    const auto loginSuccess = codec.makePacketByName(
+        "play_status",
+        {0x00, 0x00, 0x00, 0x00}
+    );
+    const auto playerSpawn = codec.makePacketByName(
+        "play_status",
+        {0x00, 0x00, 0x00, 0x03}
+    );
+    const auto littleEndianPlayerSpawn = codec.makePacketByName(
+        "play_status",
+        {0x03, 0x00, 0x00, 0x00}
+    );
+
+    const bool ok =
+        loginSuccess.fullPacket == std::vector<uint8_t>({0x02, 0x00, 0x00, 0x00, 0x00}) &&
+        playerSpawn.fullPacket == std::vector<uint8_t>({0x02, 0x00, 0x00, 0x00, 0x03}) &&
+        bedrock::VersionedPayloadReader::readPlayStatus(loginSuccess).status == 0 &&
+        bedrock::VersionedPayloadReader::readPlayStatus(playerSpawn).status == 3 &&
+        bedrock::VersionedPayloadReader::readPlayStatus(littleEndianPlayerSpawn).status != 3;
+
+    if (!ok) {
+        std::cerr << "[LIVE-RELAY-SMOKE] play_status i32 big-endian regression\n";
+    }
+    return ok;
+}
 
 static bool checkVersion(const std::string& version) {
     std::atomic<bool> downstreamJoined {false};
@@ -13,12 +44,13 @@ static bool checkVersion(const std::string& version) {
     std::atomic<bool> gotRelayStatus {false};
     std::atomic<bool> gotError {false};
 
-    auto upstreamServer = bedrock::createServer({
+    bedrock::BedrockServer upstreamServer({
         .host = "127.0.0.1",
         .port = 0,
         .version = version,
-        .motd = "Live Relay Smoke Upstream",
-        .maxPlayers = 3
+        .motd = {{"motd", "Live Relay Smoke Upstream"}},
+        .maxPlayers = 3,
+        .offline = true
     });
     upstreamServer.listen();
 
@@ -26,8 +58,9 @@ static bool checkVersion(const std::string& version) {
     relayOptions.server.host = "127.0.0.1";
     relayOptions.server.port = 0;
     relayOptions.server.version = version;
-    relayOptions.server.motd = "Live Relay Smoke";
+    relayOptions.server.motd = {{"motd", "Live Relay Smoke"}};
     relayOptions.server.maxPlayers = 3;
+    relayOptions.server.offline = true;
     relayOptions.upstream.host = "127.0.0.1";
     relayOptions.upstream.port = upstreamServer.boundPort();
     relayOptions.upstream.username = "RelaySmokeUp";
@@ -98,7 +131,7 @@ static bool checkVersion(const std::string& version) {
 }
 
 int main() {
-    bool ok = true;
+    bool ok = checkPlayStatusEndianRegression();
     ok = checkVersion("1.20.40") && ok;
     ok = checkVersion("1.20.50") && ok;
     ok = checkVersion("1.21.100") && ok;

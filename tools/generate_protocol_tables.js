@@ -35,7 +35,9 @@ function findDataRoot () {
     argRoot,
     path.join(process.cwd(), 'data', 'bedrock'),
     path.join(process.cwd(), 'bedrock'),
-    path.join(process.cwd(), 'node_modules', 'minecraft-data', 'data', 'bedrock')
+    path.join(process.cwd(), 'node_modules', 'minecraft-data', 'data', 'bedrock'),
+    path.join(process.cwd(), 'node_modules', 'minecraft-data', 'minecraft-data', 'data', 'bedrock'),
+    path.join(process.cwd(), '..', 'node_modules', 'minecraft-data', 'minecraft-data', 'data', 'bedrock')
   ].filter(Boolean)
 
   for (const c of candidates) {
@@ -46,24 +48,64 @@ function findDataRoot () {
 }
 
 function listVersions (root, requested) {
+  const protocolVersionsPath = path.join(root, 'common', 'protocolVersions.json')
+  const dataPathsPath = path.join(root, '..', 'dataPaths.json')
+
+  // minecraft-data keeps release aliases such as 1.19.63 and 1.20.15 as
+  // version-only directories. Their actual protocol/type schema is recorded
+  // in dataPaths.json. Walking only directories containing protocol.json
+  // silently dropped those public releases from the generated registry.
+  if (exists(protocolVersionsPath)) {
+    let releases = readJson(protocolVersionsPath)
+      .filter(v => v && v.releaseType === 'release')
+
+    if (requested !== 'all') {
+      releases = releases.filter(v => v.minecraftVersion === requested)
+      if (releases.length === 0) {
+        die(`release version ${requested} not found in ${protocolVersionsPath}`)
+      }
+    }
+
+    const dataPaths = exists(dataPathsPath) ? readJson(dataPathsPath) : null
+    return releases.map(entry => {
+      const minecraftVersion = entry.minecraftVersion
+      let schemaVersion = minecraftVersion
+      if (!exists(path.join(root, schemaVersion, 'protocol.json'))) {
+        const protocolPath = dataPaths && dataPaths.bedrock &&
+          dataPaths.bedrock[minecraftVersion] &&
+          dataPaths.bedrock[minecraftVersion].protocol
+        if (!protocolPath) {
+          die(`protocol schema alias for ${minecraftVersion} not found in ${dataPathsPath}`)
+        }
+        schemaVersion = protocolPath.split('/').pop()
+      }
+      if (!exists(path.join(root, schemaVersion, 'protocol.json'))) {
+        die(`protocol.json for ${minecraftVersion} (schema ${schemaVersion}) not found in ${root}`)
+      }
+      return {
+        minecraftVersion,
+        schemaVersion,
+        protocolVersion: Number(entry.version)
+      }
+    })
+  }
+
+  // Fallback for standalone extracted data sets without minecraft-data's
+  // common metadata. These cannot describe aliases, but remain useful for a
+  // single explicitly requested schema.
   const dirs = fs.readdirSync(root)
     .filter(v => exists(path.join(root, v, 'protocol.json')) && exists(path.join(root, v, 'version.json')))
-    .sort((a, b) => {
-      const pa = a.split('.').map(Number)
-      const pb = b.split('.').map(Number)
-      for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-        const da = pa[i] || 0
-        const db = pb[i] || 0
-        if (da !== db) return da - db
-      }
-      return a.localeCompare(b)
-    })
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
 
-  if (requested === 'all') return dirs
-  if (!dirs.includes(requested)) {
+  const selected = requested === 'all' ? dirs : dirs.filter(v => v === requested)
+  if (selected.length === 0) {
     die(`version ${requested} not found in ${root}`)
   }
-  return [requested]
+  return selected.map(minecraftVersion => ({
+    minecraftVersion,
+    schemaVersion: minecraftVersion,
+    protocolVersion: Number(readJson(path.join(root, minecraftVersion, 'version.json')).version || 0)
+  }))
 }
 
 function parseMcpePacketInfo (protocolJson) {
@@ -106,19 +148,21 @@ function generate (root, versions) {
 
   const versionData = []
 
-  for (const version of versions) {
-    const dir = path.join(root, version)
+  for (const versionSpec of versions) {
+    const version = versionSpec.minecraftVersion
+    const dir = path.join(root, versionSpec.schemaVersion)
     const protocolJson = readJson(path.join(dir, 'protocol.json'))
-    const versionJson = readJson(path.join(dir, 'version.json'))
     const packets = parseMcpePacketInfo(protocolJson)
 
     versionData.push({
       minecraftVersion: version,
-      protocolVersion: Number(versionJson.version || versionJson.protocol || 0),
+      protocolVersion: versionSpec.protocolVersion,
+      schemaVersion: versionSpec.schemaVersion,
       packets
     })
 
-    console.log(`[GEN] ${version}: protocol=${versionJson.version} packets=${packets.length}`)
+    const alias = versionSpec.schemaVersion === version ? '' : ` schema=${versionSpec.schemaVersion}`
+    console.log(`[GEN] ${version}: protocol=${versionSpec.protocolVersion}${alias} packets=${packets.length}`)
   }
 
   const hpp = `#pragma once

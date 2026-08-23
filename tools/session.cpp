@@ -2,7 +2,7 @@
 #include "bedrock/BedrockKeyExchange.hpp"
 #include "bedrock/BedrockEncryption.hpp"
 #include <bedrock/events/BedrockPacketEventDispatcher.hpp>
-#include <bedrock/Client.hpp>
+#include <bedrock/legacy/Client.hpp>
 #include <bedrock/PacketFromEvent.hpp>
 #include <bedrock/protocol/PacketRegistry.hpp>
 #include <bedrock/protocol/ProtocolDefinition.hpp>
@@ -957,7 +957,7 @@ static uint32_t sendEncryptedGamePacketReliable(
     const std::vector<uint8_t>& gamePacket,
     uint64_t& encryptedSendCounter,
     const std::vector<uint8_t>& secretKeyBytes,
-    bedrock::BedrockAesGcmStream& encryptStream,
+    bedrock::BedrockCipherStream& encryptStream,
     const std::string& label
 ) {
     auto framedPackets = bedrock::BedrockFramer::framePackets(
@@ -1140,7 +1140,7 @@ static uint32_t sendGamePacketReliable(
     bool encryptionReady,
     uint64_t& encryptedSendCounter,
     const std::vector<uint8_t>& secretKeyBytes,
-    bedrock::BedrockAesGcmStream* encryptStream,
+    bedrock::BedrockCipherStream* encryptStream,
     const std::string& label
 ) {
     dumpApiOutboundGamePacket(gamePacket, label);
@@ -1898,7 +1898,7 @@ static void inspectDecodedBedrockBatch(
 static void inspectEncryptedBedrockPayload(
     const std::vector<uint8_t>& payload,
     const std::vector<uint8_t>& secretKeyBytes,
-    bedrock::BedrockAesGcmStream& decryptStream,
+    bedrock::BedrockCipherStream& decryptStream,
     uint64_t& receiveCounter,
     bool& gotEncryptedGamePacket
 ) {
@@ -1907,7 +1907,7 @@ static void inspectEncryptedBedrockPayload(
     }
 
     try {
-        if (payload.size() < 2 || payload[0] != 0xfe) {
+        if (payload[0] != 0xfe) {
             throw std::runtime_error("encrypted payload missing 0xfe");
         }
 
@@ -1915,60 +1915,39 @@ static void inspectEncryptedBedrockPayload(
             payload.begin() + 1,
             payload.end()
         );
-
-        auto aesPlaintext = decryptStream.process(encryptedOnly);
-
-        if (aesPlaintext.size() < 8) {
-            throw std::runtime_error("decrypted payload too small for checksum");
-        }
-
-        std::vector<uint8_t> packetPlaintext(
-            aesPlaintext.begin(),
-            aesPlaintext.end() - 8
-        );
-
-        std::vector<uint8_t> receivedChecksum(
-            aesPlaintext.end() - 8,
-            aesPlaintext.end()
-        );
-
-        auto expectedChecksum = bedrock::BedrockEncryption::computeChecksum(
-            packetPlaintext,
+        const auto consumedCounter = receiveCounter;
+        auto verification = bedrock::BedrockEncryption::decryptAndVerify(
+            decryptStream,
+            encryptedOnly,
             receiveCounter,
             secretKeyBytes
         );
-
-        if (receivedChecksum != expectedChecksum) {
-            throw std::runtime_error("encrypted payload checksum mismatch");
+        if (!verification) {
+            return;
         }
+        if (!verification->matches()) {
+            throw std::runtime_error(verification->mismatchMessage());
+        }
+        const auto& packetPlaintext = verification->packetPlaintext;
 
         std::cout << "[DECRYPT] receiveCounter="
-                  << receiveCounter
+                  << consumedCounter
                   << " packetPlaintext="
                   << packetPlaintext.size()
                   << "\n";
 
-        receiveCounter++;
-
         // compact mode: skip decrypted plaintext hex dump
-if (packetPlaintext.empty()) {
+        if (packetPlaintext.empty()) {
             throw std::runtime_error("empty decrypted packet plaintext");
         }
 
         std::vector<uint8_t> framed;
 
         if (!usesCompressionHeader()) {
-            try {
-                framed = bedrock::BedrockFramer::inflateRaw(packetPlaintext);
-                std::cout << "[DECRYPT] compression=deflate-old framed="
-                          << framed.size()
-                          << "\n";
-            } catch (const std::exception&) {
-                framed = packetPlaintext;
-                std::cout << "[DECRYPT] compression=none-old framed="
-                          << framed.size()
-                          << "\n";
-            }
+            framed = bedrock::BedrockFramer::inflateRaw(packetPlaintext);
+            std::cout << "[DECRYPT] compression=deflate-old framed="
+                      << framed.size()
+                      << "\n";
         } else if (packetPlaintext[0] == 0x00) {
             std::vector<uint8_t> compressed(
                 packetPlaintext.begin() + 1,
@@ -2110,7 +2089,7 @@ if (packetPlaintext.empty()) {
                     emittedEvent.decodeError = "unknown decode error";
                 }
             }
-            static bedrock::Client mc;
+            static bedrock::legacy::Client mc;
             static bool mcHandlersReady = false;
 
             if (!mcHandlersReady) {
@@ -2394,8 +2373,8 @@ int main(int argc, char** argv) {
         bool gotEncryptedInboundGamePacket = false;
         std::vector<uint8_t> encryptionSecretKeyBytes;
         std::vector<uint8_t> encryptionIv16;
-        std::unique_ptr<bedrock::BedrockAesGcmStream> encryptStream;
-        std::unique_ptr<bedrock::BedrockAesGcmStream> decryptStream;
+        std::unique_ptr<bedrock::BedrockCipherStream> encryptStream;
+        std::unique_ptr<bedrock::BedrockCipherStream> decryptStream;
 
         bool sentHaveAllPacks = false;
         bool haveAllPacksAcked = false;
@@ -3005,16 +2984,18 @@ int main(int argc, char** argv) {
                         encryptionIv16 = derived.iv16;
                         encryptionReadyForInbound = true;
 
-                        encryptStream = std::make_unique<bedrock::BedrockAesGcmStream>(
+                        encryptStream = bedrock::BedrockEncryption::createCipherStream(
+                            static_cast<uint32_t>(mcProtocol),
                             encryptionSecretKeyBytes,
                             encryptionIv16,
-                            bedrock::BedrockAesGcmStream::Mode::Encrypt
+                            bedrock::BedrockCipherMode::Encrypt
                         );
 
-                        decryptStream = std::make_unique<bedrock::BedrockAesGcmStream>(
+                        decryptStream = bedrock::BedrockEncryption::createCipherStream(
+                            static_cast<uint32_t>(mcProtocol),
                             encryptionSecretKeyBytes,
                             encryptionIv16,
-                            bedrock::BedrockAesGcmStream::Mode::Decrypt
+                            bedrock::BedrockCipherMode::Decrypt
                         );
 
                         // Raw client_to_server_handshake packet is packet id 4.

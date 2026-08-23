@@ -1,5 +1,6 @@
 #pragma once
 
+#include <bedrock/Options.hpp>
 #include <bedrock/protocol/ProtocolDefinition.hpp>
 #include <bedrock/protodef/ProtoDefJson.hpp>
 #include <bedrock/protodef/ProtoDefValue.hpp>
@@ -35,8 +36,7 @@ struct ClientOptions {
     std::string host = "localhost";
     uint16_t port = 19132;
     std::string username = "Bot";
-    // Empty means: use the newest protocol version bundled in data/.
-    std::string version;
+    std::string version = std::string(CURRENT_VERSION);
     bool offline = false;
 
     // Xbox cache profile. Empty means: use username.
@@ -274,10 +274,7 @@ private:
     std::string commandFilePath_;
 
     void normalizeOptions() {
-        if (options_.version.empty() || options_.version == "auto" || options_.version == "latest") {
-            auto vs = ProtocolDefinition::versions();
-            if (!vs.empty()) options_.version = vs.back();
-        }
+        (void) validateVersion(options_.version);
         if (options_.profile.empty()) {
             options_.profile = options_.username.empty() ? std::string("Bot") : options_.username;
         }

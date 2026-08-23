@@ -163,8 +163,16 @@ private:
     std::vector<VersionedGamePacket> extraOutgoing_;
 };
 
+inline BedrockClient createBedrockClient(BedrockClientOptions options = {}) {
+    return BedrockClient(std::move(options));
+}
+
+namespace legacy {
+
 inline BedrockClient createClient(BedrockClientOptions options = {}) {
     return BedrockClient(std::move(options));
 }
+
+} // namespace legacy
 
 } // namespace bedrock

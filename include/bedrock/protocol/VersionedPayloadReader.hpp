@@ -34,6 +34,8 @@ struct VersionedLevelChunkPacket {
 };
 
 struct VersionedStartGamePacket {
+    int64_t entityId = 0;
+    uint64_t runtimeEntityId = 0;
     int32_t playerGameMode = 0;
     float x = 0.0f;
     float y = 0.0f;
@@ -90,6 +92,19 @@ public:
             (static_cast<uint32_t>(data_[offset_ + 1]) << 8) |
             (static_cast<uint32_t>(data_[offset_ + 2]) << 16) |
             (static_cast<uint32_t>(data_[offset_ + 3]) << 24);
+
+        offset_ += 4;
+        return value;
+    }
+
+    uint32_t readU32BE() {
+        require(4, "u32be");
+
+        uint32_t value =
+            (static_cast<uint32_t>(data_[offset_]) << 24) |
+            (static_cast<uint32_t>(data_[offset_ + 1]) << 16) |
+            (static_cast<uint32_t>(data_[offset_ + 2]) << 8) |
+            static_cast<uint32_t>(data_[offset_ + 3]);
 
         offset_ += 4;
         return value;
@@ -206,7 +221,7 @@ public:
         VersionedPayloadCursor cursor(packet.payload);
 
         VersionedPlayStatusPacket out;
-        out.status = static_cast<int32_t>(cursor.readU32LE());
+        out.status = static_cast<int32_t>(cursor.readU32BE());
 
         return out;
     }
@@ -279,11 +294,8 @@ public:
 
         VersionedStartGamePacket out;
 
-        // entity_unique_id
-        (void) cursor.readVarLong();
-
-        // entity_runtime_id
-        (void) cursor.readVarULong();
+        out.entityId = cursor.readVarLong();
+        out.runtimeEntityId = cursor.readVarULong();
 
         out.playerGameMode = cursor.readVarInt();
 

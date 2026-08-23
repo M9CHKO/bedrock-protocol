@@ -645,9 +645,11 @@ XboxTokenCacheData runDeviceCodeLogin(
         throw std::runtime_error("Xbox auth cache missing for profile=" + options.profileName);
     }
 
-    const std::string clientId = options.xboxClientId.empty()
-        ? "00000000402b5328"
-        : options.xboxClientId;
+    // LiveTokenManager receives authTitle as its OAuth client id. Options are
+    // normalized before this path, but resolve again here so this network edge
+    // cannot silently regress to the former MinecraftJava id.
+    const auto authFlow = XboxLiveAuth::resolveFlowOptions(options);
+    const std::string& clientId = authFlow.authTitle;
 
     auto deviceResp = curlPostForm(
         "https://login.live.com/oauth20_connect.srf",
@@ -670,7 +672,9 @@ XboxTokenCacheData runDeviceCodeLogin(
     info.verificationUri = verificationUri;
     info.userCode = userCode;
     info.message = message;
-    if (options.onDeviceCode) {
+    if (options.onMsaCode) {
+        options.onMsaCode(info);
+    } else if (options.onDeviceCode) {
         options.onDeviceCode(info);
     } else {
         log(options, "Open " + verificationUri + " and enter code " + userCode);
@@ -807,20 +811,85 @@ std::vector<std::string> requestBedrockChain(
 
 XboxLiveAuthOptions normalizeOptions(XboxLiveAuthOptions options) {
     if (options.profileName.empty()) options.profileName = "Bot";
-    if (options.version.empty() || options.version == "auto" || options.version == "latest") {
-        auto versions = ProtocolDefinition::versions();
-        if (!versions.empty()) options.version = versions.back();
-    }
-    if (!ProtocolDefinition::supportsVersion(options.version)) {
-        throw std::runtime_error("unsupported Bedrock auth version: " + options.version);
-    }
-    if (options.protocolVersion == 0) {
-        options.protocolVersion = ProtocolDefinition::forVersion(options.version).protocolVersion();
+    // options.js always derives this value from Versions; callers cannot
+    // override it independently of the selected Minecraft version.
+    options.protocolVersion = validateVersion(options.version);
+    const auto authFlow = XboxLiveAuth::resolveFlowOptions(options);
+    options.authTitle = authFlow.authTitle;
+    options.deviceType = authFlow.deviceType;
+    options.flow = authFlow.flow;
+    if (!options.offline) {
+        XboxLiveAuth::validatePrismarineAuthFlowPresence(authFlow);
+        XboxLiveAuth::validatePrismarineAuthFlow(authFlow);
     }
     return options;
 }
 
 } // namespace
+
+XboxLiveAuthFlowOptions XboxLiveAuth::resolveFlowOptions(
+    const XboxLiveAuthOptions& options
+) {
+    XboxLiveAuthFlowOptions resolved;
+    if (options.authTitle.has_value()) {
+        resolved.authTitle = *options.authTitle;
+        resolved.deviceType = options.deviceType;
+        resolved.flow = options.flow;
+    } else if (!options.xboxClientId.empty()) {
+        resolved.authTitle = options.xboxClientId;
+        resolved.deviceType = options.deviceType;
+        resolved.flow = options.flow;
+    } else {
+        resolved.authTitle = std::string(Titles::MinecraftNintendoSwitch);
+        // auth.js assigns these two values only in the same branch where
+        // authTitle is undefined; supplied values are overwritten there.
+        resolved.deviceType = "Nintendo";
+        resolved.flow = "live";
+    }
+    return resolved;
+}
+
+void XboxLiveAuth::validatePrismarineAuthFlowPresence(
+    const XboxLiveAuthFlowOptions& options
+) {
+    if (options.flow.empty()) {
+        throw std::runtime_error(
+            "Missing 'flow' argument in options. See docs for more information."
+        );
+    }
+}
+
+void XboxLiveAuth::validatePrismarineAuthFlow(
+    const XboxLiveAuthFlowOptions& options
+) {
+    if (options.flow == "live" || options.flow == "sisu") {
+        if (options.authTitle.empty()) {
+            throw std::runtime_error(
+                "Please specify an \"authTitle\" in Authflow constructor when using " +
+                options.flow + " flow"
+            );
+        }
+        return;
+    }
+
+    if (options.flow == "msal") {
+        if (options.authTitle.empty()) {
+            throw std::runtime_error(
+                "Must specify an Azure client ID token inside the `authTitle` parameter "
+                "when using Azure-based auth. See "
+                "https://learn.microsoft.com/en-us/entra/identity-platform/"
+                "quickstart-register-app#register-an-application for more information "
+                "on obtaining an Azure token."
+            );
+        }
+        return;
+    }
+
+    throw std::runtime_error(
+        "Unknown flow: " + options.flow +
+        " (expected \"live\", \"sisu\", or \"msal\")"
+    );
+}
 
 BedrockClientKeyPair XboxLiveAuth::loadOrCreateProfileKeyPair(
     const std::string& profileName,

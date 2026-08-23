@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -36,6 +37,7 @@ public:
     using CloseConnectionHandler = std::function<void(const RakNetServerPeer&)>;
     using RawPacketHandler = std::function<void(const RakNetServerPeer&, const std::vector<uint8_t>&)>;
     using EncapsulatedHandler = std::function<void(const RakNetServerPeer&, const std::vector<uint8_t>&)>;
+    using AdvertisementProvider = std::function<std::string()>;
 
     explicit RakNetServer(RakNetServerOptions options = {});
     ~RakNetServer();
@@ -43,11 +45,28 @@ public:
     RakNetServer(const RakNetServer&) = delete;
     RakNetServer& operator=(const RakNetServer&) = delete;
 
-    RakNetServer(RakNetServer&& other) noexcept;
-    RakNetServer& operator=(RakNetServer&& other) noexcept;
+    // The worker captures this.  Moving a listening server would leave that
+    // capture pointing at the moved-from object, so RakNetServer is
+    // deliberately immovable just like it is non-copyable.
+    RakNetServer(RakNetServer&& other) = delete;
+    RakNetServer& operator=(RakNetServer&& other) = delete;
 
     void listen();
     void close();
+    void closeAfter(std::chrono::milliseconds delay);
+
+    // raknet-native ServerClient.close(silent) delegates to
+    // RakPeer::CloseConnection(guid, !silent).
+    void closePeer(const RakNetServerPeer& peer, bool silent = false);
+    void closePeerAfter(
+        const RakNetServerPeer& peer,
+        std::chrono::milliseconds delay,
+        bool silent = false
+    );
+
+    bool onWorkerThread() const {
+        return thread_.joinable() && thread_.get_id() == std::this_thread::get_id();
+    }
 
     bool listening() const {
         return running_;
@@ -63,6 +82,10 @@ public:
 
     void setAdvertisement(std::string advertisement) {
         options_.advertisement = std::move(advertisement);
+    }
+
+    void setAdvertisementProvider(AdvertisementProvider provider) {
+        advertisementProvider_ = std::move(provider);
     }
 
     void onOpenConnection(OpenConnectionHandler handler) {
@@ -84,6 +107,8 @@ public:
     void sendReliable(const RakNetServerPeer& peer, const std::vector<uint8_t>& payload);
 
 private:
+    friend struct BedrockServerTestAccess;
+
     struct PeerState {
         struct SplitAccumulator {
             uint32_t count = 0;
@@ -105,6 +130,19 @@ private:
         std::array<std::map<uint32_t, std::vector<uint8_t>>, 32> pendingOrderedPayloads;
         std::unordered_map<uint16_t, SplitAccumulator> splits;
         std::unordered_map<uint32_t, std::vector<uint8_t>> sentReliableDatagrams;
+        std::chrono::steady_clock::time_point request2AssignedAt {};
+        std::chrono::steady_clock::time_point timeLastDatagramArrived {};
+        std::chrono::steady_clock::time_point lastReliableSend {};
+        bool connectionRequestAccepted = false;
+        bool connected = false;
+    };
+
+    struct ScheduledPeerClose {
+        std::chrono::steady_clock::time_point deadline;
+        std::string key;
+        uint64_t clientGuid = 0;
+        bool silent = false;
+        uint64_t order = 0;
     };
 
     RakNetServerOptions options_;
@@ -116,12 +154,26 @@ private:
     CloseConnectionHandler closeConnectionHandler_;
     RawPacketHandler rawPacketHandler_;
     EncapsulatedHandler encapsulatedHandler_;
+    AdvertisementProvider advertisementProvider_;
     std::mutex peersMutex_;
     std::unordered_map<std::string, PeerState> peers_;
+    std::mutex lifecycleMutex_;
+    std::mutex joinMutex_;
+    std::vector<ScheduledPeerClose> scheduledPeerCloses_;
+    bool shutdownScheduled_ = false;
+    std::chrono::steady_clock::time_point shutdownDeadline_ {};
+    bool advertisementUpdatesEnabled_ = false;
+    std::chrono::steady_clock::time_point nextAdvertisementUpdate_ {};
+    uint64_t scheduledCloseOrder_ = 0;
 
     void runLoop();
+    bool processLifecycleDeadlines();
+    void closePeerNow(const std::string& key, uint64_t clientGuid, bool silent);
+    void finishShutdown();
+    void joinWorkerIfExternal();
     void handlePacket(const std::vector<uint8_t>& packet, const void* sender, int senderLen);
     void sendTo(const void* target, int targetLen, const std::vector<uint8_t>& packet);
+    void sendConnectedFrame(const RakNetServerPeer& peer, const void* target, int targetLen, const std::vector<uint8_t>& payload, uint8_t reliability);
     void sendReliableOrdered(const RakNetServerPeer& peer, const void* target, int targetLen, const std::vector<uint8_t>& payload);
 };
 

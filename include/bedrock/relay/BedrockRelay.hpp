@@ -1,5 +1,6 @@
 #pragma once
 
+#include <bedrock/Options.hpp>
 #include <bedrock/client/BedrockClient.hpp>
 #include <bedrock/protocol/ProtocolDefinition.hpp>
 #include <bedrock/protocol/VersionedMcpeCodec.hpp>
@@ -248,15 +249,7 @@ private:
     bool sentClientboundStartGame_ = false;
 
     static BedrockRelayOptions normalizeOptions(BedrockRelayOptions options) {
-        if (options.clientOptions.minecraftVersion.empty() ||
-            options.clientOptions.minecraftVersion == "auto" ||
-            options.clientOptions.minecraftVersion == "latest") {
-            auto versions = ProtocolDefinition::versions();
-            if (!versions.empty()) {
-                options.clientOptions.minecraftVersion = versions.back();
-            }
-        }
-
+        (void) validateVersion(options.clientOptions.minecraftVersion);
         return options;
     }
 

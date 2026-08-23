@@ -9,7 +9,7 @@ int main() {
         .host = "0.0.0.0",
         .port = 19132,
         .version = "1.20.40",
-        .motd = "Bedrock Protocol C++",
+        .motd = {{"motd", "Bedrock Protocol C++"}},
         .maxPlayers = 3
     });
 
@@ -25,7 +25,6 @@ int main() {
         std::cout << "join " << connection.address << ":" << connection.port << "\n";
     });
 
-    server.listen();
     std::cout << "listening on port " << server.boundPort() << "\n";
 
     while (true) {

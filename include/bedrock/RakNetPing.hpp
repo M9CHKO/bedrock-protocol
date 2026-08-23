@@ -1,13 +1,23 @@
 #pragma once
 
+#include <bedrock/server/ServerAdvertisement.hpp>
+
 #include <cstdint>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace bedrock {
 
+class RakTimeout : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
 struct RakNetPongInfo {
     bool ok = false;
+    bool timedOut = false;
 
     std::string host;
     uint16_t port = 19132;
@@ -16,6 +26,7 @@ struct RakNetPongInfo {
     uint64_t serverGuid = 0;
 
     std::string rawMotd;
+    std::optional<ServerAdvertisement> advertisement;
 
     std::string edition;
     std::string motd;

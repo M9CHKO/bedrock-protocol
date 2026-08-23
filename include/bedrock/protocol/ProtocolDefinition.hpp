@@ -1,5 +1,6 @@
 #pragma once
 
+#include <bedrock/Options.hpp>
 #include <bedrock/protocol/GeneratedProtocolRegistry.hpp>
 
 #include <cstdint>
@@ -15,6 +16,12 @@ public:
         : info_(&info) {}
 
     static ProtocolDefinition forVersion(const std::string& minecraftVersion) {
+        // Generated tables can contain development snapshots and historical
+        // schemas. The public protocol contract follows options.Versions from
+        // the installed minecraft-data release exactly.
+        if (!findVersion(minecraftVersion)) {
+            throw std::runtime_error("unsupported protocol version: " + minecraftVersion);
+        }
         const auto* info = GeneratedProtocolRegistry::get(minecraftVersion);
         if (!info) {
             throw std::runtime_error("unsupported protocol version: " + minecraftVersion);
@@ -23,11 +30,12 @@ public:
     }
 
     static bool supportsVersion(const std::string& minecraftVersion) {
-        return GeneratedProtocolRegistry::get(minecraftVersion) != nullptr;
+        return findVersion(minecraftVersion) != nullptr &&
+            GeneratedProtocolRegistry::get(minecraftVersion) != nullptr;
     }
 
     static std::vector<std::string> versions() {
-        return GeneratedProtocolRegistry::versions();
+        return supportedVersionNames();
     }
 
     const char* minecraftVersion() const {

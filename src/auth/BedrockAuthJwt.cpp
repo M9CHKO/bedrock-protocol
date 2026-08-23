@@ -1,5 +1,8 @@
 #include <bedrock/auth/BedrockAuthJwt.hpp>
 
+#include <bedrock/BedrockKeyExchange.hpp>
+#include <bedrock/protodef/ProtoDefJson.hpp>
+
 #include <openssl/bio.h>
 #include <openssl/bn.h>
 #include <openssl/ec.h>
@@ -10,11 +13,133 @@
 
 #include <filesystem>
 #include <fstream>
+#include <ctime>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace bedrock {
+
+namespace {
+
+std::vector<std::string> splitJwtExact(const std::string& jwt) {
+    std::vector<std::string> parts;
+    std::size_t start = 0;
+    for (std::size_t i = 0; i <= jwt.size(); ++i) {
+        if (i == jwt.size() || jwt[i] == '.') {
+            parts.push_back(jwt.substr(start, i - start));
+            start = i + 1;
+        }
+    }
+    if (parts.size() != 3) {
+        throw std::runtime_error("jwt malformed");
+    }
+    return parts;
+}
+
+double jsonNumber(const ProtoDefValue& value, const char* field) {
+    switch (value.kind) {
+        case ProtoDefValue::Kind::Int:
+            return static_cast<double>(value.intValue);
+        case ProtoDefValue::Kind::UInt:
+            return static_cast<double>(value.uintValue);
+        case ProtoDefValue::Kind::Double:
+            return value.doubleValue;
+        default:
+            throw std::runtime_error(std::string("invalid ") + field + " value");
+    }
+}
+
+void validateJwtTimes(const ProtoDefValue& payload, int64_t clockTimestamp) {
+    if (payload.kind != ProtoDefValue::Kind::Object) {
+        return;
+    }
+    const double now = static_cast<double>(
+        clockTimestamp >= 0 ? clockTimestamp : static_cast<int64_t>(std::time(nullptr))
+    );
+    if (const auto* nbf = payload.get("nbf")) {
+        if (jsonNumber(*nbf, "nbf") > now) {
+            throw std::runtime_error("jwt not active");
+        }
+    }
+    if (const auto* exp = payload.get("exp")) {
+        if (now >= jsonNumber(*exp, "exp")) {
+            throw std::runtime_error("jwt expired");
+        }
+    }
+}
+
+void verifyJoseEs384(
+    const std::string& signingInput,
+    const std::vector<uint8_t>& joseSignature,
+    const std::string& publicKeyDerBase64
+) {
+    if (joseSignature.size() != 96) {
+        throw std::runtime_error("invalid ES384 signature length");
+    }
+
+    const auto publicDer = BedrockKeyExchange::base64Decode(publicKeyDerBase64);
+    const unsigned char* publicDerPtr = publicDer.data();
+    std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)> publicKey(
+        d2i_PUBKEY(nullptr, &publicDerPtr, static_cast<long>(publicDer.size())),
+        EVP_PKEY_free
+    );
+    if (!publicKey) {
+        throw std::runtime_error("secretOrPublicKey is not valid key material");
+    }
+    if (EVP_PKEY_base_id(publicKey.get()) != EVP_PKEY_EC) {
+        throw std::runtime_error("ES384 requires an EC public key");
+    }
+
+    const EC_KEY* ecKey = EVP_PKEY_get0_EC_KEY(publicKey.get());
+    const EC_GROUP* group = ecKey ? EC_KEY_get0_group(ecKey) : nullptr;
+    if (!group || EC_GROUP_get_curve_name(group) != NID_secp384r1) {
+        throw std::runtime_error("ES384 requires curve secp384r1");
+    }
+
+    std::unique_ptr<ECDSA_SIG, decltype(&ECDSA_SIG_free)> signature(
+        ECDSA_SIG_new(),
+        ECDSA_SIG_free
+    );
+    if (!signature) {
+        throw std::runtime_error("ECDSA_SIG_new failed");
+    }
+    BIGNUM* r = BN_bin2bn(joseSignature.data(), 48, nullptr);
+    BIGNUM* s = BN_bin2bn(joseSignature.data() + 48, 48, nullptr);
+    if (!r || !s || ECDSA_SIG_set0(signature.get(), r, s) != 1) {
+        BN_free(r);
+        BN_free(s);
+        throw std::runtime_error("invalid ES384 signature");
+    }
+
+    const int derLength = i2d_ECDSA_SIG(signature.get(), nullptr);
+    if (derLength <= 0) {
+        throw std::runtime_error("i2d_ECDSA_SIG length failed");
+    }
+    std::vector<uint8_t> derSignature(static_cast<std::size_t>(derLength));
+    unsigned char* derSignaturePtr = derSignature.data();
+    if (i2d_ECDSA_SIG(signature.get(), &derSignaturePtr) != derLength) {
+        throw std::runtime_error("i2d_ECDSA_SIG failed");
+    }
+
+    std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> digest(
+        EVP_MD_CTX_new(),
+        EVP_MD_CTX_free
+    );
+    if (!digest ||
+        EVP_DigestVerifyInit(digest.get(), nullptr, EVP_sha384(), nullptr, publicKey.get()) != 1 ||
+        EVP_DigestVerifyUpdate(digest.get(), signingInput.data(), signingInput.size()) != 1 ||
+        EVP_DigestVerifyFinal(
+            digest.get(),
+            derSignature.data(),
+            derSignature.size()
+        ) != 1) {
+        throw std::runtime_error("invalid signature");
+    }
+}
+
+} // namespace
 
 static std::string readTextFile(const std::filesystem::path& path) {
     std::ifstream in(path);
@@ -248,6 +373,40 @@ std::string BedrockAuthJwt::signEs384Jwt(
     EVP_PKEY_free(pkey);
 
     return signingInput + "." + base64Url(joseSig);
+}
+
+BedrockVerifiedJwt BedrockAuthJwt::verifyEs384Jwt(
+    const std::string& jwt,
+    const std::string& publicKeyDerBase64,
+    int64_t clockTimestamp
+) {
+    const auto parts = splitJwtExact(jwt);
+    if (parts[2].find_first_not_of(" \t\r\n") == std::string::npos) {
+        throw std::runtime_error("jwt signature is required");
+    }
+
+    const auto headerBytes = BedrockKeyExchange::base64UrlDecode(parts[0]);
+    const auto payloadBytes = BedrockKeyExchange::base64UrlDecode(parts[1]);
+    const std::string headerJson(headerBytes.begin(), headerBytes.end());
+    const std::string payloadJson(payloadBytes.begin(), payloadBytes.end());
+
+    const auto header = ProtoDefJson::parse(headerJson);
+    if (header.kind != ProtoDefValue::Kind::Object) {
+        throw std::runtime_error("invalid token");
+    }
+    const auto* algorithm = header.get("alg");
+    if (!algorithm ||
+        algorithm->kind != ProtoDefValue::Kind::String ||
+        algorithm->stringValue != "ES384") {
+        throw std::runtime_error("invalid algorithm");
+    }
+
+    const auto payload = ProtoDefJson::parse(payloadJson);
+    const auto joseSignature = BedrockKeyExchange::base64UrlDecode(parts[2]);
+    verifyJoseEs384(parts[0] + "." + parts[1], joseSignature, publicKeyDerBase64);
+    validateJwtTimes(payload, clockTimestamp);
+
+    return BedrockVerifiedJwt{headerJson, payloadJson};
 }
 
 } // namespace bedrock

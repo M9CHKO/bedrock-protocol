@@ -27,6 +27,10 @@ constexpr uint8_t ID_CONNECTED_PONG = 0x03;
 constexpr uint8_t ID_CONNECTION_REQUEST = 0x09;
 constexpr uint8_t ID_CONNECTION_REQUEST_ACCEPTED = 0x10;
 constexpr uint8_t ID_NEW_INCOMING_CONNECTION = 0x13;
+constexpr uint8_t ID_DISCONNECTION_NOTIFICATION = 0x15;
+constexpr uint8_t ID_CONNECTION_LOST = 0x16;
+constexpr uint8_t ID_CONNECTION_BANNED = 0x17;
+constexpr uint8_t ID_INCOMPATIBLE_PROTOCOL_VERSION = 0x19;
 constexpr uint8_t ID_NACK = 0xa0;
 constexpr uint8_t ID_ACK = 0xc0;
 
@@ -299,26 +303,58 @@ RakNetClient::~RakNetClient() {
     close();
 }
 
-RakNetClient::RakNetClient(RakNetClient&& other) noexcept {
+RakNetClient::RakNetClient(RakNetClient&& other) {
     *this = std::move(other);
 }
 
-RakNetClient& RakNetClient::operator=(RakNetClient&& other) noexcept {
+RakNetClient& RakNetClient::operator=(RakNetClient&& other) {
     if (this == &other) return *this;
-    close();
+
+    // A worker or in-flight connect captures the address of its original
+    // RakNetClient. Relocating that state would leave the old stack accessing
+    // moved members (and moving from its own callback cannot synchronously
+    // join). Under the usual no-concurrent-access rule for move operations,
+    // locking both activity records makes this rejection atomic with respect
+    // to worker/connect admission.
+    {
+        std::scoped_lock lock(threadMutex_, other.threadMutex_);
+        const auto active = [](const RakNetClient& client) {
+            return client.running_.load() || client.connected_.load() ||
+                client.connectActive_ || client.workerActive_ ||
+                client.joinInProgress_ || client.thread_.joinable();
+        };
+        if (active(*this) || active(other)) {
+            throw std::logic_error("Cannot move active RakNetClient");
+        }
+    }
+    const bool sourceWasClosed = other.closeRequested_.load();
+    try { close(); } catch (...) {}
+    try { other.close(); } catch (...) {}
     options_ = std::move(other.options_);
-    socket_ = other.socket_;
-    other.socket_ = -1;
+    {
+        std::scoped_lock lock(socketMutex_, other.socketMutex_);
+        socket_ = other.socket_;
+        other.socket_ = -1;
+    }
     localPort_ = other.localPort_;
     mtu_ = other.mtu_;
     target_ = other.target_;
     targetLen_ = other.targetLen_;
     running_.store(other.running_.load());
     connected_.store(other.connected_.load());
+    // A fresh, never-closed client remains connectable after a move. An
+    // explicitly closed source remains single-use after relocation.
+    closeRequested_.store(sourceWasClosed);
     error_ = std::move(other.error_);
-    connectedHandler_ = std::move(other.connectedHandler_);
-    closeHandler_ = std::move(other.closeHandler_);
-    encapsulatedHandler_ = std::move(other.encapsulatedHandler_);
+    {
+        std::scoped_lock lock(callbackMutex_, other.callbackMutex_);
+        connectedHandler_ = std::move(other.connectedHandler_);
+        closeHandler_ = std::move(other.closeHandler_);
+        encapsulatedHandler_ = std::move(other.encapsulatedHandler_);
+        callbackLifetimeProvider_ = std::move(other.callbackLifetimeProvider_);
+        beforeRunningCommitTestHook_ =
+            std::move(other.beforeRunningCommitTestHook_);
+    }
     outgoingSequence_ = other.outgoingSequence_;
     reliableIndex_ = other.reliableIndex_;
     orderedIndex_ = other.orderedIndex_;
@@ -329,12 +365,17 @@ RakNetClient& RakNetClient::operator=(RakNetClient&& other) noexcept {
     pendingOrderedPayloads_ = std::move(other.pendingOrderedPayloads_);
     receivedDatagramSequences_ = std::move(other.receivedDatagramSequences_);
     sentReliableDatagrams_ = std::move(other.sentReliableDatagrams_);
-    if (other.thread_.joinable()) thread_ = std::move(other.thread_);
     return *this;
 }
 
 bool RakNetClient::connect() {
     if (running_) return true;
+    if (!beginConnectActivity()) return running_.load();
+    auto connectActivity = std::unique_ptr<void, std::function<void(void*)>>(
+        this,
+        [this](void*) { endConnectActivity(); }
+    );
+    if (closeRequested_.load()) return false;
 
     addrinfo hints {};
     hints.ai_family = AF_INET;
@@ -349,10 +390,22 @@ bool RakNetClient::connect() {
         return false;
     }
 
-    socket_ = ::socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (socket_ < 0) {
+    const int createdSocket = ::socket(
+        res->ai_family,
+        res->ai_socktype,
+        res->ai_protocol
+    );
+    if (createdSocket < 0) {
         freeaddrinfo(res);
         error_ = "socket failed";
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(socketMutex_);
+        socket_ = createdSocket;
+    }
+    if (closeRequested_.load()) {
+        close();
         return false;
     }
 
@@ -364,7 +417,7 @@ bool RakNetClient::connect() {
 
     sockaddr_in local {};
     socklen_t localLen = sizeof(local);
-    if (getsockname(socket_, reinterpret_cast<sockaddr*>(&local), &localLen) == 0) {
+    if (getsockname(createdSocket, reinterpret_cast<sockaddr*>(&local), &localLen) == 0) {
         localPort_ = ntohs(local.sin_port);
     }
 
@@ -374,17 +427,17 @@ bool RakNetClient::connect() {
     std::vector<uint8_t> reply(4096);
     fd_set readfds;
     FD_ZERO(&readfds);
-    FD_SET(socket_, &readfds);
+    FD_SET(createdSocket, &readfds);
     timeval timeout {};
     timeout.tv_sec = options_.timeoutMs / 1000;
     timeout.tv_usec = (options_.timeoutMs % 1000) * 1000;
-    int ready = select(socket_ + 1, &readfds, nullptr, nullptr, &timeout);
+    int ready = select(createdSocket + 1, &readfds, nullptr, nullptr, &timeout);
     if (ready <= 0) {
         error_ = "timeout waiting for OpenConnectionReply1";
         close();
         return false;
     }
-    ssize_t received = recvfrom(socket_, reply.data(), reply.size(), 0, nullptr, nullptr);
+    ssize_t received = recvfrom(createdSocket, reply.data(), reply.size(), 0, nullptr, nullptr);
     if (received <= 0) {
         error_ = "failed reading OpenConnectionReply1";
         close();
@@ -435,50 +488,170 @@ bool RakNetClient::connect() {
 
     reply.assign(4096, 0);
     FD_ZERO(&readfds);
-    FD_SET(socket_, &readfds);
+    FD_SET(createdSocket, &readfds);
     timeout.tv_sec = options_.timeoutMs / 1000;
     timeout.tv_usec = (options_.timeoutMs % 1000) * 1000;
-    ready = select(socket_ + 1, &readfds, nullptr, nullptr, &timeout);
+    ready = select(createdSocket + 1, &readfds, nullptr, nullptr, &timeout);
     if (ready <= 0) {
         error_ = "timeout waiting for OpenConnectionReply2";
         close();
         return false;
     }
-    received = recvfrom(socket_, reply.data(), reply.size(), 0, nullptr, nullptr);
+    received = recvfrom(createdSocket, reply.data(), reply.size(), 0, nullptr, nullptr);
     if (received <= 0) {
         error_ = "failed reading OpenConnectionReply2";
         close();
         return false;
     }
 
-    running_ = true;
-    thread_ = std::thread([this]() {
-        runLoop();
-    });
+    if (closeRequested_.load()) {
+        close();
+        return false;
+    }
+
+    std::function<void()> beforeRunningCommitHook;
+    {
+        std::lock_guard<std::mutex> lock(callbackMutex_);
+        beforeRunningCommitHook = beforeRunningCommitTestHook_;
+    }
+    if (beforeRunningCommitHook) beforeRunningCommitHook();
+
+    // Commit the worker-visible running state, then close the only remaining
+    // cancellation window. A stop before this store cannot be overwritten;
+    // a stop after the recheck observes running=true and clears it itself.
+    running_.store(true);
+    if (closeRequested_.load()) {
+        running_.store(false);
+        close();
+        return false;
+    }
+    try {
+        std::lock_guard<std::mutex> lock(threadMutex_);
+        workerActive_ = true;
+        try {
+            thread_ = std::thread([this]() {
+                {
+                    std::lock_guard<std::mutex> lock(threadMutex_);
+                    workerThreadId_ = std::this_thread::get_id();
+                }
+                threadCv_.notify_all();
+
+                // Keep the facade/network/RakNet ownership chain alive for
+                // the entire worker callback stack. In particular, a user
+                // callback may destroy the last Client while handlePacket()
+                // is active.
+                std::shared_ptr<void> threadLease;
+                auto workerActivity =
+                    std::unique_ptr<void, std::function<void(void*)>>(
+                        this,
+                        [this](void*) { endWorkerActivity(); }
+                    );
+                const auto provider = callbackLifetimeProviderSnapshot();
+                if (provider) threadLease = provider();
+                if (provider && !threadLease) return;
+                // Do not catch live callback exceptions here. Like
+                // EventEmitter, an unhandled listener exception crosses the
+                // asynchronous event boundary; the activity guard still
+                // releases the fd safely.
+                runLoop();
+            });
+        } catch (...) {
+            workerActive_ = false;
+            throw;
+        }
+    } catch (const std::exception& e) {
+        running_.store(false);
+        error_ = e.what();
+        finalizeSocketClose();
+        threadCv_.notify_all();
+        return false;
+    } catch (...) {
+        running_.store(false);
+        error_ = "failed to start RakNet worker";
+        finalizeSocketClose();
+        threadCv_.notify_all();
+        return false;
+    }
+    if (closeRequested_.load()) {
+        running_.store(false);
+        close();
+        return false;
+    }
     sendConnectionRequest();
     return true;
 }
 
 void RakNetClient::close(const std::string& reason) {
+    closeRequested_.store(true);
     bool wasRunning = running_.exchange(false);
     bool wasConnected = connected_.exchange(false);
-    if (socket_ >= 0) {
-        ::shutdown(socket_, SHUT_RDWR);
-        ::close(socket_);
-        socket_ = -1;
-    }
-    if (thread_.joinable()) {
-        if (thread_.get_id() == std::this_thread::get_id()) {
+    shutdownSocket();
+
+    std::thread worker;
+    bool selfWorker = false;
+    bool selfConnect = false;
+    {
+        std::unique_lock<std::mutex> lock(threadMutex_);
+        const auto current = std::this_thread::get_id();
+        selfWorker = workerActive_ && workerThreadId_ == current;
+        selfConnect = connectActive_ && connectThreadId_ == current;
+
+        if (!selfConnect) {
+            threadCv_.wait(lock, [this]() { return !connectActive_; });
+        }
+
+        if (thread_.joinable() && thread_.get_id() == current) {
+            selfWorker = true;
             thread_.detach();
-        } else {
-            thread_.join();
+        } else if (thread_.joinable() && !joinInProgress_) {
+            joinInProgress_ = true;
+            worker = std::move(thread_);
+        } else if (!selfWorker) {
+            threadCv_.wait(lock, [this]() {
+                return !workerActive_ && !joinInProgress_;
+            });
         }
     }
-    if ((wasRunning || wasConnected) && closeHandler_) closeHandler_(reason);
+
+    if (worker.joinable()) {
+        worker.join();
+        {
+            std::lock_guard<std::mutex> lock(threadMutex_);
+            joinInProgress_ = false;
+        }
+        threadCv_.notify_all();
+    }
+
+    // A self-worker close leaves the descriptor allocated until runLoop's
+    // tail. Every other caller has now proved that no select/recv can use it.
+    if (!selfWorker) {
+        finalizeSocketClose();
+    }
+
+    const auto provider = callbackLifetimeProviderSnapshot();
+    auto closeLease = provider ? provider() : std::shared_ptr<void>();
+    auto handler = closeHandlerSnapshot();
+    if ((wasRunning || wasConnected) && handler && (!provider || closeLease)) {
+        handler(reason);
+    }
+}
+
+void RakNetClient::requestStop() noexcept {
+    closeRequested_.store(true);
+    running_.store(false);
+    connected_.store(false);
+    shutdownSocket();
 }
 
 void RakNetClient::sendReliable(const std::vector<uint8_t>& payload) {
-    if (payload.empty() || socket_ < 0) return;
+    // RakNativeClient.sendReliable is a no-op until its low-level `connect`
+    // event has set connected=true, and again immediately after close.
+    if (!connected_.load() || closeRequested_.load()) return;
+    sendReliableInternal(payload);
+}
+
+void RakNetClient::sendReliableInternal(const std::vector<uint8_t>& payload) {
+    if (payload.empty() || closeRequested_.load()) return;
 
     const std::size_t maxPayloadPerDatagram = static_cast<std::size_t>(
         std::max(128, mtu_ > 0 ? mtu_ - 100 : 1200)
@@ -558,29 +731,51 @@ void RakNetClient::sendReliable(const std::vector<uint8_t>& payload) {
 
 void RakNetClient::runLoop() {
     while (running_) {
+        int descriptor = -1;
+        {
+            std::lock_guard<std::mutex> lock(socketMutex_);
+            descriptor = socket_;
+        }
+        if (descriptor < 0) break;
+
         fd_set readfds;
         FD_ZERO(&readfds);
-        FD_SET(socket_, &readfds);
+        FD_SET(descriptor, &readfds);
 
         timeval timeout {};
         timeout.tv_sec = 0;
         timeout.tv_usec = 100000;
 
-        int ready = select(socket_ + 1, &readfds, nullptr, nullptr, &timeout);
+        int ready = select(descriptor + 1, &readfds, nullptr, nullptr, &timeout);
         if (!running_) break;
         if (ready <= 0) continue;
 
         std::vector<uint8_t> packet(65536);
-        ssize_t received = recvfrom(socket_, packet.data(), packet.size(), 0, nullptr, nullptr);
+        ssize_t received = recvfrom(
+            descriptor,
+            packet.data(),
+            packet.size(),
+            0,
+            nullptr,
+            nullptr
+        );
         if (received <= 0) continue;
         packet.resize(static_cast<std::size_t>(received));
         handlePacket(packet);
+        const auto provider = callbackLifetimeProviderSnapshot();
+        if (provider && !provider()) {
+            // A callback destroyed/closed the facade. Stop the worker before
+            // its thread-wide lease is released at the lambda boundary.
+            running_.store(false);
+            break;
+        }
     }
 }
 
 void RakNetClient::handlePacket(const std::vector<uint8_t>& packet) {
     if (packet.empty()) return;
     const uint8_t packetId = packet[0];
+    bool liveCallbackActive = false;
 
     try {
         if (packetId == ID_ACK || packetId == ID_NACK) {
@@ -631,15 +826,38 @@ void RakNetClient::handlePacket(const std::vector<uint8_t>& packet) {
                 bool expected = false;
                 if (connected_.compare_exchange_strong(expected, true)) {
                     sendNewIncomingConnection();
-                    if (connectedHandler_) {
-                        connectedHandler_();
+                    auto handler = connectedHandlerSnapshot();
+                    if (handler) {
+                        liveCallbackActive = true;
+                        handler();
+                        liveCallbackActive = false;
                     }
                 }
                 return;
             }
 
-            if (encapsulatedHandler_) {
-                encapsulatedHandler_(payload);
+            if (payload[0] == ID_DISCONNECTION_NOTIFICATION ||
+                payload[0] == ID_CONNECTION_LOST ||
+                payload[0] == ID_CONNECTION_BANNED ||
+                payload[0] == ID_INCOMPATIBLE_PROTOCOL_VERSION) {
+                requestStop();
+                auto handler = closeHandlerSnapshot();
+                if (handler) {
+                    liveCallbackActive = true;
+                    // raknet-native exposes MessageID as a numeric reason.
+                    // CloseHandler is string-based in this C++ API, so retain
+                    // that exact observable value in decimal form.
+                    handler(std::to_string(payload[0]));
+                    liveCallbackActive = false;
+                }
+                return;
+            }
+
+            auto handler = encapsulatedHandlerSnapshot();
+            if (handler) {
+                liveCallbackActive = true;
+                handler(payload);
+                liveCallbackActive = false;
             }
         };
 
@@ -751,12 +969,18 @@ void RakNetClient::handlePacket(const std::vector<uint8_t>& packet) {
 
         flushPendingIfReady();
     } catch (const std::exception& e) {
+        if (liveCallbackActive) throw;
         error_ = e.what();
+    } catch (...) {
+        if (liveCallbackActive) throw;
+        error_ = "RakNet packet handling failed";
     }
 }
 
 void RakNetClient::sendToTarget(const std::vector<uint8_t>& packet) {
-    if (socket_ < 0 || targetLen_ <= 0 || packet.empty()) return;
+    if (targetLen_ <= 0 || packet.empty()) return;
+    std::lock_guard<std::mutex> lock(socketMutex_);
+    if (socket_ < 0) return;
     (void) sendto(
         socket_,
         packet.data(),
@@ -767,13 +991,89 @@ void RakNetClient::sendToTarget(const std::vector<uint8_t>& packet) {
     );
 }
 
+bool RakNetClient::beginConnectActivity() {
+    std::lock_guard<std::mutex> lock(threadMutex_);
+    if (connectActive_ || workerActive_ || joinInProgress_) return false;
+    connectActive_ = true;
+    connectThreadId_ = std::this_thread::get_id();
+    return true;
+}
+
+void RakNetClient::endConnectActivity() {
+    {
+        std::lock_guard<std::mutex> lock(threadMutex_);
+        connectActive_ = false;
+        connectThreadId_ = std::thread::id{};
+    }
+    threadCv_.notify_all();
+}
+
+void RakNetClient::shutdownSocket() noexcept {
+    std::lock_guard<std::mutex> lock(socketMutex_);
+    if (socket_ >= 0) {
+        // shutdown wakes select/recv but does not make the descriptor number
+        // reusable. The worker tail or its joiner performs the final close.
+        (void) ::shutdown(socket_, SHUT_RDWR);
+    }
+}
+
+void RakNetClient::finalizeSocketClose() noexcept {
+    int descriptor = -1;
+    {
+        std::lock_guard<std::mutex> lock(socketMutex_);
+        descriptor = socket_;
+        socket_ = -1;
+    }
+    if (descriptor >= 0) {
+        (void) ::close(descriptor);
+    }
+}
+
+void RakNetClient::endWorkerActivity() noexcept {
+    running_.store(false);
+    finalizeSocketClose();
+    {
+        std::lock_guard<std::mutex> lock(threadMutex_);
+        workerActive_ = false;
+        workerThreadId_ = std::thread::id{};
+    }
+    threadCv_.notify_all();
+}
+
+RakNetClient::CallbackLifetimeProvider
+RakNetClient::callbackLifetimeProviderSnapshot() const {
+    std::lock_guard<std::mutex> lock(callbackMutex_);
+    return callbackLifetimeProvider_;
+}
+
+std::shared_ptr<void> RakNetClient::acquireCallbackLifetime() const {
+    const auto provider = callbackLifetimeProviderSnapshot();
+    return provider ? provider() : std::shared_ptr<void>();
+}
+
+RakNetClient::ConnectedHandler RakNetClient::connectedHandlerSnapshot() const {
+    std::lock_guard<std::mutex> lock(callbackMutex_);
+    return connectedHandler_;
+}
+
+RakNetClient::CloseHandler RakNetClient::closeHandlerSnapshot() const {
+    std::lock_guard<std::mutex> lock(callbackMutex_);
+    return closeHandler_;
+}
+
+RakNetClient::EncapsulatedHandler
+RakNetClient::encapsulatedHandlerSnapshot() const {
+    std::lock_guard<std::mutex> lock(callbackMutex_);
+    return encapsulatedHandler_;
+}
+
 void RakNetClient::sendConnectionRequest() {
     std::vector<uint8_t> payload;
     payload.push_back(ID_CONNECTION_REQUEST);
     writeU64BE(payload, options_.clientGuid);
     writeU64BE(payload, static_cast<uint64_t>(nowMillis()));
     payload.push_back(0x00);
-    sendReliable(payload);
+    sendReliableInternal(payload);
 }
 
 void RakNetClient::sendNewIncomingConnection() {

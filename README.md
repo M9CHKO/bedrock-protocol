@@ -6,7 +6,7 @@ Minecraft Bedrock Protocol Client Library for C++20
 
 The bundled protocol data currently includes these Bedrock versions:
 
-`0.14.3 (70)` `0.15.6 (82)` `1.0.0 (100)` `1.16.201 (422)` `1.16.210 (428)` `1.16.220 (431)` `1.17.0 (440)` `1.17.10 (448)` `1.17.30 (465)` `1.17.40 (471)` `1.18.0 (475)` `1.18.11 (486)` `1.18.30 (503)` `1.19.1 (527)` `1.19.10 (534)` `1.19.20 (544)` `1.19.21 (545)` `1.19.30 (554)` `1.19.40 (557)` `1.19.50 (560)` `1.19.60 (567)` `1.19.62 (567)` `1.19.63 (568)` `1.19.70 (575)` `1.19.80 (582)` `1.20.0 (589)` `1.20.10 (594)` `1.20.15 (594)` `1.20.30 (618)` `1.20.40 (622)` `1.20.50 (630)` `1.20.61 (649)` `1.20.71 (662)` `1.20.80 (671)` `1.21.0 (685)` `1.21.2 (686)` `1.21.20 (712)` `1.21.30 (729)` `1.21.42 (748)` `1.21.50 (766)` `1.21.60 (776)` `1.21.70 (786)` `1.21.80 (800)` `1.21.90 (818)` `1.21.93 (819)` `1.21.100 (827)` `1.21.111 (844)` `1.21.120 (859)` `1.21.124 (860)` `1.21.130 (898)` `1.26.0 (924)` `1.26.10 (944)` `1.26.20 (975)`
+`1.16.201 (422)` `1.16.210 (428)` `1.16.220 (431)` `1.17.0 (440)` `1.17.10 (448)` `1.17.30 (465)` `1.17.40 (471)` `1.18.0 (475)` `1.18.11 (486)` `1.18.30 (503)` `1.19.1 (527)` `1.19.10 (534)` `1.19.20 (544)` `1.19.21 (545)` `1.19.30 (554)` `1.19.40 (557)` `1.19.50 (560)` `1.19.60 (567)` `1.19.62 (567)` `1.19.63 (568)` `1.19.70 (575)` `1.19.80 (582)` `1.20.0 (589)` `1.20.10 (594)` `1.20.15 (594)` `1.20.30 (618)` `1.20.40 (622)` `1.20.50 (630)` `1.20.61 (649)` `1.20.71 (662)` `1.20.80 (671)` `1.21.0 (685)` `1.21.2 (686)` `1.21.20 (712)` `1.21.30 (729)` `1.21.42 (748)` `1.21.50 (766)` `1.21.60 (776)` `1.21.70 (786)` `1.21.80 (800)` `1.21.90 (818)` `1.21.93 (819)` `1.21.100 (827)` `1.21.111 (844)` `1.21.120 (859)` `1.21.124 (860)` `1.21.130 (898)` `1.26.0 (924)`
 
 More details and version-specific notes are in [documentation/VERSIONS.md](documentation/VERSIONS.md).
 
@@ -114,11 +114,11 @@ auto client = bedrock::createClient({
     .host = "localhost",
     .port = 19132,
     .username = "Notch",
-    .version = "latest",
+    .version = "1.26.0",
     .offline = false,
     .interactiveAuth = true,
     .clientCacheEnabled = false,
-    .chunkRadius = 20,
+    .chunkRadius = 10,
 });
 ```
 
@@ -128,13 +128,16 @@ auto client = bedrock::createClient({
 | `port` | `19132` | Bedrock server port. |
 | `username` | `Bot` | Bot name. In online mode this is also the default auth cache profile. |
 | `profile` | empty | Xbox auth cache profile. Empty means `username`. |
-| `version` | `latest` | Bedrock version from the bundled version table. |
+| `version` | `1.26.0` | Exact Bedrock release from the JavaScript `Versions` table. Unknown values, including `latest` and `auto`, are rejected. |
 | `offline` | `false` | Use self-signed auth instead of Xbox Live. |
 | `interactiveAuth` | `true` | If the Xbox cache is missing, show a device-code login prompt and save the profile cache. |
-| `xboxClientId` | empty | Optional OAuth client id override. Empty uses the common public Xbox client id used by Bedrock tooling. |
+| `authTitle` | unset | OAuth title id. When unset, matches JavaScript by using `title.MinecraftNintendoSwitch`. |
+| `deviceType` | conditional | Becomes `Nintendo` only while applying the unset-`authTitle` default; an explicit title leaves it unchanged. |
+| `flow` | conditional | Becomes `live` only while applying the unset-`authTitle` default; an explicit title leaves it unchanged. |
+| `xboxClientId` | empty | Deprecated C++ compatibility alias for `authTitle`; explicit `authTitle` takes precedence. |
 | `authCacheRoot` | auto | Optional Xbox auth/key cache root. Empty uses the hidden default cache folder. |
 | `clientCacheEnabled` | `false` | Sends the client cache preference used by chunk cache flow. 
-| `chunkRadius` | `20` | Requested chunk radius during automatic start-game initialization. |
+| `chunkRadius` | `10` | Requested chunk radius during automatic start-game initialization. |
 | `debug` | `Off` | `Off`, `Events`, `Packets`, `Json`, or `Trace`. |
 | `decodePackets` | `true` | Decode packet fields into JSON-style event fields. |
 | `packetDump` | `false` | Print extra packet dump output. |
@@ -148,7 +151,14 @@ client.on("packet", [](const bedrock::Packet& packet) {});
 client.on("start_game", [](const bedrock::Packet& packet) {});
 client.on("disconnect", [](const bedrock::Packet& packet) {});
 client.onText([](const bedrock::TextPacket& text) {});
+client.onSpawn([] {});
+client.onHeartbeat([](int64_t responseTime) {});
 ```
+
+The root `bedrock::title` object exposes the same seven title ids as
+`prismarine-auth`'s `Titles`. Use `Options::onMsaCode` for the device-code
+callback; the older `onDeviceCode` name remains available on the lower-level
+`XboxLiveAuthOptions` API.
 
 Packet examples for bots are in [documentation/BOT_PACKETS.md](documentation/BOT_PACKETS.md).
 

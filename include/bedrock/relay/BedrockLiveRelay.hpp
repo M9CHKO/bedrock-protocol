@@ -38,8 +38,22 @@ struct BedrockLiveRelayOptions {
     bool enableChunkCaching = false;
     bool filterDownstreamHandshakePackets = true;
     bool logging = false;
-    VersionedMcpeCompression clientboundCompression = VersionedMcpeCompression::DeflateRaw;
+    // relay.js chooses username from the relay-level offline flag, separately
+    // from destination.offline ?? relay.offline used for upstream auth mode.
+    bool useDownstreamDisplayNameForUpstreamUsername = false;
+    VersionedMcpeCompression clientboundCompression = VersionedMcpeCompression::Automatic;
 };
+
+namespace detail {
+
+// Shared with the pure option regression: relay.js replaces both the
+// username consumed by Authflow and its cache profile identity.
+void applyRelayDownstreamIdentity(
+    BedrockLiveRelayOptions& options,
+    const BedrockRelayDownstreamProfile& profile
+);
+
+} // namespace detail
 
 struct BedrockLiveRelayStatus {
     bool listening = false;
@@ -80,6 +94,7 @@ public:
     bool upstreamStarted() const;
     bool upstreamReady() const;
     uint16_t boundPort() const;
+    const BedrockLiveRelayOptions& options() const;
 
     BedrockServer& server();
     BedrockNetworkClient* upstream();

@@ -19,7 +19,7 @@ struct PlayStatusPacket {
     int32_t status = 0;
 };
 
-struct TextPacket {
+struct PayloadTextPacket {
     uint8_t type = 0;
     bool needsTranslation = false;
     std::string message;
@@ -63,8 +63,8 @@ public:
     static PlayStatusPacket readPlayStatus(const GamePacket& packet);
     static PlayStatusPacket readPlayStatus(const std::vector<uint8_t>& packetOrPayload);
 
-    static TextPacket readText(const GamePacket& packet);
-    static TextPacket readText(const std::vector<uint8_t>& packetOrPayload);
+    static PayloadTextPacket readText(const GamePacket& packet);
+    static PayloadTextPacket readText(const std::vector<uint8_t>& packetOrPayload);
 
     static LevelChunkPacket readLevelChunk(const GamePacket& packet);
     static LevelChunkPacket readLevelChunk(const std::vector<uint8_t>& packetOrPayload);
