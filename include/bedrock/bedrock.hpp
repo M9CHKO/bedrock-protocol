@@ -22,6 +22,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <deque>
 #include <filesystem>
 #include <functional>
@@ -51,6 +52,184 @@ using Server = BedrockServer;
 using PacketValue = ProtoDefValue;
 using PacketObject = std::unordered_map<std::string, PacketValue>;
 using PacketArray = std::vector<PacketValue>;
+
+// JavaScript object spread distinguishes a missing own-property from an own
+// property whose value is `undefined` or `null`.  std::optional collapses all
+// three states, which changes createClient's default precedence.  Keep the
+// observable property state and the caller's original presence separately:
+// setResolved() models a value supplied by defaultOptions/factory discovery
+// without pretending that it came from the caller object.
+enum class JsPropertyPresence {
+    Missing,
+    Undefined,
+    Null,
+    Value
+};
+
+struct JsUndefined final {};
+inline constexpr JsUndefined jsUndefined {};
+
+template <typename T>
+class JsProperty {
+public:
+    JsProperty() = default;
+    JsProperty(const JsProperty&) = default;
+    JsProperty(JsProperty&&) noexcept = default;
+    JsProperty& operator=(const JsProperty&) = default;
+    JsProperty& operator=(JsProperty&&) noexcept = default;
+
+    JsProperty(T value)
+        : value_(std::move(value)), presence_(JsPropertyPresence::Value),
+          provided_(true) {}
+
+    JsProperty(std::nullptr_t)
+        : presence_(JsPropertyPresence::Null), provided_(true) {}
+
+    JsProperty(JsUndefined)
+        : presence_(JsPropertyPresence::Undefined), provided_(true) {}
+
+    JsProperty(std::optional<T> value) {
+        if (value.has_value()) {
+            value_ = std::move(*value);
+            presence_ = JsPropertyPresence::Value;
+            provided_ = true;
+        }
+    }
+
+    JsProperty& operator=(T value) {
+        value_ = std::move(value);
+        presence_ = JsPropertyPresence::Value;
+        provided_ = true;
+        return *this;
+    }
+
+    JsProperty& operator=(std::nullptr_t) noexcept {
+        presence_ = JsPropertyPresence::Null;
+        provided_ = true;
+        return *this;
+    }
+
+    JsProperty& operator=(JsUndefined) noexcept {
+        presence_ = JsPropertyPresence::Undefined;
+        provided_ = true;
+        return *this;
+    }
+
+    JsProperty& operator=(std::optional<T> value) {
+        if (value.has_value()) {
+            return *this = std::move(*value);
+        }
+        reset();
+        return *this;
+    }
+
+    bool has_value() const noexcept {
+        return presence_ == JsPropertyPresence::Value;
+    }
+
+    bool hasOwn() const noexcept {
+        return presence_ != JsPropertyPresence::Missing;
+    }
+
+    bool provided() const noexcept {
+        return provided_;
+    }
+
+    bool isUndefined() const noexcept {
+        return presence_ == JsPropertyPresence::Undefined;
+    }
+
+    bool isNull() const noexcept {
+        return presence_ == JsPropertyPresence::Null;
+    }
+
+    JsPropertyPresence presence() const noexcept {
+        return presence_;
+    }
+
+    bool truthy() const noexcept {
+        if (!has_value()) return false;
+        if constexpr (std::is_same_v<T, bool>) {
+            return value_;
+        } else if constexpr (std::is_arithmetic_v<T>) {
+            return value_ != T{};
+        } else {
+            return !value_.empty();
+        }
+    }
+
+    T& value() {
+        if (!has_value()) throw std::bad_optional_access();
+        return value_;
+    }
+
+    const T& value() const {
+        if (!has_value()) throw std::bad_optional_access();
+        return value_;
+    }
+
+    T& operator*() { return value(); }
+    const T& operator*() const { return value(); }
+
+    T* operator->() { return &value(); }
+    const T* operator->() const { return &value(); }
+
+    T value_or(T fallback) const {
+        return has_value() ? value_ : std::move(fallback);
+    }
+
+    void reset() noexcept {
+        presence_ = JsPropertyPresence::Missing;
+        provided_ = false;
+    }
+
+    void setUndefined() noexcept {
+        presence_ = JsPropertyPresence::Undefined;
+        provided_ = true;
+    }
+
+    void setResolved(T value) {
+        value_ = std::move(value);
+        presence_ = JsPropertyPresence::Value;
+    }
+
+    std::optional<T> optionalValue() const {
+        return has_value() ? std::optional<T>(value_) : std::nullopt;
+    }
+
+    friend bool operator==(
+        const JsProperty& left,
+        const std::optional<T>& right
+    ) {
+        return left.optionalValue() == right;
+    }
+
+    friend bool operator==(
+        const std::optional<T>& left,
+        const JsProperty& right
+    ) {
+        return left == right.optionalValue();
+    }
+
+    friend bool operator!=(
+        const JsProperty& left,
+        const std::optional<T>& right
+    ) {
+        return !(left == right);
+    }
+
+    friend bool operator!=(
+        const std::optional<T>& left,
+        const JsProperty& right
+    ) {
+        return !(left == right);
+    }
+
+private:
+    T value_ {};
+    JsPropertyPresence presence_ = JsPropertyPresence::Missing;
+    bool provided_ = false;
+};
 
 // JavaScript distinguishes an omitted `version` property from a present
 // property whose value is the empty string. Keep std::string's source-level
@@ -570,11 +749,54 @@ public:
     RequestedPort& operator=(RequestedPort&&) noexcept = default;
 
     RequestedPort(uint16_t value) noexcept
-        : value_(value), hasValue_(true), provided_(true) {}
+        : value_(value), presence_(JsPropertyPresence::Value), provided_(true) {}
+
+    template <
+        typename Integer,
+        std::enable_if_t<
+            std::is_integral_v<std::remove_reference_t<Integer>> &&
+            !std::is_same_v<std::remove_cv_t<std::remove_reference_t<Integer>>, bool> &&
+            !std::is_same_v<std::remove_cv_t<std::remove_reference_t<Integer>>, uint16_t>,
+            int
+        > = 0
+    >
+    RequestedPort(Integer value) noexcept
+        : RequestedPort(static_cast<uint16_t>(value)) {}
+
+    RequestedPort(std::nullptr_t) noexcept
+        : presence_(JsPropertyPresence::Null), provided_(true) {}
+
+    RequestedPort(JsUndefined) noexcept
+        : presence_(JsPropertyPresence::Undefined), provided_(true) {}
 
     RequestedPort& operator=(uint16_t value) noexcept {
         value_ = value;
-        hasValue_ = true;
+        presence_ = JsPropertyPresence::Value;
+        provided_ = true;
+        return *this;
+    }
+
+    template <
+        typename Integer,
+        std::enable_if_t<
+            std::is_integral_v<std::remove_reference_t<Integer>> &&
+            !std::is_same_v<std::remove_cv_t<std::remove_reference_t<Integer>>, bool> &&
+            !std::is_same_v<std::remove_cv_t<std::remove_reference_t<Integer>>, uint16_t>,
+            int
+        > = 0
+    >
+    RequestedPort& operator=(Integer value) noexcept {
+        return *this = static_cast<uint16_t>(value);
+    }
+
+    RequestedPort& operator=(std::nullptr_t) noexcept {
+        presence_ = JsPropertyPresence::Null;
+        provided_ = true;
+        return *this;
+    }
+
+    RequestedPort& operator=(JsUndefined) noexcept {
+        presence_ = JsPropertyPresence::Undefined;
         provided_ = true;
         return *this;
     }
@@ -584,32 +806,58 @@ public:
     }
 
     bool has_value() const noexcept {
-        return hasValue_;
+        return presence_ == JsPropertyPresence::Value;
+    }
+
+    bool hasOwn() const noexcept {
+        return presence_ != JsPropertyPresence::Missing;
     }
 
     bool provided() const noexcept {
         return provided_;
     }
 
+    bool isUndefined() const noexcept {
+        return presence_ == JsPropertyPresence::Undefined;
+    }
+
+    bool isNull() const noexcept {
+        return presence_ == JsPropertyPresence::Null;
+    }
+
+    JsPropertyPresence presence() const noexcept {
+        return presence_;
+    }
+
     uint16_t value() const {
-        if (!hasValue_) {
+        if (!has_value()) {
             throw std::bad_optional_access();
         }
         return value_;
     }
 
     uint16_t value_or(uint16_t fallback) const noexcept {
-        return hasValue_ ? value_ : fallback;
+        return has_value() ? value_ : fallback;
     }
 
     void setResolved(uint16_t value) noexcept {
         value_ = value;
-        hasValue_ = true;
+        presence_ = JsPropertyPresence::Value;
+    }
+
+    void setUndefined() noexcept {
+        presence_ = JsPropertyPresence::Undefined;
+        provided_ = true;
+    }
+
+    void reset() noexcept {
+        presence_ = JsPropertyPresence::Missing;
+        provided_ = false;
     }
 
 private:
     uint16_t value_ = 0;
-    bool hasValue_ = false;
+    JsPropertyPresence presence_ = JsPropertyPresence::Missing;
     bool provided_ = false;
 };
 
@@ -621,7 +869,10 @@ struct Options {
     // empty string remains explicit and is rejected like the JavaScript API.
     RequestedVersion version;
     uint32_t protocolVersion = 0;
-    std::optional<bool> followPort;
+    JsProperty<bool> followPort;
+    // client.js skips init only for a truthy delayedInit property. createClient
+    // always overwrites it with true as the final object-literal field.
+    JsProperty<bool> delayedInit;
     bool skipPing = false;
     bool realms = false;
     std::function<void(const std::string&)> conLog = [](const std::string& message) {
@@ -636,6 +887,8 @@ struct Options {
     std::optional<std::string> authTitle;
     std::string deviceType;
     std::string flow;
+    std::shared_ptr<Authflow> authflow;
+    std::string password;
     // Deprecated compatibility alias. New code should use authTitle.
     std::string xboxClientId;
     std::filesystem::path authCacheRoot;
@@ -653,14 +906,15 @@ struct Options {
     std::vector<uint8_t> loginPacket;
     std::string clientDataJson;
 
-    // Canonical bedrock-protocol option names.  Present timer fields win over
-    // the older C++ aliases above; omission retains the aliases for existing
-    // native callers.  Upstream stores viewDistance in options but
+    // Canonical bedrock-protocol option names. The older C++ extension fields
+    // above remain observable for source compatibility but cannot affect the
+    // root Client: JavaScript ignores those unknown property names. Upstream
+    // stores viewDistance in options but
     // createClient.js reads client.viewDistance instead, so this option does
     // not replace chunkRadius (the same upstream behavior is preserved).
-    std::optional<int> connectTimeout;
-    std::optional<int> batchingInterval;
-    std::optional<int32_t> viewDistance;
+    JsProperty<int> connectTimeout;
+    JsProperty<int> batchingInterval;
+    JsProperty<int32_t> viewDistance;
     ProfilesFolderOption profilesFolder;
     std::string raknetBackend = "raknet-native";
     bool useRaknetWorkers = true;
@@ -690,7 +944,6 @@ private:
                   value.version.provided() || !value.version.empty()
                   ? std::optional<std::string>(value.version)
                   : std::nullopt),
-              callerConnectTimeoutProvided(value.connectTimeout.has_value()),
               options(std::move(value)) {
             // Client's constructor spreads Options.defaultOptions before its
             // delayed init. Keep the caller's presence separately while the
@@ -698,8 +951,8 @@ private:
             if (!options.version.provided()) {
                 options.version.setResolved(std::string(CURRENT_VERSION));
             }
-            if (!options.connectTimeout.has_value()) {
-                options.connectTimeout = 9000;
+            if (!options.connectTimeout.provided()) {
+                options.connectTimeout.setResolved(9000);
             }
         }
 
@@ -717,7 +970,6 @@ private:
         std::atomic<bool> ownerAlive {true};
         std::atomic<bool> callbacksSuppressed {false};
         std::optional<std::string> requestedVersion;
-        bool callerConnectTimeoutProvided = false;
         Options options;
         std::unique_ptr<ProtoDefPacketDecoder> decoder;
         std::shared_ptr<BedrockNetworkClient> network;
@@ -777,9 +1029,9 @@ private:
     std::shared_ptr<State> state_;
 
 public:
-    explicit Client(Options options = {})
+    explicit Client(Options options)
         : state_(std::make_shared<State>(std::move(options))) {
-        initialize(state_);
+        if (!state_->options.delayedInit.truthy()) initialize(state_);
     }
 
     ~Client() {
@@ -802,18 +1054,41 @@ public:
         return Client(std::move(options), FactoryTag{});
     }
 
+    void init() {
+        initialize(state_);
+    }
+
+    // A lock-aware mutation seam for the public options object. JavaScript
+    // exposes client.options directly; native callers use this callback before
+    // init/session boundaries without racing the factory's worker threads.
+    template <typename Mutator>
+    void updateOptions(Mutator&& mutator) {
+        std::lock_guard<std::mutex> lock(state_->mutex);
+        std::forward<Mutator>(mutator)(state_->options);
+    }
+
     bool connect() {
         auto state = state_;
         BedrockNetworkClient* network = nullptr;
+        bool autoConnectStarted = false;
         {
             std::lock_guard<std::mutex> lock(state->mutex);
             if (!state->network) {
                 throw std::runtime_error("Connect not currently allowed");
             }
-            if (state->autoConnectStarted) {
-                return true;
-            }
+            autoConnectStarted = state->autoConnectStarted;
             network = state->network.get();
+        }
+
+        // createClient's internal listener has already marked auto-connect by
+        // the time auth.js emits its synchronous constructor error. A user
+        // error listener may nevertheless call client.connect() recursively;
+        // JavaScript runs authentication and startQueue() again in that same
+        // stack. Only calls outside the owning preparation stack retain the
+        // native factory's already-started fast path.
+        if (autoConnectStarted &&
+            !network->connectPreparationOwnedByCurrentThread()) {
+            return true;
         }
         const bool prepared = network->prepareConnectLifecycle(false);
         if (!prepared) return false;
@@ -822,6 +1097,70 @@ public:
 
     int run() {
         return requireNetwork()->run();
+    }
+
+    std::string ping() {
+        std::shared_ptr<BedrockNetworkClient> network;
+        Options current;
+        {
+            std::lock_guard<std::mutex> lock(state_->mutex);
+            network = state_->network;
+            current = state_->options;
+        }
+
+        const auto fail = [&](const std::string& message) -> std::string {
+            if (current.conLog) {
+                current.conLog(
+                    "Unable to connect to [" + current.host + "]/" +
+                    (current.port.has_value()
+                        ? std::to_string(current.port.value())
+                        : current.port.isNull() ? "null" : "undefined") +
+                    ". Is the server running?"
+                );
+            }
+            throw std::runtime_error(message);
+        };
+
+        if (!network) {
+            return fail(
+                "Cannot read properties of undefined (reading 'ping')"
+            );
+        }
+
+        const auto target = network->options();
+        // RakNativeClient.ping(timeout = 1000) applies its parameter default
+        // only to explicit undefined. Null/zero remain zero; the ordinary
+        // defaultOptions path has already materialized 9000 in client.options.
+        int timeout = 1000;
+        if (current.connectTimeout.isNull()) {
+            timeout = 0;
+        } else if (current.connectTimeout.has_value()) {
+            timeout = *current.connectTimeout;
+        }
+
+        const auto pong = RakNetPinger::ping(
+            target.host,
+            target.port,
+            timeout
+        );
+        if (!pong.ok) {
+            if (pong.timedOut) {
+                if (current.conLog) {
+                    current.conLog(
+                        "Unable to connect to [" + current.host + "]/" +
+                        (current.port.has_value()
+                            ? std::to_string(current.port.value())
+                            : current.port.isNull() ? "null" : "undefined") +
+                        ". Is the server running?"
+                    );
+                }
+                throw RakTimeout("Ping timed out");
+            }
+            return fail(
+                pong.error.empty() ? "Bedrock ping failed" : pong.error
+            );
+        }
+        return pong.rawMotd;
     }
 
     void close(const std::string& reason = "closed") {
@@ -1018,7 +1357,15 @@ public:
         return state->network && state->network->versionLessThanOrEqualTo(protocolVersion);
     }
 
-    Options options() const {
+    Options& options() noexcept {
+        return state_->options;
+    }
+
+    const Options& options() const noexcept {
+        return state_->options;
+    }
+
+    Options optionsSnapshot() const {
         std::lock_guard<std::mutex> lock(state_->mutex);
         return state_->options;
     }
@@ -1221,17 +1568,18 @@ public:
 private:
     Client(Options options, FactoryTag)
         : state_(std::make_shared<State>(std::move(options))) {
+        state_->options.delayedInit.setResolved(true);
         if (state_->options.realms) {
             throw std::runtime_error("Realms are not supported");
         }
         // createClient.js constructs Client with
         // `{ port: 19132, followPort: !options.realms, ...options }`.
         // Preserve an explicit zero while supplying the factory-only default.
-        if (!state_->options.port.has_value()) {
+        if (!state_->options.port.provided()) {
             state_->options.port.setResolved(19132);
         }
-        if (!state_->options.followPort.has_value()) {
-            state_->options.followPort = true;
+        if (!state_->options.followPort.provided()) {
+            state_->options.followPort.setResolved(true);
         }
         state_->factoryMode = true;
 
@@ -1284,10 +1632,7 @@ private:
         });
     }
 
-    static Options normalizeOptions(
-        Options options,
-        bool callerConnectTimeoutProvided
-    ) {
+    static Options normalizeOptions(Options options) {
         if (options.host.empty() || !options.port.has_value()) {
             throw std::runtime_error("Invalid host/port");
         }
@@ -1304,14 +1649,6 @@ private:
         }
         options.protocolVersion = validateVersion(options.version);
 
-        if (callerConnectTimeoutProvided) {
-            const int value = *options.connectTimeout;
-            options.connectTimeoutMs = value == 0 ? 9000 : std::max(value, 1);
-        }
-        if (options.batchingInterval.has_value()) {
-            const int value = *options.batchingInterval;
-            options.batchingIntervalMs = value == 0 ? 20 : std::max(value, 1);
-        }
         // options.js applies this deprecated override after version
         // validation, regardless of an explicitly supplied backend.
         if (options.useNativeRaknet.has_value()) {
@@ -1354,10 +1691,7 @@ private:
         }
     }
 
-    static BedrockNetworkClientOptions toNetworkOptions(
-        const Options& options,
-        bool callerConnectTimeoutProvided
-    ) {
+    static BedrockNetworkClientOptions toNetworkOptions(const Options& options) {
         BedrockNetworkClientOptions out;
         out.host = options.host;
         out.port = static_cast<uint16_t>(options.port);
@@ -1370,28 +1704,37 @@ private:
         out.authTitle = options.authTitle;
         out.deviceType = options.deviceType;
         out.flow = options.flow;
+        out.authflow = options.authflow;
+        out.password = options.password;
         out.xboxClientId = options.xboxClientId;
         out.authCacheRoot = options.authCacheRoot;
         out.onMsaCode = options.onMsaCode;
         out.mtu = options.mtu;
-        out.connectTimeoutMs = options.connectTimeoutMs;
-        out.batchingIntervalMs = options.batchingIntervalMs;
+        const int effectiveConnectTimeout = options.connectTimeout.truthy()
+            ? std::max(*options.connectTimeout, 1)
+            : 9000;
+        const int effectiveBatchingInterval = options.batchingInterval.truthy()
+            ? std::max(*options.batchingInterval, 1)
+            : 20;
+        // client.js reads only the canonical properties at their use sites.
+        // Keep unknown legacy fields observable in Client.options, but never
+        // let them alter the canonical timer behavior.
+        out.connectTimeoutMs = effectiveConnectTimeout;
+        out.batchingIntervalMs = effectiveBatchingInterval;
         out.compressionLevel = options.compressionLevel;
         out.autoInitPlayer = options.autoInitPlayer;
         out.autoResourcePackResponses = options.autoResourcePackResponses;
         out.clientCacheEnabled = options.clientCacheEnabled;
         out.trackWorld = options.trackWorld;
-        out.chunkRadius = options.chunkRadius;
+        // createClient.js reads client.viewDistance rather than
+        // client.options.viewDistance/chunkRadius. Neither root Options field
+        // affects the request in the upstream implementation.
+        out.chunkRadius = 10;
         out.loginPacket = options.loginPacket;
         out.clientDataJson = options.clientDataJson;
-        // Client.options contains defaultOptions.connectTimeout immediately,
-        // but the native-only alias must still win when the canonical caller
-        // property was absent rather than explicitly supplied as zero.
-        out.connectTimeout = callerConnectTimeoutProvided
-            ? options.connectTimeout
-            : std::nullopt;
-        out.batchingInterval = options.batchingInterval;
-        out.viewDistance = options.viewDistance;
+        out.connectTimeout = effectiveConnectTimeout;
+        out.batchingInterval = effectiveBatchingInterval;
+        out.viewDistance = options.viewDistance.optionalValue();
         out.profilesFolder = options.profilesFolder;
         out.raknetBackend = options.raknetBackend;
         out.useRaknetWorkers = options.useRaknetWorkers;
@@ -1500,7 +1843,9 @@ private:
             if (state->options.followPort.value_or(false) &&
                 advertisement.portV4.isTruthy()) {
                 if (const auto advertisedPort = advertisement.portV4.toInteger()) {
-                    state->options.port = static_cast<uint16_t>(*advertisedPort);
+                    state->options.port.setResolved(
+                        static_cast<uint16_t>(*advertisedPort)
+                    );
                 }
             }
 
@@ -1532,16 +1877,12 @@ private:
             options = state->options;
         }
 
-        options = normalizeOptions(
-            std::move(options),
-            state->callerConnectTimeoutProvided
-        );
+        options = normalizeOptions(std::move(options));
         auto decoder = std::make_unique<ProtoDefPacketDecoder>(options.version);
         validateConnectionAddress(options);
-        auto network = std::make_shared<BedrockNetworkClient>(toNetworkOptions(
-            options,
-            state->callerConnectTimeoutProvided
-        ));
+        auto network = std::make_shared<BedrockNetworkClient>(
+            toNetworkOptions(options)
+        );
         std::weak_ptr<State> weakState = state;
         network->setAuthenticationOptionsResolvedHandler(
             [weakState](BedrockNetworkClientOptions resolved) {
@@ -1552,8 +1893,18 @@ private:
                 current->options.authTitle = resolved.authTitle;
                 current->options.deviceType = resolved.deviceType;
                 current->options.flow = resolved.flow;
-                current->options.authCacheRoot = resolved.authCacheRoot;
                 current->options.profilesFolder = resolved.profilesFolder;
+            }
+        );
+        network->setAuthenticationUnhandledRejectionHandler(
+            [weakState](std::string message) {
+                auto current = weakState.lock();
+                if (!current) return;
+                recordUnhandledAsyncError(
+                    current,
+                    std::move(message),
+                    true
+                );
             }
         );
         network->setCallbackLifetimeProvider([weakState]() -> std::shared_ptr<void> {

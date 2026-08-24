@@ -6,6 +6,7 @@
 #include <bedrock/auth/XboxProfileCache.hpp>
 #include <bedrock/auth/XboxTokenCache.hpp>
 #include <bedrock/protocol/ProtocolDefinition.hpp>
+#include <bedrock/protodef/ProtoDefJson.hpp>
 #include <bedrock/world/MinecraftDataPathResolver.hpp>
 
 #include <array>
@@ -28,6 +29,11 @@
 
 namespace bedrock {
 namespace {
+
+inline constexpr std::string_view BedrockProtocolPublicKey =
+    "MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAECRXueJeTDqNRRgJi/vlRufByu/"
+    "2G0i2Ebt6YMar5QX/R0DIIyrJMcUpruK4QveTfJSTp3Shlq4Gk34cD/"
+    "4GUWwkv0DVuzeuB+tXija7HBxii03NHDbPAD0AKnLr2wdAp";
 
 void sanitizeStdbufEnvironment() {
 #if defined(_WIN32) && !defined(__CYGWIN__) && !defined(__MSYS__)
@@ -809,6 +815,149 @@ std::vector<std::string> requestBedrockChain(
     return chain;
 }
 
+XboxLiveLoginPacket buildLoginPacket(
+    const XboxLiveAuthOptions& options,
+    BedrockClientKeyPair keys,
+    std::vector<std::string> chain,
+    std::string identity,
+    std::string displayName,
+    std::string xuid,
+    std::optional<std::string> onlineIdentityPublicKey = std::nullopt
+) {
+    const auto clientPayload = buildClientData(
+        options,
+        displayName,
+        xuid,
+        identity
+    );
+    const auto clientJwt = BedrockAuthJwt::signEs384Jwt(
+        keys.privateKeyPem,
+        keys.publicKeyDerBase64,
+        clientPayload
+    );
+
+    const auto nowSec = static_cast<long long>(
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+
+    std::string clientToRootPayload;
+    if (options.offline) {
+        clientToRootPayload =
+            "{"
+            "\"extraData\":{"
+            "\"displayName\":\"" + escapeJson(displayName) + "\","
+            "\"identity\":\"" + escapeJson(identity) + "\","
+            "\"titleId\":\"89692877\","
+            "\"XUID\":\"0\""
+            "},"
+            "\"certificateAuthority\":true,"
+            "\"identityPublicKey\":\"" + escapeJson(keys.publicKeyDerBase64) + "\","
+            "\"iat\":" + std::to_string(nowSec) +
+            "}";
+    } else {
+        const std::string rootPublicKey = onlineIdentityPublicKey.has_value()
+            ? *onlineIdentityPublicKey
+            : jwtHeaderString(chain.front(), "x5u");
+        if (rootPublicKey.empty()) {
+            throw std::runtime_error("Bedrock chain first JWT has no header.x5u");
+        }
+        clientToRootPayload =
+            "{"
+            "\"identityPublicKey\":\"" + escapeJson(rootPublicKey) + "\","
+            "\"certificateAuthority\":true,"
+            "\"iat\":" + std::to_string(nowSec) +
+            "}";
+    }
+
+    auto clientToRootJwt = BedrockAuthJwt::signEs384Jwt(
+        keys.privateKeyPem,
+        keys.publicKeyDerBase64,
+        clientToRootPayload
+    );
+    chain.insert(chain.begin(), std::move(clientToRootJwt));
+
+    std::string certificateJson = "{\"chain\":[";
+    for (std::size_t i = 0; i < chain.size(); ++i) {
+        if (i) certificateJson += ",";
+        certificateJson += "\"" + escapeJson(chain[i]) + "\"";
+    }
+    certificateJson += "]}";
+
+    std::string identityJson;
+    if (versionAtLeast(options.version, 1, 21, 90)) {
+        identityJson =
+            "{"
+            "\"Certificate\":\"" + escapeJson(certificateJson) + "\","
+            "\"AuthenticationType\":" + std::string(options.offline ? "2" : "0") + ","
+            "\"Token\":\"\""
+            "}";
+    } else {
+        identityJson = std::move(certificateJson);
+    }
+
+    XboxLiveLoginPacket out;
+    out.loginPacket = LoginPacketCodec::encode(
+        options.protocolVersion,
+        identityJson,
+        clientJwt
+    );
+    out.keyPair = std::move(keys);
+    out.identity = std::move(identity);
+    out.displayName = std::move(displayName);
+    out.xuid = std::move(xuid);
+    out.online = !options.offline;
+    return out;
+}
+
+struct AuthflowProfile {
+    std::string identity;
+    std::string displayName;
+    std::string xuid;
+};
+
+AuthflowProfile extractAuthflowProfile(
+    const std::vector<std::string>& chains
+) {
+    // auth.js does not search the chain: the Xbox profile is always decoded
+    // from chains[1]. Preserve V8's observable missing-element failure before
+    // any packet construction or cache work.
+    if (chains.size() < 2) {
+        throw std::runtime_error(
+            "Cannot read properties of undefined (reading 'split')"
+        );
+    }
+
+    const auto payload =
+        BedrockKeyExchange::extractJwtPayloadJson(chains[1]);
+    const auto xboxProfile = ProtoDefJson::parse(payload);
+    const auto* extraData = xboxProfile.kind == ProtoDefValue::Kind::Object
+        ? xboxProfile.get("extraData")
+        : nullptr;
+    const auto* profile = extraData &&
+            extraData->kind == ProtoDefValue::Kind::Object
+        ? extraData
+        : nullptr;
+    const auto claim = [profile](const char* name) {
+        const auto* value = profile ? profile->get(name) : nullptr;
+        return value && value->kind == ProtoDefValue::Kind::String
+            ? value->stringValue
+            : std::string{};
+    };
+
+    AuthflowProfile result;
+    result.displayName = claim("displayName");
+    result.identity = claim("identity");
+    result.xuid = claim("XUID");
+
+    // auth.js uses JavaScript || for each property independently.
+    if (result.displayName.empty()) result.displayName = "Player";
+    if (result.identity.empty()) {
+        result.identity = "adfcf5ca-206c-404a-aec4-f59fff264c9b";
+    }
+    if (result.xuid.empty()) result.xuid = "0";
+    return result;
+}
+
 XboxLiveAuthOptions normalizeOptions(XboxLiveAuthOptions options) {
     if (options.profileName.empty()) options.profileName = "Bot";
     // options.js always derives this value from Versions; callers cannot
@@ -938,83 +1087,40 @@ XboxLiveLoginPacket XboxLiveAuth::makeLoginPacket(XboxLiveAuthOptions options) {
 
     if (displayName.empty()) displayName = options.profileName;
     if (xuid.empty()) xuid = options.offline ? "0" : cache.xuid;
-
-    const auto clientPayload = buildClientData(options, displayName, xuid, identity);
-    const auto clientJwt = BedrockAuthJwt::signEs384Jwt(
-        keys.privateKeyPem,
-        keys.publicKeyDerBase64,
-        clientPayload
+    return buildLoginPacket(
+        options,
+        std::move(keys),
+        std::move(chain),
+        std::move(identity),
+        std::move(displayName),
+        std::move(xuid),
+        std::string(BedrockProtocolPublicKey)
     );
+}
 
-    const auto nowSec = static_cast<long long>(
-        std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count());
+XboxLiveLoginPacket XboxLiveAuth::makeLoginPacketFromChains(
+    XboxLiveAuthOptions options,
+    BedrockClientKeyPair keyPair,
+    std::vector<std::string> chains
+) {
+    // The normal Client/Options boundary has already validated the selected
+    // protocol version before options.authflow is invoked. Keep this public
+    // auth-layer entry point self-contained without running normalizeOptions,
+    // whose flow checks belong exclusively to `new PrismarineAuth(...)`.
+    if (options.profileName.empty()) options.profileName = "Bot";
+    options.protocolVersion = validateVersion(options.version);
+    options.offline = false;
 
-    std::string clientToRootPayload;
-    if (options.offline) {
-        clientToRootPayload =
-            "{"
-            "\"extraData\":{"
-            "\"displayName\":\"" + escapeJson(displayName) + "\","
-            "\"identity\":\"" + escapeJson(identity) + "\","
-            "\"titleId\":\"89692877\","
-            "\"XUID\":\"0\""
-            "},"
-            "\"certificateAuthority\":true,"
-            "\"identityPublicKey\":\"" + escapeJson(keys.publicKeyDerBase64) + "\","
-            "\"iat\":" + std::to_string(nowSec) +
-            "}";
-    } else {
-        const std::string rootPublicKey = jwtHeaderString(chain.front(), "x5u");
-        if (rootPublicKey.empty()) {
-            throw std::runtime_error("Bedrock chain first JWT has no header.x5u");
-        }
-        clientToRootPayload =
-            "{"
-            "\"identityPublicKey\":\"" + escapeJson(rootPublicKey) + "\","
-            "\"certificateAuthority\":true,"
-            "\"iat\":" + std::to_string(nowSec) +
-            "}";
-    }
-
-    auto clientToRootJwt = BedrockAuthJwt::signEs384Jwt(
-        keys.privateKeyPem,
-        keys.publicKeyDerBase64,
-        clientToRootPayload
+    auto profile = extractAuthflowProfile(chains);
+    return buildLoginPacket(
+        options,
+        std::move(keyPair),
+        std::move(chains),
+        std::move(profile.identity),
+        std::move(profile.displayName),
+        std::move(profile.xuid),
+        std::string(BedrockProtocolPublicKey)
     );
-    chain.insert(chain.begin(), clientToRootJwt);
-
-    std::string certificateJson = "{\"chain\":[";
-    for (std::size_t i = 0; i < chain.size(); ++i) {
-        if (i) certificateJson += ",";
-        certificateJson += "\"" + escapeJson(chain[i]) + "\"";
-    }
-    certificateJson += "]}";
-
-    std::string identityJson;
-    if (versionAtLeast(options.version, 1, 21, 90)) {
-        identityJson =
-            "{"
-            "\"Certificate\":\"" + escapeJson(certificateJson) + "\","
-            "\"AuthenticationType\":" + std::string(options.offline ? "2" : "0") + ","
-            "\"Token\":\"\""
-            "}";
-    } else {
-        identityJson = certificateJson;
-    }
-
-    XboxLiveLoginPacket out;
-    out.loginPacket = LoginPacketCodec::encode(
-        options.protocolVersion,
-        identityJson,
-        clientJwt
-    );
-    out.keyPair = std::move(keys);
-    out.identity = identity;
-    out.displayName = displayName;
-    out.xuid = xuid;
-    out.online = !options.offline;
-    return out;
 }
 
 } // namespace bedrock

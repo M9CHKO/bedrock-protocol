@@ -264,6 +264,35 @@ std::filesystem::path initializePrismarineAuthCacheRoot(
     return selectedRoot;
 }
 
+class AuthflowPromiseRejection final : public std::runtime_error {
+public:
+    explicit AuthflowPromiseRejection(const std::string& message)
+        : std::runtime_error(message) {}
+};
+
+void dispatchAuthenticationUnhandledRejection(
+    BedrockNetworkClient::AuthenticationUnhandledRejectionHandler handler,
+    std::string message
+) {
+    if (!handler) return;
+    // An ignored async authenticate() Promise is reported only after the
+    // synchronous Client.connect()/startQueue stack and the current microtask
+    // checkpoint. C++ has no owning JS event loop, so hand the already-owned
+    // callback/message to a detached native turn; it never captures the client.
+    std::thread([
+        handler = std::move(handler),
+        message = std::move(message)
+    ]() mutable {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        try {
+            handler(std::move(message));
+        } catch (...) {
+            // This is a process-boundary reporting seam. A throwing observer
+            // cannot retroactively change the ignored Promise or queue start.
+        }
+    }).detach();
+}
+
 } // namespace
 
 BedrockNetworkClient::BedrockNetworkClient(BedrockNetworkClientOptions options)
@@ -348,6 +377,14 @@ bool BedrockNetworkClient::connect() {
             return connectLifecyclePhase_ == ConnectLifecyclePhase::Active;
         }
         if (connectLifecyclePhase_ == ConnectLifecyclePhase::Preparing) {
+            if (connectLifecycleOwnerThreadId_ ==
+                std::this_thread::get_id()) {
+                // The facade has just completed a same-stack recursive
+                // preparation. JavaScript returns from the nested connect()
+                // after its startQueue(); transport admission remains the
+                // outer async/session continuation's responsibility.
+                return false;
+            }
             connectLifecycleCv_.wait(lock, [this]() {
                 return connectLifecyclePhase_ !=
                     ConnectLifecyclePhase::Preparing;
@@ -408,9 +445,38 @@ bool BedrockNetworkClient::connect() {
     try {
         prepareLoginPacket();
     } catch (const std::exception& e) {
-        stopQueue();
-        closed_.store(true);
-        emitError(e.what());
+        const auto currentOptions = options();
+        const bool promiseRejected =
+            dynamic_cast<const AuthflowPromiseRejection*>(&e) != nullptr;
+        if (!currentOptions.password.empty() &&
+            (!currentOptions.authflow || promiseRejected)) {
+            std::cerr
+                << "Sign in failed, try removing the password field\n";
+        }
+        // authenticate() logs the original failure and emits `error`, but its
+        // catch swallows a normally handled event. startQueue has already run
+        // and remains alive unless an error listener explicitly closes it.
+        std::cerr << e.what() << "\n";
+
+        AuthenticationUnhandledRejectionHandler rejectionHandler;
+        {
+            std::lock_guard<std::mutex> lock(eventHandlersMutex_);
+            rejectionHandler = authenticationUnhandledRejectionHandler_;
+        }
+        std::optional<std::string> unhandledRejection;
+        try {
+            emitError(e.what());
+        } catch (const std::exception& listenerError) {
+            unhandledRejection = listenerError.what();
+        } catch (...) {
+            unhandledRejection = "Unknown asynchronous error";
+        }
+        if (unhandledRejection.has_value()) {
+            dispatchAuthenticationUnhandledRejection(
+                std::move(rejectionHandler),
+                std::move(*unhandledRejection)
+            );
+        }
         return false;
     }
 
@@ -513,11 +579,28 @@ bool BedrockNetworkClient::connect() {
     return true;
 }
 
+bool BedrockNetworkClient::connectPreparationOwnedByCurrentThread() {
+    std::lock_guard<std::mutex> lock(connectLifecycleMutex_);
+    return connectLifecyclePhase_ == ConnectLifecyclePhase::Preparing &&
+        connectLifecycleOwnerThreadId_ == std::this_thread::get_id();
+}
+
 bool BedrockNetworkClient::prepareConnectLifecycle(bool deferQueuePump) {
+    bool reentrantPreparation = false;
     for (;;) {
         std::unique_lock<std::mutex> lock(connectLifecycleMutex_);
         if (rakNetStopRequested_.load()) return false;
         if (connectLifecyclePhase_ == ConnectLifecyclePhase::Preparing) {
+            if (connectLifecycleOwnerThreadId_ ==
+                std::this_thread::get_id()) {
+                // auth.authenticate() emits constructor failures before its
+                // first await. EventEmitter therefore permits an error
+                // listener to call client.connect() recursively. Run another
+                // complete auth/startQueue pass without publishing over the
+                // still-active outer preparation phase.
+                reentrantPreparation = true;
+                break;
+            }
             connectLifecycleCv_.wait(lock, [this]() {
                 return connectLifecyclePhase_ !=
                     ConnectLifecyclePhase::Preparing;
@@ -534,12 +617,22 @@ bool BedrockNetworkClient::prepareConnectLifecycle(bool deferQueuePump) {
             return true;
         }
         connectLifecyclePhase_ = ConnectLifecyclePhase::Preparing;
+        connectLifecycleOwnerThreadId_ = std::this_thread::get_id();
         break;
     }
 
     bool authenticationRejected = false;
     std::string authenticationError;
     std::optional<std::string> authenticationUnhandledRejection;
+    AuthenticationUnhandledRejectionHandler rejectionHandler;
+    {
+        std::lock_guard<std::mutex> lock(eventHandlersMutex_);
+        // This is an internal process-boundary bridge, not an EventEmitter
+        // listener. Retain the admitted callback even if an error listener
+        // synchronously calls close()/removeAllListeners below.
+        rejectionHandler = authenticationUnhandledRejectionHandler_;
+    }
+    bool queueStartedAfterTransportStop = false;
     try {
         // Client.connect() performs authentication setup before startQueue().
         // Offline auth validates only the username and does not run auth.js's
@@ -550,17 +643,17 @@ bool BedrockNetworkClient::prepareConnectLifecycle(bool deferQueuePump) {
             }
         } else {
             auto authOptionsSnapshot = options();
+            std::filesystem::path selectedCacheRoot;
 
             // auth.js validateOptions mutates profilesFolder first. The
-            // canonical JS field wins over the older native cache alias even
-            // when it is omitted/falsy.
+            // resulting public property is independent of Authflow's private
+            // cachePath. Unknown extension properties are left untouched.
             if (!authOptionsSnapshot.profilesFolder.truthy()) {
                 const auto folder = defaultProfilesFolder();
                 authOptionsSnapshot.profilesFolder.setResolved(folder);
-                authOptionsSnapshot.authCacheRoot = folder;
+                selectedCacheRoot = folder;
             } else if (!authOptionsSnapshot.profilesFolder.isBoolean()) {
-                authOptionsSnapshot.authCacheRoot =
-                    authOptionsSnapshot.profilesFolder.path();
+                selectedCacheRoot = authOptionsSnapshot.profilesFolder.path();
             }
 
             // auth.js keys solely on undefined authTitle. Unknown extension
@@ -573,37 +666,16 @@ bool BedrockNetworkClient::prepareConnectLifecycle(bool deferQueuePump) {
                 authOptionsSnapshot.flow = "live";
             }
 
-            const XboxLiveAuthFlowOptions authFlow {
-                .authTitle = *authOptionsSnapshot.authTitle,
-                .deviceType = authOptionsSnapshot.deviceType,
-                .flow = authOptionsSnapshot.flow
-            };
-
-            try {
-                // MicrosoftAuthFlow checks flow before touching its cache.
-                XboxLiveAuth::validatePrismarineAuthFlowPresence(authFlow);
-                authOptionsSnapshot.authCacheRoot =
-                    initializePrismarineAuthCacheRoot(
-                        authOptionsSnapshot.profilesFolder,
-                        authOptionsSnapshot.authCacheRoot
-                    );
-                XboxLiveAuth::validatePrismarineAuthFlow(authFlow);
-            } catch (const std::exception& error) {
-                authenticationRejected = true;
-                authenticationError = error.what();
-            }
-
-            // Publish the JS-visible mutations atomically. The full owned
-            // snapshot handed to the facade is taken while they are stable,
-            // then invoked outside every native mutex and before error emit,
-            // queue hooks, or lifecycle phase publication.
+            // validateOptions() mutates the same public object synchronously,
+            // before `new PrismarineAuth(...)` can validate flow or touch its
+            // cache. Publish those mutations before reproducing constructor
+            // work, while preserving every unrelated caller property.
             {
                 std::lock_guard<std::mutex> lock(optionsMutex_);
                 options_.authTitle = authOptionsSnapshot.authTitle;
                 options_.deviceType = authOptionsSnapshot.deviceType;
                 options_.flow = authOptionsSnapshot.flow;
                 options_.profilesFolder = authOptionsSnapshot.profilesFolder;
-                options_.authCacheRoot = authOptionsSnapshot.authCacheRoot;
                 authOptionsSnapshot = options_;
             }
 
@@ -612,8 +684,64 @@ bool BedrockNetworkClient::prepareConnectLifecycle(bool deferQueuePump) {
                 std::lock_guard<std::mutex> lock(eventHandlersMutex_);
                 resolvedHandler = authenticationOptionsResolvedHandler_;
             }
-            if (resolvedHandler) {
-                resolvedHandler(std::move(authOptionsSnapshot));
+            if (resolvedHandler) resolvedHandler(authOptionsSnapshot);
+
+            if (authOptionsSnapshot.authflow) {
+                // `options.authflow || new PrismarineAuth(...)`: a truthy
+                // supplied object bypasses the constructor, cache setup, flow
+                // validation and msalConfig processing completely. Its method
+                // call itself is synchronous; only the returned Promise is
+                // deferred until after startQueue().
+                try {
+                    std::string clientX509;
+                    {
+                        std::lock_guard<std::mutex> lock(optionsMutex_);
+                        if (clientKeys_.privateKeyPem.empty()) {
+                            clientKeys_ =
+                                BedrockAuthJwt::generateP384KeyPair();
+                        }
+                        clientX509 = clientKeys_.publicKeyDerBase64;
+                    }
+                    auto pending = authOptionsSnapshot.authflow->
+                        getMinecraftBedrockToken(clientX509);
+                    if (!pending.valid()) {
+                        throw std::runtime_error(
+                            "authflow.getMinecraftBedrockToken(...).catch "
+                            "is not a function"
+                        );
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(optionsMutex_);
+                        pendingAuthflowChains_ = std::move(pending);
+                    }
+                } catch (const std::exception& error) {
+                    authenticationRejected = true;
+                    authenticationError = error.what();
+                }
+            } else {
+                const XboxLiveAuthFlowOptions authFlow {
+                    .authTitle = *authOptionsSnapshot.authTitle,
+                    .deviceType = authOptionsSnapshot.deviceType,
+                    .flow = authOptionsSnapshot.flow
+                };
+
+                try {
+                    // MicrosoftAuthFlow checks flow before touching its cache.
+                    XboxLiveAuth::validatePrismarineAuthFlowPresence(authFlow);
+                    const auto effectiveCacheRoot =
+                        initializePrismarineAuthCacheRoot(
+                            authOptionsSnapshot.profilesFolder,
+                            selectedCacheRoot
+                        );
+                    {
+                        std::lock_guard<std::mutex> lock(optionsMutex_);
+                        authenticationCacheRoot_ = effectiveCacheRoot;
+                    }
+                    XboxLiveAuth::validatePrismarineAuthFlow(authFlow);
+                } catch (const std::exception& error) {
+                    authenticationRejected = true;
+                    authenticationError = error.what();
+                }
             }
 
             if (authenticationRejected) {
@@ -638,40 +766,50 @@ bool BedrockNetworkClient::prepareConnectLifecycle(bool deferQueuePump) {
             beforeQueueStartTestHook = beforeQueueStartTestHook_;
         }
         if (beforeQueueStartTestHook) beforeQueueStartTestHook();
-        if (!startQueue(!deferQueuePump)) {
-            std::lock_guard<std::mutex> lock(connectLifecycleMutex_);
-            authenticationRejected_ = false;
-            connectLifecyclePhase_ = ConnectLifecyclePhase::Idle;
-            connectLifecycleCv_.notify_all();
-            return false;
-        }
-
-        if (authenticationUnhandledRejection.has_value()) {
-            AuthenticationUnhandledRejectionHandler rejectionHandler;
-            {
-                std::lock_guard<std::mutex> lock(eventHandlersMutex_);
-                rejectionHandler =
-                    authenticationUnhandledRejectionHandler_;
-            }
-            if (rejectionHandler) {
-                try {
-                    rejectionHandler(*authenticationUnhandledRejection);
-                } catch (...) {
-                    // This is an internal Promise-rejection reporting seam;
-                    // a reporting sink cannot retroactively abort JS's
-                    // already completed startQueue() call.
+        queueStartedAfterTransportStop = authenticationRejected &&
+            rakNetStopRequested_.load();
+        if (!startQueue(
+                !deferQueuePump || queueStartedAfterTransportStop,
+                queueStartedAfterTransportStop
+            )) {
+            if (!reentrantPreparation) {
+                {
+                    std::lock_guard<std::mutex> lock(connectLifecycleMutex_);
+                    authenticationRejected_ = false;
+                    connectLifecyclePhase_ = ConnectLifecyclePhase::Idle;
+                    connectLifecycleOwnerThreadId_ = std::thread::id{};
                 }
+                connectLifecycleCv_.notify_all();
             }
+            return false;
         }
         resetLifecycle();
     } catch (...) {
-        {
-            std::lock_guard<std::mutex> lock(connectLifecycleMutex_);
-            authenticationRejected_ = false;
-            connectLifecyclePhase_ = ConnectLifecyclePhase::Idle;
+        if (!reentrantPreparation) {
+            {
+                std::lock_guard<std::mutex> lock(connectLifecycleMutex_);
+                authenticationRejected_ = false;
+                connectLifecyclePhase_ = ConnectLifecyclePhase::Idle;
+                connectLifecycleOwnerThreadId_ = std::thread::id{};
+            }
+            connectLifecycleCv_.notify_all();
         }
-        connectLifecycleCv_.notify_all();
         throw;
+    }
+
+    if (reentrantPreparation) {
+        // The nested JavaScript connect() has now performed its own
+        // startQueue(). Keep the outer owner's phase and rejection result
+        // untouched; it still has to run its later startQueue() and publish
+        // Prepared. Promise rejection reporting, if any, belongs to this
+        // nested authenticate() call and is independently deferred.
+        if (authenticationUnhandledRejection.has_value()) {
+            dispatchAuthenticationUnhandledRejection(
+                std::move(rejectionHandler),
+                std::move(*authenticationUnhandledRejection)
+            );
+        }
+        return !rakNetStopRequested_.load();
     }
 
     bool stopped = false;
@@ -682,14 +820,21 @@ bool BedrockNetworkClient::prepareConnectLifecycle(bool deferQueuePump) {
         connectLifecyclePhase_ = stopped
             ? ConnectLifecyclePhase::Idle
             : ConnectLifecyclePhase::Prepared;
+        connectLifecycleOwnerThreadId_ = std::thread::id{};
     }
     connectLifecycleCv_.notify_all();
+    if (authenticationUnhandledRejection.has_value()) {
+        dispatchAuthenticationUnhandledRejection(
+            std::move(rejectionHandler),
+            std::move(*authenticationUnhandledRejection)
+        );
+    }
     if (stopped) {
         // A full close may already have stopped the pump and returned before
         // this preparation owner observes the stop bit. Do not clear packets
         // queued by the caller after that close; only cancel a pump that is
         // still running (for example after requestRakNetStop()).
-        stopQueueIfRunning();
+        if (!queueStartedAfterTransportStop) stopQueueIfRunning();
         return false;
     }
     return true;
@@ -1275,8 +1420,6 @@ void BedrockNetworkClient::clearEventHandlers() {
     closeHandlers_.clear();
     errorHandlers_.clear();
     statusHandlers_.clear();
-    authenticationOptionsResolvedHandler_ = {};
-    authenticationUnhandledRejectionHandler_ = {};
 }
 
 void BedrockNetworkClient::emitAnyPacket(const VersionedGamePacket& packet) {
@@ -1742,7 +1885,13 @@ bool BedrockNetworkClient::tryStoreLevelChunk(const BedrockLevelChunkPacket& lev
 }
 
 void BedrockNetworkClient::prepareLoginPacket() {
-    auto authOptions = options();
+    BedrockNetworkClientOptions authOptions;
+    std::filesystem::path effectiveAuthenticationCacheRoot;
+    {
+        std::lock_guard<std::mutex> lock(optionsMutex_);
+        authOptions = options_;
+        effectiveAuthenticationCacheRoot = authenticationCacheRoot_;
+    }
     if (!authOptions.loginPacket.empty()) {
         if (clientKeys_.privateKeyPem.empty()) {
             clientKeys_ = XboxLiveAuth::loadOrCreateProfileKeyPair(
@@ -1753,7 +1902,7 @@ void BedrockNetworkClient::prepareLoginPacket() {
         return;
     }
 
-    auto generated = XboxLiveAuth::makeLoginPacket({
+    XboxLiveAuthOptions loginOptions {
         .profileName = authOptions.profile,
         .version = authOptions.version,
         .protocolVersion = session_.definition().protocolVersion(),
@@ -1764,7 +1913,12 @@ void BedrockNetworkClient::prepareLoginPacket() {
         .deviceType = authOptions.deviceType,
         .flow = authOptions.flow,
         .xboxClientId = authOptions.xboxClientId,
-        .cacheRoot = authOptions.authCacheRoot,
+        // Online Authflow owns the canonical profilesFolder-derived path.
+        // The legacy native alias remains available only to the native offline
+        // extension and never mutates the JavaScript-visible options object.
+        .cacheRoot = authOptions.offline
+            ? authOptions.authCacheRoot
+            : effectiveAuthenticationCacheRoot,
         .clientDataJson = authOptions.clientDataJson,
         .onMsaCode = authOptions.onMsaCode,
         .onDeviceCode = [](const XboxDeviceCodeInfo& info) {
@@ -1777,7 +1931,39 @@ void BedrockNetworkClient::prepareLoginPacket() {
         .onLog = [](const std::string& message) {
             std::cout << "[XBOX] " << message << "\n";
         }
-    });
+    };
+
+    XboxLiveLoginPacket generated;
+    if (authOptions.authflow) {
+        std::future<std::vector<std::string>> pendingChains;
+        BedrockClientKeyPair authflowKeys;
+        {
+            std::lock_guard<std::mutex> lock(optionsMutex_);
+            pendingChains = std::move(pendingAuthflowChains_);
+            authflowKeys = clientKeys_;
+        }
+        if (!pendingChains.valid()) {
+            throw std::runtime_error(
+                "authflow.getMinecraftBedrockToken(...).catch is not a function"
+            );
+        }
+        std::vector<std::string> chains;
+        try {
+            chains = pendingChains.get();
+        } catch (const std::exception& error) {
+            // auth.js's inner Promise.catch emits the password warning only
+            // for rejection of getMinecraftBedrockToken itself. Later chain
+            // parsing/build failures skip that warning.
+            throw AuthflowPromiseRejection(error.what());
+        }
+        generated = XboxLiveAuth::makeLoginPacketFromChains(
+            std::move(loginOptions),
+            std::move(authflowKeys),
+            std::move(chains)
+        );
+    } else {
+        generated = XboxLiveAuth::makeLoginPacket(std::move(loginOptions));
+    }
 
     {
         std::lock_guard<std::mutex> lock(optionsMutex_);
@@ -1843,12 +2029,15 @@ void BedrockNetworkClient::drainSessionOutgoing() {
     }
 }
 
-bool BedrockNetworkClient::startQueue(bool pumpEnabled) {
+bool BedrockNetworkClient::startQueue(
+    bool pumpEnabled,
+    bool allowAfterTransportStop
+) {
     std::lock_guard<std::mutex> lifecycleLock(queueLifecycleMutex_);
     // Serialize start admission with stopQueue(). If close published its stop
     // before this lock was acquired, no post-close queue thread is created. If
     // start won first, close necessarily acquires this lock next and joins it.
-    if (rakNetStopRequested_.load()) return false;
+    if (rakNetStopRequested_.load() && !allowAfterTransportStop) return false;
     // This is an internal lifecycle replacement, not a public stop. Preserve
     // a failed-close catch-boundary deadline installed before or during the
     // old worker's join; the fresh queue must not become runnable inside that
@@ -1856,7 +2045,9 @@ bool BedrockNetworkClient::startQueue(bool pumpEnabled) {
     stopQueueLocked(true);
     {
         std::lock_guard<std::mutex> lock(queueMutex_);
-        if (rakNetStopRequested_.load()) return false;
+        if (rakNetStopRequested_.load() && !allowAfterTransportStop) {
+            return false;
+        }
         const bool closeEmissionActive = closing_.load();
         const bool rollbackBoundaryPending =
             queuePumpResumeDue_.has_value();

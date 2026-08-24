@@ -89,6 +89,15 @@ public:
 
     static XboxLiveLoginPacket makeLoginPacket(XboxLiveAuthOptions options);
 
+    // Completes auth.js's supplied options.authflow path. The caller already
+    // owns the KeyExchange P-384 key and the Promise result, so this overload
+    // must not construct/validate the built-in Authflow or touch its cache.
+    static XboxLiveLoginPacket makeLoginPacketFromChains(
+        XboxLiveAuthOptions options,
+        BedrockClientKeyPair keyPair,
+        std::vector<std::string> chains
+    );
+
     static BedrockClientKeyPair loadOrCreateProfileKeyPair(
         const std::string& profileName,
         const std::filesystem::path& cacheRoot = {}

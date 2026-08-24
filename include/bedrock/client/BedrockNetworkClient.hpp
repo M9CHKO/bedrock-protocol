@@ -5,6 +5,7 @@
 #include <bedrock/LoginPacket.hpp>
 #include <bedrock/Options.hpp>
 #include <bedrock/auth/BedrockAuthJwt.hpp>
+#include <bedrock/auth/Authflow.hpp>
 #include <bedrock/auth/XboxLiveAuth.hpp>
 #include <bedrock/client/RakNetClient.hpp>
 #include <bedrock/client/VersionedClientSession.hpp>
@@ -155,6 +156,10 @@ struct BedrockNetworkClientOptions {
     std::optional<std::string> authTitle;
     std::string deviceType;
     std::string flow;
+    // Runtime bedrock-protocol accepts a prebuilt prismarine-auth-like object
+    // even though its bundled TypeScript declaration omits the property.
+    std::shared_ptr<Authflow> authflow;
+    std::string password;
     // Deprecated compatibility alias. New code should use authTitle.
     std::string xboxClientId;
     std::filesystem::path authCacheRoot;
@@ -394,6 +399,15 @@ private:
     std::unique_ptr<BedrockCipherStream> decryptStream_;
     BedrockClientKeyPair clientKeys_;
     mutable std::mutex optionsMutex_;
+    // MicrosoftAuthFlow keeps its selected/fallback cache directory on the
+    // Authflow instance. It never writes that private path back into the
+    // caller's options object (including unknown extension properties such as
+    // authCacheRoot), so keep the effective directory separate from options_.
+    std::filesystem::path authenticationCacheRoot_;
+    // A supplied Authflow method is invoked synchronously during
+    // Client.connect(), then its Promise settles after startQueue(). std::future
+    // carries that same split into the native connect worker.
+    std::future<std::vector<std::string>> pendingAuthflowChains_;
     // Protected by connectLifecycleMutex_. A rejected Authflow constructor
     // still permits startQueue(), but it must never reach login/transport.
     bool authenticationRejected_ = false;
@@ -443,7 +457,11 @@ private:
     void sendLogin();
     void startEncryptionFromServerHandshake(const std::string& token);
     void drainSessionOutgoing();
-    bool startQueue(bool pumpEnabled = true);
+    bool connectPreparationOwnedByCurrentThread();
+    bool startQueue(
+        bool pumpEnabled = true,
+        bool allowAfterTransportStop = false
+    );
     void resumeQueuePump();
     bool pauseQueuePump();
     void stopQueue();

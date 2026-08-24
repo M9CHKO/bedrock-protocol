@@ -384,7 +384,12 @@ bool RakNetClient::connect() {
 
     addrinfo* res = nullptr;
     const auto portString = std::to_string(options_.port);
-    int gai = getaddrinfo(options_.host.c_str(), portString.c_str(), &hints, &res);
+    // raknet-native constructs its SystemAddress with IPv4 explicitly. RakNet
+    // treats the IPv6 loopback as a special case and maps it to IPv4 loopback
+    // before starting the AF_INET connection.
+    const std::string resolvedHost =
+        options_.host == "::1" ? "127.0.0.1" : options_.host;
+    int gai = getaddrinfo(resolvedHost.c_str(), portString.c_str(), &hints, &res);
     if (gai != 0 || !res) {
         error_ = std::string("getaddrinfo failed: ") + gai_strerror(gai);
         return false;

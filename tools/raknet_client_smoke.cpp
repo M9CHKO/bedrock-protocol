@@ -21,7 +21,8 @@ int main() {
     server.listen();
 
     bedrock::RakNetClient client({
-        .host = "127.0.0.1",
+        // raknet-native maps ::1 to IPv4 loopback for its AF_INET client.
+        .host = "::1",
         .port = server.boundPort(),
         .mtu = 1400,
         .protocolVersion = 11,

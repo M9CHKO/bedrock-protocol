@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <future>
 #include <iostream>
 #include <mutex>
 #include <stdexcept>
@@ -186,6 +187,13 @@ struct BedrockNetworkClientTestAccess {
     static bool hasTransport(BedrockNetworkClient& client) {
         std::lock_guard<std::mutex> lock(client.sendMutex_);
         return static_cast<bool>(client.raknet_);
+    }
+
+    static std::filesystem::path effectiveAuthenticationCacheRoot(
+        BedrockNetworkClient& client
+    ) {
+        std::lock_guard<std::mutex> lock(client.optionsMutex_);
+        return client.authenticationCacheRoot_;
     }
 
     static bool stopRequested(const BedrockNetworkClient& client) {
@@ -446,7 +454,7 @@ bedrock::Options baseOptions(uint16_t port) {
     options.port = port;
     options.username = "FactorySmoke";
     options.offline = true;
-    options.connectTimeoutMs = 35;
+    options.connectTimeout = 35;
     options.conLog = {};
     return options;
 }
@@ -514,7 +522,88 @@ bool checkDirectAndSkipPing() {
     ok &= check(rawPortExact,
                 "direct Client with omitted port did not reject exactly");
 
-    bedrock::Client direct(baseOptions(9));
+    bedrock::Options delayedOptions;
+    delayedOptions.delayedInit = true;
+    bedrock::Client delayed(std::move(delayedOptions));
+    ok &= check(!delayed.initialized() &&
+                    delayed.options().delayedInit.truthy(),
+                "delayedInit=true did not defer direct Client.init");
+    delayed.options().host = "127.0.0.1";
+    delayed.options().port = 0;
+    delayed.options().username = "DelayedFactorySmoke";
+    delayed.options().offline = true;
+    delayed.options().connectTimeout = 0;
+    delayed.options().conLog = {};
+    delayed.init();
+    ok &= check(delayed.initialized() &&
+                    delayed.options().port == 0 &&
+                    delayed.options().connectTimeout == std::optional<int>(0) &&
+                    delayed.network().options().connectTimeoutMs == 9000,
+                "mutable delayed options were not consumed by init()");
+    delayed.close();
+
+    bool delayedInitErrorExact = false;
+    try {
+        bedrock::Options invalidDelayedOptions;
+        invalidDelayedOptions.delayedInit = true;
+        bedrock::Client invalidDelayed(std::move(invalidDelayedOptions));
+        invalidDelayed.init();
+    } catch (const std::exception& error) {
+        delayedInitErrorExact = std::string(error.what()) == "Invalid host/port";
+    }
+    ok &= check(delayedInitErrorExact,
+                "public delayed init() did not retain JS validation boundary");
+
+    std::vector<std::string> delayedPingLogs;
+    bedrock::Options delayedPingOptions;
+    delayedPingOptions.host = "delayed-host";
+    delayedPingOptions.port = 19132;
+    delayedPingOptions.delayedInit = true;
+    delayedPingOptions.conLog = [&](const std::string& message) {
+        delayedPingLogs.push_back(message);
+    };
+    bedrock::Client delayedPing(std::move(delayedPingOptions));
+    bool delayedPingErrorExact = false;
+    try {
+        (void)delayedPing.ping();
+    } catch (const std::exception& error) {
+        delayedPingErrorExact = std::string(error.what()) ==
+            "Cannot read properties of undefined (reading 'ping')";
+    }
+    ok &= check(
+        delayedPingErrorExact && delayedPingLogs == std::vector<std::string>{
+            "Unable to connect to [delayed-host]/19132. Is the server running?"
+        },
+        "Client::ping before init did not match the JS catch/log boundary"
+    );
+
+    PingResponder directPingResponder("1.20.40", 0, 0ms);
+    auto directPingOptions = baseOptions(directPingResponder.port());
+    bedrock::Client directPingClient(directPingOptions);
+    const auto directPong = directPingClient.ping();
+    ok &= check(directPong.size() > 7 && directPong.substr(2, 5) == "MCPE;",
+                "Client::ping did not return the raw RakNet advertisement");
+    directPingResponder.finish();
+
+    auto undefinedTimeoutOptions = baseOptions(9);
+    undefinedTimeoutOptions.connectTimeout = bedrock::jsUndefined;
+    bedrock::Client undefinedTimeout(undefinedTimeoutOptions);
+    ok &= check(undefinedTimeout.options().connectTimeout.isUndefined() &&
+                    undefinedTimeout.options().connectTimeout.hasOwn() &&
+                    undefinedTimeout.network().options().connectTimeoutMs == 9000,
+                "explicit connectTimeout=undefined did not override defaultOptions");
+
+    auto nullTimeoutOptions = baseOptions(9);
+    nullTimeoutOptions.connectTimeout = nullptr;
+    bedrock::Client nullTimeout(nullTimeoutOptions);
+    ok &= check(nullTimeout.options().connectTimeout.isNull() &&
+                    nullTimeout.options().connectTimeout.hasOwn() &&
+                    nullTimeout.network().options().connectTimeoutMs == 9000,
+                "explicit connectTimeout=null did not retain null/|| semantics");
+
+    auto directOptions = baseOptions(9);
+    directOptions.connectTimeout.reset();
+    bedrock::Client direct(directOptions);
     ok &= check(direct.initialized(), "direct Client did not initialize synchronously");
     ok &= check(
         direct.options().version == std::string(bedrock::CURRENT_VERSION),
@@ -556,6 +645,9 @@ bool checkDirectAndSkipPing() {
     ok &= check(client.options().port == 9, "skipPing changed port");
     ok &= check(client.options().followPort == std::optional<bool>(false),
                 "skipPing lost explicit followPort=false");
+    ok &= check(client.options().delayedInit.truthy() &&
+                    client.options().delayedInit.hasOwn(),
+                "createClient did not force delayedInit=true as its final field");
     ok &= check(logs.load() == 0, "skipPing called conLog");
     // The normal-path transport-install barrier below is the deterministic
     // proof that the native handshake runs off-thread. Keep only a generous
@@ -588,6 +680,7 @@ bool checkDirectAndSkipPing() {
     auto factoryDefaultPortClient = bedrock::createClient(factoryDefaultPort);
     ok &= check(
         factoryDefaultPortClient.options().port.has_value() &&
+            factoryDefaultPortClient.options().port.hasOwn() &&
             !factoryDefaultPortClient.options().port.provided() &&
             factoryDefaultPortClient.options().port == 19132,
         "createClient did not inject its factory-only port=19132"
@@ -605,6 +698,44 @@ bool checkDirectAndSkipPing() {
         "createClient replaced explicit port=0 with 19132"
     );
     factoryZeroPortClient.close();
+
+    const auto checkNullishFactoryPort = [&](auto nullish, const std::string& label) {
+        bool exact = false;
+        try {
+            auto options = baseOptions(9);
+            options.port = nullish;
+            options.skipPing = true;
+            auto invalidClient = bedrock::createClient(options);
+            (void)invalidClient;
+        } catch (const std::exception& error) {
+            exact = std::string(error.what()) == "Invalid host/port";
+        }
+        ok &= check(exact, label);
+    };
+    checkNullishFactoryPort(
+        bedrock::jsUndefined,
+        "createClient replaced explicit port=undefined with 19132"
+    );
+    checkNullishFactoryPort(
+        nullptr,
+        "createClient replaced explicit port=null with 19132"
+    );
+
+    auto undefinedFollow = baseOptions(9);
+    undefinedFollow.skipPing = true;
+    undefinedFollow.followPort = bedrock::jsUndefined;
+    auto undefinedFollowClient = bedrock::createClient(undefinedFollow);
+    ok &= check(undefinedFollowClient.options().followPort.isUndefined(),
+                "createClient replaced explicit followPort=undefined");
+    undefinedFollowClient.close();
+
+    auto nullFollow = baseOptions(9);
+    nullFollow.skipPing = true;
+    nullFollow.followPort = nullptr;
+    auto nullFollowClient = bedrock::createClient(nullFollow);
+    ok &= check(nullFollowClient.options().followPort.isNull(),
+                "createClient replaced explicit followPort=null");
+    nullFollowClient.close();
 
     bool invalidAddressExact = false;
     try {
@@ -671,6 +802,9 @@ bool checkDirectAndSkipPing() {
     }
     bedrock::ClientFactoryTestAccess::launchAutoConnectWorker(preparationThrow);
     const auto preparationThrowResolved = preparationThrow.options();
+    const auto preparationThrowCache =
+        bedrock::BedrockNetworkClientTestAccess::
+            effectiveAuthenticationCacheRoot(preparationThrow.network());
     ok &= check(
         preparationThrowExact && preparationThrow.autoConnectStarted() &&
             bedrock::ClientFactoryTestAccess::autoConnectCancelled(
@@ -688,7 +822,8 @@ bool checkDirectAndSkipPing() {
             preparationThrowResolved.deviceType == "Nintendo" &&
             preparationThrowResolved.flow == "live" &&
             preparationThrowResolved.profilesFolder.truthy() &&
-            preparationThrowResolved.authCacheRoot ==
+            preparationThrowResolved.authCacheRoot.empty() &&
+            preparationThrowCache ==
                 preparationThrowResolved.profilesFolder.path(),
         "failed auto-connect preparation lost preceding auth.js option mutations"
     );
@@ -735,6 +870,7 @@ bool checkCanonicalClientOptionsParity() {
                 "offline missing username did not fail at connect boundary exactly");
 
     auto aliases = baseOptions(9);
+    aliases.connectTimeout.reset();
     aliases.connectTimeoutMs = 321;
     aliases.batchingIntervalMs = -7;
     aliases.chunkRadius = -3;
@@ -745,10 +881,13 @@ bool checkCanonicalClientOptionsParity() {
                     !aliasPublic.batchingInterval.has_value() &&
                     !aliasPublic.viewDistance.has_value(),
                 "Client.options did not merge the canonical JS defaults");
-    ok &= check(aliasNetwork.connectTimeoutMs == 321 &&
-                    aliasNetwork.batchingIntervalMs == -7 &&
-                    aliasNetwork.chunkRadius == -3,
-                "legacy C++ aliases changed when canonical fields were omitted");
+    ok &= check(aliasPublic.connectTimeoutMs == 321 &&
+                    aliasPublic.batchingIntervalMs == -7 &&
+                    aliasPublic.chunkRadius == -3 &&
+                    aliasNetwork.connectTimeoutMs == 9000 &&
+                    aliasNetwork.batchingIntervalMs == 20 &&
+                    aliasNetwork.chunkRadius == 10,
+                "legacy extension fields affected canonical JS behavior");
 
     auto canonical = baseOptions(9);
     canonical.connectTimeoutMs = 123;
@@ -768,17 +907,17 @@ bool checkCanonicalClientOptionsParity() {
     const auto canonicalPublic = canonicalClient.options();
     const auto canonicalNetwork = canonicalClient.network().options();
     ok &= check(canonicalPublic.connectTimeout == std::optional<int>(0) &&
-                    canonicalPublic.connectTimeoutMs == 9000 &&
+                    canonicalPublic.connectTimeoutMs == 123 &&
                     canonicalNetwork.connectTimeoutMs == 9000,
                 "connectTimeout=0 did not use JS || 9000 semantics");
     ok &= check(canonicalPublic.batchingInterval == std::optional<int>(-8) &&
-                    canonicalPublic.batchingIntervalMs == 1 &&
+                    canonicalPublic.batchingIntervalMs == 456 &&
                     canonicalNetwork.batchingIntervalMs == 1,
                 "negative batchingInterval did not use Node's 1ms clamp");
     ok &= check(canonicalPublic.viewDistance == std::optional<int32_t>(0) &&
                     canonicalNetwork.viewDistance == std::optional<int32_t>(0) &&
                     canonicalPublic.chunkRadius == 77 &&
-                    canonicalNetwork.chunkRadius == 77,
+                    canonicalNetwork.chunkRadius == 10,
                 "options.viewDistance incorrectly changed the live chunk radius");
     ok &= check(canonicalPublic.raknetBackend == "raknet-native" &&
                     canonicalNetwork.raknetBackend == "raknet-native" &&
@@ -821,6 +960,9 @@ bool checkCanonicalClientOptionsParity() {
                 "online auth defaults ran before connect boundary");
     bedrock::ClientFactoryTestAccess::markAutoConnect(onlineClient);
     const auto onlineResolved = onlineClient.options();
+    const auto onlineEffectiveCache =
+        bedrock::BedrockNetworkClientTestAccess::
+            effectiveAuthenticationCacheRoot(onlineClient.network());
     ok &= check(onlineResolved.authTitle == std::optional<std::string>(
                     std::string(bedrock::Titles::MinecraftNintendoSwitch)) &&
                     onlineResolved.deviceType == "Nintendo" &&
@@ -828,13 +970,13 @@ bool checkCanonicalClientOptionsParity() {
                 "online auth boundary did not apply auth.js title/device/flow defaults");
     ok &= check(onlineResolved.profilesFolder.provided() &&
                     onlineResolved.profilesFolder.truthy() &&
-                    !onlineResolved.authCacheRoot.empty() &&
                     onlineResolved.authCacheRoot ==
-                        onlineResolved.profilesFolder.path() &&
-                    onlineResolved.authCacheRoot !=
                         std::filesystem::path("legacy-cache-must-not-win") &&
-                    onlineResolved.authCacheRoot.filename() == "nmp-cache",
-                "profilesFolder=false did not select the online JS default");
+                    onlineEffectiveCache ==
+                        onlineResolved.profilesFolder.path() &&
+                    onlineEffectiveCache.filename() == "nmp-cache",
+                "profilesFolder=false did not keep public options separate "
+                "from the private online JS cache");
     onlineClient.close();
 
     auto directPreparationThrowOptions = baseOptions(9);
@@ -854,6 +996,9 @@ bool checkCanonicalClientOptionsParity() {
             std::string(error.what()) == "direct queue start preparation boom";
     }
     const auto directPreparationThrowResolved = directPreparationThrow.options();
+    const auto directPreparationThrowCache =
+        bedrock::BedrockNetworkClientTestAccess::
+            effectiveAuthenticationCacheRoot(directPreparationThrow.network());
     ok &= check(
         directPreparationThrowExact &&
             directPreparationThrowResolved.authTitle ==
@@ -862,7 +1007,8 @@ bool checkCanonicalClientOptionsParity() {
             directPreparationThrowResolved.deviceType == "Nintendo" &&
             directPreparationThrowResolved.flow == "live" &&
             directPreparationThrowResolved.profilesFolder.truthy() &&
-            directPreparationThrowResolved.authCacheRoot ==
+            directPreparationThrowResolved.authCacheRoot.empty() &&
+            directPreparationThrowCache ==
                 directPreparationThrowResolved.profilesFolder.path(),
         "direct failed preparation lost preceding auth.js option mutations"
     );
@@ -878,13 +1024,20 @@ bool checkCanonicalClientOptionsParity() {
     bedrock::Client explicitOnlineClient(explicitOnline);
     bedrock::ClientFactoryTestAccess::markAutoConnect(explicitOnlineClient);
     const auto explicitResolved = explicitOnlineClient.options();
+    const auto explicitEffectiveCache =
+        bedrock::BedrockNetworkClientTestAccess::
+            effectiveAuthenticationCacheRoot(explicitOnlineClient.network());
     ok &= check(explicitResolved.authTitle == std::optional<std::string>("") &&
                     explicitResolved.deviceType == "ExplicitDevice" &&
                     explicitResolved.flow == "ExplicitFlow",
                 "explicit authTitle did not preserve deviceType/flow");
-    ok &= check(explicitResolved.authCacheRoot ==
-                    std::filesystem::path("canonical-profile-cache"),
-                "canonical profilesFolder did not override authCacheRoot alias");
+    ok &= check(
+        explicitResolved.authCacheRoot ==
+            std::filesystem::path("legacy-profile-cache") &&
+            explicitEffectiveCache ==
+                std::filesystem::path("canonical-profile-cache"),
+        "canonical profilesFolder did not remain private from authCacheRoot"
+    );
     explicitOnlineClient.close();
 
     bool unsupportedJsBackendExact = false;
@@ -907,8 +1060,8 @@ bool checkAsyncOrderAndFourPartVersion() {
     constexpr uint16_t kFollowedPort = 23010;
     PingResponder responder("1.20.40.9", kFollowedPort, 80ms);
     auto options = baseOptions(responder.port());
-    options.connectTimeoutMs = 250;
-    options.batchingIntervalMs = 5000;
+    options.connectTimeout = 250;
+    options.batchingInterval = 5000;
 
     std::mutex logMutex;
     std::string connectionLog;
@@ -1009,7 +1162,7 @@ bool checkAsyncOrderAndFourPartVersion() {
 
     std::thread optionsReader([&]() {
         while (!stopOptionsReader.load()) {
-            const auto snapshot = client.options();
+            const auto snapshot = client.optionsSnapshot();
             const bool before =
                 snapshot.version == std::string(bedrock::CURRENT_VERSION) &&
                 snapshot.port == responder.port();
@@ -1075,8 +1228,8 @@ bool checkAsyncOrderAndFourPartVersion() {
 bool checkSlowConnectAllowedQueueGate() {
     PingResponder responder("1.20.40", 0, 35ms);
     auto options = baseOptions(responder.port());
-    options.batchingIntervalMs = 20;
-    options.connectTimeoutMs = 250;
+    options.batchingInterval = 20;
+    options.connectTimeout = 250;
     auto client = bedrock::createClient(options);
     std::atomic<int> allowed {0};
     std::atomic<bool> pumpPausedInsideSnapshot {false};
@@ -1186,7 +1339,7 @@ bool checkCloseInsideConnectAllowed() {
     for (int iteration = 0; iteration < 24; ++iteration) {
         PingResponder responder("1.20.40", 0, 0ms);
         auto options = baseOptions(responder.port());
-        options.connectTimeoutMs = 20;
+        options.connectTimeout = 20;
 
         auto client = bedrock::createClient(options);
         std::atomic<int> allowed {0};
@@ -1233,7 +1386,7 @@ bool checkCloseInsideConnectAllowed() {
     // without racing fd destruction or leaking its eventual failure event.
     PingResponder activeResponder("1.20.40", 0, 20ms);
     auto activeOptions = baseOptions(activeResponder.port());
-    activeOptions.connectTimeoutMs = 500;
+    activeOptions.connectTimeout = 500;
     auto active = bedrock::createClient(activeOptions);
     std::atomic<int> activeAllowed {0};
     std::atomic<int> activeErrors {0};
@@ -1276,7 +1429,7 @@ bool checkCloseInsideConnectAllowed() {
     // edge while the listener is still active.
     PingResponder destroyInCloseResponder("1.20.40", 0, 20ms);
     auto destroyInCloseOptions = baseOptions(destroyInCloseResponder.port());
-    destroyInCloseOptions.connectTimeoutMs = 35;
+    destroyInCloseOptions.connectTimeout = 35;
     std::unique_ptr<bedrock::Client> destroyInCloseOwner(
         new bedrock::Client(bedrock::createClient(destroyInCloseOptions))
     );
@@ -1451,7 +1604,7 @@ bool checkCloseInsideConnectAllowed() {
 
     PingResponder nestedCloseResponder("1.20.40", 0, 20ms);
     auto nestedCloseOptions = baseOptions(nestedCloseResponder.port());
-    nestedCloseOptions.connectTimeoutMs = 500;
+    nestedCloseOptions.connectTimeout = 500;
     auto nestedClose = bedrock::createClient(nestedCloseOptions);
     nestedClose.onError([](const std::string&) {});
     nestedClose.onConnectAllowed([]() {});
@@ -1872,6 +2025,546 @@ bool checkPingErrorAndCloseBeforePong() {
     ok &= check(waitFor([&]() { return remainingSnapshotListeners.load() == 1; }),
                 "Client destruction skipped remaining error snapshot listener");
     selfDestroyResponder.finish();
+    return ok;
+}
+
+bool checkInvalidAuthenticationBoundary() {
+    bool ok = true;
+    const std::string authError =
+        "Missing 'flow' argument in options. See docs for more information.";
+
+    const auto makeInvalidOptions = [&]() {
+        auto options = baseOptions(9);
+        options.delayedInit = true;
+        options.offline = false;
+        options.authTitle = std::string(bedrock::Titles::MinecraftIOS);
+        options.deviceType = "ExplicitDevice";
+        options.flow = "";
+        options.profilesFolder = true;
+        return options;
+    };
+
+    const auto checkUnhandledCase = [&](bool throwingErrorListener) {
+        auto options = makeInvalidOptions();
+        std::atomic<bool> connectReturned {false};
+        std::atomic<bool> sinkBeforeConnectReturn {false};
+        std::atomic<bool> queueRunningInSink {false};
+        std::atomic<bool> transportPresentInSink {true};
+        std::atomic<bool> connectWorkerPresentInSink {true};
+        std::atomic<int> sinkCalls {0};
+        std::atomic<int> errorCalls {0};
+        std::atomic<bool> queueRunningInError {true};
+        std::mutex messageMutex;
+        std::string sinkMessage;
+        std::string listenerMessage;
+        bedrock::Client* clientPointer = nullptr;
+
+        options.onUnhandledAsyncError = [&](const std::string& message) {
+            if (!connectReturned.load()) sinkBeforeConnectReturn = true;
+            if (clientPointer) {
+                queueRunningInSink =
+                    bedrock::BedrockNetworkClientTestAccess::queueRunning(
+                        clientPointer->network()
+                    );
+                transportPresentInSink =
+                    bedrock::BedrockNetworkClientTestAccess::hasTransport(
+                        clientPointer->network()
+                    );
+                connectWorkerPresentInSink =
+                    clientPointer->connectWorkerStarted();
+            }
+            {
+                std::lock_guard<std::mutex> lock(messageMutex);
+                sinkMessage = message;
+            }
+            ++sinkCalls;
+        };
+
+        bedrock::Client client(std::move(options));
+        clientPointer = &client;
+        client.init();
+        if (throwingErrorListener) {
+            client.onError([&](const std::string& message) {
+                {
+                    std::lock_guard<std::mutex> lock(messageMutex);
+                    listenerMessage = message;
+                }
+                queueRunningInError =
+                    bedrock::BedrockNetworkClientTestAccess::queueRunning(
+                        client.network()
+                    );
+                ++errorCalls;
+                throw std::runtime_error("public auth error listener boom");
+            });
+        }
+
+        bool connectResult = true;
+        bool connectThrew = false;
+        try {
+            connectResult = client.connect();
+        } catch (...) {
+            connectThrew = true;
+        }
+        connectReturned = true;
+
+        const bool queueRunningAfterConnect =
+            bedrock::BedrockNetworkClientTestAccess::queueRunning(
+                client.network()
+            );
+        const bool transportPresentAfterConnect =
+            bedrock::BedrockNetworkClientTestAccess::hasTransport(
+                client.network()
+            );
+        const bool connectWorkerPresentAfterConnect =
+            client.connectWorkerStarted();
+        const bool delivered = waitFor(
+            [&]() { return sinkCalls.load() == 1; },
+            500ms
+        );
+        const auto stored = client.takeUnhandledAsyncError();
+
+        std::string observedSinkMessage;
+        std::string observedListenerMessage;
+        {
+            std::lock_guard<std::mutex> lock(messageMutex);
+            observedSinkMessage = sinkMessage;
+            observedListenerMessage = listenerMessage;
+        }
+        const std::string expectedUnhandled = throwingErrorListener
+            ? "public auth error listener boom"
+            : authError;
+        const std::string label = throwingErrorListener
+            ? "throwing auth error listener"
+            : "missing auth error listener";
+
+        ok &= check(
+            !connectThrew && !connectResult && queueRunningAfterConnect &&
+                !transportPresentAfterConnect &&
+                !connectWorkerPresentAfterConnect,
+            label +
+                " escaped connect or started transport instead of only queue"
+        );
+        ok &= check(
+            delivered && !sinkBeforeConnectReturn.load() &&
+                queueRunningInSink.load() &&
+                !transportPresentInSink.load() &&
+                !connectWorkerPresentInSink.load(),
+            label +
+                " did not reach async boundary after connect/queue publication"
+        );
+        ok &= check(
+            observedSinkMessage == expectedUnhandled &&
+                stored == std::optional<std::string>(expectedUnhandled),
+            label + " did not preserve the exact ignored-Promise rejection"
+        );
+        if (throwingErrorListener) {
+            ok &= check(
+                errorCalls.load() == 1 &&
+                    observedListenerMessage == authError &&
+                    !queueRunningInError.load(),
+                "throwing auth error listener did not observe the exact "
+                "pre-startQueue error"
+            );
+        } else {
+            ok &= check(
+                errorCalls.load() == 0,
+                "missing-listener auth boundary unexpectedly invoked a listener"
+            );
+        }
+        std::this_thread::sleep_for(20ms);
+        ok &= check(
+            sinkCalls.load() == 1 &&
+                !client.takeUnhandledAsyncError().has_value(),
+            label + " was reported or stored more than once"
+        );
+        client.close();
+        ok &= check(
+            !bedrock::BedrockNetworkClientTestAccess::queueRunning(
+                client.network()
+            ),
+            label + " close did not stop the auth-only queue"
+        );
+    };
+
+    checkUnhandledCase(false);
+    checkUnhandledCase(true);
+
+    auto closeOptions = makeInvalidOptions();
+    std::atomic<int> unexpectedUnhandled {0};
+    closeOptions.onUnhandledAsyncError = [&](const std::string&) {
+        ++unexpectedUnhandled;
+    };
+    bedrock::Client closeInError(std::move(closeOptions));
+    closeInError.init();
+    std::vector<int> order;
+    std::string firstMessage;
+    std::string secondMessage;
+    bool queueRunningAfterFirstClose = true;
+    closeInError.onError([&](const std::string& message) {
+        order.push_back(1);
+        firstMessage = message;
+        closeInError.close("close-inside-auth-error");
+        queueRunningAfterFirstClose =
+            bedrock::BedrockNetworkClientTestAccess::queueRunning(
+                closeInError.network()
+            );
+    });
+    closeInError.onError([&](const std::string& message) {
+        order.push_back(2);
+        secondMessage = message;
+    });
+    bedrock::BedrockNetworkClientTestAccess::setBeforeQueueStartHook(
+        closeInError.network(),
+        [&]() { order.push_back(3); }
+    );
+
+    bool closeConnectResult = true;
+    bool closeConnectThrew = false;
+    try {
+        closeConnectResult = closeInError.connect();
+    } catch (...) {
+        closeConnectThrew = true;
+    }
+    const bool queueRestartedAfterErrorSnapshot =
+        bedrock::BedrockNetworkClientTestAccess::queueRunning(
+            closeInError.network()
+        );
+    ok &= check(
+        !closeConnectThrew && !closeConnectResult &&
+            order == std::vector<int>({1, 2, 3}) &&
+            firstMessage == authError && secondMessage == authError,
+        "close inside first auth error listener invalidated the listener "
+        "snapshot or startQueue order"
+    );
+    ok &= check(
+        !queueRunningAfterFirstClose && queueRestartedAfterErrorSnapshot &&
+            closeInError.status() == bedrock::ClientStatus::Disconnected &&
+            !bedrock::BedrockNetworkClientTestAccess::hasTransport(
+                closeInError.network()
+            ) && !closeInError.connectWorkerStarted(),
+        "close inside auth error prevented mandatory post-emit startQueue"
+    );
+    closeInError.close("second-close-after-auth-error");
+    std::this_thread::sleep_for(20ms);
+    ok &= check(
+        !bedrock::BedrockNetworkClientTestAccess::queueRunning(
+            closeInError.network()
+        ) && unexpectedUnhandled.load() == 0 &&
+            !closeInError.takeUnhandledAsyncError().has_value(),
+        "second close did not clear the mandatory auth-only queue"
+    );
+
+    return ok;
+}
+
+bool checkSuppliedAuthflowBoundary() {
+    bool ok = true;
+
+    const auto looksLikeBase64Spki = [](const std::string& value) {
+        if (value.size() < 100) return false;
+        for (const unsigned char character : value) {
+            const bool base64 =
+                (character >= 'A' && character <= 'Z') ||
+                (character >= 'a' && character <= 'z') ||
+                (character >= '0' && character <= '9') ||
+                character == '+' || character == '/' || character == '=';
+            if (!base64) return false;
+        }
+        return true;
+    };
+
+    const auto suppliedOptions = [](
+        uint16_t port,
+        const std::shared_ptr<bedrock::Authflow>& authflow,
+        bool delayedInit
+    ) {
+        auto options = baseOptions(port);
+        options.delayedInit = delayedInit;
+        options.offline = false;
+        // Both are explicitly present/falsy in JS. A supplied truthy
+        // options.authflow bypasses PrismarineAuth's constructor validation.
+        options.authTitle = std::string("");
+        options.flow = "";
+        options.deviceType = "ExplicitDevice";
+        // fs.existsSync(true) would enter PrismarineAuth's caught fallback.
+        // The supplied object must bypass that cache path completely while
+        // leaving the public property Boolean(true).
+        options.profilesFolder = true;
+        options.authflow = authflow;
+        return options;
+    };
+
+    {
+        std::atomic<int> invocations {0};
+        std::string publicKey;
+        const auto supplied = std::make_shared<bedrock::Authflow>(
+            [&](std::string value) -> bedrock::MinecraftBedrockTokenFuture {
+                publicKey = std::move(value);
+                ++invocations;
+                throw std::runtime_error("supplied authflow sync boom");
+            }
+        );
+        auto options = suppliedOptions(9, supplied, true);
+        // A sync custom-method throw is outside auth.js's Promise.catch, so a
+        // truthy password must not convert it into the password-warning path.
+        options.password = "present-but-not-a-promise-rejection";
+        bedrock::Client client(std::move(options));
+        client.init();
+
+        std::vector<std::string> order;
+        std::string errorMessage;
+        bool queueRunningInsideError = true;
+        bool optionsVisibleInsideError = false;
+        bool connectReturnedInsideError = true;
+        bool connectReturned = false;
+        client.onError([&](const std::string& message) {
+            order.push_back("error");
+            errorMessage = message;
+            queueRunningInsideError =
+                bedrock::BedrockNetworkClientTestAccess::queueRunning(
+                    client.network()
+                );
+            const auto visible = client.optionsSnapshot();
+            optionsVisibleInsideError =
+                visible.authTitle == std::optional<std::string>("") &&
+                visible.flow.empty() && visible.deviceType == "ExplicitDevice" &&
+                visible.profilesFolder.isBoolean() &&
+                visible.profilesFolder.booleanValue() &&
+                visible.authflow == supplied;
+            connectReturnedInsideError = connectReturned;
+        });
+        bedrock::BedrockNetworkClientTestAccess::setBeforeQueueStartHook(
+            client.network(),
+            [&]() { order.push_back("before-queue"); }
+        );
+
+        bool connectResult = true;
+        bool connectThrew = false;
+        try {
+            connectResult = client.connect();
+        } catch (...) {
+            connectThrew = true;
+        }
+        connectReturned = true;
+        order.push_back("returned");
+
+        const auto networkOptions = client.network().options();
+        ok &= check(
+            !connectThrew && !connectResult &&
+                order == std::vector<std::string>({
+                    "error", "before-queue", "returned"
+                }) && errorMessage == "supplied authflow sync boom" &&
+                !queueRunningInsideError && !connectReturnedInsideError,
+            "supplied authflow sync throw did not precede startQueue/return"
+        );
+        ok &= check(
+            invocations.load() == 1 && looksLikeBase64Spki(publicKey) &&
+                optionsVisibleInsideError &&
+                client.options().authflow == supplied &&
+                networkOptions.authflow == supplied,
+            "supplied authflow lost invocation, x509 argument, or identity"
+        );
+        ok &= check(
+            bedrock::BedrockNetworkClientTestAccess::queueRunning(
+                client.network()
+            ) &&
+                !bedrock::BedrockNetworkClientTestAccess::hasTransport(
+                    client.network()
+                ) &&
+                bedrock::BedrockNetworkClientTestAccess::
+                    effectiveAuthenticationCacheRoot(client.network()).empty(),
+            "supplied authflow sync throw constructed cache/transport or lost queue"
+        );
+        client.close();
+    }
+
+    const auto checkRejectedFuture = [&](bool closeInsideError) {
+        PingResponder responder("1.20.40", 0, 35ms);
+        auto promise = std::make_shared<
+            std::promise<bedrock::MinecraftBedrockTokenChains>
+        >();
+        std::atomic<int> invocations {0};
+        std::string publicKey;
+        const auto supplied = std::make_shared<bedrock::Authflow>(
+            [&](std::string value) -> bedrock::MinecraftBedrockTokenFuture {
+                auto future = promise->get_future();
+                publicKey = std::move(value);
+                ++invocations;
+                return future;
+            }
+        );
+        auto options = suppliedOptions(responder.port(), supplied, false);
+        std::atomic<bool> createClientReturned {false};
+        auto client = bedrock::createClient(std::move(options));
+        createClientReturned = true;
+
+        std::atomic<int> errors {0};
+        std::atomic<bool> returnedBeforeError {false};
+        std::atomic<bool> queueRunningInsideError {false};
+        std::atomic<bool> queuePumpInsideError {false};
+        std::atomic<bool> transportInsideError {true};
+        std::atomic<bool> queueStoppedByErrorClose {false};
+        std::string errorMessage;
+        client.onError([&](const std::string& message) {
+            errorMessage = message;
+            returnedBeforeError = createClientReturned.load();
+            queueRunningInsideError =
+                bedrock::BedrockNetworkClientTestAccess::queueRunning(
+                    client.network()
+                );
+            queuePumpInsideError =
+                bedrock::BedrockNetworkClientTestAccess::queuePumpEnabled(
+                    client.network()
+                );
+            transportInsideError =
+                bedrock::BedrockNetworkClientTestAccess::hasTransport(
+                    client.network()
+                );
+            if (closeInsideError) {
+                client.close("close-inside-supplied-authflow-rejection");
+                queueStoppedByErrorClose =
+                    !bedrock::BedrockNetworkClientTestAccess::queueRunning(
+                        client.network()
+                    );
+            }
+            ++errors;
+        });
+
+        const bool reachedAuthflow = waitFor(
+            [&]() { return invocations.load() == 1; },
+            800ms
+        );
+        const bool queueAndWorkerStarted = reachedAuthflow && waitFor(
+            [&]() {
+                return client.connectWorkerStarted() &&
+                    bedrock::BedrockNetworkClientTestAccess::queueRunning(
+                        client.network()
+                    ) &&
+                    bedrock::BedrockNetworkClientTestAccess::queuePumpEnabled(
+                        client.network()
+                    );
+            },
+            800ms
+        );
+        promise->set_exception(std::make_exception_ptr(
+            std::runtime_error("supplied authflow future rejected")
+        ));
+
+        const bool delivered = waitFor(
+            [&]() { return errors.load() == 1; },
+            800ms
+        );
+        const bool workerExited = waitFor(
+            [&]() {
+                return bedrock::ClientFactoryTestAccess::connectWorkerExited(
+                    client
+                );
+            },
+            800ms
+        );
+        const bool queueRunningAfterHandledError =
+            bedrock::BedrockNetworkClientTestAccess::queueRunning(
+                client.network()
+            );
+        const auto visible = client.optionsSnapshot();
+
+        const std::string label = closeInsideError
+            ? "close-inside supplied authflow rejection"
+            : "handled supplied authflow rejection";
+        ok &= check(
+            reachedAuthflow && queueAndWorkerStarted &&
+                delivered && workerExited && returnedBeforeError.load() &&
+                errorMessage == "supplied authflow future rejected" &&
+                queueRunningInsideError.load() &&
+                queuePumpInsideError.load() &&
+                !transportInsideError.load(),
+            label + " did not settle after the public queue/return boundary"
+        );
+        ok &= check(
+            invocations.load() == 1 && looksLikeBase64Spki(publicKey) &&
+                visible.authflow == supplied &&
+                visible.authTitle == std::optional<std::string>("") &&
+                visible.flow.empty() && visible.profilesFolder.isBoolean() &&
+                visible.profilesFolder.booleanValue() &&
+                client.network().options().authflow == supplied &&
+                !bedrock::BedrockNetworkClientTestAccess::hasTransport(
+                    client.network()
+                ) && !client.takeUnhandledAsyncError().has_value(),
+            label + " lost public identity/options or created transport"
+        );
+        if (closeInsideError) {
+            ok &= check(
+                queueStoppedByErrorClose.load() &&
+                    !queueRunningAfterHandledError,
+                "close inside supplied authflow rejection resurrected queue"
+            );
+        } else {
+            ok &= check(
+                queueRunningAfterHandledError,
+                "handled supplied authflow rejection stopped startQueue"
+            );
+            client.close("close-after-handled-supplied-authflow-rejection");
+        }
+        responder.finish();
+    };
+
+    checkRejectedFuture(false);
+    checkRejectedFuture(true);
+
+    {
+        // The second chain is the only JWT auth.js decodes for the Xbox
+        // profile. Signature verification is intentionally absent there.
+        const std::string profileJwt =
+            "e30."
+            "eyJleHRyYURhdGEiOnsiZGlzcGxheU5hbWUiOiJJbmplY3RlZCIs"
+            "ImlkZW50aXR5IjoidXVpZCIsIlhVSUQiOiI0MiJ9fQ."
+            "c2ln";
+        std::atomic<int> invocations {0};
+        const auto supplied = std::make_shared<bedrock::Authflow>(
+            [&](std::string) {
+                ++invocations;
+                return bedrock::makeReadyAuthflowFuture(
+                    bedrock::MinecraftBedrockTokenChains {
+                        "eyJhbGciOiJFUzM4NCIsIng1dSI6ImR1bW15LXJvb3Qta2V5In0."
+                        "eyJjZXJ0aWZpY2F0ZUF1dGhvcml0eSI6dHJ1ZX0.c2ln",
+                        profileJwt
+                    }
+                );
+            }
+        );
+        auto options = suppliedOptions(9, supplied, true);
+        bedrock::Client client(std::move(options));
+        client.init();
+        std::atomic<int> errors {0};
+        client.onError([&](const std::string&) { ++errors; });
+        bool reachedPreTransport = false;
+        bool loginPacketBuilt = false;
+        bedrock::BedrockNetworkClientTestAccess::setBeforeTransportInstallHook(
+            client.network(),
+            [&]() {
+                reachedPreTransport = true;
+                loginPacketBuilt =
+                    !client.network().options().loginPacket.empty();
+                client.close("resolved-authflow-before-transport-install");
+            }
+        );
+
+        const bool connectResult = client.connect();
+        ok &= check(
+            !connectResult && invocations.load() == 1 &&
+                reachedPreTransport && loginPacketBuilt &&
+                errors.load() == 0 &&
+                client.options().authflow == supplied &&
+                !bedrock::BedrockNetworkClientTestAccess::hasTransport(
+                    client.network()
+                ) &&
+                !bedrock::BedrockNetworkClientTestAccess::queueRunning(
+                    client.network()
+                ),
+            "resolved supplied authflow did not build chains before transport"
+        );
+    }
+
     return ok;
 }
 
@@ -3099,7 +3792,7 @@ bool checkRakNetCloseAndRealCallbackDestruction() {
     // the already-admitted EventEmitter snapshot.
     auto options = baseOptions(server.boundPort());
     options.followPort = false;
-    options.connectTimeoutMs = 500;
+    options.connectTimeout = 500;
     std::unique_ptr<bedrock::Client> owner(
         new bedrock::Client(bedrock::createClient(options))
     );
@@ -3154,6 +3847,8 @@ int main() {
     ok &= checkPrototypeVersionAdvertisement();
     ok &= checkExplicitEmptyVersionAdvertisement();
     ok &= checkPingErrorAndCloseBeforePong();
+    ok &= checkInvalidAuthenticationBoundary();
+    ok &= checkSuppliedAuthflowBoundary();
     ok &= checkEventLifetimeAndRakNetBoundaries();
     ok &= checkRakNetCloseAndRealCallbackDestruction();
     if (!ok) return 1;

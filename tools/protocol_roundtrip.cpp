@@ -15,6 +15,8 @@
 #include <bedrock/protodef/ProtoDefWriter.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -24,6 +26,7 @@
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
@@ -41,6 +44,13 @@ struct BedrockNetworkClientTestAccess {
         return static_cast<bool>(client.raknet_);
     }
 
+    static std::filesystem::path effectiveAuthenticationCacheRoot(
+        BedrockNetworkClient& client
+    ) {
+        std::lock_guard<std::mutex> lock(client.optionsMutex_);
+        return client.authenticationCacheRoot_;
+    }
+
     static bool connectLifecycleIdle(BedrockNetworkClient& client) {
         std::lock_guard<std::mutex> lock(client.connectLifecycleMutex_);
         return client.connectLifecyclePhase_ ==
@@ -53,6 +63,13 @@ struct BedrockNetworkClientTestAccess {
     ) {
         std::lock_guard<std::mutex> lock(client.eventHandlersMutex_);
         client.beforeQueueStartTestHook_ = std::move(hook);
+    }
+};
+
+struct ClientFactoryTestAccess {
+    static void setAutoConnectStarted(Client& client) {
+        std::lock_guard<std::mutex> lock(client.state_->mutex);
+        client.state_->autoConnectStarted = true;
     }
 };
 
@@ -994,6 +1011,8 @@ bool checkVersionContractGolden() {
 
     try {
         bedrock::Options options;
+        options.host = "127.0.0.1";
+        options.port = 19132;
         options.version = "1.20.15";
         options.protocolVersion = 1u;
         bedrock::Client client(options);
@@ -1247,7 +1266,10 @@ bool checkAuthTitleGolden() {
         ok = false;
     }
 
-    bedrock::Client normalizedRootClient;
+    bedrock::Options normalizedRootOptions;
+    normalizedRootOptions.host = "127.0.0.1";
+    normalizedRootOptions.port = 19132;
+    bedrock::Client normalizedRootClient(std::move(normalizedRootOptions));
     const auto rootOptions = normalizedRootClient.options();
     if (rootOptions.authTitle.has_value() ||
         !rootOptions.deviceType.empty() || !rootOptions.flow.empty()) {
@@ -1260,6 +1282,72 @@ bool checkAuthTitleGolden() {
 
 bool checkOnlineAuthBoundaryGolden() {
     bool ok = true;
+
+    {
+        bedrock::Options options;
+        options.host = "127.0.0.1";
+        options.port = 9;
+        options.username = "AuthBoundary";
+        options.offline = false;
+        options.authTitle = std::string(bedrock::Titles::MinecraftIOS);
+        options.flow = "";
+        options.profilesFolder = true;
+        options.conLog = {};
+
+        bedrock::Client client(std::move(options));
+        std::vector<std::string> order;
+        std::size_t errorCount = 0;
+        bool nestedResult = true;
+
+        bedrock::BedrockNetworkClientTestAccess::setBeforeQueueStartHook(
+            client.network(),
+            [&]() { order.push_back("queue"); }
+        );
+        client.onError([&](const std::string& message) {
+            if (message !=
+                "Missing 'flow' argument in options. See docs for more information.") {
+                ok = false;
+                std::cerr << "[FAIL] reentrant auth emitted the wrong error\n";
+            }
+            order.push_back("error");
+            if (errorCount++ == 0) {
+                // createClient's own connect_allowed listener sets this before
+                // authentication. Reproduce that state at the exact callback
+                // boundary so the facade must not take its normal no-op path.
+                bedrock::ClientFactoryTestAccess::setAutoConnectStarted(client);
+                nestedResult = client.connect();
+                order.push_back("inner-return");
+            }
+        });
+
+        const bool outerResult = client.connect();
+        order.push_back("outer-return");
+
+        // This was captured directly from node_modules/bedrock-protocol:
+        // authenticate() emits its constructor error synchronously, the error
+        // listener's nested connect performs auth + startQueue, and only then
+        // does the outer connect reach its own startQueue.
+        const std::vector<std::string> expectedOrder {
+            "error",
+            "error",
+            "queue",
+            "inner-return",
+            "queue",
+            "outer-return"
+        };
+        if (order != expectedOrder || errorCount != 2 || nestedResult ||
+            outerResult ||
+            !bedrock::BedrockNetworkClientTestAccess::queueRunning(
+                client.network()
+            ) ||
+            bedrock::BedrockNetworkClientTestAccess::hasTransport(
+                client.network()
+            )) {
+            std::cerr << "[FAIL] reentrant invalid-auth connect order mismatch\n";
+            ok = false;
+        }
+        client.close();
+    }
 
     const auto checkRejected = [&ok](
         const std::string& label,
@@ -1285,6 +1373,9 @@ bool checkOnlineAuthBoundaryGolden() {
         std::optional<bedrock::BedrockNetworkClientOptions> resolved;
         std::string observedError;
         std::string unhandledRejection;
+        std::atomic<bool> returnedPublished {false};
+        std::atomic<bool> unhandledDelivered {false};
+        std::atomic<bool> unhandledBeforeReturn {false};
         bool queueWasRunningInsideError = true;
 
         client.setAuthenticationOptionsResolvedHandler(
@@ -1295,8 +1386,9 @@ bool checkOnlineAuthBoundaryGolden() {
         );
         client.setAuthenticationUnhandledRejectionHandler(
             [&](std::string message) {
-                order.push_back("unhandled");
+                if (!returnedPublished.load()) unhandledBeforeReturn = true;
                 unhandledRejection = std::move(message);
+                unhandledDelivered = true;
             }
         );
         client.onError([&](const std::string& message) {
@@ -1324,6 +1416,7 @@ bool checkOnlineAuthBoundaryGolden() {
         try {
             prepared = client.prepareConnectLifecycle(false);
             order.push_back("returned");
+            returnedPublished = true;
         } catch (const std::exception& error) {
             std::cerr << "[FAIL] " << label
                       << " auth rejection escaped connect(): "
@@ -1332,33 +1425,43 @@ bool checkOnlineAuthBoundaryGolden() {
         }
 
         const auto afterPrepare = client.options();
+        const auto effectiveCacheRoot =
+            bedrock::BedrockNetworkClientTestAccess::
+                effectiveAuthenticationCacheRoot(client);
         const bool connected = client.connect();
         const bool queueRunningAfterConnect =
             bedrock::BedrockNetworkClientTestAccess::queueRunning(client);
         const bool hasTransport =
             bedrock::BedrockNetworkClientTestAccess::hasTransport(client);
 
-        const std::vector<std::string> expectedOrder = throwingErrorListener
-            ? std::vector<std::string>{
-                  "options", "error", "before-queue", "unhandled", "returned"
-              }
-            : std::vector<std::string>{
-                  "options", "error", "before-queue", "returned"
-              };
+        const std::vector<std::string> expectedOrder {
+            "options", "error", "before-queue", "returned"
+        };
         if (!prepared || observedError != expectedError ||
             queueWasRunningInsideError || order != expectedOrder ||
             !resolved.has_value() || connected || !queueRunningAfterConnect ||
             hasTransport || !afterPrepare.profilesFolder.isBoolean() ||
-            !afterPrepare.profilesFolder.booleanValue()) {
+            !afterPrepare.profilesFolder.booleanValue() ||
+            resolved->authCacheRoot !=
+                std::filesystem::path("cache-before-constructor") ||
+            afterPrepare.authCacheRoot !=
+                std::filesystem::path("cache-before-constructor")) {
             std::cerr << "[FAIL] " << label
                       << " auth error/queue/transport ordering mismatch\n";
             ok = false;
         }
 
         if (throwingErrorListener) {
-            if (unhandledRejection != "auth error listener boom") {
+            const auto deadline = std::chrono::steady_clock::now() +
+                std::chrono::milliseconds(250);
+            while (!unhandledDelivered.load() &&
+                   std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            if (!unhandledDelivered.load() || unhandledBeforeReturn.load() ||
+                unhandledRejection != "auth error listener boom") {
                 std::cerr << "[FAIL] " << label
-                          << " ignored-Promise rejection mismatch\n";
+                          << " ignored-Promise rejection timing mismatch\n";
                 ok = false;
             }
         } else if (!unhandledRejection.empty()) {
@@ -1368,15 +1471,14 @@ bool checkOnlineAuthBoundaryGolden() {
         }
 
         if (cacheInitializationExpected) {
-            if (afterPrepare.authCacheRoot.filename() != "src" ||
-                afterPrepare.authCacheRoot.parent_path().filename() !=
+            if (effectiveCacheRoot.filename() != "src" ||
+                effectiveCacheRoot.parent_path().filename() !=
                     "prismarine-auth") {
                 std::cerr << "[FAIL] " << label
                           << " did not use prismarine-auth/src cache fallback\n";
                 ok = false;
             }
-        } else if (afterPrepare.authCacheRoot !=
-                   std::filesystem::path("cache-before-constructor")) {
+        } else if (!effectiveCacheRoot.empty()) {
             std::cerr << "[FAIL] " << label
                       << " initialized cache before missing-flow validation\n";
             ok = false;
@@ -1469,14 +1571,21 @@ bool checkOnlineAuthBoundaryGolden() {
                 "auth boundary stop";
         }
         const auto visible = client.options();
+        const auto effectiveCacheRoot =
+            bedrock::BedrockNetworkClientTestAccess::
+                effectiveAuthenticationCacheRoot(client);
         if (!exactHookError || !published.has_value() ||
+            published->authCacheRoot !=
+                std::filesystem::path("must-be-overridden") ||
             visible.authTitle != std::optional<std::string>(
                 std::string(bedrock::Titles::MinecraftNintendoSwitch)) ||
             visible.deviceType != "Nintendo" || visible.flow != "live" ||
             !visible.profilesFolder.isBoolean() ||
             !visible.profilesFolder.booleanValue() ||
-            visible.authCacheRoot.filename() != "src" ||
-            visible.authCacheRoot.parent_path().filename() !=
+            visible.authCacheRoot !=
+                std::filesystem::path("must-be-overridden") ||
+            effectiveCacheRoot.filename() != "src" ||
+            effectiveCacheRoot.parent_path().filename() !=
                 "prismarine-auth" ||
             !bedrock::BedrockNetworkClientTestAccess::connectLifecycleIdle(client) ||
             bedrock::BedrockNetworkClientTestAccess::queueRunning(client)) {
