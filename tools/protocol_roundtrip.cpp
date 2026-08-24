@@ -1,5 +1,12 @@
 #include <bedrock/BedrockFramer.hpp>
 #include <bedrock/bedrock.hpp>
+#include <bedrock/auth/FileAuthCache.hpp>
+#include <bedrock/auth/MsalCachePlugin.hpp>
+#include <bedrock/auth/MsalError.hpp>
+#include <bedrock/auth/MsalRequestParameterBuilder.hpp>
+#include <bedrock/auth/MsalSerializableTokenCache.hpp>
+#include <bedrock/auth/MsaTokenManager.hpp>
+#include <bedrock/auth/UuidV3.hpp>
 #include <bedrock/debug/PacketFieldDecoder.hpp>
 #include <bedrock/relay/BedrockRelay.hpp>
 #include <bedrock/protocol/ProtocolDefinition.hpp>
@@ -15,11 +22,14 @@
 #include <bedrock/protodef/ProtoDefWriter.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <functional>
+#include <future>
 #include <iostream>
 #include <mutex>
 #include <optional>
@@ -49,6 +59,29 @@ struct BedrockNetworkClientTestAccess {
     ) {
         std::lock_guard<std::mutex> lock(client.optionsMutex_);
         return client.authenticationCacheRoot_;
+    }
+
+    static MsalConfigPtr effectiveMsalConfig(BedrockNetworkClient& client) {
+        std::lock_guard<std::mutex> lock(client.optionsMutex_);
+        return client.authenticationMsalConfig_;
+    }
+
+    static AuthCachePtr authenticationCache(
+        BedrockNetworkClient& client,
+        const std::string& name
+    ) {
+        std::lock_guard<std::mutex> lock(client.optionsMutex_);
+        const auto it = client.authenticationCaches_.find(name);
+        return it == client.authenticationCaches_.end()
+            ? AuthCachePtr{}
+            : it->second;
+    }
+
+    static bool hasAuthenticationXboxProofKey(
+        BedrockNetworkClient& client
+    ) {
+        std::lock_guard<std::mutex> lock(client.optionsMutex_);
+        return client.authenticationXboxProofKey_.has_value();
     }
 
     static bool connectLifecycleIdle(BedrockNetworkClient& client) {
@@ -1258,6 +1291,31 @@ bool checkAuthTitleGolden() {
         ok = false;
     }
 
+    bedrock::XboxLiveAuthOptions explicitNull;
+    explicitNull.authTitle = nullptr;
+    explicitNull.deviceType = "NullDevice";
+    explicitNull.flow = "msal";
+    const auto nullFlow = bedrock::XboxLiveAuth::resolveFlowOptions(explicitNull);
+    if (!nullFlow.authTitle.empty() || nullFlow.deviceType != "NullDevice" ||
+        nullFlow.flow != "msal" || !explicitNull.authTitle.isNull()) {
+        std::cerr << "[FAIL] null authTitle incorrectly received JS defaults\n";
+        ok = false;
+    }
+
+    bedrock::XboxLiveAuthOptions explicitUndefined;
+    explicitUndefined.authTitle = bedrock::jsUndefined;
+    explicitUndefined.deviceType = "must-be-overwritten";
+    explicitUndefined.flow = "must-be-overwritten";
+    const auto undefinedFlow =
+        bedrock::XboxLiveAuth::resolveFlowOptions(explicitUndefined);
+    if (undefinedFlow.authTitle != bedrock::Titles::MinecraftNintendoSwitch ||
+        undefinedFlow.deviceType != "Nintendo" ||
+        undefinedFlow.flow != "live" ||
+        !explicitUndefined.authTitle.isUndefined()) {
+        std::cerr << "[FAIL] undefined authTitle did not receive JS defaults\n";
+        ok = false;
+    }
+
     bedrock::BedrockNetworkClient normalizedNetworkClient;
     const auto networkOptions = normalizedNetworkClient.options();
     if (networkOptions.authTitle.has_value() ||
@@ -1275,6 +1333,1494 @@ bool checkAuthTitleGolden() {
         !rootOptions.deviceType.empty() || !rootOptions.flow.empty()) {
         std::cerr << "[FAIL] root client ran auth defaults at construction\n";
         ok = false;
+    }
+
+    return ok;
+}
+
+bool checkMsalConfigGolden() {
+    bool ok = true;
+    const bedrock::XboxLiveAuthFlowOptions msalEmptyTitle {
+        .authTitle = "",
+        .deviceType = "ExplicitDevice",
+        .flow = "msal"
+    };
+
+    auto supplied = bedrock::makeMsalConfig(
+        "caller-client-id",
+        "https://login.example.test/tenant"
+    );
+    supplied->set(
+        "cache",
+        bedrock::MsalConfig::string("must-be-replaced")
+    );
+    const auto initialized = bedrock::XboxLiveAuth::
+        initializePrismarineAuthFlow(msalEmptyTitle, supplied);
+    const auto* suppliedAuth = supplied->get("auth");
+    const auto* suppliedCache = supplied->get("cache");
+    const auto* suppliedPlugin = suppliedCache && suppliedCache->isObject()
+        ? suppliedCache->get("cachePlugin")
+        : nullptr;
+    if (initialized != supplied || !suppliedAuth || !suppliedCache ||
+        !suppliedPlugin || !suppliedPlugin->isObject() ||
+        suppliedCache->objectNode()->size() != 1 ||
+        suppliedAuth->get("clientId")->stringValue() != "caller-client-id" ||
+        suppliedAuth->get("authority")->stringValue() !=
+            "https://login.example.test/tenant") {
+        std::cerr << "[FAIL] supplied msalConfig identity/cache mutation mismatch\n";
+        ok = false;
+    }
+
+    const bedrock::XboxLiveAuthFlowOptions fallbackFlow {
+        .authTitle = "fallback-client-id",
+        .deviceType = "",
+        .flow = "msal"
+    };
+    const auto fallback = bedrock::XboxLiveAuth::
+        initializePrismarineAuthFlow(fallbackFlow, {});
+    const auto* fallbackAuth = fallback ? fallback->get("auth") : nullptr;
+    if (!fallback || fallback == supplied || !fallbackAuth ||
+        fallbackAuth->get("clientId")->stringValue() != "fallback-client-id" ||
+        fallbackAuth->get("authority")->stringValue() !=
+            "https://login.microsoftonline.com/consumers" ||
+        !fallback->get("cache")) {
+        std::cerr << "[FAIL] private default msalConfig clone mismatch\n";
+        ok = false;
+    }
+
+    const auto checkMalformed = [&ok, &msalEmptyTitle](
+        bedrock::MsalConfigPtr config,
+        const std::string& expected
+    ) {
+        bool exact = false;
+        try {
+            (void) bedrock::XboxLiveAuth::initializePrismarineAuthFlow(
+                msalEmptyTitle,
+                config
+            );
+        } catch (const std::exception& error) {
+            exact = error.what() == expected;
+        }
+        if (!exact || (config && config->isObject() && config->get("cache"))) {
+            std::cerr << "[FAIL] malformed msalConfig constructor boundary mismatch\n";
+            ok = false;
+        }
+    };
+    checkMalformed(
+        std::make_shared<bedrock::MsalConfig>(
+            bedrock::MsalConfig::object({})
+        ),
+        "Cannot read properties of undefined (reading 'clientId')"
+    );
+    checkMalformed(
+        std::make_shared<bedrock::MsalConfig>(
+            bedrock::MsalConfig::object({
+                {"auth", bedrock::MsalConfig::null()}
+            })
+        ),
+        "Cannot read properties of null (reading 'clientId')"
+    );
+
+    auto falsyConfig = std::make_shared<bedrock::MsalConfig>(
+        bedrock::MsalConfig::boolean(false)
+    );
+    bool exactMissingTitle = false;
+    try {
+        (void) bedrock::XboxLiveAuth::initializePrismarineAuthFlow(
+            msalEmptyTitle,
+            falsyConfig
+        );
+    } catch (const std::exception& error) {
+        exactMissingTitle = std::string(error.what()) ==
+            "Must specify an Azure client ID token inside the `authTitle` parameter "
+            "when using Azure-based auth. See "
+            "https://learn.microsoft.com/en-us/entra/identity-platform/"
+            "quickstart-register-app#register-an-application for more information "
+            "on obtaining an Azure token.";
+    }
+    if (!exactMissingTitle) {
+        std::cerr << "[FAIL] falsy msalConfig did not take fallback title branch\n";
+        ok = false;
+    }
+
+    auto ignoredByLive = bedrock::makeMsalConfig("ignored");
+    ignoredByLive->set(
+        "cache",
+        bedrock::MsalConfig::string("unchanged")
+    );
+    const auto liveResult = bedrock::XboxLiveAuth::
+        initializePrismarineAuthFlow(
+            bedrock::XboxLiveAuthFlowOptions {
+                .authTitle = "live-title",
+                .deviceType = "Nintendo",
+                .flow = "live"
+            },
+            ignoredByLive
+        );
+    if (liveResult || !ignoredByLive->get("cache")->isString()) {
+        std::cerr << "[FAIL] live flow inspected or mutated msalConfig\n";
+        ok = false;
+    }
+
+    return ok;
+}
+
+class RecordingSerializableTokenCache final
+    : public bedrock::ISerializableTokenCache {
+public:
+    void deserialize(
+        const std::optional<std::string>& serializedCache
+    ) override {
+        ++deserializeCalls;
+        deserialized = serializedCache;
+        if (onDeserialize) onDeserialize(serializedCache);
+    }
+
+    std::string serialize() override {
+        ++serializeCalls;
+        if (onSerialize) return onSerialize();
+        return serialized;
+    }
+
+    int deserializeCalls = 0;
+    int serializeCalls = 0;
+    std::optional<std::string> deserialized;
+    std::string serialized = "{}";
+    std::function<void(const std::optional<std::string>&)> onDeserialize;
+    std::function<std::string()> onSerialize;
+};
+
+class ScriptedMsalPublicClientApplication final
+    : public bedrock::IMsalPublicClientApplication {
+public:
+    using Method = std::function<bedrock::JsPromise<bedrock::JsRuntimeValue>(
+        bedrock::JsRuntimeValue request
+    )>;
+
+    bedrock::JsPromise<bedrock::JsRuntimeValue>
+    acquireTokenByRefreshToken(bedrock::JsRuntimeValue request) override {
+        if (!refresh) throw std::runtime_error("refresh script missing");
+        return refresh(std::move(request));
+    }
+
+    bedrock::JsPromise<bedrock::JsRuntimeValue>
+    acquireTokenByDeviceCode(bedrock::JsRuntimeValue request) override {
+        if (!device) throw std::runtime_error("device script missing");
+        return device(std::move(request));
+    }
+
+    Method refresh;
+    Method device;
+};
+
+bool checkMsalRequestBuilderGolden() {
+    bool ok = true;
+    bedrock::MsalRequestBuilderOptions options;
+    options.clientId = "CID";
+    options.scopes = {"XboxLive.signin", "offline_access"};
+    options.correlationId = "11111111-1111-4111-8111-111111111111";
+    options.authority =
+        "https://login.microsoftonline.com/consumers/";
+    const bedrock::MsalRequestBuilder builder(std::move(options));
+
+    const auto device = builder.deviceCodeRequest();
+    const auto poll = builder.deviceCodeTokenRequest("D C/+?");
+    const auto refresh = builder.refreshTokenRequest("R T/+?");
+    const std::string contentType =
+        "application/x-www-form-urlencoded;charset=utf-8";
+
+    if (device.method != "POST" ||
+        device.url !=
+            "https://login.microsoftonline.com/consumers/oauth2/v2.0/"
+            "devicecode" ||
+        device.body !=
+            "scope=XboxLive.signin%20offline_access%20openid%20profile&"
+            "client_id=CID" ||
+        !device.header("Content-Type") ||
+        *device.header("Content-Type") != contentType ||
+        device.headers.size() != 1) {
+        std::cerr << "[FAIL] MSAL device-code request oracle mismatch\n";
+        ok = false;
+    }
+
+    const std::string tokenUrl =
+        "https://login.microsoftonline.com/consumers/oauth2/v2.0/token?"
+        "client-request-id=11111111-1111-4111-8111-111111111111";
+    const std::string platformFields =
+        "&x-client-SKU=msal.js.node&x-client-VER=2.16.3&x-client-OS=" +
+        builder.platform().os + "&x-client-CPU=" + builder.platform().cpu;
+    const std::string commonTail = platformFields +
+        "&x-ms-lib-capability=retry-after, h429";
+
+    if (poll.method != "POST" || poll.url != tokenUrl ||
+        poll.body !=
+            "scope=XboxLive.signin%20offline_access%20openid%20profile&"
+            "client_id=CID&grant_type=device_code&device_code=D%20C%2F%2B%3F&"
+            "client-request-id=11111111-1111-4111-8111-111111111111&"
+            "client_info=1" + commonTail +
+            "&x-client-current-telemetry=5|671,0,,,|,&"
+            "x-client-last-telemetry=5|0|||0,0" ||
+        !poll.header("Content-Type") ||
+        *poll.header("Content-Type") != contentType) {
+        std::cerr << "[FAIL] MSAL device-code poll request oracle mismatch: "
+                  << poll.body << "\n";
+        ok = false;
+    }
+
+    if (refresh.method != "POST" || refresh.url != tokenUrl ||
+        refresh.body !=
+            "client_id=CID&"
+            "scope=XboxLive.signin%20offline_access%20openid%20profile&"
+            "grant_type=refresh_token&client_info=1" + commonTail +
+            "&x-client-current-telemetry=5|872,0,,,|,&"
+            "x-client-last-telemetry=5|0|||0,0&refresh_token=R%20T%2F%2B%3F" ||
+        !refresh.header("Content-Type") ||
+        *refresh.header("Content-Type") != contentType) {
+        std::cerr << "[FAIL] MSAL refresh request oracle mismatch: "
+                  << refresh.body << "\n";
+        ok = false;
+    }
+
+    const auto scopes = bedrock::MsalRequestParameterBuilder::normalizeScopes({
+        "  OpenID  ", "scope", "scope", "", "offline_access"
+    });
+    if (scopes != std::vector<std::string>({
+            "OpenID", "scope", "offline_access", "openid", "profile"
+        })) {
+        std::cerr << "[FAIL] MSAL ScopeSet normalization/order mismatch\n";
+        ok = false;
+    }
+
+    bool malformed = false;
+    try {
+        (void) bedrock::MsalRequestParameterBuilder::encodeURIComponent(
+            std::string("\xed\xa0\x80", 3)
+        );
+    } catch (const std::exception& error) {
+        malformed = std::string(error.what()) == "URI malformed";
+    }
+    if (!malformed) {
+        std::cerr << "[FAIL] MSAL encodeURIComponent lone-surrogate mismatch\n";
+        ok = false;
+    }
+
+    return ok;
+}
+
+bool checkMsalSerializableTokenCacheGolden() {
+    bool ok = true;
+    bedrock::MsalSerializableTokenCache cache;
+    const std::string empty =
+        "{\"Account\":{},\"IdToken\":{},\"AccessToken\":{},"
+        "\"RefreshToken\":{},\"AppMetadata\":{}}";
+    if (cache.hasChanged() || cache.serialize() != empty ||
+        cache.hasChanged()) {
+        std::cerr << "[FAIL] MSAL TokenCache fresh serialization mismatch\n";
+        ok = false;
+    }
+
+    const std::string snapshot =
+        "{\"unknown\":{\"kept\":true},\"Account\":{\"a\":{"
+        "\"home_account_id\":\"h\",\"environment\":\"e\","
+        "\"realm\":\"r\",\"local_account_id\":\"l\","
+        "\"username\":\"u\",\"authority_type\":\"MSSTS\","
+        "\"extra\":\"preserved\",\"tenantProfiles\":["
+        "\"{ \\\"tenantId\\\" : \\\"r\\\" }\"]}},"
+        "\"IdToken\":{},\"AccessToken\":{},\"RefreshToken\":{},"
+        "\"AppMetadata\":{}}";
+    cache.deserialize(snapshot);
+    if (!cache.hasChanged()) {
+        std::cerr << "[FAIL] MSAL TokenCache deserialize change flag mismatch\n";
+        ok = false;
+    }
+    const auto serialized = cache.serialize();
+    const auto materialized = bedrock::JsRuntimeJson::parse(serialized);
+    const auto* unknown = materialized.get("unknown");
+    const auto* accountMap = materialized.get("Account");
+    const auto* account = accountMap ? accountMap->get("a") : nullptr;
+    const auto* profiles = account ? account->get("tenantProfiles") : nullptr;
+    if (cache.hasChanged() || !unknown || !unknown->get("kept") ||
+        !unknown->get("kept")->boolValue() || !account ||
+        !account->get("extra") ||
+        account->get("extra")->stringValue() != "preserved" ||
+        !profiles || !profiles->isArray() || profiles->length() != 1 ||
+        !profiles->get(0) ||
+        profiles->get(0)->stringValue() != "{\"tenantId\":\"r\"}") {
+        std::cerr << "[FAIL] MSAL TokenCache snapshot merge/projection mismatch\n";
+        ok = false;
+    }
+
+    // NodeStorage.setInMemoryCache overlays a second deserialize on its flat
+    // store, so an entity absent from the new document remains live.
+    cache.deserialize(empty);
+    if (!cache.hasEntity(
+            bedrock::MsalSerializableTokenCache::EntityMap::Account,
+            "a"
+        )) {
+        std::cerr << "[FAIL] MSAL TokenCache repeated-deserialize overlay mismatch\n";
+        ok = false;
+    }
+    cache.removeEntity(
+        bedrock::MsalSerializableTokenCache::EntityMap::Account,
+        "a"
+    );
+    const auto removed = bedrock::JsRuntimeJson::parse(cache.serialize());
+    if (!removed.get("Account") ||
+        removed.get("Account")->hasOwn("a")) {
+        std::cerr << "[FAIL] MSAL TokenCache removal merge mismatch\n";
+        ok = false;
+    }
+
+    // Falsy deserialize replaces cacheSnapshot but leaves live maps intact.
+    cache.setEntity(
+        bedrock::MsalSerializableTokenCache::EntityMap::AccessToken,
+        "token",
+        bedrock::JsRuntimeValue::object({
+            {"home_account_id", bedrock::JsRuntimeValue::string("home")},
+            {"environment", bedrock::JsRuntimeValue::string("env")},
+            {"credential_type", bedrock::JsRuntimeValue::string("AccessToken")},
+            {"client_id", bedrock::JsRuntimeValue::string("CID")},
+            {"secret", bedrock::JsRuntimeValue::string("AT")},
+            {"realm", bedrock::JsRuntimeValue::string("tenant")},
+            {"target", bedrock::JsRuntimeValue::string("scope")}
+        })
+    );
+    cache.deserialize(std::nullopt);
+    if (!cache.snapshot().isUndefined() ||
+        !cache.hasEntity(
+            bedrock::MsalSerializableTokenCache::EntityMap::AccessToken,
+            "token"
+        )) {
+        std::cerr << "[FAIL] MSAL TokenCache undefined deserialize mismatch\n";
+        ok = false;
+    }
+
+    return ok;
+}
+
+bool checkJsRuntimeDateMapGolden() {
+    bool ok = true;
+    const auto epoch = bedrock::JsRuntimeValue::date(0.9);
+    const auto beforeEpoch = bedrock::JsRuntimeValue::date(-1.9);
+    const auto maximum = bedrock::JsRuntimeValue::date(8.64e15);
+    const auto minimum = bedrock::JsRuntimeValue::date(-8.64e15);
+    const auto invalid = bedrock::JsRuntimeValue::date(8.64e15 + 1.0);
+    if (epoch.dateMilliseconds() != 0.0 ||
+        epoch.dateIsoString() != "1970-01-01T00:00:00.000Z" ||
+        beforeEpoch.dateMilliseconds() != -1.0 ||
+        beforeEpoch.dateIsoString() != "1969-12-31T23:59:59.999Z" ||
+        maximum.dateIsoString() != "+275760-09-13T00:00:00.000Z" ||
+        minimum.dateIsoString() != "-271821-04-20T00:00:00.000Z" ||
+        bedrock::JsRuntimeJson::stringify(invalid) !=
+            std::optional<std::string>("null")) {
+        std::cerr << "[FAIL] JsRuntime Date/TimeClip/toJSON mismatch\n";
+        ok = false;
+    }
+
+    auto profiles = bedrock::JsRuntimeValue::map();
+    auto profile = bedrock::JsRuntimeValue::object({
+        {"tenantId", bedrock::JsRuntimeValue::string("tenant")}
+    });
+    profiles.mapSet(
+        bedrock::JsRuntimeValue::string("tenant"),
+        profile
+    );
+    auto copied = profiles;
+    const auto* found = profiles.mapGet(
+        bedrock::JsRuntimeValue::string("tenant")
+    );
+    if (profiles.mapSize() != 1 || !profiles.get("size") ||
+        profiles.get("size")->numberValue() != 1 ||
+        profiles.hasOwn("size") || !found ||
+        !found->sharesIdentityWith(profile) ||
+        !copied.sharesIdentityWith(profiles) ||
+        bedrock::JsRuntimeJson::stringify(profiles) !=
+            std::optional<std::string>("{}")) {
+        std::cerr << "[FAIL] JsRuntime Map identity/JSON mismatch\n";
+        ok = false;
+    }
+    return ok;
+}
+
+bool checkMsalErrorGolden() {
+    bool ok = true;
+    bedrock::MsalClientAuthError cancelled(
+        "device_code_polling_cancelled",
+        "Caller has cancelled token endpoint polling during device code flow "
+        "by setting DeviceCodeRequest.cancel = true."
+    );
+    cancelled.setCorrelationId("correlation");
+    const auto cancelledJson = cancelled.jsonStringify();
+    if (std::string(cancelled.what()) !=
+            "device_code_polling_cancelled: Caller has cancelled token "
+            "endpoint polling during device code flow by setting "
+            "DeviceCodeRequest.cancel = true." ||
+        cancelledJson != std::optional<std::string>(
+            "{\"errorCode\":\"device_code_polling_cancelled\","
+            "\"errorMessage\":\"Caller has cancelled token endpoint polling "
+            "during device code flow by setting DeviceCodeRequest.cancel = "
+            "true.\",\"subError\":\"\",\"name\":\"ClientAuthError\","
+            "\"correlationId\":\"correlation\"}"
+        )) {
+        std::cerr << "[FAIL] MSAL ClientAuthError shape/stringify mismatch\n";
+        ok = false;
+    }
+
+    bedrock::MsalServerError server(
+        "invalid_grant",
+        "description",
+        "bad_token",
+        bedrock::JsRuntimeValue::number(70000),
+        bedrock::JsRuntimeValue::undefined()
+    );
+    server.setCorrelationId("server-correlation");
+    const auto serverJson = bedrock::stringifyMsalException(
+        std::make_exception_ptr(server)
+    );
+    if (serverJson != std::optional<std::string>(
+            "{\"errorCode\":\"invalid_grant\","
+            "\"errorMessage\":\"description\","
+            "\"subError\":\"bad_token\",\"name\":\"ServerError\","
+            "\"errorNo\":70000,\"correlationId\":"
+            "\"server-correlation\"}"
+        ) ||
+        bedrock::stringifyMsalException(
+            std::make_exception_ptr(std::runtime_error("plain"))
+        ) != std::optional<std::string>("{}")) {
+        std::cerr << "[FAIL] MSAL ServerError/plain Error stringify mismatch\n";
+        ok = false;
+    }
+    return ok;
+}
+
+bool checkMsalCachePluginGolden() {
+    bool ok = true;
+    const bedrock::XboxLiveAuthFlowOptions flow {
+        .authTitle = "plugin-client-id",
+        .deviceType = "",
+        .flow = "msal"
+    };
+
+    auto oldCache = bedrock::MsalConfig::object({
+        {"old", bedrock::MsalConfig::boolean(true)}
+    });
+    auto retained = bedrock::MsalConfig::object({
+        {"identity", bedrock::MsalConfig::string("same")}
+    });
+    auto config = std::make_shared<bedrock::MsalConfig>(
+        bedrock::MsalConfig::object({
+            {"2", bedrock::MsalConfig::string("two")},
+            {"alpha", bedrock::MsalConfig::boolean(true)},
+            {"cache", oldCache},
+            {"beta", retained},
+            {"1", bedrock::MsalConfig::string("one")},
+            {"auth", bedrock::MsalConfig::object({
+                {"clientId", bedrock::MsalConfig::string("plugin-client-id")}
+            })}
+        })
+    );
+
+    std::vector<std::string> order;
+    auto readPromise = std::make_shared<
+        std::promise<bedrock::AuthCacheValue>
+    >();
+    auto integrationCache = std::make_shared<bedrock::AuthCache>();
+    integrationCache->setGetCachedMethod([&order, readPromise] {
+        order.push_back("getCached");
+        return readPromise->get_future();
+    });
+    integrationCache->setSetCachedPartialMethod(
+        [](bedrock::AuthCacheValue) {
+            return bedrock::makeReadyAuthCacheFuture();
+        }
+    );
+
+    const auto initialized = bedrock::XboxLiveAuth::
+        initializePrismarineAuthFlow(flow, config, integrationCache);
+    const auto* installedCache = config->get("cache");
+    const auto* plugin = installedCache
+        ? installedCache->get("cachePlugin")
+        : nullptr;
+    const auto* before = plugin ? plugin->get("beforeCacheAccess") : nullptr;
+    const auto* after = plugin ? plugin->get("afterCacheAccess") : nullptr;
+
+    std::vector<std::string> rootKeys;
+    for (const auto& property : config->ownProperties()) {
+        rootKeys.push_back(property.key);
+    }
+    std::vector<std::string> pluginKeys;
+    if (plugin) {
+        for (const auto& property : plugin->ownProperties()) {
+            pluginKeys.push_back(property.key);
+        }
+    }
+    if (initialized != config || !installedCache || !plugin || !before ||
+        !after || !before->isFunctionOf<bedrock::MsalCacheHookSignature>() ||
+        !after->isFunctionOf<bedrock::MsalCacheHookSignature>() ||
+        !before->get("name") ||
+        before->get("name")->stringValue() != "beforeCacheAccess" ||
+        !before->get("length") ||
+        before->get("length")->numberValue() != 1 ||
+        !after->get("name") ||
+        after->get("name")->stringValue() != "afterCacheAccess" ||
+        !after->get("length") ||
+        after->get("length")->numberValue() != 1 ||
+        !before->ownProperties().empty() || !after->ownProperties().empty() ||
+        rootKeys != std::vector<std::string>({
+            "1", "2", "alpha", "cache", "beta", "auth"
+        }) ||
+        pluginKeys != std::vector<std::string>({
+            "beforeCacheAccess", "afterCacheAccess"
+        }) ||
+        !config->get("beta")->sharesIdentityWith(retained) ||
+        !oldCache.get("old") || installedCache->sharesIdentityWith(oldCache)) {
+        std::cerr << "[FAIL] MSAL cache plugin topology/identity/order mismatch\n";
+        ok = false;
+    }
+
+    if (before) {
+        auto originalTokenCache =
+            std::make_shared<RecordingSerializableTokenCache>();
+        originalTokenCache->onDeserialize = [&order](const auto&) {
+            order.push_back("deserialize");
+        };
+        auto replacementTokenCache =
+            std::make_shared<RecordingSerializableTokenCache>();
+        auto context = std::make_shared<bedrock::TokenCacheContext>();
+        context->tokenCache = std::static_pointer_cast<
+            bedrock::ISerializableTokenCache
+        >(originalTokenCache);
+
+        auto pending = before->call<bedrock::MsalCacheHookSignature>(context);
+        order.push_back("returned");
+        context->tokenCache = std::static_pointer_cast<
+            bedrock::ISerializableTokenCache
+        >(replacementTokenCache);
+        readPromise->set_value(bedrock::JsRuntimeValue::object({
+            {"x", bedrock::JsRuntimeValue::number(1)}
+        }));
+        try {
+            pending.get();
+        } catch (const std::exception& error) {
+            std::cerr << "[FAIL] beforeCacheAccess rejected: "
+                      << error.what() << "\n";
+            ok = false;
+        }
+        if (order != std::vector<std::string>({
+                "getCached", "returned", "deserialize"
+            }) ||
+            originalTokenCache->deserialized !=
+                std::optional<std::string>("{\"x\":1}") ||
+            replacementTokenCache->deserializeCalls != 0) {
+            std::cerr << "[FAIL] beforeCacheAccess await/callee capture mismatch\n";
+            ok = false;
+        }
+    }
+
+    auto cacheA = std::make_shared<bedrock::AuthCache>();
+    auto cacheB = std::make_shared<bedrock::AuthCache>();
+    std::vector<std::string> writeCalls;
+    bedrock::JsRuntimeValue writtenA;
+    bedrock::JsRuntimeValue writtenB;
+    cacheA->setSetCachedPartialMethod(
+        [&writeCalls, &writtenA](bedrock::AuthCacheValue value) {
+            writeCalls.push_back("A");
+            writtenA = std::move(value);
+            return bedrock::makeReadyAuthCacheFuture();
+        }
+    );
+    cacheB->setSetCachedPartialMethod(
+        [&writeCalls, &writtenB](bedrock::AuthCacheValue value) {
+            writeCalls.push_back("B");
+            writtenB = std::move(value);
+            return bedrock::makeReadyAuthCacheFuture();
+        }
+    );
+    cacheB->setGetCachedMethod([] {
+        return bedrock::makeReadyAuthCacheFuture(
+            bedrock::JsRuntimeValue::object({
+                {"late", bedrock::JsRuntimeValue::boolean(true)}
+            })
+        );
+    });
+
+    auto clientIdObject = bedrock::JsRuntimeValue::object({
+        {"opaque-id", bedrock::JsRuntimeValue::boolean(true)}
+    });
+    auto runtime = bedrock::makeMsaTokenManagerCachePlugin(
+        cacheA,
+        clientIdObject
+    );
+    const auto* runtimeBefore = runtime.cachePlugin.get("beforeCacheAccess");
+    const auto* runtimeAfter = runtime.cachePlugin.get("afterCacheAccess");
+    auto tokenCache = std::make_shared<RecordingSerializableTokenCache>();
+    auto changed = std::make_shared<bedrock::TokenCacheContext>();
+    changed->tokenCache = std::static_pointer_cast<
+        bedrock::ISerializableTokenCache
+    >(tokenCache);
+
+    // The false branch must not resolve this.cache or tokenCache at all.
+    changed->cacheHasChanged = false;
+    tokenCache->onSerialize = []() -> std::string {
+        throw std::runtime_error("serialize must not run");
+    };
+    try {
+        runtimeAfter->call<bedrock::MsalCacheHookSignature>(changed).get();
+    } catch (...) {
+        std::cerr << "[FAIL] afterCacheAccess false branch touched cache\n";
+        ok = false;
+    }
+
+    // setCachedPartial is captured from A before serialize swaps this.cache.
+    changed->cacheHasChanged = true;
+    tokenCache->onSerialize = [&runtime, cacheB] {
+        runtime.managerState->cache = cacheB;
+        return std::string("{\"z\":3}");
+    };
+    try {
+        runtimeAfter->call<bedrock::MsalCacheHookSignature>(changed).get();
+    } catch (const std::exception& error) {
+        std::cerr << "[FAIL] afterCacheAccess rejected: "
+                  << error.what() << "\n";
+        ok = false;
+    }
+    tokenCache->onSerialize = [] {
+        return std::string("{\"z\":4}");
+    };
+    try {
+        runtimeAfter->call<bedrock::MsalCacheHookSignature>(changed).get();
+    } catch (const std::exception& error) {
+        std::cerr << "[FAIL] second afterCacheAccess rejected: "
+                  << error.what() << "\n";
+        ok = false;
+    }
+    if (writeCalls != std::vector<std::string>({"A", "B"}) ||
+        !writtenA.get("z") || writtenA.get("z")->numberValue() != 3 ||
+        !writtenB.get("z") || writtenB.get("z")->numberValue() != 4 ||
+        !runtime.managerState->msaClientId.sharesIdentityWith(clientIdObject)) {
+        std::cerr << "[FAIL] afterCacheAccess capture/live manager state mismatch\n";
+        ok = false;
+    }
+
+    // A later before invocation observes the manager's newly assigned cache.
+    auto lateTokenCache = std::make_shared<RecordingSerializableTokenCache>();
+    auto lateContext = std::make_shared<bedrock::TokenCacheContext>();
+    lateContext->tokenCache = std::static_pointer_cast<
+        bedrock::ISerializableTokenCache
+    >(lateTokenCache);
+    try {
+        runtimeBefore->call<bedrock::MsalCacheHookSignature>(lateContext).get();
+    } catch (const std::exception& error) {
+        std::cerr << "[FAIL] late beforeCacheAccess rejected: "
+                  << error.what() << "\n";
+        ok = false;
+    }
+    if (lateTokenCache->deserialized !=
+            std::optional<std::string>("{\"late\":true}")) {
+        std::cerr << "[FAIL] beforeCacheAccess did not use live cache slot\n";
+        ok = false;
+    }
+
+    const auto expectRejectedWithoutSyncThrow = [&ok](
+        const std::string& label,
+        const std::function<bedrock::JsPromise<void>()>& invoke,
+        const std::string& expected
+    ) {
+        bedrock::JsPromise<void> promise;
+        bool synchronousThrow = false;
+        try {
+            promise = invoke();
+        } catch (...) {
+            synchronousThrow = true;
+        }
+        std::string rejection;
+        if (!synchronousThrow) {
+            try {
+                promise.get();
+            } catch (const std::exception& error) {
+                rejection = error.what();
+            }
+        }
+        if (synchronousThrow || rejection != expected) {
+            std::cerr << "[FAIL] " << label
+                      << " sync-throw/rejection mismatch: " << rejection
+                      << "\n";
+            ok = false;
+        }
+    };
+
+    auto throwingRead = std::make_shared<bedrock::AuthCache>();
+    throwingRead->setGetCachedMethod([]() -> bedrock::AuthCacheValueFuture {
+        throw std::runtime_error("get boom");
+    });
+    auto throwingRuntime = bedrock::makeMsaTokenManagerCachePlugin(
+        throwingRead
+    );
+    auto errorTokenCache =
+        std::make_shared<RecordingSerializableTokenCache>();
+    auto errorContext = std::make_shared<bedrock::TokenCacheContext>();
+    errorContext->tokenCache = std::static_pointer_cast<
+        bedrock::ISerializableTokenCache
+    >(errorTokenCache);
+    const auto* throwingBefore =
+        throwingRuntime.cachePlugin.get("beforeCacheAccess");
+    expectRejectedWithoutSyncThrow(
+        "beforeCacheAccess sync getCached throw",
+        [throwingBefore, errorContext] {
+            return throwingBefore->call<bedrock::MsalCacheHookSignature>(
+                errorContext
+            );
+        },
+        "get boom"
+    );
+    expectRejectedWithoutSyncThrow(
+        "beforeCacheAccess null context",
+        [throwingBefore] {
+            return throwingBefore->call<bedrock::MsalCacheHookSignature>(
+                bedrock::TokenCacheContextPtr {}
+            );
+        },
+        "Cannot read properties of null (reading 'tokenCache')"
+    );
+
+    auto missingMethods = std::make_shared<bedrock::AuthCache>();
+    auto missingRuntime = bedrock::makeMsaTokenManagerCachePlugin(
+        missingMethods
+    );
+    const auto* missingBefore =
+        missingRuntime.cachePlugin.get("beforeCacheAccess");
+    expectRejectedWithoutSyncThrow(
+        "beforeCacheAccess missing getCached",
+        [missingBefore, errorContext] {
+            return missingBefore->call<bedrock::MsalCacheHookSignature>(
+                errorContext
+            );
+        },
+        "this.cache.getCached is not a function"
+    );
+
+    auto parseRuntime = bedrock::makeMsaTokenManagerCachePlugin(cacheB);
+    const auto* parseAfter = parseRuntime.cachePlugin.get("afterCacheAccess");
+    errorContext->cacheHasChanged = true;
+    errorTokenCache->onSerialize = [] {
+        return std::string("{bad json}");
+    };
+    bedrock::JsPromise<void> parsePromise;
+    bool parseSyncThrow = false;
+    try {
+        parsePromise = parseAfter->call<bedrock::MsalCacheHookSignature>(
+            errorContext
+        );
+    } catch (...) {
+        parseSyncThrow = true;
+    }
+    bool parseRejected = false;
+    if (!parseSyncThrow) {
+        try {
+            parsePromise.get();
+        } catch (...) {
+            parseRejected = true;
+        }
+    }
+    if (parseSyncThrow || !parseRejected) {
+        std::cerr << "[FAIL] afterCacheAccess JSON.parse error boundary mismatch\n";
+        ok = false;
+    }
+
+    return ok;
+}
+
+bool checkMsaTokenManagerGolden() {
+    bool ok = true;
+    auto queue = bedrock::JsMicrotaskQueue::create();
+    auto cache = std::make_shared<bedrock::AuthCache>();
+    auto app = std::make_shared<ScriptedMsalPublicClientApplication>();
+    auto config = bedrock::makeMsalConfig("manager-client-id");
+    auto scopes = bedrock::JsRuntimeValue::array({
+        bedrock::JsRuntimeValue::string("XboxLive.signin"),
+        bedrock::JsRuntimeValue::string("offline_access")
+    });
+    bool factorySawPlugin = false;
+    bedrock::MsaTokenManagerObservers observers;
+    observers.dateNowMilliseconds = [] { return 11000.0; };
+    bedrock::MsaTokenManager manager(
+        config,
+        scopes,
+        cache,
+        [&](const std::shared_ptr<bedrock::JsRuntimeValue>& supplied) {
+            const auto* cacheValue = supplied ? supplied->get("cache") : nullptr;
+            factorySawPlugin = cacheValue &&
+                cacheValue->get("cachePlugin") &&
+                cacheValue->get("cachePlugin")->get("beforeCacheAccess");
+            return app;
+        },
+        queue,
+        observers
+    );
+
+    if (!factorySawPlugin || manager.msaClientId.stringValue() !=
+            "manager-client-id" ||
+        !manager.scopes.sharesIdentityWith(scopes) ||
+        manager.msalConfig != config || manager.msalApp != app ||
+        manager.forceRefresh.truthy() || !manager.forceRefresh.isUndefined()) {
+        std::cerr << "[FAIL] MsaTokenManager constructor fields/order mismatch\n";
+        ok = false;
+    }
+
+    bool exactGetUsersError = false;
+    try {
+        (void) manager.getUsers();
+    } catch (const std::exception& error) {
+        exactGetUsersError = std::string(error.what()) ==
+            "Cannot read properties of undefined (reading 'Account')";
+    }
+    if (!exactGetUsersError) {
+        std::cerr << "[FAIL] MsaTokenManager fresh getUsers bug mismatch\n";
+        ok = false;
+    }
+
+    auto userTwo = bedrock::JsRuntimeValue::object({
+        {"name", bedrock::JsRuntimeValue::string("two")}
+    });
+    auto userTen = bedrock::JsRuntimeValue::object({
+        {"name", bedrock::JsRuntimeValue::string("ten")}
+    });
+    auto userZ = bedrock::JsRuntimeValue::object({
+        {"name", bedrock::JsRuntimeValue::string("z")}
+    });
+    auto userA = bedrock::JsRuntimeValue::object({
+        {"name", bedrock::JsRuntimeValue::string("a")}
+    });
+    manager.msaCache = bedrock::JsRuntimeValue::object({
+        {"Account", bedrock::JsRuntimeValue::object({
+            {"z", userZ},
+            {"10", userTen},
+            {"2", userTwo},
+            {"a", userA}
+        })}
+    });
+    const auto users = manager.getUsers();
+    if (!users.isArray() || users.length() != 4 ||
+        !users.get(0)->sharesIdentityWith(userTwo) ||
+        !users.get(1)->sharesIdentityWith(userTen) ||
+        !users.get(2)->sharesIdentityWith(userZ) ||
+        !users.get(3)->sharesIdentityWith(userA)) {
+        std::cerr << "[FAIL] MsaTokenManager getUsers Object.values order mismatch\n";
+        ok = false;
+    }
+    manager.msaCache = bedrock::JsRuntimeValue::object({
+        {"Account", bedrock::JsRuntimeValue::string("A\xF0\x9F\x98\x80")}
+    });
+    if (bedrock::JsRuntimeJson::stringify(manager.getUsers()) !=
+        std::optional<std::string>("[\"A\",\"\\ud83d\",\"\\ude00\"]")) {
+        std::cerr << "[FAIL] MsaTokenManager getUsers UTF-16 values mismatch\n";
+        ok = false;
+    }
+
+    const auto account = [](std::string clientId, double expires,
+                            std::string secret) {
+        return bedrock::JsRuntimeValue::object({
+            {"client_id", bedrock::JsRuntimeValue::string(std::move(clientId))},
+            {"expires_on", bedrock::JsRuntimeValue::number(expires)},
+            {"secret", bedrock::JsRuntimeValue::string(std::move(secret))}
+        });
+    };
+    const auto refreshAccount = [](std::string clientId,
+                                   std::string secret) {
+        return bedrock::JsRuntimeValue::object({
+            {"client_id", bedrock::JsRuntimeValue::string(std::move(clientId))},
+            {"secret", bedrock::JsRuntimeValue::string(std::move(secret))}
+        });
+    };
+
+    auto accessCache = bedrock::JsRuntimeValue::object({
+        {"AccessToken", bedrock::JsRuntimeValue::object({
+            {"z", account("manager-client-id", 99, "Z")},
+            {"10", account("other", 99, "TEN")},
+            {"2", account("manager-client-id", 12.3456, "TWO")},
+            {"a", account("manager-client-id", 99, "A")}
+        })}
+    });
+    cache->setGetCachedMethod([accessCache] {
+        return bedrock::makeReadyAuthCacheFuture(accessCache);
+    });
+    try {
+        const auto access = manager.getAccessToken().get();
+        if (!access.isObject() ||
+            !access.get("valid")->boolValue() ||
+            access.get("until")->numberValue() != 1345.0 ||
+            access.get("token")->stringValue() != "TWO") {
+            std::cerr << "[FAIL] MsaTokenManager access selection/TimeClip mismatch\n";
+            ok = false;
+        }
+    } catch (const std::exception& error) {
+        std::cerr << "[FAIL] MsaTokenManager getAccessToken rejected: "
+                  << error.what() << "\n";
+        ok = false;
+    }
+
+    auto fullFilterCache = bedrock::JsRuntimeValue::object({
+        {"AccessToken", bedrock::JsRuntimeValue::object({
+            {"0", account("manager-client-id", 99, "FIRST")},
+            {"1", bedrock::JsRuntimeValue::null()}
+        })}
+    });
+    cache->setGetCachedMethod([fullFilterCache] {
+        return bedrock::makeReadyAuthCacheFuture(fullFilterCache);
+    });
+    bool fullFilterRejected = false;
+    try {
+        (void) manager.getAccessToken().get();
+    } catch (const std::exception& error) {
+        fullFilterRejected = std::string(error.what()) ==
+            "Cannot read properties of null (reading 'client_id')";
+    }
+    if (!fullFilterRejected) {
+        std::cerr << "[FAIL] MsaTokenManager filter stopped after first match\n";
+        ok = false;
+    }
+
+    auto refreshCache = bedrock::JsRuntimeValue::object({
+        {"RefreshToken", bedrock::JsRuntimeValue::object({
+            {"b", refreshAccount("manager-client-id", "B")},
+            {"3", refreshAccount("manager-client-id", "THREE")},
+            {"1", refreshAccount("other", "ONE")}
+        })}
+    });
+    cache->setGetCachedMethod([refreshCache] {
+        return bedrock::makeReadyAuthCacheFuture(refreshCache);
+    });
+    try {
+        const auto refresh = manager.getRefreshToken().get();
+        if (!refresh.isObject() ||
+            refresh.get("token")->stringValue() != "THREE") {
+            std::cerr << "[FAIL] MsaTokenManager refresh selection order mismatch\n";
+            ok = false;
+        }
+    } catch (const std::exception& error) {
+        std::cerr << "[FAIL] MsaTokenManager getRefreshToken rejected: "
+                  << error.what() << "\n";
+        ok = false;
+    }
+
+    std::vector<bedrock::JsRuntimeValue> verifyReads {
+        refreshCache,
+        bedrock::JsRuntimeValue::object({
+            {"AccessToken", bedrock::JsRuntimeValue::object({
+                {"token", account("manager-client-id", 99, "ACCESS")}
+            })}
+        }),
+        refreshCache
+    };
+    std::size_t verifyReadIndex = 0;
+    cache->setGetCachedMethod([&verifyReads, &verifyReadIndex] {
+        if (verifyReadIndex >= verifyReads.size()) {
+            throw std::runtime_error("unexpected verify cache read");
+        }
+        return bedrock::makeReadyAuthCacheFuture(
+            verifyReads[verifyReadIndex++]
+        );
+    });
+    int refreshCalls = 0;
+    bedrock::JsRuntimeValue observedRefreshRequest;
+    app->refresh = [queue, &refreshCalls, &observedRefreshRequest](
+        bedrock::JsRuntimeValue request
+    ) {
+        ++refreshCalls;
+        observedRefreshRequest = request;
+        return bedrock::JsPromise<bedrock::JsRuntimeValue>::resolved(
+            queue,
+            bedrock::JsRuntimeValue::object({
+                {"accessToken", bedrock::JsRuntimeValue::string("new")}
+            })
+        );
+    };
+    manager.forceRefresh = bedrock::JsRuntimeValue::string("false");
+    try {
+        const auto verified = manager.verifyTokens().get();
+        if (!verified.isBool() || !verified.boolValue() ||
+            refreshCalls != 1 || verifyReadIndex != 3 ||
+            !observedRefreshRequest.get("refreshToken") ||
+            observedRefreshRequest.get("refreshToken")->stringValue() !=
+                "THREE" ||
+            !observedRefreshRequest.get("scopes")->sharesIdentityWith(
+                manager.scopes
+            )) {
+            std::cerr << "[FAIL] MsaTokenManager forceRefresh/request mismatch\n";
+            ok = false;
+        }
+    } catch (const std::exception& error) {
+        std::cerr << "[FAIL] MsaTokenManager verifyTokens rejected: "
+                  << error.what() << "\n";
+        ok = false;
+    }
+
+    auto deviceCacheDocument = bedrock::JsRuntimeValue::object();
+    bedrock::JsRuntimeValue deviceWrite;
+    std::atomic<int> ignoredDeviceWriteRejections {0};
+    cache->setGetCachedMethod([deviceCacheDocument] {
+        return bedrock::makeReadyAuthCacheFuture(deviceCacheDocument);
+    });
+    cache->setSetCachedPartialMethod([&deviceWrite](
+        bedrock::AuthCacheValue value
+    ) {
+        deviceWrite = value;
+        return bedrock::makeRejectedAuthCacheFuture<void>(
+            "ignored device write"
+        );
+    });
+    bedrock::MsaTokenManagerObservers deviceObservers = observers;
+    deviceObservers.unhandledRejection =
+        [&ignoredDeviceWriteRejections](std::exception_ptr) {
+            ++ignoredDeviceWriteRejections;
+        };
+    auto deviceConfig = bedrock::makeMsalConfig("manager-client-id");
+    auto deviceApp = std::make_shared<ScriptedMsalPublicClientApplication>();
+    bedrock::JsRuntimeValue observedDeviceRequest;
+    auto deviceResponse = bedrock::JsRuntimeValue::object({
+        {"accessToken", bedrock::JsRuntimeValue::string("device-access")},
+        {"account", bedrock::JsRuntimeValue::object({
+            {"username", bedrock::JsRuntimeValue::string("player")}
+        })}
+    });
+    auto callbackResponse = bedrock::JsRuntimeValue::object({
+        {"message", bedrock::JsRuntimeValue::string("visit")}
+    });
+    deviceApp->device = [
+        queue,
+        &observedDeviceRequest,
+        callbackResponse,
+        deviceResponse
+    ](bedrock::JsRuntimeValue request) {
+        observedDeviceRequest = request;
+        auto* callback = request.get("deviceCodeCallback");
+        callback->call<void(bedrock::JsRuntimeValue)>(callbackResponse);
+        return bedrock::JsPromise<bedrock::JsRuntimeValue>::resolved(
+            queue,
+            deviceResponse
+        );
+    };
+    bedrock::MsaTokenManager deviceManager(
+        deviceConfig,
+        scopes,
+        cache,
+        [deviceApp](const auto&) { return deviceApp; },
+        queue,
+        deviceObservers
+    );
+    bedrock::JsRuntimeValue callbackSeen;
+    try {
+        const auto result = deviceManager.authDeviceCode(
+            [&callbackSeen](const bedrock::JsRuntimeValue& response) {
+                callbackSeen = response;
+            }
+        ).get();
+        const auto* callback = observedDeviceRequest.get("deviceCodeCallback");
+        if (!result.sharesIdentityWith(deviceResponse) ||
+            !callbackSeen.sharesIdentityWith(callbackResponse) ||
+            !observedDeviceRequest.get("scopes")->sharesIdentityWith(scopes) ||
+            !callback || callback->get("name")->stringValue() !=
+                "deviceCodeCallback" ||
+            callback->get("length")->numberValue() != 1 ||
+            !deviceWrite.sharesIdentityWith(deviceCacheDocument) ||
+            !deviceCacheDocument.get("Account") ||
+            !deviceCacheDocument.get("Account")->get("") ||
+            !deviceCacheDocument.get("Account")->get("")->sharesIdentityWith(
+                *deviceResponse.get("account")
+            )) {
+            std::cerr << "[FAIL] MsaTokenManager authDeviceCode shape/write mismatch\n";
+            ok = false;
+        }
+    } catch (const std::exception& error) {
+        std::cerr << "[FAIL] MsaTokenManager authDeviceCode rejected: "
+                  << error.what() << "\n";
+        ok = false;
+    }
+    for (int attempt = 0;
+         attempt < 100 && ignoredDeviceWriteRejections.load() == 0;
+         ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (ignoredDeviceWriteRejections.load() != 1) {
+        std::cerr << "[FAIL] authDeviceCode awaited/hidden rejected write\n";
+        ok = false;
+    }
+
+    return ok;
+}
+
+bool checkOfflineUuidGolden() {
+    bool ok = true;
+
+    if (bedrock::uuidFrom("Notch") !=
+        "ce229d4c-d328-3d41-95ad-bb356a551668") {
+        std::cerr << "[FAIL] uuidFrom URL-namespace UUID v3 golden mismatch\n";
+        ok = false;
+    }
+    if (bedrock::uuidFrom("") !=
+        "14cdb9b4-de01-3faa-aff5-65bc2f771745") {
+        std::cerr << "[FAIL] uuidFrom empty-name UUID v3 golden mismatch\n";
+        ok = false;
+    }
+
+    return ok;
+}
+
+bool checkFileAuthCacheGolden() {
+    bool ok = true;
+
+    if (bedrock::FileAuthCache::usernameHash("") != "da39a3" ||
+        bedrock::FileAuthCache::usernameHash("alice@example.com") !=
+            "fc2398" ||
+        bedrock::FileAuthCache::cacheFileName("msal", "alice@example.com") !=
+            "fc2398_msal-cache.json") {
+        std::cerr << "[FAIL] FileCache filename/hash golden mismatch\n";
+        ok = false;
+    }
+
+    const auto nonce = std::chrono::steady_clock::now()
+        .time_since_epoch().count();
+    const auto root = std::filesystem::temp_directory_path() /
+        ("bedrock-file-auth-cache-" + std::to_string(nonce));
+    std::error_code filesystemError;
+    std::filesystem::create_directories(root, filesystemError);
+    if (filesystemError) {
+        std::cerr << "[FAIL] could not create isolated FileCache test root\n";
+        return false;
+    }
+
+    try {
+        const bedrock::AuthCacheFactoryOptions options {
+            .cacheName = "live",
+            .username = "alice@example.com"
+        };
+        bedrock::FileAuthCache cache(root, options);
+        const auto expectedLocation = root / "fc2398_live-cache.json";
+        auto initial = cache.getCached().get();
+        if (cache.cacheLocation() != expectedLocation ||
+            !initial.isObject() || !initial.objectNode()->empty() ||
+            !std::filesystem::exists(expectedLocation)) {
+            std::cerr << "[FAIL] FileCache missing-file reset/lazy load mismatch\n";
+            ok = false;
+        }
+
+        cache.setCached(bedrock::JsRuntimeValue::object({
+            {"first", bedrock::JsRuntimeValue::number(1)}
+        })).get();
+        cache.setCachedPartial(bedrock::JsRuntimeValue::object({
+            {"second", bedrock::JsRuntimeValue::string("two")}
+        })).get();
+        const auto merged = cache.getCached().get();
+        const auto* first = merged.get("first");
+        const auto* second = merged.get("second");
+        if (!first || !first->isNumber() || first->numberValue() != 1 ||
+            !second || !second->isString() ||
+            second->stringValue() != "two") {
+            std::cerr << "[FAIL] FileCache shallow partial merge mismatch\n";
+            ok = false;
+        }
+
+        const auto resetResult = cache.reset().get();
+        const auto staleAfterReset = cache.getCached().get();
+        bedrock::FileAuthCache freshAfterReset(root, options);
+        const auto diskAfterReset = freshAfterReset.getCached().get();
+        if (!resetResult.isObject() || !resetResult.objectNode()->empty() ||
+            !staleAfterReset.get("first") ||
+            !diskAfterReset.isObject() ||
+            !diskAfterReset.objectNode()->empty()) {
+            std::cerr << "[FAIL] FileCache reset memory/disk behavior mismatch\n";
+            ok = false;
+        }
+
+        freshAfterReset.setCached(bedrock::JsRuntimeValue::object({
+            {"diskOnly", bedrock::JsRuntimeValue::boolean(true)}
+        })).get();
+        bedrock::FileAuthCache partialBeforeRead(root, options);
+        partialBeforeRead.setCachedPartial(bedrock::JsRuntimeValue::object({
+            {"newOnly", bedrock::JsRuntimeValue::boolean(true)}
+        })).get();
+        bedrock::FileAuthCache verifyPartialBeforeRead(root, options);
+        const auto partialDisk = verifyPartialBeforeRead.getCached().get();
+        if (partialDisk.get("diskOnly") || !partialDisk.get("newOnly")) {
+            std::cerr << "[FAIL] FileCache partial-before-read loaded disk state\n";
+            ok = false;
+        }
+
+        {
+            std::ofstream invalid(expectedLocation, std::ios::trunc);
+            invalid << "not json";
+        }
+        bedrock::FileAuthCache invalidJson(root, options);
+        const auto recovered = invalidJson.getCached().get();
+        if (!recovered.isObject() || !recovered.objectNode()->empty()) {
+            std::cerr << "[FAIL] FileCache invalid JSON recovery mismatch\n";
+            ok = false;
+        }
+    } catch (const std::exception& error) {
+        std::cerr << "[FAIL] FileCache golden threw: " << error.what() << "\n";
+        ok = false;
+    }
+
+    std::filesystem::remove_all(root, filesystemError);
+    if (filesystemError) {
+        std::cerr << "[FAIL] could not remove isolated FileCache test root\n";
+        ok = false;
+    }
+    return ok;
+}
+
+bool checkAuthCacheFactoryGolden() {
+    bool ok = true;
+
+    {
+        std::vector<std::string> calls;
+        std::vector<bedrock::AuthCachePtr> returned;
+        auto config = bedrock::makeMsalConfig("factory-client-id");
+        auto factory = std::make_shared<bedrock::AuthCacheFactory>(
+            [&](bedrock::AuthCacheFactoryOptions options) {
+                calls.push_back(options.cacheName + ":" + options.username);
+                if (options.cacheName == "msal" && config->get("cache")) {
+                    ok = false;
+                    std::cerr << "[FAIL] msalConfig mutated before msal cache factory\n";
+                }
+                if (options.cacheName == "xbl" && !config->get("cache")) {
+                    ok = false;
+                    std::cerr << "[FAIL] msalConfig mutation was late for xbl factory\n";
+                }
+                auto cache = std::make_shared<bedrock::AuthCache>();
+                returned.push_back(cache);
+                return cache;
+            }
+        );
+
+        bedrock::BedrockNetworkClientOptions options;
+        options.host = "127.0.0.1";
+        options.port = 9;
+        options.username = "CacheFactoryUser";
+        options.profile = "CacheFactoryUser";
+        options.offline = false;
+        options.authTitle = "";
+        options.flow = "msal";
+        options.msalConfig = config;
+        options.profilesFolder = factory;
+
+        bedrock::BedrockNetworkClient client(std::move(options));
+        bedrock::BedrockNetworkClientTestAccess::setBeforeQueueStartHook(
+            client,
+            []() { throw std::runtime_error("stop after cache factories"); }
+        );
+        bool exactHookError = false;
+        try {
+            (void) client.prepareConnectLifecycle(false);
+        } catch (const std::exception& error) {
+            exactHookError = std::string(error.what()) ==
+                "stop after cache factories";
+        }
+
+        const std::vector<std::string> expected {
+            "msal:CacheFactoryUser",
+            "xbl:CacheFactoryUser",
+            "bed:CacheFactoryUser",
+            "mca:CacheFactoryUser",
+            "mcs:CacheFactoryUser",
+            "pfb:CacheFactoryUser"
+        };
+        if (!exactHookError || calls != expected || returned.size() != 6 ||
+            !client.options().profilesFolder.isFactory() ||
+            client.options().profilesFolder.factory() != factory ||
+            !bedrock::BedrockNetworkClientTestAccess::
+                effectiveAuthenticationCacheRoot(client).empty() ||
+            !bedrock::BedrockNetworkClientTestAccess::
+                hasAuthenticationXboxProofKey(client)) {
+            std::cerr << "[FAIL] CacheFactory identity/order/path mismatch\n";
+            ok = false;
+        }
+        const std::array<const char*, 6> cacheNames {
+            "msal", "xbl", "bed", "mca", "mcs", "pfb"
+        };
+        for (std::size_t index = 0; index < returned.size(); ++index) {
+            const auto* name = cacheNames[index];
+            if (bedrock::BedrockNetworkClientTestAccess::authenticationCache(
+                    client,
+                    name
+                ) != returned[index]) {
+                std::cerr << "[FAIL] CacheFactory return identity was not retained\n";
+                ok = false;
+            }
+        }
+        client.close();
+    }
+
+    const auto runRejected = [&ok](
+        bool factoryThrows,
+        const std::string& expectedError
+    ) {
+        std::vector<std::string> calls;
+        auto malformed = std::make_shared<bedrock::MsalConfig>(
+            bedrock::MsalConfig::object({})
+        );
+        auto factory = std::make_shared<bedrock::AuthCacheFactory>(
+            [&](bedrock::AuthCacheFactoryOptions options) {
+                calls.push_back(options.cacheName);
+                if (factoryThrows) {
+                    throw std::runtime_error("cache factory boom");
+                }
+                return std::make_shared<bedrock::AuthCache>();
+            }
+        );
+
+        bedrock::BedrockNetworkClientOptions options;
+        options.host = "127.0.0.1";
+        options.port = 9;
+        options.username = "CacheFactoryFailure";
+        options.profile = "CacheFactoryFailure";
+        options.offline = false;
+        options.authTitle = "";
+        options.flow = "msal";
+        options.msalConfig = malformed;
+        options.profilesFolder = factory;
+
+        bedrock::BedrockNetworkClient client(std::move(options));
+        std::string observedError;
+        client.onError([&](const std::string& error) {
+            observedError = error;
+        });
+        const bool prepared = client.prepareConnectLifecycle(false);
+        if (!prepared || observedError != expectedError ||
+            calls != std::vector<std::string> {"msal"} ||
+            malformed->get("cache") ||
+            !bedrock::BedrockNetworkClientTestAccess::queueRunning(client)) {
+            std::cerr << "[FAIL] CacheFactory/config error precedence mismatch\n";
+            ok = false;
+        }
+        client.close();
+    };
+
+    runRejected(true, "cache factory boom");
+    runRejected(
+        false,
+        "Cannot read properties of undefined (reading 'clientId')"
+    );
+
+    {
+        std::size_t calls = 0;
+        auto factory = std::make_shared<bedrock::AuthCacheFactory>(
+            [&](bedrock::AuthCacheFactoryOptions) {
+                ++calls;
+                return std::make_shared<bedrock::AuthCache>();
+            }
+        );
+        bedrock::BedrockNetworkClientOptions options;
+        options.host = "127.0.0.1";
+        options.port = 9;
+        options.username = "InvalidBeforeFactory";
+        options.profile = "InvalidBeforeFactory";
+        options.offline = false;
+        options.authTitle = "";
+        options.flow = "live";
+        options.profilesFolder = factory;
+        bedrock::BedrockNetworkClient client(std::move(options));
+        client.onError([](const std::string&) {});
+        (void) client.prepareConnectLifecycle(false);
+        if (calls != 0) {
+            std::cerr << "[FAIL] invalid live flow invoked CacheFactory\n";
+            ok = false;
+        }
+        client.close();
+    }
+
+    {
+        const auto nonce = std::chrono::steady_clock::now()
+            .time_since_epoch().count();
+        const auto root = std::filesystem::temp_directory_path() /
+            ("bedrock-built-in-auth-cache-" + std::to_string(nonce));
+        std::error_code filesystemError;
+        std::filesystem::create_directories(root, filesystemError);
+        if (filesystemError) {
+            std::cerr << "[FAIL] could not create built-in cache test root\n";
+            ok = false;
+        } else {
+            const std::array<const char*, 6> names {
+                "msal", "xbl", "bed", "mca", "mcs", "pfb"
+            };
+            for (const char* name : names) {
+                bedrock::FileAuthCache seed(
+                    root,
+                    bedrock::AuthCacheFactoryOptions {
+                        .cacheName = name,
+                        .username = "BuiltInCacheUser"
+                    }
+                );
+                seed.setCached(bedrock::JsRuntimeValue::object({
+                    {"stale", bedrock::JsRuntimeValue::boolean(true)}
+                })).get();
+            }
+
+            bedrock::BedrockNetworkClientOptions options;
+            options.host = "127.0.0.1";
+            options.port = 9;
+            options.username = "BuiltInCacheUser";
+            options.profile = "BuiltInCacheUser";
+            options.offline = false;
+            options.authTitle = "built-in-msal-client-id";
+            options.flow = "msal";
+            options.forceRefresh = true;
+            options.profilesFolder = root;
+
+            bedrock::BedrockNetworkClient client(std::move(options));
+            bedrock::BedrockNetworkClientTestAccess::setBeforeQueueStartHook(
+                client,
+                []() { throw std::runtime_error("stop after built-in caches"); }
+            );
+            bool exactHookError = false;
+            try {
+                (void) client.prepareConnectLifecycle(false);
+            } catch (const std::exception& error) {
+                exactHookError = std::string(error.what()) ==
+                    "stop after built-in caches";
+            }
+
+            if (!exactHookError ||
+                bedrock::BedrockNetworkClientTestAccess::
+                    effectiveAuthenticationCacheRoot(client) != root) {
+                std::cerr << "[FAIL] built-in FileCache root/order boundary mismatch\n";
+                ok = false;
+            }
+            for (const char* name : names) {
+                const auto cache = bedrock::BedrockNetworkClientTestAccess::
+                    authenticationCache(client, name);
+                const auto fileCache =
+                    std::dynamic_pointer_cast<bedrock::FileAuthCache>(cache);
+                if (!fileCache || fileCache->cacheLocation() !=
+                        bedrock::FileAuthCache::cacheLocationFor(
+                            root,
+                            name,
+                            "BuiltInCacheUser"
+                        )) {
+                    std::cerr << "[FAIL] built-in FileCache identity/path mismatch\n";
+                    ok = false;
+                    continue;
+                }
+                bedrock::FileAuthCache fromDisk(
+                    root,
+                    bedrock::AuthCacheFactoryOptions {
+                        .cacheName = name,
+                        .username = "BuiltInCacheUser"
+                    }
+                );
+                const auto value = fromDisk.getCached().get();
+                if (!value.isObject() || !value.objectNode()->empty()) {
+                    std::cerr << "[FAIL] forceRefresh did not reset FileCache\n";
+                    ok = false;
+                }
+            }
+            client.close();
+            std::filesystem::remove_all(root, filesystemError);
+            if (filesystemError) {
+                std::cerr << "[FAIL] could not remove built-in cache test root\n";
+                ok = false;
+            }
+        }
     }
 
     return ok;
@@ -1495,6 +3041,49 @@ bool checkOnlineAuthBoundaryGolden() {
         true,
         false
     );
+
+    {
+        auto supplied = bedrock::makeMsalConfig(
+            "supplied-client-id",
+            "https://login.example.test/tenant"
+        );
+        bedrock::BedrockNetworkClientOptions options;
+        options.host = "127.0.0.1";
+        options.port = 9;
+        options.profile = "MsalConfigBoundary";
+        options.offline = false;
+        options.authTitle = nullptr;
+        options.deviceType = "NullTitleDevice";
+        options.flow = "msal";
+        options.msalConfig = supplied;
+        options.profilesFolder = true;
+
+        bedrock::BedrockNetworkClient client(std::move(options));
+        bool exactHookError = false;
+        bedrock::BedrockNetworkClientTestAccess::setBeforeQueueStartHook(
+            client,
+            []() { throw std::runtime_error("stop after msal constructor"); }
+        );
+        try {
+            (void) client.prepareConnectLifecycle(false);
+        } catch (const std::exception& error) {
+            exactHookError = std::string(error.what()) ==
+                "stop after msal constructor";
+        }
+        const auto visible = client.options();
+        const auto effective = bedrock::BedrockNetworkClientTestAccess::
+            effectiveMsalConfig(client);
+        if (!exactHookError || !visible.authTitle.isNull() ||
+            visible.flow != "msal" || visible.deviceType != "NullTitleDevice" ||
+            visible.msalConfig != supplied || effective != supplied ||
+            !supplied->get("cache") ||
+            !supplied->get("cache")->get("cachePlugin") ||
+            bedrock::BedrockNetworkClientTestAccess::queueRunning(client)) {
+            std::cerr << "[FAIL] supplied msalConfig/null authTitle boundary mismatch\n";
+            ok = false;
+        }
+        client.close();
+    }
     checkRejected(
         "live empty authTitle",
         std::string(""),
@@ -1860,6 +3449,36 @@ int main() {
         ++failures;
     }
     if (!checkAuthTitleGolden()) {
+        ++failures;
+    }
+    if (!checkMsalConfigGolden()) {
+        ++failures;
+    }
+    if (!checkMsalRequestBuilderGolden()) {
+        ++failures;
+    }
+    if (!checkMsalSerializableTokenCacheGolden()) {
+        ++failures;
+    }
+    if (!checkJsRuntimeDateMapGolden()) {
+        ++failures;
+    }
+    if (!checkMsalErrorGolden()) {
+        ++failures;
+    }
+    if (!checkMsalCachePluginGolden()) {
+        ++failures;
+    }
+    if (!checkMsaTokenManagerGolden()) {
+        ++failures;
+    }
+    if (!checkOfflineUuidGolden()) {
+        ++failures;
+    }
+    if (!checkFileAuthCacheGolden()) {
+        ++failures;
+    }
+    if (!checkAuthCacheFactoryGolden()) {
         ++failures;
     }
     if (!checkOnlineAuthBoundaryGolden()) {

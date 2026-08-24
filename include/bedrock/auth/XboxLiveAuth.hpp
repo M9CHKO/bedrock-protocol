@@ -1,17 +1,41 @@
 #pragma once
 
+#include <bedrock/JsValue.hpp>
 #include <bedrock/Options.hpp>
+#include <bedrock/auth/AuthCache.hpp>
 #include <bedrock/auth/BedrockAuthJwt.hpp>
+#include <bedrock/auth/JsRuntimeValue.hpp>
+#include <bedrock/auth/MsaTokenManager.hpp>
 
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace bedrock {
+
+// @azure/msal-node accepts an open JavaScript configuration object and
+// prismarine-auth preserves the caller's object identity while overwriting its
+// `cache` member. This auth-only JS graph keeps property order, callable
+// values, opaque callback identity, and nested object reference identity.
+using MsalConfig = JsRuntimeValue;
+using MsalConfigPtr = std::shared_ptr<MsalConfig>;
+
+inline MsalConfigPtr makeMsalConfig(
+    std::string clientId,
+    std::string authority = "https://login.microsoftonline.com/consumers"
+) {
+    return std::make_shared<MsalConfig>(MsalConfig::object({
+        {"auth", MsalConfig::object({
+            {"clientId", MsalConfig::string(std::move(clientId))},
+            {"authority", MsalConfig::string(std::move(authority))}
+        })}
+    }));
+}
 
 // Exact prismarine-auth/src/common/Titles.js surface.  Static members support
 // Titles::MinecraftNintendoSwitch while the root `title` object below mirrors
@@ -41,9 +65,11 @@ struct XboxLiveAuthOptions {
     std::string serverAddress;
     bool offline = false;
     bool interactiveAuth = true;
-    std::optional<std::string> authTitle;
+    JsProperty<std::string> authTitle;
     std::string deviceType;
     std::string flow;
+    bool forceRefresh = false;
+    MsalConfigPtr msalConfig;
     // Deprecated compatibility alias. New code should use authTitle.
     std::string xboxClientId;
     std::filesystem::path cacheRoot;
@@ -69,6 +95,11 @@ struct XboxLiveLoginPacket {
     bool online = false;
 };
 
+struct PrismarineAuthFlowRuntime {
+    MsalConfigPtr effectiveMsalConfig;
+    std::shared_ptr<MsaTokenManager> msa;
+};
+
 class XboxLiveAuth {
 public:
     static XboxLiveAuthFlowOptions resolveFlowOptions(
@@ -87,7 +118,41 @@ public:
         const XboxLiveAuthFlowOptions& options
     );
 
+    // Runs the exact flow-specific constructor segment after cache selection.
+    // For a truthy supplied msalConfig the same object is returned and its
+    // `cache` property is overwritten. A falsy/omitted config yields the
+    // private structuredClone(defaultConfig) used by prismarine-auth.
+    static MsalConfigPtr initializePrismarineAuthFlow(
+        const XboxLiveAuthFlowOptions& options,
+        const MsalConfigPtr& msalConfig
+    );
+
+    static MsalConfigPtr initializePrismarineAuthFlow(
+        const XboxLiveAuthFlowOptions& options,
+        const MsalConfigPtr& msalConfig,
+        AuthCachePtr msaCache
+    );
+
+    static PrismarineAuthFlowRuntime initializePrismarineAuthFlowRuntime(
+        const XboxLiveAuthFlowOptions& options,
+        const MsalConfigPtr& msalConfig,
+        AuthCachePtr msaCache,
+        MsalPublicClientApplicationFactory applicationFactory = {},
+        std::shared_ptr<JsMicrotaskQueue> microtaskQueue = {},
+        MsaTokenManagerObservers observers = {}
+    );
+
+    static bool isTruthyMsalConfig(const MsalConfigPtr& msalConfig);
+
     static XboxLiveLoginPacket makeLoginPacket(XboxLiveAuthOptions options);
+
+    // BedrockNetworkClient has already executed the synchronous Authflow
+    // constructor before startQueue(). This entry point consumes that private
+    // effective MSAL config without mutating a supplied config a second time.
+    static XboxLiveLoginPacket makeLoginPacketFromPreparedFlow(
+        XboxLiveAuthOptions options,
+        MsalConfigPtr effectiveMsalConfig
+    );
 
     // Completes auth.js's supplied options.authflow path. The caller already
     // owns the KeyExchange P-384 key and the Promise result, so this overload

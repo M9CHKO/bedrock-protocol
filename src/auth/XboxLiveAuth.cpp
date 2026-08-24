@@ -3,6 +3,8 @@
 #include <bedrock/BedrockKeyExchange.hpp>
 #include <bedrock/LoginPacket.hpp>
 #include <bedrock/auth/BedrockClientDataBuilder.hpp>
+#include <bedrock/auth/MsalCachePlugin.hpp>
+#include <bedrock/auth/UuidV3.hpp>
 #include <bedrock/auth/XboxProfileCache.hpp>
 #include <bedrock/auth/XboxTokenCache.hpp>
 #include <bedrock/protocol/ProtocolDefinition.hpp>
@@ -16,6 +18,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <cmath>
 #include <random>
 #include <sstream>
 #include <stdexcept>
@@ -209,6 +212,10 @@ std::string extractDisplayClaim(const std::string& json, const std::string& key)
     auto xui = json.find("\"xui\"");
     if (xui == std::string::npos) return "";
     return jsonString(json.substr(xui), key);
+}
+
+bool jsTruthy(const MsalConfigPtr& value) {
+    return value && value->truthy();
 }
 
 std::string curlPostForm(const std::string& url, const std::string& data) {
@@ -524,35 +531,6 @@ std::string readVersionedSteveClientData(
         }
     }
     return "";
-}
-
-std::string readOrCreateUuid(const std::filesystem::path& path) {
-    if (std::filesystem::exists(path)) {
-        std::ifstream in(path);
-        std::string uuid;
-        std::getline(in, uuid);
-        if (!uuid.empty()) return uuid;
-    }
-
-    std::random_device rd;
-    std::mt19937_64 gen(rd());
-    uint8_t b[16];
-    for (auto& x : b) x = static_cast<uint8_t>(gen() & 0xff);
-    b[6] = static_cast<uint8_t>((b[6] & 0x0f) | 0x40);
-    b[8] = static_cast<uint8_t>((b[8] & 0x3f) | 0x80);
-
-    const char* hex = "0123456789abcdef";
-    std::string out;
-    for (int i = 0; i < 16; ++i) {
-        if (i == 4 || i == 6 || i == 8 || i == 10) out.push_back('-');
-        out.push_back(hex[b[i] >> 4]);
-        out.push_back(hex[b[i] & 0x0f]);
-    }
-
-    std::filesystem::create_directories(path.parent_path());
-    std::ofstream file(path);
-    file << out << "\n";
-    return out;
 }
 
 std::string jwtHeaderString(const std::string& jwt, const std::string& key) {
@@ -958,7 +936,10 @@ AuthflowProfile extractAuthflowProfile(
     return result;
 }
 
-XboxLiveAuthOptions normalizeOptions(XboxLiveAuthOptions options) {
+XboxLiveAuthOptions normalizeOptions(
+    XboxLiveAuthOptions options,
+    bool prismarineAuthFlowPrepared = false
+) {
     if (options.profileName.empty()) options.profileName = "Bot";
     // options.js always derives this value from Versions; callers cannot
     // override it independently of the selected Minecraft version.
@@ -969,7 +950,12 @@ XboxLiveAuthOptions normalizeOptions(XboxLiveAuthOptions options) {
     options.flow = authFlow.flow;
     if (!options.offline) {
         XboxLiveAuth::validatePrismarineAuthFlowPresence(authFlow);
-        XboxLiveAuth::validatePrismarineAuthFlow(authFlow);
+        if (!prismarineAuthFlowPrepared) {
+            options.msalConfig = XboxLiveAuth::initializePrismarineAuthFlow(
+                authFlow,
+                options.msalConfig
+            );
+        }
     }
     return options;
 }
@@ -982,6 +968,13 @@ XboxLiveAuthFlowOptions XboxLiveAuth::resolveFlowOptions(
     XboxLiveAuthFlowOptions resolved;
     if (options.authTitle.has_value()) {
         resolved.authTitle = *options.authTitle;
+        resolved.deviceType = options.deviceType;
+        resolved.flow = options.flow;
+    } else if (options.authTitle.isNull()) {
+        // validateOptions only defaults a property whose value is undefined.
+        // null remains public and flows through PrismarineAuth as a falsy
+        // authTitle without receiving Nintendo/live defaults.
+        resolved.authTitle.clear();
         resolved.deviceType = options.deviceType;
         resolved.flow = options.flow;
     } else if (!options.xboxClientId.empty()) {
@@ -1040,6 +1033,78 @@ void XboxLiveAuth::validatePrismarineAuthFlow(
     );
 }
 
+MsalConfigPtr XboxLiveAuth::initializePrismarineAuthFlow(
+    const XboxLiveAuthFlowOptions& options,
+    const MsalConfigPtr& msalConfig
+) {
+    return initializePrismarineAuthFlow(options, msalConfig, {});
+}
+
+MsalConfigPtr XboxLiveAuth::initializePrismarineAuthFlow(
+    const XboxLiveAuthFlowOptions& options,
+    const MsalConfigPtr& msalConfig,
+    AuthCachePtr msaCache
+) {
+    return initializePrismarineAuthFlowRuntime(
+        options,
+        msalConfig,
+        std::move(msaCache)
+    ).effectiveMsalConfig;
+}
+
+PrismarineAuthFlowRuntime XboxLiveAuth::
+initializePrismarineAuthFlowRuntime(
+    const XboxLiveAuthFlowOptions& options,
+    const MsalConfigPtr& msalConfig,
+    AuthCachePtr msaCache,
+    MsalPublicClientApplicationFactory applicationFactory,
+    std::shared_ptr<JsMicrotaskQueue> microtaskQueue,
+    MsaTokenManagerObservers observers
+) {
+    validatePrismarineAuthFlowPresence(options);
+
+    if (options.flow == "live" || options.flow == "sisu") {
+        validatePrismarineAuthFlow(options);
+        return {};
+    }
+
+    if (options.flow != "msal") {
+        validatePrismarineAuthFlow(options);
+        return {};
+    }
+
+    MsalConfigPtr effective;
+    if (jsTruthy(msalConfig)) {
+        // JavaScript keeps the exact supplied object. In particular it does
+        // not clone or publish a normalized replacement.
+        effective = msalConfig;
+    } else {
+        // The Azure client-id error is conditional on a falsy msalConfig.
+        validatePrismarineAuthFlow(options);
+        effective = makeMsalConfig(options.authTitle);
+    }
+
+    auto manager = std::make_shared<MsaTokenManager>(
+        effective,
+        JsRuntimeValue::array({
+            JsRuntimeValue::string("XboxLive.signin"),
+            JsRuntimeValue::string("offline_access")
+        }),
+        std::move(msaCache),
+        std::move(applicationFactory),
+        std::move(microtaskQueue),
+        std::move(observers)
+    );
+    return PrismarineAuthFlowRuntime {
+        .effectiveMsalConfig = std::move(effective),
+        .msa = std::move(manager)
+    };
+}
+
+bool XboxLiveAuth::isTruthyMsalConfig(const MsalConfigPtr& msalConfig) {
+    return jsTruthy(msalConfig);
+}
+
 BedrockClientKeyPair XboxLiveAuth::loadOrCreateProfileKeyPair(
     const std::string& profileName,
     const std::filesystem::path& cacheRoot
@@ -1068,7 +1133,62 @@ XboxLiveLoginPacket XboxLiveAuth::makeLoginPacket(XboxLiveAuthOptions options) {
 
     XboxTokenCacheData cache;
     std::vector<std::string> chain;
-    std::string identity = readOrCreateUuid(paths.identityUuidTxt);
+    // auth.js createOfflineSession() derives this directly from username via
+    // uuid-1345 v3 and never stores it in prismarine-auth's profile cache.
+    std::string identity = options.offline
+        ? uuidFrom(options.profileName)
+        : std::string{};
+    std::string displayName = options.profileName;
+    std::string xuid = "0";
+
+    if (!options.offline) {
+        cache = loadOrLoginXboxCache(options, paths);
+        chain = requestBedrockChain(options, cache, keys);
+        identity = extractChainExtraDataString(chain, "identity");
+        displayName = extractChainExtraDataString(chain, "displayName");
+        xuid = extractChainExtraDataString(chain, "XUID");
+        if (displayName.empty()) displayName = !cache.minecraftName.empty() ? cache.minecraftName : cache.gamertag;
+        if (xuid.empty()) xuid = cache.xuid;
+        if (identity.empty()) {
+            throw std::runtime_error("Bedrock authentication chain has no extraData.identity");
+        }
+    }
+
+    if (displayName.empty()) displayName = options.profileName;
+    if (xuid.empty()) xuid = options.offline ? "0" : cache.xuid;
+    return buildLoginPacket(
+        options,
+        std::move(keys),
+        std::move(chain),
+        std::move(identity),
+        std::move(displayName),
+        std::move(xuid),
+        std::string(BedrockProtocolPublicKey)
+    );
+}
+
+XboxLiveLoginPacket XboxLiveAuth::makeLoginPacketFromPreparedFlow(
+    XboxLiveAuthOptions options,
+    MsalConfigPtr effectiveMsalConfig
+) {
+    sanitizeStdbufEnvironment();
+    options.msalConfig = std::move(effectiveMsalConfig);
+    options = normalizeOptions(std::move(options), true);
+
+    XboxProfileCache profiles(options.cacheRoot.empty() ? XboxProfileCache() : XboxProfileCache(options.cacheRoot));
+    profiles.ensureProfileVersionDir(options.profileName, options.version);
+    auto paths = profiles.pathsForVersion(options.profileName, options.version);
+
+    auto keys = BedrockAuthJwt::loadOrCreateKeyPair(
+        paths.profileDir / "client_private_key.pem",
+        paths.profileDir / "client_public_key.der.b64"
+    );
+
+    XboxTokenCacheData cache;
+    std::vector<std::string> chain;
+    std::string identity = options.offline
+        ? uuidFrom(options.profileName)
+        : std::string{};
     std::string displayName = options.profileName;
     std::string xuid = "0";
 

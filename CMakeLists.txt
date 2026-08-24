@@ -26,6 +26,18 @@ add_library(bedrock_protocol
     src/BedrockKeyExchange.cpp
     src/auth/BedrockAuthJwt.cpp
     src/auth/BedrockClientDataBuilder.cpp
+    src/auth/FileAuthCache.cpp
+    src/auth/JsPromise.cpp
+    src/auth/JsRuntimeValue.cpp
+    src/auth/MsaTokenManager.cpp
+    src/auth/MsalCachePlugin.cpp
+    src/auth/MsalError.cpp
+    src/auth/MsalHttpClient.cpp
+    src/auth/MsalRequestParameterBuilder.cpp
+    src/auth/MsalSerializableTokenCache.cpp
+    src/auth/MsalServerTelemetryManager.cpp
+    src/auth/MsalTokenResponseHandler.cpp
+    src/auth/NativeMsalPublicClientApplication.cpp
     src/auth/XboxLiveAuth.cpp
     src/auth/XboxProofKey.cpp
     src/client/BedrockNetworkClient.cpp
@@ -85,6 +97,9 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
     add_executable(protocol-roundtrip tools/protocol_roundtrip.cpp)
     target_link_libraries(protocol-roundtrip PRIVATE BedrockProtocol::bedrock_protocol)
 
+    add_executable(msal-native-smoke tools/msal_native_smoke.cpp)
+    target_link_libraries(msal-native-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
     add_executable(ping-api-smoke tools/ping_api_smoke.cpp)
     target_link_libraries(ping-api-smoke PRIVATE BedrockProtocol::bedrock_protocol)
 
@@ -129,6 +144,7 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
 
     if(BUILD_TESTING)
         add_test(NAME protocol-roundtrip COMMAND protocol-roundtrip)
+        add_test(NAME msal-native-smoke COMMAND msal-native-smoke)
         add_test(NAME ping-api-smoke COMMAND ping-api-smoke)
         add_test(NAME create-server-factory-smoke COMMAND create-server-factory-smoke)
         add_test(NAME create-client-factory-smoke COMMAND create-client-factory-smoke)
@@ -145,6 +161,7 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
         add_test(NAME xbox-proof-key-smoke COMMAND xbox-proof-key-smoke)
         set_tests_properties(
             protocol-roundtrip
+            msal-native-smoke
             ping-api-smoke
             create-server-factory-smoke
             create-client-factory-smoke
@@ -211,7 +228,7 @@ if(BEDROCK_PROTOCOL_CPP_INSTALL)
     )
 
     if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
-        install(TARGETS bedrock bedrock-session login xbox-login ping protocol-roundtrip ping-api-smoke create-server-factory-smoke create-client-factory-smoke legacy-encryption-smoke raknet-server-smoke raknet-connection-lifecycle-smoke server-login-verifier-smoke raknet-client-smoke network-client-smoke live-relay-smoke chunk-smoke
+        install(TARGETS bedrock bedrock-session login xbox-login ping protocol-roundtrip msal-native-smoke ping-api-smoke create-server-factory-smoke create-client-factory-smoke legacy-encryption-smoke raknet-server-smoke raknet-connection-lifecycle-smoke server-login-verifier-smoke raknet-client-smoke network-client-smoke live-relay-smoke chunk-smoke
             RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
         )
     endif()

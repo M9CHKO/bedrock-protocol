@@ -2,6 +2,7 @@
 
 #include <bedrock/auth/BedrockAuthJwt.hpp>
 #include <bedrock/auth/BedrockClientDataBuilder.hpp>
+#include <bedrock/auth/FileAuthCache.hpp>
 #include <bedrock/protocol/ProtocolDefinition.hpp>
 #include <bedrock/protodef/ProtoDefPacketDecoder.hpp>
 
@@ -10,7 +11,6 @@
 #include <cctype>
 #include <cstdlib>
 #include <iostream>
-#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
@@ -85,26 +85,6 @@ std::string escapeJson(const std::string& s) {
         else if (c == '\n') out += "\\n";
         else if (c == '\r') out += "\\r";
         else out += c;
-    }
-    return out;
-}
-
-std::string randomUuid() {
-    std::random_device rd;
-    std::mt19937_64 gen(rd());
-    uint8_t b[16];
-    for (auto& x : b) {
-        x = static_cast<uint8_t>(gen() & 0xff);
-    }
-    b[6] = static_cast<uint8_t>((b[6] & 0x0f) | 0x40);
-    b[8] = static_cast<uint8_t>((b[8] & 0x3f) | 0x80);
-
-    const char* hex = "0123456789abcdef";
-    std::string out;
-    for (int i = 0; i < 16; ++i) {
-        if (i == 4 || i == 6 || i == 8 || i == 10) out.push_back('-');
-        out.push_back(hex[b[i] >> 4]);
-        out.push_back(hex[b[i] & 0x0f]);
     }
     return out;
 }
@@ -247,6 +227,10 @@ std::filesystem::path initializePrismarineAuthCacheRoot(
     const ProfilesFolderOption& profilesFolder,
     const std::filesystem::path& selectedRoot
 ) {
+    // A truthy function is passed through as prismarine-auth's CacheFactory;
+    // no filesystem lookup, creation or fallback is attempted.
+    if (profilesFolder.isFactory()) return {};
+
     // fs.existsSync(true) throws ERR_INVALID_ARG_TYPE. MicrosoftAuthFlow
     // catches that error and switches its private cachePath to __dirname;
     // auth.js's public options.profilesFolder remains Boolean(true).
@@ -659,7 +643,8 @@ bool BedrockNetworkClient::prepareConnectLifecycle(bool deferQueuePump) {
             // auth.js keys solely on undefined authTitle. Unknown extension
             // fields (including the legacy xboxClientId alias) cannot prevent
             // these three conditional assignments.
-            if (!authOptionsSnapshot.authTitle.has_value()) {
+            if (!authOptionsSnapshot.authTitle.hasOwn() ||
+                authOptionsSnapshot.authTitle.isUndefined()) {
                 authOptionsSnapshot.authTitle =
                     std::string(Titles::MinecraftNintendoSwitch);
                 authOptionsSnapshot.deviceType = "Nintendo";
@@ -720,7 +705,7 @@ bool BedrockNetworkClient::prepareConnectLifecycle(bool deferQueuePump) {
                 }
             } else {
                 const XboxLiveAuthFlowOptions authFlow {
-                    .authTitle = *authOptionsSnapshot.authTitle,
+                    .authTitle = authOptionsSnapshot.authTitle.value_or(""),
                     .deviceType = authOptionsSnapshot.deviceType,
                     .flow = authOptionsSnapshot.flow
                 };
@@ -736,8 +721,81 @@ bool BedrockNetworkClient::prepareConnectLifecycle(bool deferQueuePump) {
                     {
                         std::lock_guard<std::mutex> lock(optionsMutex_);
                         authenticationCacheRoot_ = effectiveCacheRoot;
+                        authenticationMsalConfig_.reset();
+                        authenticationMsaTokenManager_.reset();
+                        authenticationXboxProofKey_.reset();
+                        authenticationCaches_.clear();
                     }
-                    XboxLiveAuth::validatePrismarineAuthFlow(authFlow);
+
+                    // Flow-specific validation precedes evaluation of the
+                    // first CacheFactory argument. String/FileCache setup above
+                    // still happens first, matching initTokenManagers().
+                    if (authFlow.flow == "live" ||
+                        authFlow.flow == "sisu" ||
+                        authFlow.flow != "msal" ||
+                        !XboxLiveAuth::isTruthyMsalConfig(
+                            authOptionsSnapshot.msalConfig
+                        )) {
+                        XboxLiveAuth::validatePrismarineAuthFlow(authFlow);
+                    }
+
+                    std::unordered_map<std::string, AuthCachePtr> caches;
+                    const auto initializeCache = [&](const std::string& name) {
+                        AuthCacheFactoryOptions cacheOptions {
+                            .cacheName = name,
+                            .username = authOptionsSnapshot.username
+                        };
+                        if (authOptionsSnapshot.profilesFolder.isFactory()) {
+                            const auto& factory =
+                                authOptionsSnapshot.profilesFolder.factory();
+                            // A null function pointer is falsy and would have
+                            // been replaced by validateOptions' default path.
+                            caches[name] = (*factory)(cacheOptions);
+                            return;
+                        }
+                        auto cache = makeFileAuthCache(
+                            effectiveCacheRoot,
+                            std::move(cacheOptions)
+                        );
+                        if (authOptionsSnapshot.forceRefresh) {
+                            // FileCache.reset() performs writeFileSync before
+                            // returning its Promise. Authflow deliberately
+                            // does not await or observe that Promise.
+                            (void) cache->reset();
+                        }
+                        caches[name] = std::move(cache);
+                    };
+
+                    const std::string firstCache = authFlow.flow == "msal"
+                        ? "msal"
+                        : authFlow.flow;
+                    initializeCache(firstCache);
+                    auto authRuntime =
+                        XboxLiveAuth::initializePrismarineAuthFlowRuntime(
+                            authFlow,
+                            authOptionsSnapshot.msalConfig,
+                            caches[firstCache]
+                        );
+                    // MicrosoftAuthFlow generates one P-256 key immediately
+                    // after constructing its MSA manager and before it asks
+                    // CacheFactory for xbl. XboxTokenManager retains this key
+                    // for every PoP signature in the flow lifetime.
+                    auto xboxProofKey = XboxProofKey::generate();
+                    for (const char* name : {
+                            "xbl", "bed", "mca", "mcs", "pfb"
+                        }) {
+                        initializeCache(name);
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(optionsMutex_);
+                        authenticationMsalConfig_ =
+                            std::move(authRuntime.effectiveMsalConfig);
+                        authenticationMsaTokenManager_ =
+                            std::move(authRuntime.msa);
+                        authenticationXboxProofKey_ =
+                            std::move(xboxProofKey);
+                        authenticationCaches_ = std::move(caches);
+                    }
                 } catch (const std::exception& error) {
                     authenticationRejected = true;
                     authenticationError = error.what();
@@ -1887,10 +1945,12 @@ bool BedrockNetworkClient::tryStoreLevelChunk(const BedrockLevelChunkPacket& lev
 void BedrockNetworkClient::prepareLoginPacket() {
     BedrockNetworkClientOptions authOptions;
     std::filesystem::path effectiveAuthenticationCacheRoot;
+    MsalConfigPtr effectiveMsalConfig;
     {
         std::lock_guard<std::mutex> lock(optionsMutex_);
         authOptions = options_;
         effectiveAuthenticationCacheRoot = authenticationCacheRoot_;
+        effectiveMsalConfig = authenticationMsalConfig_;
     }
     if (!authOptions.loginPacket.empty()) {
         if (clientKeys_.privateKeyPem.empty()) {
@@ -1912,6 +1972,8 @@ void BedrockNetworkClient::prepareLoginPacket() {
         .authTitle = authOptions.authTitle,
         .deviceType = authOptions.deviceType,
         .flow = authOptions.flow,
+        .forceRefresh = authOptions.forceRefresh,
+        .msalConfig = authOptions.msalConfig,
         .xboxClientId = authOptions.xboxClientId,
         // Online Authflow owns the canonical profilesFolder-derived path.
         // The legacy native alias remains available only to the native offline
@@ -1962,7 +2024,10 @@ void BedrockNetworkClient::prepareLoginPacket() {
             std::move(chains)
         );
     } else {
-        generated = XboxLiveAuth::makeLoginPacket(std::move(loginOptions));
+        generated = XboxLiveAuth::makeLoginPacketFromPreparedFlow(
+            std::move(loginOptions),
+            std::move(effectiveMsalConfig)
+        );
     }
 
     {

@@ -2,11 +2,14 @@
 
 #include <bedrock/BedrockEncryption.hpp>
 #include <bedrock/BedrockKeyExchange.hpp>
+#include <bedrock/JsValue.hpp>
 #include <bedrock/LoginPacket.hpp>
 #include <bedrock/Options.hpp>
 #include <bedrock/auth/BedrockAuthJwt.hpp>
 #include <bedrock/auth/Authflow.hpp>
+#include <bedrock/auth/AuthCache.hpp>
 #include <bedrock/auth/XboxLiveAuth.hpp>
+#include <bedrock/auth/XboxProofKey.hpp>
 #include <bedrock/client/RakNetClient.hpp>
 #include <bedrock/client/VersionedClientSession.hpp>
 #include <bedrock/protodef/ProtoDefPacketEncoder.hpp>
@@ -49,16 +52,17 @@ enum class BedrockNetworkClientStatus {
     Initialized
 };
 
-// JavaScript accepts either a cache-directory string or the explicit boolean
-// false for `profilesFolder`.  Keep omission distinct from both values so the
-// auth boundary can apply auth.js's `if (!options.profilesFolder)` default at
-// the same time as the JavaScript implementation.
+// JavaScript accepts a cache-directory value, false, or a truthy CacheFactory
+// function for `profilesFolder`. Keep omission distinct so auth.js's
+// `if (!options.profilesFolder)` default and prismarine-auth's typeof-function
+// branch remain independently observable.
 class ProfilesFolderOption {
 public:
     enum class Kind {
         Omitted,
         Path,
-        Boolean
+        Boolean,
+        Factory
     };
 
     ProfilesFolderOption() = default;
@@ -83,10 +87,19 @@ public:
         *this = value;
     }
 
+    ProfilesFolderOption(AuthCacheFactory value) {
+        *this = std::move(value);
+    }
+
+    ProfilesFolderOption(AuthCacheFactoryPtr value) {
+        *this = std::move(value);
+    }
+
     ProfilesFolderOption& operator=(const char* value) {
         kind_ = Kind::Path;
         path_ = value ? std::filesystem::path(value) : std::filesystem::path{};
         boolean_ = false;
+        factory_.reset();
         return *this;
     }
 
@@ -94,6 +107,7 @@ public:
         kind_ = Kind::Path;
         path_ = std::filesystem::path(std::move(value));
         boolean_ = false;
+        factory_.reset();
         return *this;
     }
 
@@ -101,6 +115,7 @@ public:
         kind_ = Kind::Path;
         path_ = std::move(value);
         boolean_ = false;
+        factory_.reset();
         return *this;
     }
 
@@ -108,6 +123,23 @@ public:
         kind_ = Kind::Boolean;
         path_.clear();
         boolean_ = value;
+        factory_.reset();
+        return *this;
+    }
+
+    ProfilesFolderOption& operator=(AuthCacheFactory value) {
+        kind_ = Kind::Factory;
+        path_.clear();
+        boolean_ = false;
+        factory_ = std::make_shared<AuthCacheFactory>(std::move(value));
+        return *this;
+    }
+
+    ProfilesFolderOption& operator=(AuthCacheFactoryPtr value) {
+        kind_ = Kind::Factory;
+        path_.clear();
+        boolean_ = false;
+        factory_ = std::move(value);
         return *this;
     }
 
@@ -117,6 +149,9 @@ public:
 
     bool truthy() const noexcept {
         if (kind_ == Kind::Path) return !path_.empty();
+        if (kind_ == Kind::Factory) {
+            return factory_ && static_cast<bool>(*factory_);
+        }
         return kind_ == Kind::Boolean && boolean_;
     }
 
@@ -128,6 +163,14 @@ public:
         return boolean_;
     }
 
+    bool isFactory() const noexcept {
+        return kind_ == Kind::Factory;
+    }
+
+    const AuthCacheFactoryPtr& factory() const noexcept {
+        return factory_;
+    }
+
     const std::filesystem::path& path() const noexcept {
         return path_;
     }
@@ -136,12 +179,14 @@ public:
         kind_ = Kind::Path;
         path_ = std::move(value);
         boolean_ = false;
+        factory_.reset();
     }
 
 private:
     Kind kind_ = Kind::Omitted;
     std::filesystem::path path_;
     bool boolean_ = false;
+    AuthCacheFactoryPtr factory_;
 };
 
 struct BedrockNetworkClientOptions {
@@ -153,9 +198,11 @@ struct BedrockNetworkClientOptions {
     uint32_t protocolVersion = 0;
     bool offline = false;
     bool interactiveAuth = true;
-    std::optional<std::string> authTitle;
+    JsProperty<std::string> authTitle;
     std::string deviceType;
     std::string flow;
+    bool forceRefresh = false;
+    MsalConfigPtr msalConfig;
     // Runtime bedrock-protocol accepts a prebuilt prismarine-auth-like object
     // even though its bundled TypeScript declaration omits the property.
     std::shared_ptr<Authflow> authflow;
@@ -404,6 +451,13 @@ private:
     // caller's options object (including unknown extension properties such as
     // authCacheRoot), so keep the effective directory separate from options_.
     std::filesystem::path authenticationCacheRoot_;
+    // Effective private config retained by the built-in Authflow. This is the
+    // caller's same object for a truthy options.msalConfig, otherwise the
+    // unexposed structured clone of prismarine-auth's default config.
+    MsalConfigPtr authenticationMsalConfig_;
+    std::shared_ptr<MsaTokenManager> authenticationMsaTokenManager_;
+    std::optional<XboxProofKey> authenticationXboxProofKey_;
+    std::unordered_map<std::string, AuthCachePtr> authenticationCaches_;
     // A supplied Authflow method is invoked synchronously during
     // Client.connect(), then its Promise settles after startQueue(). std::future
     // carries that same split into the native connect worker.
