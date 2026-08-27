@@ -5,17 +5,30 @@
 
 #include <bedrock/Options.hpp>
 #include <bedrock/JsValue.hpp>
+#include <bedrock/auth/LiveTokenManager.hpp>
+#include <bedrock/auth/MicrosoftAuthFlow.hpp>
+#include <bedrock/auth/MinecraftBedrockServicesManager.hpp>
+#include <bedrock/auth/MinecraftBedrockTokenManager.hpp>
+#include <bedrock/auth/NativeBedrockAuthflow.hpp>
+#include <bedrock/auth/PlayfabTokenManager.hpp>
 #include <bedrock/api/Client.hpp>
 #include <bedrock/RakNetPing.hpp>
 #include <bedrock/client/BedrockNetworkClient.hpp>
+#include <bedrock/nbt/BedrockNbt.hpp>
 #include <bedrock/protocol/ProtocolDefinition.hpp>
+#include <bedrock/protocol/SnappyCodec.hpp>
+#include <bedrock/protodef/ProtoDefNbt.hpp>
 #include <bedrock/protodef/ProtoDefPacketDecoder.hpp>
 #include <bedrock/protodef/ProtoDefValue.hpp>
+#include <bedrock/protodef/ProtoDefVariables.hpp>
+#include <bedrock/realms/BedrockRealms.hpp>
 #include <bedrock/relay/BedrockLiveRelay.hpp>
 #include <bedrock/relay/BedrockRelay.hpp>
 #include <bedrock/server/BedrockServer.hpp>
 #include <bedrock/server/ServerAdvertisement.hpp>
+#include <bedrock/util/XxHash64.hpp>
 #include <bedrock/world/BedrockChunk.hpp>
+#include <bedrock/world/BedrockSubChunkPacket.hpp>
 
 #include <algorithm>
 #include <cstdint>
@@ -697,7 +710,7 @@ struct Options {
     // always overwrites it with true as the final object-literal field.
     JsProperty<bool> delayedInit;
     bool skipPing = false;
-    bool realms = false;
+    BedrockRealmSelection realms;
     std::function<void(const std::string&)> conLog = [](const std::string& message) {
         std::cout << message << "\n";
     };
@@ -1394,9 +1407,6 @@ private:
     Client(Options options, FactoryTag)
         : state_(std::make_shared<State>(std::move(options))) {
         state_->options.delayedInit.setResolved(true);
-        if (state_->options.realms) {
-            throw std::runtime_error("Realms are not supported");
-        }
         // createClient.js constructs Client with
         // `{ port: 19132, followPort: !options.realms, ...options }`.
         // Preserve an explicit zero while supplying the factory-only default.
@@ -1404,7 +1414,9 @@ private:
             state_->options.port.setResolved(19132);
         }
         if (!state_->options.followPort.provided()) {
-            state_->options.followPort.setResolved(true);
+            state_->options.followPort.setResolved(
+                !static_cast<bool>(state_->options.realms)
+            );
         }
         state_->factoryMode = true;
 
@@ -1416,7 +1428,8 @@ private:
             if (auto state = weak.lock()) markAutoConnect(state);
         });
 
-        if (state_->options.skipPing) {
+        if (state_->options.skipPing &&
+            !static_cast<bool>(state_->options.realms)) {
             initialize(state_);
             return;
         }
@@ -1629,12 +1642,93 @@ private:
         return fromServerName(pong.rawMotd);
     }
 
+    static void resolveRealmForFactory(const std::shared_ptr<State>& state) {
+        Options options;
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (!state->ownerAlive.load()) return;
+            options = state->options;
+        }
+
+        NativeBedrockAuthflowOptions nativeAuthOptions {
+            .username = options.username,
+            .profilesFolder = options.profilesFolder,
+            .authTitle = options.authTitle,
+            .deviceType = options.deviceType,
+            .flow = options.flow,
+            .forceRefresh = options.forceRefresh,
+            .msalConfig = options.msalConfig,
+            .password = options.password,
+            .onMsaCode = options.onMsaCode
+        };
+        validateNativeBedrockAuthflowOptions(nativeAuthOptions);
+
+        // realmAuthenticate() publishes validateOptions mutations before the
+        // PrismarineAuth constructor can fail.
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (!state->ownerAlive.load()) return;
+            state->options.profilesFolder =
+                nativeAuthOptions.profilesFolder;
+            state->options.authTitle = nativeAuthOptions.authTitle;
+            state->options.deviceType = nativeAuthOptions.deviceType;
+            state->options.flow = nativeAuthOptions.flow;
+        }
+
+        validateNativeBedrockAuthflowPresence(nativeAuthOptions);
+        const auto effectiveCacheRoot =
+            initializeNativeBedrockAuthCacheRoot(
+                nativeAuthOptions.profilesFolder
+            );
+        auto authRuntime = createNativeBedrockAuthflow(
+            nativeAuthOptions,
+            effectiveCacheRoot
+        );
+        auto authflow = std::move(authRuntime.authflow);
+
+        // realmAuthenticate assigns the newly constructed flow back to the
+        // caller's options before its first Realms request. Later game login
+        // therefore reuses this exact object.
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (!state->ownerAlive.load()) return;
+            state->options.authflow = authflow;
+            options = state->options;
+        }
+
+        auto address = resolveBedrockRealmAddress(
+            authflow,
+            options.realms
+        );
+
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (!state->ownerAlive.load()) return;
+            state->options.host = std::move(address.host);
+            state->options.port.setResolved(address.port);
+        }
+    }
+
     static void runPreflight(const std::shared_ptr<State>& state) {
         Options pingOptions;
         {
             std::lock_guard<std::mutex> lock(state->mutex);
             if (!state->ownerAlive.load()) return;
             pingOptions = state->options;
+        }
+
+        if (static_cast<bool>(pingOptions.realms)) {
+            resolveRealmForFactory(state);
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                if (!state->ownerAlive.load()) return;
+                pingOptions = state->options;
+            }
+        }
+
+        if (pingOptions.skipPing) {
+            initialize(state);
+            return;
         }
 
         const auto advertisement = pingForFactory(pingOptions);
@@ -1705,10 +1799,13 @@ private:
         }
 
         options = normalizeOptions(std::move(options));
-        auto decoder = std::make_unique<ProtoDefPacketDecoder>(options.version);
         validateConnectionAddress(options);
         auto network = std::make_shared<BedrockNetworkClient>(
             toNetworkOptions(options)
+        );
+        auto decoder = std::make_unique<ProtoDefPacketDecoder>(
+            options.version,
+            network->packetVariableStore()
         );
         std::weak_ptr<State> weakState = state;
         network->setAuthenticationOptionsResolvedHandler(
@@ -2364,6 +2461,7 @@ inline ServerAdvertisement ping(PingOptions options) {
 struct RelayDestination {
     std::string host = "127.0.0.1";
     uint16_t port = 19132;
+    BedrockRealmSelection realms;
     // JavaScript uses destination.offline ?? relay.offline, so omission must
     // remain distinguishable from an explicit false value.
     std::optional<bool> offline;
@@ -2383,7 +2481,19 @@ struct RelayOptions {
     std::optional<std::string> authTitle;
     std::string deviceType;
     std::string flow;
+    bool forceRefresh = false;
+    MsalConfigPtr msalConfig;
+    std::shared_ptr<Authflow> authflow;
+    std::string password;
+    ProfilesFolderOption profilesFolder;
+    std::function<void(const XboxDeviceCodeInfo&)> onMsaCode;
     int batchingInterval = 20;
+    bool logging = false;
+    bool enableChunkCaching = false;
+    bool forceSingle = false;
+    // Match RelayPlayer.readUpstream: malformed backend packets are always
+    // dropped, and normally disconnect that downstream unless this is true.
+    bool omitParseErrors = false;
     RelayDestination destination;
 };
 
@@ -2398,6 +2508,7 @@ struct RelayPacketDestination {
 class RelayPacketEvent {
 public:
     BedrockRelayDirection direction = BedrockRelayDirection::Clientbound;
+    std::string sessionId;
     std::string name;
     PacketObject params;
     VersionedGamePacket packet;
@@ -2405,11 +2516,20 @@ public:
 
     RelayPacketEvent(
         std::string version,
-        BedrockRelayPacketEvent& event
-    ) : version_(std::move(version)),
-        direction(event.direction),
+        BedrockRelayPacketEvent& event,
+        ProtoDefVariableStorePtr variables = {},
+        bool strictDecode = false
+    ) : direction(event.direction),
+        sessionId(event.sessionId),
         name(event.packet.name),
-        packet(event.packet) {}
+        packet(event.packet),
+        version_(std::move(version)),
+        variables_(variables ? std::move(variables) : makeProtoDefVariableStore()),
+        strictDecode_(strictDecode) {
+        if (name == "start_game" || name == "item_registry") {
+            ensureDecoded();
+        }
+    }
 
     void cancel() {
         canceled = true;
@@ -2547,11 +2667,15 @@ public:
     void replace(VersionedGamePacket replacement) {
         canceled = false;
         replacements_.clear();
+        if (replacement.name == "start_game" || replacement.name == "item_registry") {
+            ProtoDefPacketDecoder decoder(version_, variables_);
+            (void) decoder.decodePacket(replacement.name, replacement.payload);
+        }
         replacements_.push_back(std::move(replacement));
     }
 
     void replace(const std::string& packetName, PacketValue value) {
-        ProtoDefPacketEncoder encoder(version_);
+        ProtoDefPacketEncoder encoder(version_, variables_);
         auto payload = encoder.encodePacket(packetName, value);
         VersionedMcpeCodec codec = VersionedMcpeCodec::forVersion(version_);
         replace(codec.packetCodec().makePacketByName(packetName, payload));
@@ -2560,6 +2684,8 @@ public:
 private:
     friend class Relay;
     std::string version_;
+    ProtoDefVariableStorePtr variables_;
+    bool strictDecode_ = false;
     mutable bool decoded_ = false;
     bool mutated_ = false;
     mutable PacketObject originalParams_;
@@ -2571,8 +2697,11 @@ private:
         }
 
         auto* self = const_cast<RelayPacketEvent*>(this);
-        ProtoDefPacketDecoder decoder(version_);
-        for (const auto& field : decoder.decodePacket(packet.name, packet.payload)) {
+        ProtoDefPacketDecoder decoder(version_, variables_);
+        const auto fields = strictDecode_
+            ? decoder.decodePacketStrict(packet.name, packet.payload)
+            : decoder.decodePacket(packet.name, packet.payload);
+        for (const auto& field : fields) {
             setDecodedParam(self->params, field);
         }
         self->originalParams_ = self->params;
@@ -2673,6 +2802,55 @@ private:
             return;
         }
 
+        if (field.type == "void") {
+            return;
+        }
+
+        if (field.type == "switch" && field.value.rfind("<no_branch:", 0) == 0) {
+            // ProtoDef exposes an inactive named switch as undefined. There is
+            // no Undefined ProtoDefValue kind, so omit it rather than leaking
+            // an internal diagnostic string into relay packet parameters.
+            return;
+        }
+
+        const auto structuralParent = [&](const char* suffix) -> std::optional<std::string> {
+            const std::string ending(suffix);
+            if (field.path.size() < ending.size() ||
+                field.path.compare(field.path.size() - ending.size(), ending.size(), ending) != 0) {
+                return std::nullopt;
+            }
+            return field.path.substr(0, field.path.size() - ending.size());
+        };
+
+        if (field.type.rfind("array_count", 0) == 0) {
+            if (const auto parent = structuralParent(".$count")) {
+                setNestedParam(root, *parent, PacketValue::array({}));
+            }
+            return;
+        }
+
+        if (field.type == "option_present") {
+            if (const auto parent = structuralParent(".$present")) {
+                setNestedParam(
+                    root,
+                    *parent,
+                    field.value == "true"
+                        ? PacketValue::boolean(true)
+                        : PacketValue::null()
+                );
+            }
+            return;
+        }
+
+        if (field.type == "entityMetadataLoop_end") {
+            if (const auto parent = structuralParent(".$end")) {
+                if (!findNestedParam(static_cast<const PacketObject&>(root), *parent)) {
+                    setNestedParam(root, *parent, PacketValue::array({}));
+                }
+            }
+            return;
+        }
+
         if (field.type == "vec3f" || field.type == "vec3i") {
             auto c1 = field.value.find(',');
             auto c2 = c1 == std::string::npos
@@ -2742,6 +2920,10 @@ private:
     }
 
     static PacketValue valueFromDecodedField(const ProtoDefField& field) {
+        if (field.structuredValue.has_value()) {
+            return *field.structuredValue;
+        }
+
         if (field.type == "bitflags") {
             PacketObject out;
             out["_value"] = decodedUnsignedValue(field.value);
@@ -2888,7 +3070,7 @@ private:
         }
 
         try {
-            ProtoDefPacketEncoder encoder(version_);
+            ProtoDefPacketEncoder encoder(version_, variables_);
             auto payload = encoder.encodePacket(name, PacketValue::object(params));
             VersionedMcpeCodec codec = VersionedMcpeCodec::forVersion(version_);
             event.replace(codec.packetCodec().makePacketByName(name, payload));
@@ -2906,8 +3088,9 @@ public:
         explicit Upstream(BedrockLiveRelay* relay = nullptr) : relay_(relay) {}
 
         void queue(const std::string& packetName, PacketValue value) {
-            if (!relay_ || !relay_->upstream()) return;
-            relay_->upstream()->queue(packetName, value);
+            auto target = client();
+            if (!target) return;
+            target->queue(packetName, value);
         }
 
         void queue(const std::string& packetName, PacketObject value) {
@@ -2919,8 +3102,9 @@ public:
         }
 
         void write(const std::string& packetName, PacketValue value) {
-            if (!relay_ || !relay_->upstream()) return;
-            relay_->upstream()->write(packetName, value);
+            auto target = client();
+            if (!target) return;
+            target->write(packetName, value);
         }
 
         void write(const std::string& packetName, PacketObject value) {
@@ -2944,7 +3128,17 @@ public:
         }
 
     private:
+        friend class RelayPlayer;
         BedrockLiveRelay* relay_ = nullptr;
+        BedrockServerConnection connection_;
+
+        std::shared_ptr<BedrockNetworkClient> client() const {
+            return relay_ ? relay_->upstreamShared(connection_) : nullptr;
+        }
+
+        void bind(const BedrockServerConnection& connection) {
+            connection_ = connection;
+        }
     };
 
     using PacketHandler = std::function<void(RelayPacketEvent&)>;
@@ -2958,7 +3152,12 @@ public:
         : upstream(relay),
           relay_(relay) {}
 
+    std::string sessionId() const {
+        return BedrockLiveRelay::sessionId(connection);
+    }
+
     void on(const std::string& direction, PacketHandler handler) {
+        std::lock_guard<std::recursive_mutex> lock(handlerMutex_);
         if (direction == "clientbound") {
             clientboundHandlers_.push_back(std::move(handler));
             return;
@@ -2971,6 +3170,7 @@ public:
     }
 
     void on(const std::string& direction, PacketWithDestinationHandler handler) {
+        std::lock_guard<std::recursive_mutex> lock(handlerMutex_);
         if (direction == "clientbound") {
             clientboundDestinationHandlers_.push_back(std::move(handler));
             return;
@@ -3000,7 +3200,7 @@ public:
 
     void queue(const std::string& packetName, PacketValue value) {
         if (!relay_) return;
-        relay_->server().send(connection, packetName, value);
+        relay_->server().queue(connection, packetName, value);
     }
 
     void queue(const std::string& packetName, PacketObject value) {
@@ -3012,38 +3212,47 @@ public:
     }
 
     void write(const std::string& packetName, PacketValue value) {
-        queue(packetName, std::move(value));
+        if (!relay_) return;
+        relay_->server().write(connection, packetName, value);
     }
 
     void write(const std::string& packetName, PacketObject value) {
-        queue(packetName, std::move(value));
+        write(packetName, PacketValue::object(std::move(value)));
     }
 
     void write(const std::string& packetName, std::initializer_list<std::pair<const std::string, PacketValue>> value) {
-        queue(packetName, value);
+        write(packetName, PacketValue::object(PacketObject(value)));
     }
 
     void send(const std::string& packetName, PacketValue value) {
-        queue(packetName, std::move(value));
+        if (!relay_) return;
+        relay_->server().send(connection, packetName, value);
     }
 
     void send(const std::string& packetName, PacketObject value) {
-        queue(packetName, std::move(value));
+        send(packetName, PacketValue::object(std::move(value)));
     }
 
     void send(const std::string& packetName, std::initializer_list<std::pair<const std::string, PacketValue>> value) {
-        queue(packetName, value);
+        send(packetName, PacketValue::object(PacketObject(value)));
     }
 
 private:
     friend class Relay;
     BedrockLiveRelay* relay_ = nullptr;
+    mutable std::recursive_mutex handlerMutex_;
     std::vector<PacketHandler> clientboundHandlers_;
     std::vector<PacketHandler> serverboundHandlers_;
     std::vector<PacketWithDestinationHandler> clientboundDestinationHandlers_;
     std::vector<PacketWithDestinationHandler> serverboundDestinationHandlers_;
 
+    void setConnection(const BedrockServerConnection& value) {
+        connection = value;
+        upstream.bind(value);
+    }
+
     void resetSessionHandlers() {
+        std::lock_guard<std::recursive_mutex> lock(handlerMutex_);
         clientboundHandlers_.clear();
         serverboundHandlers_.clear();
         clientboundDestinationHandlers_.clear();
@@ -3051,6 +3260,7 @@ private:
     }
 
     void dispatch(RelayPacketEvent& event) {
+        std::lock_guard<std::recursive_mutex> lock(handlerMutex_);
         if (!clientboundHandlers_.empty() ||
             !serverboundHandlers_.empty() ||
             !clientboundDestinationHandlers_.empty() ||
@@ -3090,50 +3300,108 @@ public:
     explicit Relay(RelayOptions options)
         : options_(normalizeOptions(std::move(options))),
           live_(toLiveOptions(options_)),
-          player_(&live_) {}
+          fallbackPlayer_(std::make_shared<RelayPlayer>(&live_)),
+          currentPlayer_(fallbackPlayer_) {}
 
     void listen() {
         live_.onConnect([this](const BedrockServerConnection& connection) {
-            player_.resetSessionHandlers();
-            player_.connection = connection;
+            auto player = std::make_shared<RelayPlayer>(&live_);
+            player->setConnection(connection);
+            const auto id = player->sessionId();
+            {
+                std::lock_guard<std::mutex> lock(playersMutex_);
+                players_[id] = player;
+                packetVariables_[id] = makeProtoDefVariableStore();
+                currentPlayer_ = player;
+            }
             for (auto& handler : connectHandlers_) {
-                handler(player_);
+                handler(*player);
             }
         });
 
         live_.onDisconnect([this](const BedrockServerConnection& connection) {
-            player_.connection = connection;
-            for (auto& handler : disconnectHandlers_) {
-                handler(player_);
+            const auto id = BedrockLiveRelay::sessionId(connection);
+            std::shared_ptr<RelayPlayer> player;
+            {
+                std::lock_guard<std::mutex> lock(playersMutex_);
+                const auto found = players_.find(id);
+                if (found != players_.end()) player = found->second;
             }
-            player_.resetSessionHandlers();
+            if (!player) return;
+            player->setConnection(connection);
+            for (auto& handler : disconnectHandlers_) {
+                handler(*player);
+            }
+            player->resetSessionHandlers();
+            {
+                std::lock_guard<std::mutex> lock(playersMutex_);
+                players_.erase(id);
+                packetVariables_.erase(id);
+                retiredPlayers_.push_back(player);
+                if (currentPlayer_ == player) {
+                    currentPlayer_ = players_.empty()
+                        ? player
+                        : players_.begin()->second;
+                }
+            }
         });
 
         live_.on("clientbound", [this](BedrockRelayPacketEvent& event) {
-            RelayPacketEvent wrapped(options_.version, event);
-            player_.dispatch(wrapped);
-            if (!clientboundHandlers_.empty() || !clientboundDestinationHandlers_.empty()) {
-                (void) wrapped.decodedParams();
+            const auto player = playerForSession(event.sessionId);
+            auto packetVariables = variablesForSession(event.sessionId);
+            std::unique_ptr<RelayPacketEvent> wrapped;
+            try {
+                wrapped = std::make_unique<RelayPacketEvent>(
+                    options_.version,
+                    event,
+                    std::move(packetVariables),
+                    true
+                );
+                // relay.js parses every upstream packet before deciding
+                // whether user handlers exist. Keep parse-error behavior
+                // observable even for a transparent high-level Relay.
+                (void) wrapped->decodedParams();
+            } catch (const std::exception& error) {
+                std::cerr << "[relay] clientbound parse error session="
+                          << event.sessionId
+                          << " packet=" << event.packet.name
+                          << ": " << error.what() << "\n";
+                event.cancel();
+                if (!options_.omitParseErrors && player) {
+                    live_.server().disconnect(
+                        player->connection,
+                        "Server packet parse error"
+                    );
+                }
+                return;
             }
+            if (player) player->dispatch(*wrapped);
             for (auto& handler : clientboundHandlers_) {
-                handler(wrapped);
+                handler(*wrapped);
             }
             RelayPacketDestination des;
             for (auto& handler : clientboundDestinationHandlers_) {
-                handler(wrapped, des);
+                handler(*wrapped, des);
                 if (des.canceled) {
-                    wrapped.cancel();
+                    wrapped->cancel();
                 }
             }
-            wrapped.apply(event);
+            wrapped->apply(event);
         });
 
         live_.on("serverbound", [this](BedrockRelayPacketEvent& event) {
-            RelayPacketEvent wrapped(options_.version, event);
-            player_.dispatch(wrapped);
-            if (!serverboundHandlers_.empty() || !serverboundDestinationHandlers_.empty()) {
-                (void) wrapped.decodedParams();
-            }
+            const auto player = playerForSession(event.sessionId);
+            auto packetVariables = variablesForSession(event.sessionId);
+            RelayPacketEvent wrapped(
+                options_.version,
+                event,
+                std::move(packetVariables),
+                true
+            );
+            // RelayPlayer.readPacket also deserializes before dispatch. Unlike
+            // readUpstream, Node deliberately does not catch this direction.
+            (void) wrapped.decodedParams();
+            if (player) player->dispatch(wrapped);
             for (auto& handler : serverboundHandlers_) {
                 handler(wrapped);
             }
@@ -3242,19 +3510,89 @@ public:
     }
 
     BedrockLiveRelay& live() { return live_; }
-    RelayPlayer& player() { return player_; }
+
+    // Compatibility accessor matching the former single-player relay API.
+    // While multiple downstreams are connected this is the most recently
+    // accepted player; use player(connection) or players() for exact routing.
+    RelayPlayer& player() {
+        std::lock_guard<std::mutex> lock(playersMutex_);
+        return *(currentPlayer_ ? currentPlayer_ : fallbackPlayer_);
+    }
+
+    const RelayPlayer& player() const {
+        std::lock_guard<std::mutex> lock(playersMutex_);
+        return *(currentPlayer_ ? currentPlayer_ : fallbackPlayer_);
+    }
+
+    RelayPlayer* player(const BedrockServerConnection& connection) {
+        const auto found = playerForSession(BedrockLiveRelay::sessionId(connection));
+        return found.get();
+    }
+
+    const RelayPlayer* player(const BedrockServerConnection& connection) const {
+        const auto found = playerForSession(BedrockLiveRelay::sessionId(connection));
+        return found.get();
+    }
+
+    std::vector<std::reference_wrapper<RelayPlayer>> players() {
+        std::vector<std::reference_wrapper<RelayPlayer>> out;
+        std::lock_guard<std::mutex> lock(playersMutex_);
+        out.reserve(players_.size());
+        for (auto& [id, value] : players_) {
+            (void) id;
+            out.emplace_back(*value);
+        }
+        return out;
+    }
+
+    std::vector<std::reference_wrapper<const RelayPlayer>> players() const {
+        std::vector<std::reference_wrapper<const RelayPlayer>> out;
+        std::lock_guard<std::mutex> lock(playersMutex_);
+        out.reserve(players_.size());
+        for (const auto& [id, value] : players_) {
+            (void) id;
+            out.emplace_back(*value);
+        }
+        return out;
+    }
+
+    std::size_t playerCount() const {
+        std::lock_guard<std::mutex> lock(playersMutex_);
+        return players_.size();
+    }
+
     const RelayOptions& options() const { return options_; }
 
 private:
     RelayOptions options_;
     BedrockLiveRelay live_;
-    RelayPlayer player_;
+    mutable std::mutex playersMutex_;
+    std::unordered_map<std::string, std::shared_ptr<RelayPlayer>> players_;
+    std::unordered_map<std::string, ProtoDefVariableStorePtr> packetVariables_;
+    // Keep disconnected player objects alive so references handed to user
+    // callbacks cannot become dangling during the Relay lifetime.
+    std::vector<std::shared_ptr<RelayPlayer>> retiredPlayers_;
+    std::shared_ptr<RelayPlayer> fallbackPlayer_;
+    std::shared_ptr<RelayPlayer> currentPlayer_;
     std::vector<ConnectHandler> connectHandlers_;
     std::vector<DisconnectHandler> disconnectHandlers_;
     std::vector<PacketHandler> clientboundHandlers_;
     std::vector<PacketHandler> serverboundHandlers_;
     std::vector<PacketWithDestinationHandler> clientboundDestinationHandlers_;
     std::vector<PacketWithDestinationHandler> serverboundDestinationHandlers_;
+
+    std::shared_ptr<RelayPlayer> playerForSession(const std::string& id) const {
+        std::lock_guard<std::mutex> lock(playersMutex_);
+        const auto found = players_.find(id);
+        return found == players_.end() ? nullptr : found->second;
+    }
+
+    ProtoDefVariableStorePtr variablesForSession(const std::string& id) {
+        std::lock_guard<std::mutex> lock(playersMutex_);
+        auto& variables = packetVariables_[id];
+        if (!variables) variables = makeProtoDefVariableStore();
+        return variables;
+    }
 
     static RelayOptions normalizeOptions(RelayOptions options) {
         (void) validateVersion(options.version);
@@ -3272,6 +3610,7 @@ private:
         out.server.compressionAlgorithm = options.compressionAlgorithm;
         out.server.compressionLevel = options.compressionLevel;
         out.server.compressionThreshold = options.compressionThreshold;
+        out.server.batchingInterval = options.batchingInterval;
 
         out.upstream.host = options.destination.host;
         out.upstream.port = options.destination.port;
@@ -3283,14 +3622,22 @@ private:
         out.upstream.authTitle = options.authTitle;
         out.upstream.deviceType = options.deviceType;
         out.upstream.flow = options.flow;
+        out.upstream.forceRefresh = options.forceRefresh;
+        out.upstream.msalConfig = options.msalConfig;
+        out.upstream.authflow = options.authflow;
+        out.upstream.password = options.password;
+        out.upstream.profilesFolder = options.profilesFolder;
+        out.upstream.onMsaCode = options.onMsaCode;
         out.upstream.batchingIntervalMs = options.batchingInterval;
         out.upstream.compressionLevel = options.compressionLevel;
         out.upstream.clientCacheEnabled = false;
         out.upstream.trackWorld = false;
         out.upstream.chunkRadius = 10;
+        out.realms = options.destination.realms;
 
-        out.enableChunkCaching = false;
-        out.logging = false;
+        out.enableChunkCaching = options.enableChunkCaching;
+        out.logging = options.logging;
+        out.forceSingle = options.forceSingle;
         out.useDownstreamDisplayNameForUpstreamUsername = options.offline;
         return out;
     }

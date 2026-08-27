@@ -39,10 +39,13 @@ public:
 
         switch (out.version) {
             case 0:
-            case 1:
             case 8:
                 require(data, offset, 1, "subchunk storage count");
                 out.storageCount = data[offset++];
+                break;
+
+            case 1:
+                out.storageCount = 1;
                 break;
 
             case 9:
@@ -78,7 +81,8 @@ public:
 
     static SubChunkScanResult scanWithStorages(
         const std::vector<uint8_t>& data,
-        uint32_t expectedSubChunks
+        uint32_t expectedSubChunks,
+        BedrockNbtEncoding persistentEncoding = BedrockNbtEncoding::LittleVarInt
     ) {
         SubChunkScanResult out;
 
@@ -91,7 +95,7 @@ public:
             section.storages.reserve(section.storageCount);
 
             for (uint8_t storageIndex = 0; storageIndex < section.storageCount; ++storageIndex) {
-                auto storage = PalettedStorageParser::scanAt(data, offset);
+                auto storage = PalettedStorageParser::scanAt(data, offset, persistentEncoding);
                 section.storages.push_back(storage);
                 offset += storage.totalBytes;
             }

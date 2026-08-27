@@ -1,5 +1,7 @@
 #include <bedrock/protocol/VersionedMcpeCodec.hpp>
 
+#include <bedrock/protocol/SnappyCodec.hpp>
+
 #include <zlib.h>
 
 #include <cctype>
@@ -35,6 +37,13 @@ bool VersionedMcpeCodec::compressorInPacketHeader() const noexcept {
 }
 
 VersionedMcpePayload VersionedMcpeCodec::decodeMcpePayload(const std::vector<uint8_t>& mcpePayload) const {
+    return decodeMcpePayload(mcpePayload, "deflate");
+}
+
+VersionedMcpePayload VersionedMcpeCodec::decodeMcpePayload(
+    const std::vector<uint8_t>& mcpePayload,
+    const std::string& legacyCompressionAlgorithm
+) const {
     if (mcpePayload.empty()) {
         throw std::runtime_error("empty mcpe payload");
     }
@@ -48,11 +57,18 @@ VersionedMcpePayload VersionedMcpeCodec::decodeMcpePayload(const std::vector<uin
     }
 
     std::vector<uint8_t> compressionPacket(mcpePayload.begin() + 1, mcpePayload.end());
-    return decodeCompressionPacket(compressionPacket);
+    return decodeCompressionPacket(compressionPacket, legacyCompressionAlgorithm);
 }
 
 VersionedMcpePayload VersionedMcpeCodec::decodeCompressionPacket(
     const std::vector<uint8_t>& compressionPacket
+) const {
+    return decodeCompressionPacket(compressionPacket, "deflate");
+}
+
+VersionedMcpePayload VersionedMcpeCodec::decodeCompressionPacket(
+    const std::vector<uint8_t>& compressionPacket,
+    const std::string& legacyCompressionAlgorithm
 ) const {
     if (compressionPacket.empty()) {
         throw std::runtime_error("empty compression packet");
@@ -62,9 +78,23 @@ VersionedMcpePayload VersionedMcpeCodec::decodeCompressionPacket(
     payload.compressionPacket = compressionPacket;
 
     if (!compressorInPacketHeader_) {
-        payload.compressionHeader = static_cast<uint8_t>(VersionedMcpeCompression::DeflateRaw);
+        if (legacyCompressionAlgorithm == "none") {
+            payload.compressionHeader = static_cast<uint8_t>(VersionedMcpeCompression::Uncompressed);
+            payload.framedBatch = compressionPacket;
+            payload.batch = batchCodec_.decodeFramedBatch(payload.framedBatch);
+            return payload;
+        }
+
         try {
-            payload.framedBatch = inflateRaw(compressionPacket);
+            if (legacyCompressionAlgorithm == "snappy") {
+                payload.compressionHeader = static_cast<uint8_t>(VersionedMcpeCompression::Snappy);
+                payload.framedBatch = SnappyCodec::decompress(compressionPacket);
+            } else if (legacyCompressionAlgorithm == "deflate") {
+                payload.compressionHeader = static_cast<uint8_t>(VersionedMcpeCompression::DeflateRaw);
+                payload.framedBatch = inflateRaw(compressionPacket);
+            } else {
+                throw std::runtime_error("unknown legacy compression algorithm");
+            }
         } catch (const std::exception&) {
             payload.compressionHeader = static_cast<uint8_t>(VersionedMcpeCompression::Uncompressed);
             payload.framedBatch = compressionPacket;
@@ -82,7 +112,7 @@ VersionedMcpePayload VersionedMcpeCodec::decodeCompressionPacket(
     } else if (payload.compressionHeader == static_cast<uint8_t>(VersionedMcpeCompression::DeflateRaw)) {
         payload.framedBatch = inflateRaw(body);
     } else if (payload.compressionHeader == static_cast<uint8_t>(VersionedMcpeCompression::Snappy)) {
-        throw std::runtime_error("Snappy compression not implemented");
+        payload.framedBatch = SnappyCodec::decompress(body);
     } else {
         throw std::runtime_error(
             "Unknown compression type " + std::to_string(payload.compressionHeader)
@@ -272,7 +302,7 @@ std::vector<uint8_t> VersionedMcpeCodec::encodeFramedBatch(
         }
 
         if (compression == VersionedMcpeCompression::Snappy) {
-            throw std::runtime_error("Snappy compression not implemented");
+            return SnappyCodec::compress(framedBatch);
         }
 
         throw std::runtime_error("unsupported compression mode");
@@ -292,7 +322,9 @@ std::vector<uint8_t> VersionedMcpeCodec::encodeFramedBatch(
     }
 
     if (compression == VersionedMcpeCompression::Snappy) {
-        throw std::runtime_error("Snappy compression not implemented");
+        auto compressed = SnappyCodec::compress(framedBatch);
+        out.insert(out.end(), compressed.begin(), compressed.end());
+        return out;
     }
 
     throw std::runtime_error("unsupported compression mode");

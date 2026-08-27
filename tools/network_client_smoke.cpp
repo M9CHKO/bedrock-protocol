@@ -1,6 +1,7 @@
 #include <bedrock/bedrock.hpp>
 #include <bedrock/client/BedrockNetworkClient.hpp>
 #include <bedrock/server/BedrockServer.hpp>
+#include <bedrock/world/BedrockSubChunkPacket.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -60,6 +61,16 @@ struct BedrockNetworkClientTestAccess {
     static uint64_t receiveCounter(const BedrockNetworkClient& client) {
         return client.receiveCounter_;
     }
+
+    static void applySubChunk(
+        BedrockNetworkClient& client,
+        const std::vector<uint8_t>& payload
+    ) {
+        VersionedGamePacket packet;
+        packet.name = "subchunk";
+        packet.payload = payload;
+        client.handleSubChunk(packet);
+    }
 };
 
 } // namespace bedrock
@@ -117,10 +128,61 @@ bool checkDisconnectGolden(
     return false;
 }
 
+bool checkSubChunkWorldTracking() {
+    bedrock::BedrockNetworkClientOptions options;
+    options.version = "1.18.11";
+    options.offline = true;
+    options.trackWorld = true;
+    bedrock::BedrockNetworkClient client(options);
+
+    auto terrain = bedrock::BedrockSubChunk::createAir(-2, 0);
+    terrain.setBlockStateId(1, 2, 3, 321);
+
+    bedrock::BedrockSubChunkPacket packet;
+    packet.cacheEnabled = false;
+    packet.dimension = 0;
+    packet.originX = 10;
+    packet.originY = -4;
+    packet.originZ = -8;
+    bedrock::BedrockSubChunkPacketEntry terrainEntry;
+    terrainEntry.dx = 1;
+    terrainEntry.dy = 2;
+    terrainEntry.dz = -3;
+    terrainEntry.result = bedrock::BedrockSubChunkResult::Success;
+    terrainEntry.payload = terrain.encode(bedrock::ChunkStorageType::Runtime);
+    packet.entries.push_back(std::move(terrainEntry));
+    bedrock::BedrockSubChunkPacketEntry airEntry;
+    airEntry.dx = -4;
+    airEntry.dy = 5;
+    airEntry.dz = 6;
+    airEntry.result = bedrock::BedrockSubChunkResult::SuccessAllAir;
+    packet.entries.push_back(std::move(airEntry));
+
+    bedrock::BedrockNetworkClientTestAccess::applySubChunk(
+        client,
+        bedrock::BedrockSubChunkPacketCodec::encodePacketPayload(packet, "1.18.11")
+    );
+
+    const auto* terrainColumn = client.world().getLoadedColumn(11, -11);
+    const auto* airColumn = client.world().getLoadedColumn(6, -2);
+    if (terrainColumn == nullptr || airColumn == nullptr ||
+        terrainColumn->getBlockStateId({.x = 1, .y = -30, .z = 3}) != 321 ||
+        airColumn->getSection(16) == nullptr ||
+        airColumn->getBlockStateId({.x = 0, .y = 16, .z = 0}) != 0) {
+        std::cerr << "[NETWORK-CLIENT-SMOKE] subchunk world tracking mismatch\n";
+        return false;
+    }
+
+    std::cout << "[NETWORK-CLIENT-SMOKE] subchunk world tracking ok\n";
+    return true;
+}
+
 bool checkVersion(
     const std::string& version,
     LifecycleOrder lifecycleOrder,
-    CloseMode closeMode
+    CloseMode closeMode,
+    const std::string& compressionAlgorithm = "deflate",
+    uint16_t compressionThreshold = 512
 ) {
     const bool race = lifecycleOrder == LifecycleOrder::SpawnBeforeStartGame;
     const bool expectTickSync = tickSyncExpected(version);
@@ -213,7 +275,9 @@ bool checkVersion(
         // The JavaScript server does not negotiate resource packs. This smoke
         // explicitly exercises the retained C++ empty-pack extension because
         // the client-side lifecycle assertions below depend on that exchange.
-        .autoResourcePacks = true
+        .autoResourcePacks = true,
+        .compressionThreshold = compressionThreshold,
+        .compressionAlgorithm = compressionAlgorithm
     });
 
     server.on("client_cache_status", [&](const bedrock::BedrockServerPacketEvent& event) {
@@ -1024,6 +1088,7 @@ bool checkEncryptedErrorSurface() {
 
 int main() {
     bool ok = true;
+    ok = checkSubChunkWorldTracking() && ok;
     ok = checkDisconnectGolden(
         "1.20.40",
         {0x05, 0x00, 0x00, 0x03, 0x77, 0x68, 0x79}
@@ -1040,12 +1105,16 @@ int main() {
     ok = checkVersion(
         "1.20.50",
         LifecycleOrder::SpawnBeforeStartGame,
-        CloseMode::LocalClose
+        CloseMode::LocalClose,
+        "snappy",
+        0
     ) && ok;
     ok = checkVersion(
         "1.21.100",
         LifecycleOrder::Normal,
-        CloseMode::RemoteDisconnect
+        CloseMode::RemoteDisconnect,
+        "snappy",
+        0
     ) && ok;
     ok = checkHighLevelKickDecoding() && ok;
     ok = checkEncryptedErrorSurface() && ok;

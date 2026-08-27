@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdint>
 #include <iostream>
+#include <memory>
 #include <thread>
 #include <vector>
 
@@ -38,11 +39,13 @@ static bool checkPlayStatusEndianRegression() {
     return ok;
 }
 
-static bool checkVersion(const std::string& version) {
+static bool checkVersion(const std::string& version, bool useRealm = false) {
     std::atomic<bool> downstreamJoined {false};
     std::atomic<bool> upstreamReady {false};
     std::atomic<bool> gotRelayStatus {false};
     std::atomic<bool> gotError {false};
+    std::atomic<int> realmResolverCalls {0};
+    std::shared_ptr<bedrock::Authflow> realmAuthflow;
 
     bedrock::BedrockServer upstreamServer({
         .host = "127.0.0.1",
@@ -53,6 +56,7 @@ static bool checkVersion(const std::string& version) {
         .offline = true
     });
     upstreamServer.listen();
+    const auto upstreamPort = upstreamServer.boundPort();
 
     bedrock::BedrockLiveRelayOptions relayOptions;
     relayOptions.server.host = "127.0.0.1";
@@ -62,11 +66,27 @@ static bool checkVersion(const std::string& version) {
     relayOptions.server.maxPlayers = 3;
     relayOptions.server.offline = true;
     relayOptions.upstream.host = "127.0.0.1";
-    relayOptions.upstream.port = upstreamServer.boundPort();
+    relayOptions.upstream.port = upstreamPort;
     relayOptions.upstream.username = "RelaySmokeUp";
     relayOptions.upstream.version = version;
     relayOptions.upstream.offline = true;
     relayOptions.upstream.connectTimeoutMs = 1000;
+    if (useRealm) {
+        relayOptions.upstream.host = "unresolved.realm.invalid";
+        relayOptions.upstream.port = 1;
+        relayOptions.upstream.profilesFolder = true;
+        relayOptions.realms.realmId = "1112223";
+        relayOptions.realms.addressResolver = [&](
+            std::shared_ptr<bedrock::Authflow> flow
+        ) {
+            realmAuthflow = std::move(flow);
+            ++realmResolverCalls;
+            return bedrock::BedrockRealmAddress {
+                .host = "127.0.0.1",
+                .port = upstreamPort
+            };
+        };
+    }
 
     auto relay = bedrock::createRelayServer(std::move(relayOptions));
     relay.onJoin([&](const bedrock::BedrockServerConnection&) {
@@ -125,6 +145,17 @@ static bool checkVersion(const std::string& version) {
     if (gotError.load()) {
         return false;
     }
+    if (useRealm &&
+        (realmResolverCalls.load() != 1 || !realmAuthflow ||
+         !realmAuthflow->hasXboxTokenMethod() ||
+         !realmAuthflow->hasMinecraftBedrockTokenMethod() ||
+         relay.options().upstream.host != "127.0.0.1" ||
+         relay.options().upstream.port != upstreamPort ||
+         relay.options().upstream.authflow != realmAuthflow)) {
+        std::cerr << "[LIVE-RELAY-SMOKE] " << version
+                  << " Realm destination did not publish address/Authflow\n";
+        return false;
+    }
 
     std::cout << "[LIVE-RELAY-SMOKE] " << version << " ok\n";
     return true;
@@ -132,7 +163,7 @@ static bool checkVersion(const std::string& version) {
 
 int main() {
     bool ok = checkPlayStatusEndianRegression();
-    ok = checkVersion("1.20.40") && ok;
+    ok = checkVersion("1.20.40", true) && ok;
     ok = checkVersion("1.20.50") && ok;
     ok = checkVersion("1.21.100") && ok;
     return ok ? 0 : 1;

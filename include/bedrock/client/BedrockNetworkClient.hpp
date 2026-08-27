@@ -8,10 +8,16 @@
 #include <bedrock/auth/BedrockAuthJwt.hpp>
 #include <bedrock/auth/Authflow.hpp>
 #include <bedrock/auth/AuthCache.hpp>
+#include <bedrock/auth/MinecraftBedrockServicesManager.hpp>
+#include <bedrock/auth/MinecraftBedrockTokenManager.hpp>
+#include <bedrock/auth/MicrosoftAuthFlow.hpp>
+#include <bedrock/auth/PlayfabTokenManager.hpp>
 #include <bedrock/auth/XboxLiveAuth.hpp>
 #include <bedrock/auth/XboxProofKey.hpp>
+#include <bedrock/auth/XboxTokenManager.hpp>
 #include <bedrock/client/RakNetClient.hpp>
 #include <bedrock/client/VersionedClientSession.hpp>
+#include <bedrock/protodef/ProtoDefPacketDecoder.hpp>
 #include <bedrock/protodef/ProtoDefPacketEncoder.hpp>
 #include <bedrock/protodef/ProtoDefValue.hpp>
 #include <bedrock/world/BedrockChunk.hpp>
@@ -338,6 +344,7 @@ public:
     BedrockWorld& world();
     const BedrockBlobStore& blobStore() const;
     BedrockBlobStore& blobStore();
+    ProtoDefVariableStorePtr packetVariableStore() const;
 
 private:
     friend class Client;
@@ -357,12 +364,28 @@ private:
 
     BedrockNetworkClientOptions options_;
     VersionedClientSession session_;
+    ProtoDefVariableStorePtr packetVariables_;
     ProtoDefPacketEncoder packetEncoder_;
+    ProtoDefPacketDecoder packetDecoder_;
     std::shared_ptr<RakNetClient> raknet_;
     BedrockWorld world_;
     BedrockBlobStore blobStore_;
-    std::unordered_map<uint64_t, BlobType> pendingBlobTypes_;
+    struct PendingBlobMetadata {
+        BlobType type = BlobType::Biomes;
+        int32_t x = 0;
+        int32_t y = 0;
+        int32_t z = 0;
+    };
+    std::unordered_map<uint64_t, PendingBlobMetadata> pendingBlobMetadata_;
     std::vector<BedrockLevelChunkPacket> pendingCachedLevelChunks_;
+    struct PendingCachedSubChunk {
+        int32_t chunkX = 0;
+        int32_t sectionY = 0;
+        int32_t chunkZ = 0;
+        uint64_t hash = 0;
+        std::vector<uint8_t> blockEntityPayload;
+    };
+    std::vector<PendingCachedSubChunk> pendingCachedSubChunks_;
 
     mutable std::mutex mutex_;
     std::condition_variable closedCv_;
@@ -455,7 +478,15 @@ private:
     // caller's same object for a truthy options.msalConfig, otherwise the
     // unexposed structured clone of prismarine-auth's default config.
     MsalConfigPtr authenticationMsalConfig_;
+    std::shared_ptr<LiveTokenManager> authenticationLiveTokenManager_;
     std::shared_ptr<MsaTokenManager> authenticationMsaTokenManager_;
+    std::shared_ptr<XboxTokenManager> authenticationXboxTokenManager_;
+    std::shared_ptr<MinecraftBedrockTokenManager>
+        authenticationBedrockTokenManager_;
+    std::shared_ptr<MinecraftBedrockServicesTokenManager>
+        authenticationBedrockServicesTokenManager_;
+    std::shared_ptr<PlayfabTokenManager> authenticationPlayfabTokenManager_;
+    std::shared_ptr<MicrosoftAuthFlow> authenticationMicrosoftAuthFlow_;
     std::optional<XboxProofKey> authenticationXboxProofKey_;
     std::unordered_map<std::string, AuthCachePtr> authenticationCaches_;
     // A supplied Authflow method is invoked synchronously during
@@ -504,8 +535,11 @@ private:
     void handlePlayStatus(const VersionedGamePacket& packet);
     void handleTickSync(const VersionedGamePacket& packet);
     void handleLevelChunk(const VersionedGamePacket& packet);
+    void handleSubChunk(const VersionedGamePacket& packet);
     void handleClientCacheMissResponse(const VersionedGamePacket& packet);
     bool tryStoreLevelChunk(const BedrockLevelChunkPacket& levelChunk);
+    bool tryStoreCachedSubChunk(const PendingCachedSubChunk& subChunk);
+    BedrockChunkColumn& ensureTrackedColumn(int32_t chunkX, int32_t chunkZ);
 
     void prepareLoginPacket();
     void sendLogin();

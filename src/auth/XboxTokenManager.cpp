@@ -14,6 +14,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <regex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -30,12 +31,16 @@ struct XboxTokenManagerState {
     JsRuntimeValue jwk = JsRuntimeValue::undefined();
     AuthCachePtr cache;
     JsRuntimeValue headers = JsRuntimeValue::undefined();
+    JsRuntimeValue forceRefresh = JsRuntimeValue::undefined();
     XboxTokenHttpClientPtr httpClient;
+    MsalHttpClientPtr replayHttpClient;
     std::shared_ptr<JsMicrotaskQueue> microtaskQueue;
     std::function<double()> dateNowMilliseconds;
 };
 
 namespace {
+
+using ValuePromise = JsPromise<JsRuntimeValue>;
 
 constexpr std::string_view kXboxDeviceAuth =
     "https://device.auth.xboxlive.com/device/authenticate";
@@ -43,6 +48,8 @@ constexpr std::string_view kXboxTitleAuth =
     "https://title.auth.xboxlive.com/title/authenticate";
 constexpr std::string_view kXboxUserAuth =
     "https://user.auth.xboxlive.com/user/authenticate";
+constexpr std::string_view kSisuAuthorize =
+    "https://sisu.xboxlive.com/authorize";
 constexpr std::string_view kXstsAuthorize =
     "https://xsts.auth.xboxlive.com/xsts/authorize";
 
@@ -653,6 +660,405 @@ JsRuntimeValue makeXstsResult(const JsRuntimeValue& response) {
     });
 }
 
+JsRuntimeValue makeSisuXstsResult(const JsRuntimeValue& response) {
+    const auto authorizationToken = getProperty(
+        response,
+        "AuthorizationToken"
+    );
+    const auto displayClaims = getProperty(
+        authorizationToken,
+        "DisplayClaims"
+    );
+    const auto first = getIndex(getProperty(displayClaims, "xui"), 0);
+    const auto xid = getProperty(first, "xid");
+    return JsRuntimeValue::object({
+        {"userXUID", xid.truthy() ? xid : JsRuntimeValue::null()},
+        {"userHash", getProperty(first, "uhs")},
+        {"XSTSToken", getProperty(authorizationToken, "Token")},
+        {"expiresOn", getProperty(authorizationToken, "NotAfter")}
+    });
+}
+
+JsRuntimeValue parseIntHeader(const std::string* header) {
+    if (!header) {
+        return JsRuntimeValue::number(
+            std::numeric_limits<double>::quiet_NaN()
+        );
+    }
+    const auto& value = *header;
+    std::size_t offset = 0;
+    const auto whitespace = [](char byte) {
+        return byte == ' ' || byte == '\t' || byte == '\n' ||
+            byte == '\r' || byte == '\f' || byte == '\v';
+    };
+    while (offset < value.size() && whitespace(value[offset])) ++offset;
+    bool negative = false;
+    if (offset < value.size() &&
+        (value[offset] == '+' || value[offset] == '-')) {
+        negative = value[offset] == '-';
+        ++offset;
+    }
+    int radix = 10;
+    if (offset + 1 < value.size() && value[offset] == '0' &&
+        (value[offset + 1] == 'x' || value[offset + 1] == 'X')) {
+        radix = 16;
+        offset += 2;
+    }
+    double result = 0;
+    bool any = false;
+    for (; offset < value.size(); ++offset) {
+        const char byte = value[offset];
+        int digit = -1;
+        if (byte >= '0' && byte <= '9') digit = byte - '0';
+        else if (byte >= 'a' && byte <= 'f') digit = byte - 'a' + 10;
+        else if (byte >= 'A' && byte <= 'F') digit = byte - 'A' + 10;
+        if (digit < 0 || digit >= radix) break;
+        any = true;
+        result = result * static_cast<double>(radix) + digit;
+    }
+    if (!any) {
+        return JsRuntimeValue::number(
+            std::numeric_limits<double>::quiet_NaN()
+        );
+    }
+    return JsRuntimeValue::number(negative ? -result : result);
+}
+
+class XboxReplayError final : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
+std::string exceptionMessage(std::exception_ptr error) {
+    try {
+        if (error) std::rethrow_exception(error);
+    } catch (const std::exception& caught) {
+        return caught.what();
+    } catch (...) {
+        return "non-standard exception";
+    }
+    return {};
+}
+
+bool isXboxReplayError(std::exception_ptr error) {
+    try {
+        if (error) std::rethrow_exception(error);
+    } catch (const XboxReplayError&) {
+        return true;
+    } catch (...) {
+    }
+    return false;
+}
+
+std::string queryEscape(std::string_view value) {
+    static constexpr char hex[] = "0123456789ABCDEF";
+    std::string result;
+    for (const unsigned char byte : value) {
+        const bool unescaped =
+            (byte >= 'a' && byte <= 'z') ||
+            (byte >= 'A' && byte <= 'Z') ||
+            (byte >= '0' && byte <= '9') ||
+            byte == '!' || byte == '\'' || byte == '(' || byte == ')' ||
+            byte == '*' || byte == '-' || byte == '.' || byte == '_' ||
+            byte == '~';
+        if (unescaped) {
+            result.push_back(static_cast<char>(byte));
+        } else {
+            result.push_back('%');
+            result.push_back(hex[(byte >> 4U) & 0x0fU]);
+            result.push_back(hex[byte & 0x0fU]);
+        }
+    }
+    return result;
+}
+
+std::string queryUnescape(std::string_view value) {
+    const auto hexDigit = [](char byte) -> int {
+        if (byte >= '0' && byte <= '9') return byte - '0';
+        if (byte >= 'a' && byte <= 'f') return byte - 'a' + 10;
+        if (byte >= 'A' && byte <= 'F') return byte - 'A' + 10;
+        return -1;
+    };
+    std::string result;
+    for (std::size_t index = 0; index < value.size(); ++index) {
+        if (value[index] == '+') {
+            result.push_back(' ');
+            continue;
+        }
+        if (value[index] == '%' && index + 2 < value.size()) {
+            const int high = hexDigit(value[index + 1]);
+            const int low = hexDigit(value[index + 2]);
+            if (high >= 0 && low >= 0) {
+                result.push_back(static_cast<char>((high << 4) | low));
+                index += 2;
+                continue;
+            }
+        }
+        result.push_back(value[index]);
+    }
+    return result;
+}
+
+std::vector<std::pair<std::string, std::string>> replayBaseHeaders() {
+    return {
+        {"Accept", "application/json, text/plain, */*"},
+        {"Accept-encoding", "gzip"},
+        {"Accept-Language", "en-US"},
+        {
+            "User-Agent",
+            "Mozilla/5.0 (XboxReplay; XboxLiveAuth/3.0) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/71.0.3578.98 Safari/537.36"
+        }
+    };
+}
+
+MsalHttpRequest replayRequest(
+    std::string method,
+    std::string url,
+    std::vector<std::pair<std::string, std::string>> headers,
+    std::string body = {},
+    int maxRedirects = 0
+) {
+    MsalHttpRequest request;
+    request.method = std::move(method);
+    request.url = std::move(url);
+    request.headers = std::move(headers);
+    request.body = std::move(body);
+    request.maxRedirects = maxRedirects;
+    request.decompress = true;
+    return request;
+}
+
+std::string firstCookiePart(std::string_view cookie) {
+    return std::string(cookie.substr(0, cookie.find(';')));
+}
+
+std::string replayCookies(const MsalHttpResponse& response) {
+    std::vector<std::string> cookies;
+    const auto* values = response.headersObject.get("set-cookie");
+    if (values && values->isArray()) {
+        for (std::size_t index = 0; index < values->length(); ++index) {
+            const auto* item = values->get(index);
+            if (item && item->isString()) {
+                cookies.push_back(firstCookiePart(item->stringValue()));
+            }
+        }
+    } else if (values && values->isString()) {
+        cookies.push_back(firstCookiePart(values->stringValue()));
+    } else if (const auto* scalar = response.header("set-cookie")) {
+        cookies.push_back(firstCookiePart(*scalar));
+    }
+    std::string result;
+    for (std::size_t index = 0; index < cookies.size(); ++index) {
+        if (index) result += "; ";
+        result += cookies[index];
+    }
+    return result;
+}
+
+std::optional<std::string> htmlAttributeMatch(
+    const std::string& body,
+    const std::regex& pattern
+) {
+    std::smatch match;
+    if (!std::regex_search(body, match, pattern) || match.size() < 2) {
+        return std::nullopt;
+    }
+    return match[1].str();
+}
+
+JsRuntimeValue parseHashQuery(std::string_view hash) {
+    auto result = JsRuntimeValue::object();
+    std::size_t offset = 0;
+    while (offset <= hash.size()) {
+        const auto separator = hash.find('&', offset);
+        const auto entry = hash.substr(
+            offset,
+            separator == std::string_view::npos
+                ? std::string_view::npos
+                : separator - offset
+        );
+        const auto equals = entry.find('=');
+        auto key = queryUnescape(entry.substr(0, equals));
+        auto value = equals == std::string_view::npos
+            ? std::string()
+            : queryUnescape(entry.substr(equals + 1));
+        result.set(std::move(key), JsRuntimeValue::string(std::move(value)));
+        if (separator == std::string_view::npos) break;
+        offset = separator + 1;
+    }
+    const auto expires = getProperty(result, "expires_in");
+    if (expires.isString()) {
+        char* end = nullptr;
+        const double number = std::strtod(expires.stringValue().c_str(), &end);
+        result.set(
+            "expires_in",
+            JsRuntimeValue::number(
+                end == expires.stringValue().c_str() ? 0.0 : number
+            )
+        );
+    }
+    return result;
+}
+
+ValuePromise replayPreAuth(
+    const std::shared_ptr<XboxTokenManagerState>& state
+) {
+    const std::string url =
+        "https://login.live.com/oauth20_authorize.srf?"
+        "client_id=000000004C12AE6F&"
+        "redirect_uri=https%3A%2F%2Flogin.live.com%2Foauth20_desktop.srf&"
+        "scope=service%3A%3Auser.auth.xboxlive.com%3A%3AMBI_SSL&"
+        "display=touch&response_type=token&locale=en";
+    return state->replayHttpClient->send(replayRequest(
+        "GET",
+        url,
+        replayBaseHeaders()
+    )).then([](const MsalHttpResponse& response) {
+        if (response.status != 200) {
+            throw XboxReplayError("Pre-authentication failed.");
+        }
+        // Keep the source regex behavior while accepting insignificant space
+        // before the closing quote used by newer Live pages.
+        const auto ppft = htmlAttributeMatch(
+            response.bodyText,
+            std::regex(R"REGEX(sFTTag:'.*value="(.*)"/>)REGEX")
+        );
+        const auto urlPost = htmlAttributeMatch(
+            response.bodyText,
+            std::regex(R"REGEX(urlPost:'([^']+))REGEX")
+        );
+        if (!ppft) {
+            throw XboxReplayError(
+                "Could not match \"PPFT\" parameter, please fill an issue "
+                "on https://bit.ly/xr-xbl-auth-create-issue"
+            );
+        }
+        if (!urlPost) {
+            throw XboxReplayError(
+                "Could not match \"urlPost\" parameter, please fill an "
+                "issue on https://bit.ly/xr-xbl-auth-create-issue"
+            );
+        }
+        return JsRuntimeValue::object({
+            {"cookie", JsRuntimeValue::string(replayCookies(response))},
+            {"matches", JsRuntimeValue::object({
+                {"PPFT", JsRuntimeValue::string(*ppft)},
+                {"urlPost", JsRuntimeValue::string(*urlPost)}
+            })}
+        });
+    }).catchError([state](std::exception_ptr error) -> ValuePromise {
+        if (isXboxReplayError(error)) std::rethrow_exception(error);
+        throw XboxReplayError(exceptionMessage(error));
+    });
+}
+
+ValuePromise replayLogUser(
+    const std::shared_ptr<XboxTokenManagerState>& state,
+    JsRuntimeValue preAuth,
+    const JsRuntimeValue& email,
+    const JsRuntimeValue& password
+) {
+    const auto matches = getProperty(preAuth, "matches");
+    const auto urlPost = jsToString(getProperty(matches, "urlPost"));
+    const auto emailText = jsToString(email);
+    const std::string body =
+        "login=" + queryEscape(emailText) +
+        "&loginfmt=" + queryEscape(emailText) +
+        "&passwd=" + queryEscape(jsToString(password)) +
+        "&PPFT=" + queryEscape(jsToString(getProperty(matches, "PPFT")));
+    auto headers = replayBaseHeaders();
+    headers.emplace_back(
+        "Content-Type",
+        "application/x-www-form-urlencoded"
+    );
+    headers.emplace_back(
+        "Cookie",
+        jsToString(getProperty(preAuth, "cookie"))
+    );
+    return state->replayHttpClient->send(replayRequest(
+        "POST",
+        urlPost,
+        std::move(headers),
+        body,
+        1
+    )).then([urlPost](const MsalHttpResponse& response) {
+        if (response.status != 200) {
+            throw XboxReplayError("Authentication failed.");
+        }
+        const auto& responseUrl = response.url;
+        if (responseUrl == urlPost) {
+            throw XboxReplayError("Invalid credentials.");
+        }
+        const auto hashSeparator = responseUrl.find('#');
+        if (hashSeparator == std::string::npos) {
+            const bool identityConfirmation =
+                response.bodyText.find("id=\"fmHF\"") !=
+                    std::string::npos &&
+                response.bodyText.find("identity/confirm") !=
+                    std::string::npos;
+            throw XboxReplayError(
+                identityConfirmation
+                    ? "Activity confirmation required, please refer to "
+                        "https://bit.ly/xr-xbl-auth-err-activity"
+                    : "Invalid credentials or 2FA enabled, please refer to "
+                        "https://bit.ly/xr-xbl-auth-err-2fa"
+            );
+        }
+        return parseHashQuery(responseUrl.substr(hashSeparator + 1));
+    }).catchError([](std::exception_ptr error) -> ValuePromise {
+        if (isXboxReplayError(error)) std::rethrow_exception(error);
+        throw XboxReplayError(exceptionMessage(error));
+    });
+}
+
+ValuePromise replayExchangeUserToken(
+    const std::shared_ptr<XboxTokenManagerState>& state,
+    const JsRuntimeValue& rpsTicket
+) {
+    auto headers = replayBaseHeaders();
+    for (auto& [name, value] : headers) {
+        if (name == "Accept") {
+            value = "application/json";
+            break;
+        }
+    }
+    headers.emplace_back("x-xbl-contract-version", "0");
+    headers.emplace_back("Content-Type", "application/json");
+    const auto body = stringifyRequired(JsRuntimeValue::object({
+        {
+            "RelyingParty",
+            JsRuntimeValue::string("http://auth.xboxlive.com")
+        },
+        {"TokenType", JsRuntimeValue::string("JWT")},
+        {"Properties", JsRuntimeValue::object({
+            {"AuthMethod", JsRuntimeValue::string("RPS")},
+            {
+                "SiteName",
+                JsRuntimeValue::string("user.auth.xboxlive.com")
+            },
+            {"RpsTicket", rpsTicket}
+        })}
+    }));
+    return state->replayHttpClient->send(replayRequest(
+        "POST",
+        "https://user.auth.xboxlive.com/user/authenticate",
+        std::move(headers),
+        body
+    )).then([](const MsalHttpResponse& response) {
+        if (response.status != 200) {
+            throw XboxReplayError(
+                "Could not exchange specified \"RpsTicket\""
+            );
+        }
+        return JsRuntimeJson::parse(response.bodyText);
+    }).catchError([](std::exception_ptr error) -> ValuePromise {
+        if (isXboxReplayError(error)) std::rethrow_exception(error);
+        throw XboxReplayError(exceptionMessage(error));
+    });
+}
+
 [[noreturn]] void throwTokenError(
     const JsRuntimeValue& errorCode,
     const JsRuntimeValue& response
@@ -714,6 +1120,89 @@ JsRuntimeValue makeXstsResult(const JsRuntimeValue& response) {
     throw std::runtime_error(
         "Xbox Live authentication failed to obtain a XSTS token. XErr: " +
         keyValue + "\n" + stringifyRequired(response)
+    );
+}
+
+ValuePromise getXstsTokenState(
+    const std::shared_ptr<XboxTokenManagerState>& state,
+    JsRuntimeValue tokens,
+    JsRuntimeValue options
+) {
+    options = normalizedDefaultOptions(std::move(options));
+    return ValuePromise::fromSynchronous(
+        state->microtaskQueue,
+        [state,
+         tokens = std::move(tokens),
+         options = std::move(options)]() mutable {
+            const auto userToken = getProperty(tokens, "userToken");
+            auto payload = JsRuntimeValue::object({
+                {"RelyingParty", getProperty(options, "relyingParty")},
+                {"TokenType", JsRuntimeValue::string("JWT")},
+                {"Properties", JsRuntimeValue::object({
+                    {"UserTokens", JsRuntimeValue::array({userToken})},
+                    {"DeviceToken", getProperty(tokens, "deviceToken")},
+                    {"TitleToken", getProperty(tokens, "titleToken")},
+                    {
+                        "OptionalDisplayClaims",
+                        getProperty(options, "optionalDisplayClaims")
+                    },
+                    {"ProofKey", state->jwk},
+                    {"SandboxId", JsRuntimeValue::string("RETAIL")}
+                })}
+            });
+            const auto body = stringifyRequired(payload);
+            auto requestHeaders = spreadObject(state->headers);
+            requestHeaders.set(
+                "Signature",
+                JsRuntimeValue::string(signatureBase64(
+                    state,
+                    kXstsAuthorize,
+                    body
+                ))
+            );
+
+            return state->httpClient->fetch(makeRequest(
+                std::string(kXstsAuthorize),
+                std::move(requestHeaders),
+                body
+            )).then(
+                [](const XboxTokenHttpResponse& httpResponse) {
+                    const auto response = JsRuntimeJson::parse(
+                        httpResponse.bodyText
+                    );
+                    return std::pair<XboxTokenHttpResponse, JsRuntimeValue>(
+                        httpResponse,
+                        response
+                    );
+                }
+            ).then(
+                [state, options](
+                    const std::pair<XboxTokenHttpResponse, JsRuntimeValue>& pair
+                ) {
+                    const auto& httpResponse = pair.first;
+                    const auto& response = pair.second;
+                    if (!httpResponse.ok()) {
+                        throwTokenError(
+                            getProperty(response, "XErr"),
+                            response
+                        );
+                    }
+
+                    const auto xsts = makeXstsResult(response);
+                    auto cached = JsRuntimeValue::object();
+                    cached.set(
+                        XboxTokenManager::relyingPartyCacheKey(
+                            getProperty(options, "relyingParty")
+                        ),
+                        xsts
+                    );
+                    return setCachedTokenState(
+                        state,
+                        std::move(cached)
+                    ).then([xsts] { return xsts; });
+                }
+            );
+        }
     );
 }
 
@@ -800,7 +1289,8 @@ XboxTokenManager::XboxTokenManager(
     key(state_->key),
     jwk(state_->jwk),
     cache(state_->cache),
-    headers(state_->headers) {
+    headers(state_->headers),
+    forceRefresh(state_->forceRefresh) {
     if (!dependencies.microtaskQueue) {
         dependencies.microtaskQueue = JsMicrotaskQueue::create();
     }
@@ -813,6 +1303,9 @@ XboxTokenManager::XboxTokenManager(
         : std::make_shared<CurlXboxTokenHttpClient>(
             state_->microtaskQueue
         );
+    state_->replayHttpClient = dependencies.replayHttpClient
+        ? std::move(dependencies.replayHttpClient)
+        : std::make_shared<CurlMsalHttpClient>(state_->microtaskQueue);
 
     state_->jwk = makeJwk(state_->key.jwk());
     state_->headers = JsRuntimeValue::object({
@@ -963,6 +1456,141 @@ JsPromise<JsRuntimeValue> XboxTokenManager::getUserToken(
     );
 }
 
+JsPromise<JsRuntimeValue> XboxTokenManager::doSisuAuth(
+    JsRuntimeValue accessToken,
+    JsRuntimeValue deviceToken,
+    JsRuntimeValue options
+) {
+    const auto state = state_;
+    options = normalizedDefaultOptions(std::move(options));
+    return JsPromise<JsRuntimeValue>::fromSynchronous(
+        state->microtaskQueue,
+        [state,
+         accessToken = std::move(accessToken),
+         deviceToken = std::move(deviceToken),
+         options = std::move(options)]() mutable {
+            auto payload = JsRuntimeValue::object({
+                {
+                    "AccessToken",
+                    JsRuntimeValue::string(
+                        "t=" + jsToString(accessToken)
+                    )
+                },
+                {"AppId", getProperty(options, "authTitle")},
+                {"DeviceToken", deviceToken},
+                {"Sandbox", JsRuntimeValue::string("RETAIL")},
+                {"UseModernGamertag", JsRuntimeValue::boolean(true)},
+                {
+                    "SiteName",
+                    JsRuntimeValue::string("user.auth.xboxlive.com")
+                },
+                {"RelyingParty", getProperty(options, "relyingParty")},
+                {"ProofKey", state->jwk}
+            });
+            const auto body = stringifyRequired(payload);
+            auto requestHeaders = JsRuntimeValue::object({
+                {
+                    "Signature",
+                    JsRuntimeValue::string(signatureBase64(
+                        state,
+                        kSisuAuthorize,
+                        body
+                    ))
+                }
+            });
+            return state->httpClient->fetch(makeRequest(
+                std::string(kSisuAuthorize),
+                std::move(requestHeaders),
+                body
+            )).then([](const XboxTokenHttpResponse& httpResponse) {
+                return std::pair<XboxTokenHttpResponse, JsRuntimeValue>(
+                    httpResponse,
+                    JsRuntimeJson::parse(httpResponse.bodyText)
+                );
+            }).then([state, options](
+                const std::pair<XboxTokenHttpResponse, JsRuntimeValue>& pair
+            ) {
+                const auto& httpResponse = pair.first;
+                const auto& response = pair.second;
+                if (!httpResponse.ok()) {
+                    throwTokenError(
+                        parseIntHeader(httpResponse.header("x-err")),
+                        response
+                    );
+                }
+
+                const auto xsts = makeSisuXstsResult(response);
+                auto cached = JsRuntimeValue::object({
+                    {"userToken", getProperty(response, "UserToken")},
+                    {"titleToken", getProperty(response, "TitleToken")}
+                });
+                cached.set(
+                    XboxTokenManager::relyingPartyCacheKey(
+                        getProperty(options, "relyingParty")
+                    ),
+                    xsts
+                );
+                return setCachedTokenState(
+                    state,
+                    std::move(cached)
+                ).then([xsts] { return xsts; });
+            });
+        }
+    );
+}
+
+JsPromise<JsRuntimeValue> XboxTokenManager::doReplayAuth(
+    JsRuntimeValue email,
+    JsRuntimeValue password,
+    JsRuntimeValue options
+) {
+    const auto state = state_;
+    options = normalizedDefaultOptions(std::move(options));
+    return ValuePromise::fromSynchronous(
+        state->microtaskQueue,
+        [state,
+         email = std::move(email),
+         password = std::move(password),
+         options = std::move(options)]() mutable {
+            return replayPreAuth(state).then([
+                state,
+                email,
+                password
+            ](const JsRuntimeValue& preAuth) {
+                return replayLogUser(
+                    state,
+                    preAuth,
+                    email,
+                    password
+                );
+            }).then([state](const JsRuntimeValue& login) {
+                return replayExchangeUserToken(
+                    state,
+                    getProperty(login, "access_token")
+                );
+            }).then([state, options](const JsRuntimeValue& userToken) {
+                return setCachedTokenState(
+                    state,
+                    JsRuntimeValue::object({
+                        {"userToken", userToken}
+                    })
+                ).then([state, options, userToken] {
+                    return getXstsTokenState(
+                        state,
+                        JsRuntimeValue::object({
+                            {
+                                "userToken",
+                                getProperty(userToken, "Token")
+                            }
+                        }),
+                        options
+                    );
+                });
+            });
+        }
+    );
+}
+
 std::vector<std::uint8_t> XboxTokenManager::sign(
     std::string_view url,
     std::string_view authorizationToken,
@@ -1051,82 +1679,10 @@ JsPromise<JsRuntimeValue> XboxTokenManager::getXSTSToken(
     JsRuntimeValue tokens,
     JsRuntimeValue options
 ) {
-    const auto state = state_;
-    options = normalizedDefaultOptions(std::move(options));
-    return JsPromise<JsRuntimeValue>::fromSynchronous(
-        state->microtaskQueue,
-        [state,
-         tokens = std::move(tokens),
-         options = std::move(options)]() mutable {
-            const auto userToken = getProperty(tokens, "userToken");
-            auto payload = JsRuntimeValue::object({
-                {"RelyingParty", getProperty(options, "relyingParty")},
-                {"TokenType", JsRuntimeValue::string("JWT")},
-                {"Properties", JsRuntimeValue::object({
-                    {"UserTokens", JsRuntimeValue::array({userToken})},
-                    {"DeviceToken", getProperty(tokens, "deviceToken")},
-                    {"TitleToken", getProperty(tokens, "titleToken")},
-                    {
-                        "OptionalDisplayClaims",
-                        getProperty(options, "optionalDisplayClaims")
-                    },
-                    {"ProofKey", state->jwk},
-                    {"SandboxId", JsRuntimeValue::string("RETAIL")}
-                })}
-            });
-            const auto body = stringifyRequired(payload);
-            auto requestHeaders = spreadObject(state->headers);
-            requestHeaders.set(
-                "Signature",
-                JsRuntimeValue::string(signatureBase64(
-                    state,
-                    kXstsAuthorize,
-                    body
-                ))
-            );
-
-            return state->httpClient->fetch(makeRequest(
-                std::string(kXstsAuthorize),
-                std::move(requestHeaders),
-                body
-            )).then(
-                [](const XboxTokenHttpResponse& httpResponse) {
-                    const auto response = JsRuntimeJson::parse(
-                        httpResponse.bodyText
-                    );
-                    return std::pair<XboxTokenHttpResponse, JsRuntimeValue>(
-                        httpResponse,
-                        response
-                    );
-                }
-            ).then(
-                [state, options](
-                    const std::pair<XboxTokenHttpResponse, JsRuntimeValue>& pair
-                ) {
-                    const auto& httpResponse = pair.first;
-                    const auto& response = pair.second;
-                    if (!httpResponse.ok()) {
-                        throwTokenError(
-                            getProperty(response, "XErr"),
-                            response
-                        );
-                    }
-
-                    const auto xsts = makeXstsResult(response);
-                    auto cached = JsRuntimeValue::object();
-                    cached.set(
-                        XboxTokenManager::relyingPartyCacheKey(
-                            getProperty(options, "relyingParty")
-                        ),
-                        xsts
-                    );
-                    return setCachedTokenState(
-                        state,
-                        std::move(cached)
-                    ).then([xsts] { return xsts; });
-                }
-            );
-        }
+    return getXstsTokenState(
+        state_,
+        std::move(tokens),
+        std::move(options)
     );
 }
 

@@ -29,6 +29,9 @@ add_library(bedrock_protocol
     src/auth/FileAuthCache.cpp
     src/auth/JsPromise.cpp
     src/auth/JsRuntimeValue.cpp
+    src/auth/LiveTokenManager.cpp
+    src/auth/BedrockTokenManagers.cpp
+    src/auth/MicrosoftAuthFlow.cpp
     src/auth/MsaTokenManager.cpp
     src/auth/MsalCachePlugin.cpp
     src/auth/MsalError.cpp
@@ -37,13 +40,17 @@ add_library(bedrock_protocol
     src/auth/MsalSerializableTokenCache.cpp
     src/auth/MsalServerTelemetryManager.cpp
     src/auth/MsalTokenResponseHandler.cpp
+    src/auth/NativeBedrockAuthflow.cpp
     src/auth/NativeMsalPublicClientApplication.cpp
     src/auth/XboxLiveAuth.cpp
     src/auth/XboxProofKey.cpp
+    src/auth/XboxTokenManager.cpp
     src/client/BedrockNetworkClient.cpp
     src/client/RakNetClient.cpp
     src/events/BedrockPacketEventAdapter.cpp
     src/generated/GeneratedProtocolTables.cpp
+    src/nbt/BedrockNbt.cpp
+    src/protodef/ProtoDefNbt.cpp
     src/protocol/BatchCodec.cpp
     src/protocol/BedrockPacketIO.cpp
     src/protocol/GamePacketCodec.cpp
@@ -51,15 +58,19 @@ add_library(bedrock_protocol
     src/protocol/PacketFactory.cpp
     src/protocol/PacketPayloadReader.cpp
     src/protocol/PacketRegistry.cpp
+    src/protocol/SnappyCodec.cpp
     src/protocol/TypedPacketDispatcher.cpp
     src/protocol/VersionedMcpeCodec.cpp
+    src/realms/BedrockRealms.cpp
     src/relay/BedrockLiveRelay.cpp
     src/server/BedrockLoginVerifier.cpp
     src/server/ServerAdvertisement.cpp
     src/server/RakNetServer.cpp
     src/util/BinaryStream.cpp
     src/util/VarInt.cpp
+    src/util/XxHash64.cpp
     src/world/BedrockChunk.cpp
+    src/world/BedrockSubChunkPacket.cpp
 )
 add_library(BedrockProtocol::bedrock_protocol ALIAS bedrock_protocol)
 add_library(Bedrock::bedrock ALIAS bedrock_protocol)
@@ -97,14 +108,50 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
     add_executable(protocol-roundtrip tools/protocol_roundtrip.cpp)
     target_link_libraries(protocol-roundtrip PRIVATE BedrockProtocol::bedrock_protocol)
 
+    add_executable(snappy-codec-smoke tools/snappy_codec_smoke.cpp)
+    target_link_libraries(snappy-codec-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
+    add_executable(nbt-codec-smoke tools/nbt_codec_smoke.cpp)
+    target_link_libraries(nbt-codec-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
+    add_executable(protodef-nbt-smoke tools/protodef_nbt_smoke.cpp)
+    target_link_libraries(protodef-nbt-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
+    add_executable(protodef-variables-smoke tools/protodef_variables_smoke.cpp)
+    target_link_libraries(protodef-variables-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
+    add_executable(protodef-structured-smoke tools/protodef_structured_smoke.cpp)
+    target_link_libraries(protodef-structured-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
+    add_executable(subchunk-packet-smoke tools/subchunk_packet_smoke.cpp)
+    target_link_libraries(subchunk-packet-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
     add_executable(msal-native-smoke tools/msal_native_smoke.cpp)
     target_link_libraries(msal-native-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
+    add_executable(live-token-manager-smoke tools/live_token_manager_smoke.cpp)
+    target_link_libraries(live-token-manager-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
+    add_executable(bedrock-token-managers-smoke tools/bedrock_token_managers_smoke.cpp)
+    target_link_libraries(bedrock-token-managers-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
+    add_executable(bedrock-realms-smoke tools/bedrock_realms_smoke.cpp)
+    target_link_libraries(bedrock-realms-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
+    add_executable(xbox-token-manager-smoke tools/xbox_token_manager_smoke.cpp)
+    target_link_libraries(xbox-token-manager-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
+    add_executable(microsoft-auth-flow-smoke tools/microsoft_auth_flow_smoke.cpp)
+    target_link_libraries(microsoft-auth-flow-smoke PRIVATE BedrockProtocol::bedrock_protocol)
 
     add_executable(ping-api-smoke tools/ping_api_smoke.cpp)
     target_link_libraries(ping-api-smoke PRIVATE BedrockProtocol::bedrock_protocol)
 
     add_executable(create-server-factory-smoke tools/create_server_factory_smoke.cpp)
     target_link_libraries(create-server-factory-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
+    add_executable(server-outbound-queue-smoke tools/server_outbound_queue_smoke.cpp)
+    target_link_libraries(server-outbound-queue-smoke PRIVATE BedrockProtocol::bedrock_protocol)
 
     add_executable(create-client-factory-smoke tools/create_client_factory_smoke.cpp)
     target_link_libraries(create-client-factory-smoke PRIVATE BedrockProtocol::bedrock_protocol)
@@ -130,6 +177,12 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
     add_executable(live-relay-smoke tools/live_relay_smoke.cpp)
     target_link_libraries(live-relay-smoke PRIVATE BedrockProtocol::bedrock_protocol)
 
+    add_executable(live-relay-multi-client-smoke tools/live_relay_multi_client_smoke.cpp)
+    target_link_libraries(live-relay-multi-client-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
+    add_executable(live-relay-options-smoke tools/live_relay_options_smoke.cpp)
+    target_link_libraries(live-relay-options-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
     add_executable(chunk-smoke tools/chunk_smoke.cpp)
     target_link_libraries(chunk-smoke PRIVATE BedrockProtocol::bedrock_protocol)
 
@@ -144,9 +197,21 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
 
     if(BUILD_TESTING)
         add_test(NAME protocol-roundtrip COMMAND protocol-roundtrip)
+        add_test(NAME snappy-codec-smoke COMMAND snappy-codec-smoke)
+        add_test(NAME nbt-codec-smoke COMMAND nbt-codec-smoke)
+        add_test(NAME protodef-nbt-smoke COMMAND protodef-nbt-smoke)
+        add_test(NAME protodef-variables-smoke COMMAND protodef-variables-smoke)
+        add_test(NAME protodef-structured-smoke COMMAND protodef-structured-smoke)
+        add_test(NAME subchunk-packet-smoke COMMAND subchunk-packet-smoke)
         add_test(NAME msal-native-smoke COMMAND msal-native-smoke)
+        add_test(NAME live-token-manager-smoke COMMAND live-token-manager-smoke)
+        add_test(NAME bedrock-token-managers-smoke COMMAND bedrock-token-managers-smoke)
+        add_test(NAME bedrock-realms-smoke COMMAND bedrock-realms-smoke)
+        add_test(NAME xbox-token-manager-smoke COMMAND xbox-token-manager-smoke)
+        add_test(NAME microsoft-auth-flow-smoke COMMAND microsoft-auth-flow-smoke)
         add_test(NAME ping-api-smoke COMMAND ping-api-smoke)
         add_test(NAME create-server-factory-smoke COMMAND create-server-factory-smoke)
+        add_test(NAME server-outbound-queue-smoke COMMAND server-outbound-queue-smoke)
         add_test(NAME create-client-factory-smoke COMMAND create-client-factory-smoke)
         add_test(NAME legacy-encryption-smoke COMMAND legacy-encryption-smoke)
         add_test(NAME chunk-smoke COMMAND chunk-smoke)
@@ -156,14 +221,25 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
         add_test(NAME raknet-client-smoke COMMAND raknet-client-smoke)
         add_test(NAME network-client-smoke COMMAND network-client-smoke)
         add_test(NAME live-relay-smoke COMMAND live-relay-smoke)
+        add_test(NAME live-relay-multi-client-smoke COMMAND live-relay-multi-client-smoke)
+        add_test(NAME live-relay-options-smoke COMMAND live-relay-options-smoke)
         add_test(NAME public-header-smoke COMMAND public-header-smoke)
         add_test(NAME public-header-reverse-smoke COMMAND public-header-reverse-smoke)
         add_test(NAME xbox-proof-key-smoke COMMAND xbox-proof-key-smoke)
         set_tests_properties(
             protocol-roundtrip
+            protodef-nbt-smoke
+            protodef-variables-smoke
+            protodef-structured-smoke
             msal-native-smoke
+            live-token-manager-smoke
+            bedrock-token-managers-smoke
+            bedrock-realms-smoke
+            xbox-token-manager-smoke
+            microsoft-auth-flow-smoke
             ping-api-smoke
             create-server-factory-smoke
+            server-outbound-queue-smoke
             create-client-factory-smoke
             legacy-encryption-smoke
             chunk-smoke
@@ -173,6 +249,8 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
             raknet-client-smoke
             network-client-smoke
             live-relay-smoke
+            live-relay-multi-client-smoke
+            live-relay-options-smoke
             public-header-smoke
             public-header-reverse-smoke
             xbox-proof-key-smoke
@@ -228,7 +306,7 @@ if(BEDROCK_PROTOCOL_CPP_INSTALL)
     )
 
     if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
-        install(TARGETS bedrock bedrock-session login xbox-login ping protocol-roundtrip msal-native-smoke ping-api-smoke create-server-factory-smoke create-client-factory-smoke legacy-encryption-smoke raknet-server-smoke raknet-connection-lifecycle-smoke server-login-verifier-smoke raknet-client-smoke network-client-smoke live-relay-smoke chunk-smoke
+        install(TARGETS bedrock bedrock-session login xbox-login ping protocol-roundtrip msal-native-smoke live-token-manager-smoke bedrock-token-managers-smoke xbox-token-manager-smoke microsoft-auth-flow-smoke ping-api-smoke create-server-factory-smoke server-outbound-queue-smoke create-client-factory-smoke legacy-encryption-smoke raknet-server-smoke raknet-connection-lifecycle-smoke server-login-verifier-smoke raknet-client-smoke network-client-smoke live-relay-smoke live-relay-multi-client-smoke live-relay-options-smoke chunk-smoke
             RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
         )
     endif()

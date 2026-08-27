@@ -16,12 +16,19 @@ struct MsalHttpRequest {
     std::string url;
     std::vector<std::pair<std::string, std::string>> headers;
     std::string body;
+    // Optional Axios/follow-redirects behavior used by the legacy XboxReplay
+    // password flow. Ordinary MSAL requests retain the zero/no-follow default.
+    int maxRedirects = 0;
+    bool decompress = false;
 
     const std::string* header(std::string_view name) const noexcept;
 };
 
 struct MsalHttpResponse {
     int status = 0;
+    // Final effective URL after redirects. Empty for injected transports that
+    // do not need to model response.request.res.responseUrl.
+    std::string url;
 
     // Scalar convenience view used by the native PCA. Header names are
     // lower-case and duplicate scalar fields have Node's IncomingMessage

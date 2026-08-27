@@ -1992,16 +1992,70 @@ bool checkPingErrorAndCloseBeforePong() {
                 "close-before-pong retained internal auto-connect listener");
     delayed.finish();
 
-    bool realmsExact = false;
-    try {
-        auto realms = baseOptions(19132);
-        realms.realms = true;
-        auto unsupported = bedrock::createClient(realms);
-        (void) unsupported;
-    } catch (const std::exception& e) {
-        realmsExact = std::string(e.what()) == "Realms are not supported";
+    auto missingRealmOptions = baseOptions(19132);
+    missingRealmOptions.realms = true;
+    missingRealmOptions.skipPing = true;
+    missingRealmOptions.profilesFolder = true;
+    auto missingRealm = bedrock::createClient(missingRealmOptions);
+    std::mutex missingRealmMutex;
+    std::string missingRealmError;
+    missingRealm.onError([&](const std::string& message) {
+        std::lock_guard<std::mutex> lock(missingRealmMutex);
+        missingRealmError = message;
+    });
+    ok &= check(waitFor([&]() {
+        std::lock_guard<std::mutex> lock(missingRealmMutex);
+        return !missingRealmError.empty();
+    }), "Realm selection failure was not delivered asynchronously");
+    {
+        std::lock_guard<std::mutex> lock(missingRealmMutex);
+        ok &= check(
+            missingRealmError ==
+                "Couldn't find a Realm to connect to. Authenticated account "
+                "must be the owner or has been invited to the Realm.",
+            "missing Realm selection error differs from auth.realmAuthenticate"
+        );
     }
-    ok &= check(realmsExact, "Realms slice was not explicitly rejected");
+
+    auto realmOptions = baseOptions(19132);
+    realmOptions.skipPing = true;
+    realmOptions.profilesFolder = true;
+    std::shared_ptr<bedrock::Authflow> resolverAuthflow;
+    std::atomic<int> realmResolverCalls {0};
+    realmOptions.realms.addressResolver = [&](
+        std::shared_ptr<bedrock::Authflow> flow
+    ) {
+        resolverAuthflow = std::move(flow);
+        ++realmResolverCalls;
+        return bedrock::BedrockRealmAddress {
+            .host = "127.0.0.1",
+            .port = 9
+        };
+    };
+    auto realmClient = bedrock::createClient(realmOptions);
+    realmClient.onError([](const std::string&) {});
+    ok &= check(
+        waitFor([&]() { return realmClient.initialized(); }) &&
+            realmResolverCalls.load() == 1,
+        "Realm address preflight did not initialize createClient"
+    );
+    if (realmClient.initialized()) {
+        const auto visible = realmClient.options();
+        const auto networkVisible = realmClient.network().options();
+        ok &= check(
+            visible.host == "127.0.0.1" &&
+                static_cast<uint16_t>(visible.port) == 9 &&
+                visible.followPort.has_value() &&
+                !visible.followPort.value_or(true) &&
+                visible.authflow == resolverAuthflow &&
+                networkVisible.authflow == resolverAuthflow &&
+                resolverAuthflow &&
+                resolverAuthflow->hasXboxTokenMethod() &&
+                resolverAuthflow->hasMinecraftBedrockTokenMethod(),
+            "Realm preflight did not publish address/followPort/shared Authflow"
+        );
+    }
+    realmClient.close("realm-factory-smoke-complete");
 
     // A Node error listener may synchronously dispose its Client. Exercise
     // the equivalent C++ path on the tracked connect worker: shutdown must

@@ -1059,13 +1059,30 @@ initializePrismarineAuthFlowRuntime(
     AuthCachePtr msaCache,
     MsalPublicClientApplicationFactory applicationFactory,
     std::shared_ptr<JsMicrotaskQueue> microtaskQueue,
-    MsaTokenManagerObservers observers
+    MsaTokenManagerObservers observers,
+    LiveTokenManagerDependencies liveDependencies
 ) {
     validatePrismarineAuthFlowPresence(options);
 
     if (options.flow == "live" || options.flow == "sisu") {
         validatePrismarineAuthFlow(options);
-        return {};
+        if (!liveDependencies.microtaskQueue) {
+            liveDependencies.microtaskQueue = std::move(microtaskQueue);
+        }
+        auto manager = std::make_shared<LiveTokenManager>(
+            JsRuntimeValue::string(options.authTitle),
+            JsRuntimeValue::array({
+                JsRuntimeValue::string(
+                    "service::user.auth.xboxlive.com::MBI_SSL"
+                )
+            }),
+            std::move(msaCache),
+            std::move(liveDependencies)
+        );
+        return PrismarineAuthFlowRuntime {
+            .live = std::move(manager),
+            .doTitleAuth = true
+        };
     }
 
     if (options.flow != "msal") {
@@ -1097,7 +1114,8 @@ initializePrismarineAuthFlowRuntime(
     );
     return PrismarineAuthFlowRuntime {
         .effectiveMsalConfig = std::move(effective),
-        .msa = std::move(manager)
+        .msa = std::move(manager),
+        .doTitleAuth = false
     };
 }
 

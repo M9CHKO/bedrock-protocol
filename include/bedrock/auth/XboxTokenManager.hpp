@@ -3,6 +3,7 @@
 #include <bedrock/auth/AuthCache.hpp>
 #include <bedrock/auth/JsPromise.hpp>
 #include <bedrock/auth/JsRuntimeValue.hpp>
+#include <bedrock/auth/MsalHttpClient.hpp>
 #include <bedrock/auth/XboxProofKey.hpp>
 
 #include <cstdint>
@@ -21,6 +22,10 @@ struct XboxTokenHttpRequest {
     JsRuntimeValue headersObject = JsRuntimeValue::object();
     std::vector<std::pair<std::string, std::string>> headers;
     std::string body;
+    // WHATWG Request.credentials. Xbox requests leave it undefined; the
+    // legacy Live OAuth manager explicitly uses "include" on its first two
+    // requests, matching prismarine-auth's fetch init object.
+    JsRuntimeValue credentials = JsRuntimeValue::undefined();
 
     const std::string* header(std::string_view name) const noexcept;
 };
@@ -73,6 +78,7 @@ struct XboxTokenManagerDependencies {
     // Date.now() seam. It is evaluated independently at every source call:
     // UUID names, signature timestamps, and each cache-validity check.
     std::function<double()> dateNowMilliseconds;
+    MsalHttpClientPtr replayHttpClient;
 };
 
 struct XboxTokenManagerState;
@@ -85,6 +91,9 @@ private:
     std::shared_ptr<XboxTokenManagerState> state_;
 
 public:
+    inline static constexpr std::string_view SisuAuthorizeEndpoint =
+        "https://sisu.xboxlive.com/authorize";
+
     XboxTokenManager(XboxProofKey ecKey, AuthCachePtr cacheValue);
 
     // C++ testing/integration extension; the production constructor above
@@ -106,6 +115,10 @@ public:
     JsRuntimeValue& jwk;
     AuthCachePtr& cache;
     JsRuntimeValue& headers;
+    // MicrosoftAuthFlow assigns this dynamic property before its Bedrock
+    // retry. XboxTokenManager.js itself does not read it, but retaining the
+    // slot preserves the observable flow object without importing Java logic.
+    JsRuntimeValue& forceRefresh;
 
     JsPromise<void> setCachedToken(JsRuntimeValue data);
     JsPromise<JsRuntimeValue> getCachedTokens(
@@ -120,6 +133,18 @@ public:
     JsPromise<JsRuntimeValue> getUserToken(
         JsRuntimeValue accessToken,
         JsRuntimeValue azure = JsRuntimeValue::undefined()
+    );
+
+    JsPromise<JsRuntimeValue> doSisuAuth(
+        JsRuntimeValue accessToken,
+        JsRuntimeValue deviceToken,
+        JsRuntimeValue options = JsRuntimeValue::object()
+    );
+
+    JsPromise<JsRuntimeValue> doReplayAuth(
+        JsRuntimeValue email,
+        JsRuntimeValue password,
+        JsRuntimeValue options = JsRuntimeValue::object()
     );
 
     std::vector<std::uint8_t> sign(

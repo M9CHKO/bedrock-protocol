@@ -1,6 +1,7 @@
 #pragma once
 
 #include <bedrock/BinaryStream.hpp>
+#include <bedrock/nbt/BedrockNbt.hpp>
 
 #include <cstdint>
 #include <functional>
@@ -37,7 +38,26 @@ struct BedrockBlockState {
     int32_t stateId = 0;
     std::string name;
     uint32_t count = 0;
+    NbtValue states = NbtValue::compound();
+    int32_t version = 0;
+    bool hasPersistentData = false;
 };
+
+struct BedrockBlockStateDescriptor {
+    std::string name;
+    NbtValue states = NbtValue::compound();
+    int32_t version = 0;
+};
+
+using BedrockBlockStateResolver = std::function<std::optional<int32_t>(
+    const std::string& name,
+    const NbtValue& states,
+    int32_t version
+)>;
+
+using BedrockBlockStateProvider = std::function<std::optional<BedrockBlockStateDescriptor>(
+    int32_t stateId
+)>;
 
 enum class BlobType : uint8_t {
     ChunkSection = 0,
@@ -104,23 +124,27 @@ public:
     static BedrockSubChunk decode(
         ChunkStorageType format,
         const std::vector<uint8_t>& data,
-        int32_t airStateId = 0
+        int32_t airStateId = 0,
+        BedrockBlockStateResolver resolver = {}
     );
 
     std::vector<uint8_t> encode(
         ChunkStorageType format = ChunkStorageType::Runtime,
-        bool compact = true
+        bool compact = true,
+        BedrockBlockStateProvider provider = {}
     ) const;
 
     void decodeFrom(
         ChunkStorageType format,
         BinaryStream& stream,
-        int32_t airStateId = 0
+        int32_t airStateId = 0,
+        BedrockBlockStateResolver resolver = {}
     );
     void encodeTo(
         ChunkStorageType format,
         BinaryStream& stream,
-        bool compact = true
+        bool compact = true,
+        BedrockBlockStateProvider provider = {}
     ) const;
 
     int8_t y() const;
@@ -142,6 +166,11 @@ public:
     void setSkyLight(uint8_t x, uint8_t y, uint8_t z, uint8_t value);
 
     const std::vector<BedrockBlockState>& palette(uint8_t layer = 0) const;
+    void setPaletteEntryDescriptor(
+        uint8_t layer,
+        std::size_t paletteIndex,
+        BedrockBlockStateDescriptor descriptor
+    );
     std::vector<BedrockBlockState> compactedPalette(uint8_t layer = 0) const;
     bool isCompactable(uint8_t layer = 0) const;
     void compact(uint8_t layer = 0);
@@ -157,8 +186,19 @@ private:
 
     void ensureLayer(uint8_t layer);
     void addToPalette(uint8_t layer, int32_t stateId, uint32_t count = 0);
-    void loadPalettedBlocks(uint8_t layer, BinaryStream& stream, uint8_t bitsPerBlock, ChunkStorageType format);
-    void writeStorage(uint8_t layer, BinaryStream& stream, ChunkStorageType format) const;
+    void loadPalettedBlocks(
+        uint8_t layer,
+        BinaryStream& stream,
+        uint8_t bitsPerBlock,
+        ChunkStorageType format,
+        const BedrockBlockStateResolver& resolver
+    );
+    void writeStorage(
+        uint8_t layer,
+        BinaryStream& stream,
+        ChunkStorageType format,
+        const BedrockBlockStateProvider& provider
+    ) const;
 
     static uint8_t neededBits(uint32_t value);
     static int32_t readZigZagVarInt(BinaryStream& stream);
@@ -234,6 +274,16 @@ struct BedrockClientCacheBlobStatus {
     std::vector<uint64_t> have;
 };
 
+struct BedrockEncodedChunkCache {
+    std::vector<uint64_t> blobHashes;
+    std::vector<uint8_t> payload;
+};
+
+struct BedrockEncodedSubChunkCache {
+    uint64_t blobHash = 0;
+    std::vector<uint8_t> payload;
+};
+
 class BedrockLevelChunkCodec {
 public:
     static BedrockLevelChunkPacket decodePacketPayload(const std::vector<uint8_t>& payload);
@@ -281,8 +331,14 @@ public:
     void setBlockStateId(const BlockPosition& pos, int32_t stateId);
 
     void setBlockEntity(const BlockPosition& pos, std::vector<uint8_t> tag);
+    void setBlockEntityNbt(const BlockPosition& pos, NbtDocument tag);
     const std::vector<uint8_t>* getBlockEntity(const BlockPosition& pos) const;
+    const NbtDocument* getBlockEntityNbt(const BlockPosition& pos) const;
     void removeBlockEntity(const BlockPosition& pos);
+    std::size_t blockEntityCount() const;
+
+    std::vector<uint8_t> diskEncodeBlockEntities() const;
+    void diskDecodeBlockEntities(const std::vector<uint8_t>& data);
 
     const std::vector<std::optional<BedrockSubChunk>>& sections() const;
 
@@ -295,11 +351,37 @@ public:
     void writeBiomes(BinaryStream& stream) const;
 
     void networkDecodeNoCache(const std::vector<uint8_t>& payload, int32_t sectionCount);
+    void networkDecodeNoCache(
+        const std::vector<uint8_t>& payload,
+        int32_t sectionCount,
+        bool use3DBiomes
+    );
     std::vector<uint8_t> networkEncodeNoCache() const;
+    std::vector<uint8_t> networkEncodeNoCache(bool use3DBiomes) const;
+    void networkDecodeSubChunkNoCache(int32_t sectionY, const std::vector<uint8_t>& payload);
+    std::vector<uint8_t> networkEncodeSubChunkNoCache(
+        int32_t sectionY,
+        bool compact = true
+    ) const;
+    BedrockEncodedChunkCache networkEncodeCached(
+        BedrockBlobStore& blobStore,
+        bool use3DBiomes,
+        BedrockBlockStateProvider provider = {}
+    ) const;
+    BedrockEncodedChunkCache networkEncodeCached(
+        BedrockBlobStore& blobStore,
+        BedrockBlockStateProvider provider = {}
+    ) const;
+    BedrockEncodedSubChunkCache networkEncodeSubChunkCached(
+        int32_t sectionY,
+        BedrockBlobStore& blobStore,
+        bool compact = true
+    ) const;
     std::vector<uint64_t> networkDecodeCached(
         const std::vector<uint64_t>& blobHashes,
         const BedrockBlobStore& blobStore,
-        const std::vector<uint8_t>& payload
+        const std::vector<uint8_t>& payload,
+        BedrockBlockStateResolver resolver = {}
     );
 
 private:
@@ -314,8 +396,16 @@ private:
     std::vector<std::optional<BedrockSubChunk>> sections_;
     std::vector<BedrockBiomeSection> biomes_;
     std::unordered_map<std::string, std::vector<uint8_t>> blockEntities_;
+    std::unordered_map<std::string, NbtDocument> blockEntityNbt_;
 
     int32_t sectionIndexForBlockY(int32_t y) const;
+    void decodeBlockEntities(BinaryStream& stream, BedrockNbtEncoding encoding);
+    void encodeBlockEntities(
+        BinaryStream& stream,
+        BedrockNbtEncoding encoding,
+        std::optional<int32_t> sectionY = std::nullopt
+    ) const;
+    static BlockPosition blockEntityPosition(const NbtDocument& tag);
     static uint8_t localCoord(int32_t value);
     static std::string blockEntityKey(const BlockPosition& pos);
 };

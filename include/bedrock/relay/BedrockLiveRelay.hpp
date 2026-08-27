@@ -1,6 +1,7 @@
 #pragma once
 
 #include <bedrock/client/BedrockNetworkClient.hpp>
+#include <bedrock/realms/BedrockRealms.hpp>
 #include <bedrock/relay/BedrockRelay.hpp>
 #include <bedrock/server/BedrockServer.hpp>
 
@@ -14,6 +15,8 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace bedrock {
@@ -27,6 +30,7 @@ struct BedrockRelayDownstreamProfile {
 struct BedrockLiveRelayOptions {
     BedrockServerOptions server;
     BedrockNetworkClientOptions upstream;
+    BedrockRealmSelection realms;
 
     bool forwardServerbound = true;
     bool forwardClientbound = true;
@@ -38,6 +42,9 @@ struct BedrockLiveRelayOptions {
     bool enableChunkCaching = false;
     bool filterDownstreamHandshakePackets = true;
     bool logging = false;
+    // Relay#forceSingle rejects a second transport while any accepted
+    // downstream Player session is still present.
+    bool forceSingle = false;
     // relay.js chooses username from the relay-level offline flag, separately
     // from destination.offline ?? relay.offline used for upstream auth mode.
     bool useDownstreamDisplayNameForUpstreamUsername = false;
@@ -61,6 +68,10 @@ struct BedrockLiveRelayStatus {
     bool upstreamStarted = false;
     bool upstreamReady = false;
     uint16_t boundPort = 0;
+    std::size_t downstreamConnections = 0;
+    std::size_t downstreamJoinedCount = 0;
+    std::size_t upstreamStartedCount = 0;
+    std::size_t upstreamReadyCount = 0;
 };
 
 class BedrockLiveRelay {
@@ -97,31 +108,39 @@ public:
     const BedrockLiveRelayOptions& options() const;
 
     BedrockServer& server();
+    // Compatibility view of the first active relay session.
     BedrockNetworkClient* upstream();
+    BedrockNetworkClient* upstream(const BedrockServerConnection& connection);
+    // Owning snapshots for code that may race a session disconnect.
+    std::shared_ptr<BedrockNetworkClient> upstreamShared();
+    std::shared_ptr<BedrockNetworkClient> upstreamShared(
+        const BedrockServerConnection& connection
+    );
+    std::size_t sessionCount() const;
+    std::size_t upstreamCount() const;
+    void closeUpstreamConnection(
+        const BedrockServerConnection& connection,
+        const std::string& reason = "closed"
+    );
+
+    static std::string sessionId(const BedrockServerConnection& connection);
 
 private:
+    struct Session;
+
     BedrockLiveRelayOptions options_;
+    BedrockNetworkClientOptions baseUpstreamOptions_;
     std::unique_ptr<BedrockServer> server_;
-    std::unique_ptr<BedrockNetworkClient> upstream_;
-    std::thread upstreamThread_;
 
     mutable std::mutex mutex_;
     std::condition_variable closedCv_;
-    std::optional<BedrockServerConnection> downstream_;
-    std::vector<VersionedGamePacket> pendingServerbound_;
-    std::vector<VersionedGamePacket> pendingPostSpawnServerbound_;
-    std::vector<VersionedGamePacket> pendingClientbound_;
-    std::vector<VersionedGamePacket> heldClientboundLevelChunks_;
-    std::chrono::steady_clock::time_point clientboundChunkReleaseAt_ {};
-    BedrockRelayDownstreamProfile downstreamProfile_;
+    std::unordered_map<std::string, std::shared_ptr<Session>> sessions_;
+    std::unordered_set<std::string> rejectedConnections_;
+    std::string primarySessionId_;
+    mutable std::mutex handlerDispatchMutex_;
 
     std::atomic<bool> closed_ {true};
     std::atomic<bool> listening_ {false};
-    std::atomic<bool> downstreamJoined_ {false};
-    std::atomic<bool> upstreamStarted_ {false};
-    std::atomic<bool> upstreamReady_ {false};
-    std::atomic<bool> clientboundStartGameSent_ {false};
-    std::atomic<bool> clientboundPlayerSpawnSeen_ {false};
 
     std::vector<ConnectionHandler> connectHandlers_;
     std::vector<ConnectionHandler> joinHandlers_;
@@ -140,14 +159,41 @@ private:
 
     void emitError(const std::string& message);
     void emitStatus();
-    void captureDownstreamClientData(const VersionedGamePacket& packet);
-    void resetRelaySession(const std::string& reason);
-    void startUpstream();
-    void handleUpstreamPacket(const VersionedGamePacket& packet);
+    std::shared_ptr<Session> findSession(
+        const BedrockServerConnection& connection
+    ) const;
+    std::shared_ptr<Session> primarySession() const;
+    void captureDownstreamClientData(
+        const std::shared_ptr<Session>& session,
+        const VersionedGamePacket& packet
+    );
+    void resolveUpstreamRealm(BedrockNetworkClientOptions& upstreamOptions);
+    void resetRelaySession(
+        const std::shared_ptr<Session>& session,
+        const std::string& reason,
+        bool retainDownstream
+    );
+    void removeRelaySession(
+        const std::shared_ptr<Session>& session,
+        const std::string& reason
+    );
+    void startUpstream(const std::shared_ptr<Session>& session);
+    void handleUpstreamPacket(
+        const std::shared_ptr<Session>& session,
+        const VersionedGamePacket& packet
+    );
     void handleDownstreamPacket(const BedrockServerPacketEvent& event);
-    void forwardClientbound(const VersionedGamePacket& packet);
-    void forwardServerbound(const VersionedGamePacket& packet);
+    void forwardClientbound(
+        const std::shared_ptr<Session>& session,
+        const VersionedGamePacket& packet
+    );
+    void forwardServerbound(
+        const std::shared_ptr<Session>& session,
+        const VersionedGamePacket& packet,
+        bool immediate = false
+    );
     std::vector<VersionedGamePacket> applyHandlers(
+        const std::shared_ptr<Session>& session,
         BedrockRelayDirection direction,
         const VersionedGamePacket& packet
     );

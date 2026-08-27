@@ -1,6 +1,8 @@
 #pragma once
 
+#include <bedrock/protodef/ProtoDefNbt.hpp>
 #include <bedrock/protodef/ProtoDefValue.hpp>
+#include <bedrock/protodef/ProtoDefVariables.hpp>
 #include <bedrock/protodef/ProtoDefWriter.hpp>
 #include <bedrock/generated/GeneratedProtocolTypes.hpp>
 
@@ -24,6 +26,46 @@ public:
 
     explicit ProtoDefEncoder(TypeResolver resolver)
         : resolver_(std::move(resolver)) {}
+
+    void setVariable(std::string key, std::string value) {
+        variables_[std::move(key)] = std::move(value);
+    }
+
+    void setVariable(std::string key, const char* value) {
+        setVariable(std::move(key), value ? std::string(value) : std::string());
+    }
+
+    void setVariable(std::string key, bool value) {
+        setVariable(std::move(key), value ? "true" : "false");
+    }
+
+    template<std::integral T>
+        requires (!std::same_as<T, bool>)
+    void setVariable(std::string key, T value) {
+        if constexpr (std::signed_integral<T>) {
+            setVariable(std::move(key), std::to_string(static_cast<long long>(value)));
+        } else {
+            setVariable(std::move(key), std::to_string(static_cast<unsigned long long>(value)));
+        }
+    }
+
+    template<std::floating_point T>
+    void setVariable(std::string key, T value) {
+        std::ostringstream out;
+        out << std::setprecision(17) << value;
+        setVariable(std::move(key), out.str());
+    }
+
+    void setVariables(const ProtoDefVariableMap& variables) {
+        variables_ = variables;
+    }
+
+    std::optional<std::string> variable(const std::string& key) const {
+        const auto found = variables_.find(key);
+        return found == variables_.end()
+            ? std::nullopt
+            : std::optional<std::string>(found->second);
+    }
 
     void encode(
         const std::string& typeJson,
@@ -490,34 +532,43 @@ private:
                 continue;
             }
 
-            if (anon) {
-                encode(*type, value, writer);
-            } else {
-                if (!name.has_value()) {
-                    throw std::runtime_error("container field missing name");
-                }
-
-                std::string normalizedType = trim(*type);
-
-                if (
-                    startsWith(normalizedType, "[\"switch\"") ||
-                    startsWith(normalizedType, "[\"entityMetadataItem\"")
-                ) {
-                    ProtoDefValue switchContext = value;
-
-                    if (const ProtoDefValue* child = value.get(*name)) {
-                        switchContext.objectValue["$value"] = withParent(*child, value);
-                    }
-
-                    encode(*type, switchContext, writer);
+            try {
+                if (anon) {
+                    encode(*type, value, writer);
                 } else {
-                    const ProtoDefValue* child = value.get(*name);
-                    if (!child) {
-                        throw std::runtime_error("container missing field: " + *name);
+                    if (!name.has_value()) {
+                        throw std::runtime_error("container field missing name");
                     }
 
-                    encode(*type, withParent(*child, value), writer);
+                    std::string normalizedType = trim(*type);
+
+                    if (
+                        startsWith(normalizedType, "[\"switch\"") ||
+                        startsWith(normalizedType, "[\"entityMetadataItem\"")
+                    ) {
+                        ProtoDefValue switchContext = value;
+
+                        if (const ProtoDefValue* child = value.get(*name)) {
+                            switchContext.objectValue["$value"] = withParent(*child, value);
+                        }
+
+                        encode(*type, switchContext, writer);
+                    } else {
+                        const ProtoDefValue* child = value.get(*name);
+                        if (!child) {
+                            throw std::runtime_error("container missing field: " + *name);
+                        }
+
+                        encode(*type, withParent(*child, value), writer);
+                    }
                 }
+            } catch (const std::exception& error) {
+                auto fieldLabel = anon
+                    ? std::string("<anonymous ") + trim(*type).substr(0, 96) + ">"
+                    : name.value_or("<unnamed>");
+                throw std::runtime_error(
+                    "at container field " + fieldLabel + ": " + error.what()
+                );
             }
 
             pos = objEnd + 1;
@@ -582,7 +633,11 @@ private:
                 throw std::runtime_error("nbtLoop encode expects array");
             }
             for (const auto& item : value.arrayValue) {
-                encodeNativeNbt(item, writer, true);
+                if (item.kind != ProtoDefValue::Kind::Bytes &&
+                    protoDefValueToNbtDocument(item).root.type == NbtTagType::End) {
+                    throw std::runtime_error("nbtLoop cannot contain TAG_End values");
+                }
+                writeProtoDefNbt(writer, item, BedrockNbtEncoding::LittleVarInt);
             }
             writer.u8(0);
             return;
@@ -593,12 +648,12 @@ private:
         }
 
         if (typeName == "native" || typeName == "nbt") {
-            encodeNativeNbt(value, writer, true);
+            writeProtoDefNbt(writer, value, BedrockNbtEncoding::LittleVarInt);
             return;
         }
 
         if (typeName == "lnbt") {
-            encodeNativeNbt(value, writer, false);
+            writeProtoDefNbt(writer, value, BedrockNbtEncoding::LittleEndian);
             return;
         }
 
@@ -744,219 +799,6 @@ private:
         }
 
         throw std::runtime_error("ProtoDefEncoder unknown primitive type: " + typeName);
-    }
-
-
-    static const ProtoDefValue* requiredField(
-        const ProtoDefValue& object,
-        const std::string& key
-    ) {
-        const ProtoDefValue* v = object.get(key);
-        if (!v) {
-            throw std::runtime_error("missing object field: " + key);
-        }
-        return v;
-    }
-
-    static std::string nbtTagName(const ProtoDefValue& node) {
-        return asString(*requiredField(node, "tag"));
-    }
-
-    static uint8_t nbtTagIdByName(const std::string& tag) {
-        if (tag == "end") return 0;
-        if (tag == "byte") return 1;
-        if (tag == "short") return 2;
-        if (tag == "int") return 3;
-        if (tag == "long") return 4;
-        if (tag == "float") return 5;
-        if (tag == "double") return 6;
-        if (tag == "byteArray") return 7;
-        if (tag == "string") return 8;
-        if (tag == "list") return 9;
-        if (tag == "compound") return 10;
-        if (tag == "intArray") return 11;
-        if (tag == "longArray") return 12;
-
-        throw std::runtime_error("unknown nbt tag: " + tag);
-    }
-
-    static void writeNbtName(
-        ProtoDefWriter& writer,
-        const std::string& name
-    ) {
-        writer.string(name);
-    }
-
-    static void encodeNativeNbt(
-        const ProtoDefValue& value,
-        ProtoDefWriter& writer,
-        bool withRootName
-    ) {
-        if (value.kind == ProtoDefValue::Kind::Bytes) {
-            writer.bytes(value.bytesValue);
-            return;
-        }
-
-        if (value.kind == ProtoDefValue::Kind::Null) {
-            writer.u8(0);
-            return;
-        }
-
-        if (value.kind != ProtoDefValue::Kind::Object) {
-            throw std::runtime_error("nbt encode expects object/bytes/null");
-        }
-
-        std::string tag = nbtTagName(value);
-        uint8_t tagId = nbtTagIdByName(tag);
-
-        writer.u8(tagId);
-
-        if (tagId == 0) {
-            return;
-        }
-
-        if (withRootName) {
-            std::string name;
-            if (const ProtoDefValue* n = value.get("name")) {
-                name = asString(*n);
-            }
-            writeNbtName(writer, name);
-        }
-
-        const ProtoDefValue& payload = *requiredField(value, "value");
-        encodeNbtPayload(tagId, payload, writer);
-    }
-
-    static void encodeNbtPayload(
-        uint8_t tagId,
-        const ProtoDefValue& payload,
-        ProtoDefWriter& writer
-    ) {
-        switch (tagId) {
-            case 0:
-                return;
-
-            case 1:
-                writer.u8(static_cast<uint8_t>(asInt(payload)));
-                return;
-
-            case 2:
-                writer.u16le(static_cast<uint16_t>(asInt(payload)));
-                return;
-
-            case 3:
-                writer.zigzag32(static_cast<int32_t>(asInt(payload)));
-                return;
-
-            case 4:
-                writer.zigzag64(static_cast<int64_t>(asInt(payload)));
-                return;
-
-            case 5:
-                writer.f32le(static_cast<float>(asDouble(payload)));
-                return;
-
-            case 6:
-                writer.f64le(static_cast<double>(asDouble(payload)));
-                return;
-
-            case 7: {
-                if (payload.kind != ProtoDefValue::Kind::Bytes) {
-                    throw std::runtime_error("nbt byteArray expects bytes");
-                }
-
-                writer.zigzag32(static_cast<int32_t>(payload.bytesValue.size()));
-                writer.bytes(payload.bytesValue);
-                return;
-            }
-
-            case 8:
-                writer.string(asString(payload));
-                return;
-
-            case 9: {
-                if (payload.kind != ProtoDefValue::Kind::Object) {
-                    throw std::runtime_error("nbt list expects object");
-                }
-
-                std::string childTagName = asString(*requiredField(payload, "childTag"));
-                uint8_t childTag = nbtTagIdByName(childTagName);
-
-                const ProtoDefValue& values = *requiredField(payload, "value");
-                if (values.kind != ProtoDefValue::Kind::Array) {
-                    throw std::runtime_error("nbt list value expects array");
-                }
-
-                writer.u8(childTag);
-                writer.zigzag32(static_cast<int32_t>(values.arrayValue.size()));
-
-                for (const auto& item : values.arrayValue) {
-                    encodeNbtPayload(childTag, item, writer);
-                }
-
-                return;
-            }
-
-            case 10: {
-                if (payload.kind != ProtoDefValue::Kind::Object) {
-                    throw std::runtime_error("nbt compound expects object");
-                }
-
-                for (const auto& kv : payload.objectValue) {
-                    const std::string& childName = kv.first;
-                    const ProtoDefValue& child = kv.second;
-
-                    if (child.kind != ProtoDefValue::Kind::Object) {
-                        throw std::runtime_error("nbt compound child expects object: " + childName);
-                    }
-
-                    std::string childTagName = nbtTagName(child);
-                    uint8_t childTag = nbtTagIdByName(childTagName);
-
-                    writer.u8(childTag);
-                    if (childTag == 0) {
-                        continue;
-                    }
-
-                    writeNbtName(writer, childName);
-                    encodeNbtPayload(
-                        childTag,
-                        *requiredField(child, "value"),
-                        writer
-                    );
-                }
-
-                writer.u8(0);
-                return;
-            }
-
-            case 11: {
-                if (payload.kind != ProtoDefValue::Kind::Array) {
-                    throw std::runtime_error("nbt intArray expects array");
-                }
-
-                writer.zigzag32(static_cast<int32_t>(payload.arrayValue.size()));
-                for (const auto& item : payload.arrayValue) {
-                    writer.zigzag32(static_cast<int32_t>(asInt(item)));
-                }
-                return;
-            }
-
-            case 12: {
-                if (payload.kind != ProtoDefValue::Kind::Array) {
-                    throw std::runtime_error("nbt longArray expects array");
-                }
-
-                writer.zigzag32(static_cast<int32_t>(payload.arrayValue.size()));
-                for (const auto& item : payload.arrayValue) {
-                    writer.zigzag64(static_cast<int64_t>(asInt(item)));
-                }
-                return;
-            }
-
-            default:
-                throw std::runtime_error("unsupported nbt tag id");
-        }
     }
 
 
@@ -1115,20 +957,13 @@ private:
             }
         } else if (value.kind == ProtoDefValue::Kind::Object) {
             auto flags = readBitflagValues128(bitflagsJson);
-            for (const auto& [name, enabled] : value.objectValue) {
-                if (name == "_value" || name == ".." || name == "$value") continue;
-                const bool enabledFlag = asBool(enabled);
-                auto it = flags.find(name);
-                if (it == flags.end()) {
-                    if (!enabledFlag) {
-                        continue;
-                    }
-                    throw std::runtime_error("unknown bitflag: " + name);
-                }
-                if (enabledFlag) {
-                    mask |= it->second;
-                } else {
-                    mask &= ~it->second;
+            // ProtoDef treats _value as the preserved raw mask and only ORs
+            // named flags whose value is truthy. False flags and unrelated
+            // object properties must not clear overlapping or unknown bits.
+            for (const auto& [name, bit] : flags) {
+                auto enabled = value.objectValue.find(name);
+                if (enabled != value.objectValue.end() && asBool(enabled->second)) {
+                    mask |= bit;
                 }
             }
         } else {
@@ -1458,10 +1293,10 @@ private:
         return current;
     }
 
-    static std::optional<std::string> findSwitchBranchType(
+    std::optional<std::string> findSwitchBranchType(
         const std::string& switchJson,
         const std::string& key
-    ) {
+    ) const {
         std::string fieldsNeedle = "\"fields\"";
         auto f = switchJson.find(fieldsNeedle);
         if (f == std::string::npos) return std::nullopt;
@@ -1474,38 +1309,17 @@ private:
 
         std::string obj = switchJson.substr(objStart, objEnd - objStart + 1);
 
+        // ProtoDef variables are referenced by switch field names prefixed
+        // with '/'. Their primitive value becomes the actual switch key.
+        for (const auto& [name, value] : variables_) {
+            if (!switchValuesEqual(key, value)) continue;
+            if (auto branch = readSwitchObjectField(obj, "/" + name)) {
+                return branch;
+            }
+        }
+
         for (const auto& candidate : switchLookupKeys(key)) {
-            std::string quoted = "\"" + candidate + "\"";
-            auto k = obj.find(quoted);
-            if (k == std::string::npos) continue;
-
-            auto colon = obj.find(':', k + quoted.size());
-            if (colon == std::string::npos) continue;
-
-            std::size_t a = colon + 1;
-            while (a < obj.size() && std::isspace(static_cast<unsigned char>(obj[a]))) {
-                ++a;
-            }
-
-            if (a >= obj.size()) continue;
-
-            if (obj[a] == '"') {
-                auto b = obj.find('"', a + 1);
-                if (b == std::string::npos) continue;
-                return obj.substr(a, b - a + 1);
-            }
-
-            if (obj[a] == '[') {
-                auto b = findMatching(obj, a, '[', ']');
-                if (b == std::string::npos) continue;
-                return obj.substr(a, b - a + 1);
-            }
-
-            if (obj[a] == '{') {
-                auto b = findMatching(obj, a, '{', '}');
-                if (b == std::string::npos) continue;
-                return obj.substr(a, b - a + 1);
-            }
+            if (auto branch = readSwitchObjectField(obj, candidate)) return branch;
         }
 
         return std::nullopt;
@@ -1527,6 +1341,54 @@ private:
         }
 
         return keys;
+    }
+
+    static bool switchValuesEqual(
+        const std::string& lhs,
+        const std::string& rhs
+    ) {
+        const auto lhsKeys = switchLookupKeys(lhs);
+        const auto rhsKeys = switchLookupKeys(rhs);
+        return std::any_of(lhsKeys.begin(), lhsKeys.end(), [&](const auto& left) {
+            return std::find(rhsKeys.begin(), rhsKeys.end(), left) != rhsKeys.end();
+        });
+    }
+
+    static std::optional<std::string> readSwitchObjectField(
+        const std::string& objectJson,
+        const std::string& key
+    ) {
+        const std::string quoted = "\"" + key + "\"";
+        const auto k = objectJson.find(quoted);
+        if (k == std::string::npos) return std::nullopt;
+
+        const auto colon = objectJson.find(':', k + quoted.size());
+        if (colon == std::string::npos) return std::nullopt;
+
+        std::size_t start = colon + 1;
+        while (start < objectJson.size() &&
+               std::isspace(static_cast<unsigned char>(objectJson[start]))) {
+            ++start;
+        }
+        if (start >= objectJson.size()) return std::nullopt;
+
+        if (objectJson[start] == '"') {
+            const auto end = objectJson.find('"', start + 1);
+            if (end != std::string::npos) {
+                return objectJson.substr(start, end - start + 1);
+            }
+        } else if (objectJson[start] == '[') {
+            const auto end = findMatching(objectJson, start, '[', ']');
+            if (end != std::string::npos) {
+                return objectJson.substr(start, end - start + 1);
+            }
+        } else if (objectJson[start] == '{') {
+            const auto end = findMatching(objectJson, start, '{', '}');
+            if (end != std::string::npos) {
+                return objectJson.substr(start, end - start + 1);
+            }
+        }
+        return std::nullopt;
     }
 
 
@@ -1673,48 +1535,111 @@ private:
         const std::string& json,
         const std::string& key
     ) {
-        std::string needle = "\"" + key + "\"";
-        auto p = json.find(needle);
-        if (p == std::string::npos) return std::nullopt;
+        std::string object = trim(json);
+        auto objStart = object.find('{');
+        if (objStart == std::string::npos) return std::nullopt;
 
-        auto colon = json.find(':', p + needle.size());
-        if (colon == std::string::npos) return std::nullopt;
+        auto objEnd = findMatching(object, objStart, '{', '}');
+        if (objEnd == std::string::npos) return std::nullopt;
 
-        std::size_t a = colon + 1;
-        while (a < json.size() && std::isspace(static_cast<unsigned char>(json[a]))) {
-            ++a;
+        std::size_t pos = objStart + 1;
+        while (pos < objEnd) {
+            while (pos < objEnd &&
+                   (std::isspace(static_cast<unsigned char>(object[pos])) || object[pos] == ',')) {
+                ++pos;
+            }
+
+            if (pos >= objEnd) break;
+            if (object[pos] != '"') {
+                ++pos;
+                continue;
+            }
+
+            auto keyEnd = findStringEnd(object, pos);
+            if (keyEnd == std::string::npos || keyEnd >= objEnd) return std::nullopt;
+
+            std::string currentKey = object.substr(pos + 1, keyEnd - pos - 1);
+            pos = keyEnd + 1;
+
+            while (pos < objEnd && std::isspace(static_cast<unsigned char>(object[pos]))) {
+                ++pos;
+            }
+
+            if (pos >= objEnd || object[pos] != ':') return std::nullopt;
+            ++pos;
+
+            while (pos < objEnd && std::isspace(static_cast<unsigned char>(object[pos]))) {
+                ++pos;
+            }
+
+            if (pos >= objEnd) return std::nullopt;
+
+            auto valueEnd = findJsonValueEnd(object, pos, objEnd);
+            if (valueEnd == std::string::npos) return std::nullopt;
+
+            if (currentKey == key) {
+                return object.substr(pos, valueEnd - pos);
+            }
+
+            pos = valueEnd;
         }
 
-        if (a >= json.size()) return std::nullopt;
+        return std::nullopt;
+    }
 
-        if (json[a] == '"') {
-            auto b = json.find('"', a + 1);
-            if (b == std::string::npos) return std::nullopt;
-            return json.substr(a, b - a + 1);
+    static std::size_t findStringEnd(const std::string& s, std::size_t open) {
+        bool esc = false;
+        for (std::size_t i = open + 1; i < s.size(); ++i) {
+            if (esc) {
+                esc = false;
+                continue;
+            }
+
+            if (s[i] == '\\') {
+                esc = true;
+                continue;
+            }
+
+            if (s[i] == '"') {
+                return i;
+            }
         }
 
-        if (json[a] == '[') {
-            auto b = findMatching(json, a, '[', ']');
-            if (b == std::string::npos) return std::nullopt;
-            return json.substr(a, b - a + 1);
+        return std::string::npos;
+    }
+
+    static std::size_t findJsonValueEnd(
+        const std::string& s,
+        std::size_t valueStart,
+        std::size_t objectEnd
+    ) {
+        if (valueStart >= objectEnd) return std::string::npos;
+
+        if (s[valueStart] == '"') {
+            auto end = findStringEnd(s, valueStart);
+            return end == std::string::npos ? std::string::npos : end + 1;
         }
 
-        if (json[a] == '{') {
-            auto b = findMatching(json, a, '{', '}');
-            if (b == std::string::npos) return std::nullopt;
-            return json.substr(a, b - a + 1);
+        if (s[valueStart] == '[') {
+            auto end = findMatching(s, valueStart, '[', ']');
+            return end == std::string::npos ? std::string::npos : end + 1;
         }
 
-        std::size_t b = a;
-        while (b < json.size() && json[b] != ',' && json[b] != '}' && json[b] != ']') {
-            ++b;
+        if (s[valueStart] == '{') {
+            auto end = findMatching(s, valueStart, '{', '}');
+            return end == std::string::npos ? std::string::npos : end + 1;
         }
 
-        while (b > a && std::isspace(static_cast<unsigned char>(json[b - 1]))) {
-            --b;
+        std::size_t pos = valueStart;
+        while (pos < objectEnd && s[pos] != ',') {
+            ++pos;
         }
 
-        return json.substr(a, b - a);
+        while (pos > valueStart && std::isspace(static_cast<unsigned char>(s[pos - 1]))) {
+            --pos;
+        }
+
+        return pos;
     }
 
     static std::size_t findMatching(
@@ -1784,6 +1709,7 @@ private:
 
 private:
     TypeResolver resolver_;
+    ProtoDefVariableMap variables_;
 };
 
 }

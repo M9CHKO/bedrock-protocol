@@ -2,6 +2,7 @@
 
 #include <bedrock/events/BedrockPacketEvent.hpp>
 #include <bedrock/protocol/GamePacket.hpp>
+#include <bedrock/protodef/ProtoDefVariables.hpp>
 
 #include <string>
 
@@ -11,7 +12,8 @@ class BedrockPacketEventAdapter {
 public:
     static BedrockPacketEvent fromGamePacket(
         const GamePacket& packet,
-        const std::string& minecraftVersion
+        const std::string& minecraftVersion,
+        ProtoDefVariableStorePtr variables = {}
     );
 };
 

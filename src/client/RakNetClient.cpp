@@ -587,9 +587,34 @@ bool RakNetClient::connect() {
 }
 
 void RakNetClient::close(const std::string& reason) {
-    closeRequested_.store(true);
-    bool wasRunning = running_.exchange(false);
-    bool wasConnected = connected_.exchange(false);
+    bool firstClose = false;
+    bool wasRunning = false;
+    bool wasConnected = false;
+    {
+        // Select one close owner before changing connected_. Otherwise two
+        // concurrent callers can split ownership of these atomics and omit
+        // the peer notification entirely.
+        std::lock_guard<std::mutex> lock(threadMutex_);
+        firstClose = !closeRequested_.exchange(true);
+        if (firstClose) {
+            // Keep the worker/socket alive until the notification has entered
+            // the UDP send path below.
+            wasRunning = running_.load();
+            wasConnected = connected_.exchange(false);
+        }
+    }
+
+    // RakPeer::CloseConnection notifies the remote peer before releasing the
+    // UDP socket. Without this frame a locally closed client remains in a
+    // BedrockServer client table until a much later timeout, which also keeps
+    // the corresponding RelayPlayer/upstream session alive.
+    if (firstClose && wasConnected) {
+        sendReliableInternal(
+            std::vector<uint8_t>{ID_DISCONNECTION_NOTIFICATION},
+            true
+        );
+    }
+    if (firstClose) running_.store(false);
     shutdownSocket();
 
     std::thread worker;
@@ -655,8 +680,11 @@ void RakNetClient::sendReliable(const std::vector<uint8_t>& payload) {
     sendReliableInternal(payload);
 }
 
-void RakNetClient::sendReliableInternal(const std::vector<uint8_t>& payload) {
-    if (payload.empty() || closeRequested_.load()) return;
+void RakNetClient::sendReliableInternal(
+    const std::vector<uint8_t>& payload,
+    bool allowDuringClose
+) {
+    if (payload.empty() || (closeRequested_.load() && !allowDuringClose)) return;
 
     const std::size_t maxPayloadPerDatagram = static_cast<std::size_t>(
         std::max(128, mtu_ > 0 ? mtu_ - 100 : 1200)

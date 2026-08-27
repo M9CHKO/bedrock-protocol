@@ -41,6 +41,9 @@ struct BedrockRelayOptions {
 
 struct BedrockRelayPacketEvent {
     BedrockRelayDirection direction = BedrockRelayDirection::Clientbound;
+    // Empty for the pure packet relay. BedrockLiveRelay fills this with the
+    // downstream Player identity so concurrent upstreams remain routable.
+    std::string sessionId;
     VersionedGamePacket packet;
     bool canceled = false;
     std::vector<VersionedGamePacket> replacements;

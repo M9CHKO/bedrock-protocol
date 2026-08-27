@@ -70,25 +70,27 @@ public:
         const int32_t localX = floorMod16(x);
         const int32_t localZ = floorMod16(z);
 
-        if (y < 0) {
-            throw std::runtime_error("negative y is not supported by simple getRuntimeIdAt yet");
-        }
-
-        const std::size_t subChunkIndex = static_cast<std::size_t>(y / 16);
-        const std::size_t localY = static_cast<std::size_t>(y % 16);
+        const int32_t sectionY = floorDiv16(y);
+        const std::size_t localY = static_cast<std::size_t>(floorMod16(y));
 
         const std::size_t blockIndex =
-            (static_cast<std::size_t>(localY) * 16 * 16) +
+            (static_cast<std::size_t>(localX) * 16 * 16) +
             (static_cast<std::size_t>(localZ) * 16) +
-            static_cast<std::size_t>(localX);
+            localY;
 
-        return getRuntimeId(
-            chunkX,
-            chunkZ,
-            subChunkIndex,
-            storageIndex,
-            blockIndex
-        );
+        const auto& chunk = get(chunkX, chunkZ);
+        for (std::size_t index = 0; index < chunk.subChunks.sections.size(); ++index) {
+            const auto& section = chunk.subChunks.sections[index];
+            const int32_t decodedY = section.version >= 9
+                ? static_cast<int32_t>(section.yIndex)
+                : static_cast<int32_t>(index);
+            if (decodedY != sectionY) {
+                continue;
+            }
+            return chunk.getRuntimeId(index, storageIndex, blockIndex);
+        }
+
+        throw std::runtime_error("subchunk not found for block y");
     }
 
     void clear() {

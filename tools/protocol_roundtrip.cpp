@@ -84,6 +84,31 @@ struct BedrockNetworkClientTestAccess {
         return client.authenticationXboxProofKey_.has_value();
     }
 
+    static bool hasBedrockOnlyAuthenticationManagers(
+        BedrockNetworkClient& client
+    ) {
+        std::lock_guard<std::mutex> lock(client.optionsMutex_);
+        const auto cache = [&](const char* name) -> AuthCachePtr {
+            const auto it = client.authenticationCaches_.find(name);
+            return it == client.authenticationCaches_.end()
+                ? AuthCachePtr{}
+                : it->second;
+        };
+        return client.authenticationXboxProofKey_.has_value() &&
+            client.authenticationXboxTokenManager_ &&
+            client.authenticationBedrockTokenManager_ &&
+            client.authenticationBedrockServicesTokenManager_ &&
+            client.authenticationPlayfabTokenManager_ &&
+            client.authenticationMicrosoftAuthFlow_ &&
+            client.authenticationXboxTokenManager_->cache == cache("xbl") &&
+            client.authenticationBedrockTokenManager_->cache == cache("bed") &&
+            client.authenticationBedrockServicesTokenManager_->cache ==
+                cache("mcs") &&
+            client.authenticationPlayfabTokenManager_->cache == cache("pfb") &&
+            client.authenticationXboxTokenManager_->key.jwkJson() ==
+                client.authenticationXboxProofKey_->jwkJson();
+    }
+
     static bool connectLifecycleIdle(BedrockNetworkClient& client) {
         std::lock_guard<std::mutex> lock(client.connectLifecycleMutex_);
         return client.connectLifecyclePhase_ ==
@@ -176,7 +201,11 @@ bool checkPacketRoundtrip(const std::string& version, const std::string& packetN
     return true;
 }
 
-bool checkBatchRoundtrip(const std::string& version, bool compressionReady) {
+bool checkBatchRoundtrip(
+    const std::string& version,
+    bool compressionReady,
+    uint16_t compressionAlgorithm = 0
+) {
     auto codec = bedrock::VersionedPacketCodec::forVersion(version);
 
     if (
@@ -196,19 +225,21 @@ bool checkBatchRoundtrip(const std::string& version, bool compressionReady) {
     settings.compressionReady = compressionReady;
     settings.compressorInHeader = versionAtLeast(version, "1.20.61");
     settings.compressionThreshold = 0;
-    settings.compressionAlgorithm = 0;
+    settings.compressionAlgorithm = compressionAlgorithm;
 
     auto encoded = bedrock::BedrockFramer::encodeBatch(packets, settings);
     auto decoded = bedrock::BedrockFramer::decodeBatch(encoded, settings);
 
     if (decoded.size() != packets.size()) {
-        std::cerr << "[FAIL] " << version << " batch size mismatch\n";
+        std::cerr << "[FAIL] " << version << " batch size mismatch for compressor "
+                  << compressionAlgorithm << "\n";
         return false;
     }
 
     for (std::size_t i = 0; i < packets.size(); ++i) {
         if (!sameBytes(decoded[i], packets[i])) {
-            std::cerr << "[FAIL] " << version << " batch packet " << i << " mismatch\n";
+            std::cerr << "[FAIL] " << version << " batch packet " << i
+                      << " mismatch for compressor " << compressionAlgorithm << "\n";
             return false;
         }
     }
@@ -2621,22 +2652,23 @@ bool checkAuthCacheFactoryGolden() {
             "msal:CacheFactoryUser",
             "xbl:CacheFactoryUser",
             "bed:CacheFactoryUser",
-            "mca:CacheFactoryUser",
             "mcs:CacheFactoryUser",
             "pfb:CacheFactoryUser"
         };
-        if (!exactHookError || calls != expected || returned.size() != 6 ||
+        if (!exactHookError || calls != expected || returned.size() != 5 ||
             !client.options().profilesFolder.isFactory() ||
             client.options().profilesFolder.factory() != factory ||
             !bedrock::BedrockNetworkClientTestAccess::
                 effectiveAuthenticationCacheRoot(client).empty() ||
             !bedrock::BedrockNetworkClientTestAccess::
-                hasAuthenticationXboxProofKey(client)) {
+                hasAuthenticationXboxProofKey(client) ||
+            !bedrock::BedrockNetworkClientTestAccess::
+                hasBedrockOnlyAuthenticationManagers(client)) {
             std::cerr << "[FAIL] CacheFactory identity/order/path mismatch\n";
             ok = false;
         }
-        const std::array<const char*, 6> cacheNames {
-            "msal", "xbl", "bed", "mca", "mcs", "pfb"
+        const std::array<const char*, 5> cacheNames {
+            "msal", "xbl", "bed", "mcs", "pfb"
         };
         for (std::size_t index = 0; index < returned.size(); ++index) {
             const auto* name = cacheNames[index];
@@ -2740,8 +2772,8 @@ bool checkAuthCacheFactoryGolden() {
             std::cerr << "[FAIL] could not create built-in cache test root\n";
             ok = false;
         } else {
-            const std::array<const char*, 6> names {
-                "msal", "xbl", "bed", "mca", "mcs", "pfb"
+            const std::array<const char*, 5> names {
+                "msal", "xbl", "bed", "mcs", "pfb"
             };
             for (const char* name : names) {
                 bedrock::FileAuthCache seed(
@@ -3187,6 +3219,27 @@ bool checkOnlineAuthBoundaryGolden() {
     return ok;
 }
 
+bool checkStrictPacketDecoderGolden() {
+    bedrock::ProtoDefPacketDecoder decoder("1.21.100");
+
+    try {
+        (void) decoder.decodePacket("text", {});
+    } catch (const std::exception& error) {
+        std::cerr << "[FAIL] best-effort packet decoder threw: "
+                  << error.what() << "\n";
+        return false;
+    }
+
+    try {
+        (void) decoder.decodePacketStrict("text", {});
+    } catch (const std::exception&) {
+        return true;
+    }
+
+    std::cerr << "[FAIL] strict packet decoder accepted truncated text packet\n";
+    return false;
+}
+
 bool checkRelayOptionsGolden() {
     bool ok = true;
 
@@ -3225,9 +3278,14 @@ bool checkRelayOptionsGolden() {
             liveOptions.server.compressionAlgorithm != "deflate" ||
             liveOptions.server.compressionLevel != 7 ||
             liveOptions.server.compressionThreshold != 512 ||
+            liveOptions.server.batchingInterval != 20 ||
             liveOptions.upstream.offline ||
             liveOptions.upstream.chunkRadius != 10 ||
             liveOptions.upstream.batchingIntervalMs != 20 ||
+            liveOptions.logging || liveOptions.enableChunkCaching ||
+            liveOptions.forceSingle ||
+            relayOptions.logging || relayOptions.enableChunkCaching ||
+            relayOptions.forceSingle || relayOptions.omitParseErrors ||
             liveOptions.clientboundCompression !=
                 bedrock::VersionedMcpeCompression::Automatic) {
             std::cerr << "[FAIL] relay inherited defaults mismatch\n";
@@ -3247,6 +3305,10 @@ bool checkRelayOptionsGolden() {
         bedrock::RelayOptions options;
         options.offline = true;
         options.batchingInterval = 37;
+        options.logging = true;
+        options.enableChunkCaching = true;
+        options.forceSingle = true;
+        options.omitParseErrors = true;
         options.authTitle = std::string(bedrock::Titles::MinecraftAndroid);
         options.deviceType = "Android";
         options.flow = "sisu";
@@ -3255,7 +3317,11 @@ bool checkRelayOptionsGolden() {
         if (!liveOptions.server.offline ||
             !liveOptions.upstream.offline ||
             !liveOptions.useDownstreamDisplayNameForUpstreamUsername ||
+            liveOptions.server.batchingInterval != 37 ||
             liveOptions.upstream.batchingIntervalMs != 37 ||
+            !liveOptions.logging || !liveOptions.enableChunkCaching ||
+            !liveOptions.forceSingle ||
+            !relay.options().omitParseErrors ||
             liveOptions.upstream.authTitle !=
                 std::optional<std::string>(bedrock::Titles::MinecraftAndroid) ||
             liveOptions.upstream.deviceType != "Android" ||
@@ -3321,6 +3387,22 @@ bool checkRelayOptionsGolden() {
         if (upstream.authTitle.has_value() ||
             upstream.deviceType != "Android" || upstream.flow != "sisu") {
             std::cerr << "[FAIL] relay omitted authTitle mutated before auth boundary\n";
+            ok = false;
+        }
+    }
+
+    {
+        bedrock::RelayOptions options;
+        options.destination.realms.realmId = "1112223";
+        options.profilesFolder = true;
+        bedrock::Relay relay(std::move(options));
+        const auto& liveOptions = relay.live().options();
+        if (!static_cast<bool>(liveOptions.realms) ||
+            !liveOptions.realms.realmId.has_value() ||
+            *liveOptions.realms.realmId != 1112223 ||
+            !liveOptions.upstream.profilesFolder.isBoolean() ||
+            !liveOptions.upstream.profilesFolder.booleanValue()) {
+            std::cerr << "[FAIL] relay Realm destination/auth options were not propagated\n";
             ok = false;
         }
     }
@@ -3397,13 +3479,36 @@ bool checkCompressionHeaderErrorsGolden() {
     const auto codec = bedrock::VersionedMcpeCodec::forVersion("1.20.61");
     bool ok = true;
 
+    bedrock::VersionedGamePacket packet;
+    packet.fullPacket = {0x11, 0x22, 0x33};
+    const std::vector<uint8_t> snappyGolden {
+        0x01, 0x04, 0x0c, 0x03, 0x11, 0x22, 0x33
+    };
+    const auto encoded = codec.encodeCompressionPacket(
+        {packet},
+        bedrock::VersionedMcpeCompression::Snappy
+    );
+    if (encoded != snappyGolden) {
+        std::cerr << "[FAIL] snappy compression packet golden mismatch\n";
+        ok = false;
+    } else {
+        const auto decoded = codec.decodeCompressionPacket(encoded);
+        if (decoded.framedBatch != std::vector<uint8_t>({0x03, 0x11, 0x22, 0x33}) ||
+            decoded.batch.packets.size() != 1 ||
+            decoded.batch.packets[0].fullPacket != packet.fullPacket) {
+            std::cerr << "[FAIL] snappy compression packet roundtrip mismatch\n";
+            ok = false;
+        }
+    }
+
     try {
         (void) codec.decodeCompressionPacket({0x01});
-        std::cerr << "[FAIL] snappy compression header did not throw\n";
+        std::cerr << "[FAIL] malformed snappy compression packet did not throw\n";
         ok = false;
     } catch (const std::exception& error) {
-        if (std::string(error.what()) != "Snappy compression not implemented") {
-            std::cerr << "[FAIL] snappy compression header error mismatch\n";
+        if (std::string(error.what()) !=
+            "snappy block is missing the uncompressed length") {
+            std::cerr << "[FAIL] malformed snappy packet error mismatch\n";
             ok = false;
         }
     }
@@ -3484,6 +3589,9 @@ int main() {
     if (!checkOnlineAuthBoundaryGolden()) {
         ++failures;
     }
+    if (!checkStrictPacketDecoderGolden()) {
+        ++failures;
+    }
     if (!checkRelayOptionsGolden()) {
         ++failures;
     }
@@ -3504,6 +3612,7 @@ int main() {
 
         ok = checkBatchRoundtrip(version, false) && ok;
         ok = checkBatchRoundtrip(version, true) && ok;
+        ok = checkBatchRoundtrip(version, true, 1) && ok;
         ok = checkSchemaEncodes(version) && ok;
         ok = checkRelayPipeline(version) && ok;
 

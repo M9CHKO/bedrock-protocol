@@ -2,6 +2,7 @@
 
 #include <bedrock/protocol/GamePacket.hpp>
 #include <bedrock/protodef/ProtoDefPacketDecoder.hpp>
+#include <bedrock/protodef/ProtoDefVariables.hpp>
 
 #include <iostream>
 #include <string>
@@ -10,11 +11,22 @@ namespace bedrock {
 
 class PacketInspector {
 public:
-    explicit PacketInspector(std::string minecraftVersion)
-        : minecraftVersion_(std::move(minecraftVersion)) {}
+    explicit PacketInspector(
+        std::string minecraftVersion,
+        ProtoDefVariableStorePtr variables = {}
+    ) : minecraftVersion_(std::move(minecraftVersion)),
+        variables_(variables ? std::move(variables) : makeProtoDefVariableStore()) {}
+
+    ProtoDefVariableStorePtr variableStore() const {
+        return variables_;
+    }
+
+    void setVariable(std::string key, std::string value) {
+        variables_->setVariable(std::move(key), std::move(value));
+    }
 
     void inspect(const GamePacket& packet) const {
-        ProtoDefPacketDecoder decoder(minecraftVersion_);
+        ProtoDefPacketDecoder decoder(minecraftVersion_, variables_);
         auto fields = decoder.decodePacket(packet.name, packet.payload);
 
         std::cout << "[INSPECT] packet "
@@ -40,6 +52,7 @@ public:
 
 private:
     std::string minecraftVersion_;
+    ProtoDefVariableStorePtr variables_;
 };
 
 } // namespace bedrock

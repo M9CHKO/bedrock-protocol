@@ -1,5 +1,7 @@
 #include <bedrock/relay/BedrockLiveRelay.hpp>
 
+#include <bedrock/auth/NativeBedrockAuthflow.hpp>
+
 #include <bedrock/BedrockKeyExchange.hpp>
 #include <bedrock/LoginPacket.hpp>
 #include <bedrock/Options.hpp>
@@ -355,6 +357,28 @@ std::string packetSummary(const std::string& version, const VersionedGamePacket&
 
 } // namespace
 
+struct BedrockLiveRelay::Session {
+    mutable std::mutex mutex;
+    std::string id;
+    BedrockServerConnection downstream;
+    BedrockNetworkClientOptions upstreamOptions;
+    std::shared_ptr<BedrockNetworkClient> upstream;
+    std::thread upstreamThread;
+    std::vector<VersionedGamePacket> pendingServerbound;
+    std::vector<VersionedGamePacket> pendingPostSpawnServerbound;
+    std::vector<VersionedGamePacket> pendingClientbound;
+    std::vector<VersionedGamePacket> heldClientboundLevelChunks;
+    std::chrono::steady_clock::time_point clientboundChunkReleaseAt {};
+    BedrockRelayDownstreamProfile downstreamProfile;
+    bool downstreamJoined = false;
+    bool upstreamStarted = false;
+    bool upstreamReady = false;
+    bool clientboundStartGameSent = false;
+    bool clientboundPlayerSpawnSeen = false;
+    bool closing = false;
+    bool upstreamDisconnectRequested = false;
+};
+
 void detail::applyRelayDownstreamIdentity(
     BedrockLiveRelayOptions& options,
     const BedrockRelayDownstreamProfile& profile
@@ -367,6 +391,7 @@ void detail::applyRelayDownstreamIdentity(
 
 BedrockLiveRelay::BedrockLiveRelay(BedrockLiveRelayOptions options)
     : options_(normalizeOptions(std::move(options))),
+      baseUpstreamOptions_(options_.upstream),
       server_(std::make_unique<BedrockServer>(options_.server)) {}
 
 BedrockLiveRelay::~BedrockLiveRelay() {
@@ -379,6 +404,33 @@ void BedrockLiveRelay::listen() {
     }
 
     server_->onConnect([this](const BedrockServerConnection& connection) {
+        const auto id = sessionId(connection);
+        std::shared_ptr<Session> session;
+        bool rejected = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (options_.forceSingle && !sessions_.empty()) {
+                rejectedConnections_.insert(id);
+                rejected = true;
+            } else {
+                session = std::make_shared<Session>();
+                session->id = id;
+                session->downstream = connection;
+                session->upstreamOptions = baseUpstreamOptions_;
+                sessions_[id] = session;
+                if (primarySessionId_.empty()) primarySessionId_ = id;
+            }
+        }
+
+        if (rejected) {
+            if (options_.logging) {
+                relayLogLine("[relay] dropping connection as single client relay: " + id);
+            }
+            server_->closeConnection(connection);
+            emitStatus();
+            return;
+        }
+
         for (auto& handler : connectHandlers_) {
             handler(connection);
         }
@@ -386,10 +438,12 @@ void BedrockLiveRelay::listen() {
     });
 
     server_->onJoin([this](const BedrockServerConnection& connection) {
+        const auto session = findSession(connection);
+        if (!session) return;
         {
-            std::lock_guard<std::mutex> lock(mutex_);
-            downstream_ = connection;
-            downstreamJoined_.store(true);
+            std::lock_guard<std::mutex> lock(session->mutex);
+            if (session->closing) return;
+            session->downstreamJoined = true;
         }
 
         for (auto& handler : joinHandlers_) {
@@ -398,31 +452,50 @@ void BedrockLiveRelay::listen() {
 
         std::vector<VersionedGamePacket> queuedClientbound;
         {
-            std::lock_guard<std::mutex> lock(mutex_);
-            queuedClientbound = std::move(pendingClientbound_);
-            pendingClientbound_.clear();
+            std::lock_guard<std::mutex> lock(session->mutex);
+            queuedClientbound = std::move(session->pendingClientbound);
+            session->pendingClientbound.clear();
         }
         for (const auto& packet : queuedClientbound) {
-            forwardClientbound(packet);
+            forwardClientbound(session, packet);
         }
 
         emitStatus();
     });
 
     server_->onDisconnect([this](const BedrockServerConnection& connection) {
+        const auto id = sessionId(connection);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            const auto rejected = rejectedConnections_.find(id);
+            if (rejected != rejectedConnections_.end()) {
+                rejectedConnections_.erase(rejected);
+                return;
+            }
+        }
+
+        const auto session = findSession(connection);
+        if (!session) return;
+        removeRelaySession(session, "downstream disconnected");
         for (auto& handler : disconnectHandlers_) {
             handler(connection);
         }
-        resetRelaySession("downstream disconnected");
         emitStatus();
     });
 
     server_->onLogin([this](const BedrockServerPacketEvent& event) {
-        if (upstreamStarted_.load() || upstream_ || downstreamJoined_.load()) {
-            resetRelaySession("downstream reconnect");
+        const auto session = findSession(event.connection);
+        if (!session) return;
+        bool alreadyStarted = false;
+        {
+            std::lock_guard<std::mutex> lock(session->mutex);
+            alreadyStarted = session->upstreamStarted || session->upstream != nullptr;
         }
-        captureDownstreamClientData(event.packet);
-        startUpstream();
+        if (alreadyStarted) {
+            resetRelaySession(session, "downstream reconnect", true);
+        }
+        captureDownstreamClientData(session, event.packet);
+        startUpstream(session);
     });
 
     server_->onAny([this](const BedrockServerPacketEvent& event) {
@@ -449,19 +522,29 @@ void BedrockLiveRelay::close(const std::string& reason) {
         return;
     }
 
-    if (upstream_) {
-        upstream_->close(reason);
+    std::vector<std::shared_ptr<Session>> sessions;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        sessions.reserve(sessions_.size());
+        for (const auto& [id, session] : sessions_) {
+            (void) id;
+            sessions.push_back(session);
+        }
+    }
+    for (const auto& session : sessions) {
+        resetRelaySession(session, reason, false);
     }
     if (server_) {
         server_->close();
     }
-    if (upstreamThread_.joinable() &&
-        upstreamThread_.get_id() != std::this_thread::get_id()) {
-        upstreamThread_.join();
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        sessions_.clear();
+        rejectedConnections_.clear();
+        primarySessionId_.clear();
     }
 
     listening_.store(false);
-    upstreamReady_.store(false);
     emitStatus();
     closedCv_.notify_all();
 }
@@ -511,15 +594,51 @@ bool BedrockLiveRelay::listening() const {
 }
 
 bool BedrockLiveRelay::downstreamJoined() const {
-    return downstreamJoined_.load();
+    std::vector<std::shared_ptr<Session>> sessions;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& [id, session] : sessions_) {
+            (void) id;
+            sessions.push_back(session);
+        }
+    }
+    for (const auto& session : sessions) {
+        std::lock_guard<std::mutex> lock(session->mutex);
+        if (session->downstreamJoined && !session->closing) return true;
+    }
+    return false;
 }
 
 bool BedrockLiveRelay::upstreamStarted() const {
-    return upstreamStarted_.load();
+    std::vector<std::shared_ptr<Session>> sessions;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& [id, session] : sessions_) {
+            (void) id;
+            sessions.push_back(session);
+        }
+    }
+    for (const auto& session : sessions) {
+        std::lock_guard<std::mutex> lock(session->mutex);
+        if (session->upstreamStarted && !session->closing) return true;
+    }
+    return false;
 }
 
 bool BedrockLiveRelay::upstreamReady() const {
-    return upstreamReady_.load();
+    std::vector<std::shared_ptr<Session>> sessions;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& [id, session] : sessions_) {
+            (void) id;
+            sessions.push_back(session);
+        }
+    }
+    for (const auto& session : sessions) {
+        std::lock_guard<std::mutex> lock(session->mutex);
+        if (session->upstreamReady && !session->closing) return true;
+    }
+    return false;
 }
 
 uint16_t BedrockLiveRelay::boundPort() const {
@@ -535,7 +654,84 @@ BedrockServer& BedrockLiveRelay::server() {
 }
 
 BedrockNetworkClient* BedrockLiveRelay::upstream() {
-    return upstream_.get();
+    return upstreamShared().get();
+}
+
+BedrockNetworkClient* BedrockLiveRelay::upstream(
+    const BedrockServerConnection& connection
+) {
+    return upstreamShared(connection).get();
+}
+
+std::shared_ptr<BedrockNetworkClient> BedrockLiveRelay::upstreamShared() {
+    const auto session = primarySession();
+    if (!session) return nullptr;
+    std::lock_guard<std::mutex> lock(session->mutex);
+    return session->upstream;
+}
+
+std::shared_ptr<BedrockNetworkClient> BedrockLiveRelay::upstreamShared(
+    const BedrockServerConnection& connection
+) {
+    const auto session = findSession(connection);
+    if (!session) return nullptr;
+    std::lock_guard<std::mutex> lock(session->mutex);
+    return session->upstream;
+}
+
+std::size_t BedrockLiveRelay::sessionCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return sessions_.size();
+}
+
+std::size_t BedrockLiveRelay::upstreamCount() const {
+    std::vector<std::shared_ptr<Session>> sessions;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& [id, session] : sessions_) {
+            (void) id;
+            sessions.push_back(session);
+        }
+    }
+    std::size_t count = 0;
+    for (const auto& session : sessions) {
+        std::lock_guard<std::mutex> lock(session->mutex);
+        if (session->upstream) ++count;
+    }
+    return count;
+}
+
+void BedrockLiveRelay::closeUpstreamConnection(
+    const BedrockServerConnection& connection,
+    const std::string& reason
+) {
+    const auto session = findSession(connection);
+    if (!session) {
+        throw std::runtime_error(
+            "unable to close non-open connection " + sessionId(connection)
+        );
+    }
+    {
+        std::lock_guard<std::mutex> lock(session->mutex);
+        if (!session->upstream) {
+            throw std::runtime_error(
+                "unable to close non-open connection " + session->id
+            );
+        }
+    }
+    resetRelaySession(session, reason, true);
+    // Node's upstream `close` listener disconnects the matching downstream
+    // Player. Keep that lifecycle while suppressing an `error` event for this
+    // intentional close.
+    server_->disconnect(connection, "Backend server closed connection");
+    emitStatus();
+}
+
+std::string BedrockLiveRelay::sessionId(
+    const BedrockServerConnection& connection
+) {
+    return connection.address + ":" + std::to_string(connection.port) + "#" +
+        std::to_string(connection.clientGuid);
 }
 
 BedrockLiveRelayOptions BedrockLiveRelay::normalizeOptions(BedrockLiveRelayOptions options) {
@@ -623,38 +819,105 @@ void BedrockLiveRelay::emitError(const std::string& message) {
 void BedrockLiveRelay::emitStatus() {
     BedrockLiveRelayStatus status;
     status.listening = listening_.load();
-    status.downstreamJoined = downstreamJoined_.load();
-    status.upstreamStarted = upstreamStarted_.load();
-    status.upstreamReady = upstreamReady_.load();
     status.boundPort = boundPort();
+
+    std::vector<std::shared_ptr<Session>> sessions;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        sessions.reserve(sessions_.size());
+        for (const auto& [id, session] : sessions_) {
+            (void) id;
+            sessions.push_back(session);
+        }
+    }
+    for (const auto& session : sessions) {
+        std::lock_guard<std::mutex> lock(session->mutex);
+        if (session->closing) continue;
+        ++status.downstreamConnections;
+        if (session->downstreamJoined) ++status.downstreamJoinedCount;
+        if (session->upstreamStarted) ++status.upstreamStartedCount;
+        if (session->upstreamReady) ++status.upstreamReadyCount;
+    }
+    status.downstreamJoined = status.downstreamJoinedCount != 0;
+    status.upstreamStarted = status.upstreamStartedCount != 0;
+    status.upstreamReady = status.upstreamReadyCount != 0;
 
     for (auto& handler : statusHandlers_) {
         handler(status);
     }
 }
 
-void BedrockLiveRelay::captureDownstreamClientData(const VersionedGamePacket& packet) {
+std::shared_ptr<BedrockLiveRelay::Session> BedrockLiveRelay::findSession(
+    const BedrockServerConnection& connection
+) const {
+    const auto id = sessionId(connection);
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto found = sessions_.find(id);
+    return found == sessions_.end() ? nullptr : found->second;
+}
+
+std::shared_ptr<BedrockLiveRelay::Session> BedrockLiveRelay::primarySession() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (primarySessionId_.empty()) return nullptr;
+    const auto found = sessions_.find(primarySessionId_);
+    return found == sessions_.end() ? nullptr : found->second;
+}
+
+void BedrockLiveRelay::captureDownstreamClientData(
+    const std::shared_ptr<Session>& session,
+    const VersionedGamePacket& packet
+) {
+    bool alreadyStarted = false;
+    bool hasClientData = false;
+    {
+        std::lock_guard<std::mutex> lock(session->mutex);
+        alreadyStarted = session->upstreamStarted;
+        hasClientData = !session->upstreamOptions.clientDataJson.empty();
+    }
     if (!options_.forwardDownstreamClientData ||
-        upstreamStarted_.load() ||
-        !options_.upstream.clientDataJson.empty()) {
+        alreadyStarted || hasClientData) {
         return;
     }
 
     try {
         auto login = LoginPacketCodec::decode(packet.fullPacket);
-        options_.upstream.clientDataJson =
-            BedrockKeyExchange::extractJwtPayloadJson(login.client);
-        downstreamProfile_ = downstreamProfileFromLogin(login);
+        auto clientDataJson = BedrockKeyExchange::extractJwtPayloadJson(login.client);
+        auto downstreamProfile = downstreamProfileFromLogin(login);
+        BedrockRelayDownstreamProfile profileSnapshot;
 
         // relay.js assigns this ternary result unconditionally. Keep an empty
         // string rather than falling back to the prior RelayBot identity.
-        detail::applyRelayDownstreamIdentity(options_, downstreamProfile_);
+        {
+            std::lock_guard<std::mutex> lock(session->mutex);
+            session->upstreamOptions.clientDataJson = std::move(clientDataJson);
+            session->downstreamProfile = std::move(downstreamProfile);
+            session->upstreamOptions.username =
+                options_.useDownstreamDisplayNameForUpstreamUsername
+                    ? session->downstreamProfile.displayName
+                    : session->downstreamProfile.xuid;
+            session->upstreamOptions.profile = session->upstreamOptions.username;
+            profileSnapshot = session->downstreamProfile;
+        }
+
+        // Preserve the original single-session inspection surface for the
+        // first active Player while all actual connection work uses the
+        // session-local options above.
+        bool publishPrimary = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            publishPrimary = primarySessionId_ == session->id;
+        }
+        if (publishPrimary) {
+            std::lock_guard<std::mutex> lock(session->mutex);
+            options_.upstream = session->upstreamOptions;
+        }
 
         if (options_.logging) {
             std::ostringstream out;
             out << "[relay] downstream profile"
-                << " name=" << downstreamProfile_.displayName
-                << " xuid=" << downstreamProfile_.xuid;
+                << " session=" << session->id
+                << " name=" << profileSnapshot.displayName
+                << " xuid=" << profileSnapshot.xuid;
             relayLogLine(out.str());
         }
     } catch (const std::exception& e) {
@@ -662,95 +925,276 @@ void BedrockLiveRelay::captureDownstreamClientData(const VersionedGamePacket& pa
     }
 }
 
-void BedrockLiveRelay::resetRelaySession(const std::string& reason) {
-    if (upstream_) {
-        upstream_->close(reason);
+void BedrockLiveRelay::resolveUpstreamRealm(
+    BedrockNetworkClientOptions& upstreamOptions
+) {
+    if (!static_cast<bool>(options_.realms)) return;
+
+    NativeBedrockAuthflowOptions authOptions {
+        .username = upstreamOptions.username,
+        .profilesFolder = upstreamOptions.profilesFolder,
+        .authTitle = upstreamOptions.authTitle,
+        .deviceType = upstreamOptions.deviceType,
+        .flow = upstreamOptions.flow,
+        .forceRefresh = upstreamOptions.forceRefresh,
+        .msalConfig = upstreamOptions.msalConfig,
+        .password = upstreamOptions.password,
+        .onMsaCode = upstreamOptions.onMsaCode
+    };
+    validateNativeBedrockAuthflowOptions(authOptions);
+    upstreamOptions.profilesFolder = authOptions.profilesFolder;
+    upstreamOptions.authTitle = authOptions.authTitle;
+    upstreamOptions.deviceType = authOptions.deviceType;
+    upstreamOptions.flow = authOptions.flow;
+
+    validateNativeBedrockAuthflowPresence(authOptions);
+    const auto effectiveCacheRoot = initializeNativeBedrockAuthCacheRoot(
+        authOptions.profilesFolder
+    );
+    auto runtime = createNativeBedrockAuthflow(
+        authOptions,
+        effectiveCacheRoot
+    );
+    upstreamOptions.authflow = std::move(runtime.authflow);
+    auto address = resolveBedrockRealmAddress(
+        upstreamOptions.authflow,
+        options_.realms
+    );
+    upstreamOptions.host = std::move(address.host);
+    upstreamOptions.port = address.port;
+}
+
+void BedrockLiveRelay::resetRelaySession(
+    const std::shared_ptr<Session>& session,
+    const std::string& reason,
+    bool retainDownstream
+) {
+    std::shared_ptr<BedrockNetworkClient> upstream;
+    std::thread upstreamThread;
+    {
+        std::lock_guard<std::mutex> lock(session->mutex);
+        if (!retainDownstream) session->closing = true;
+        upstream = session->upstream;
+        if (session->upstreamThread.joinable()) {
+            upstreamThread = std::move(session->upstreamThread);
+        }
+        session->upstreamReady = false;
+        session->upstreamStarted = false;
+        // Suppress the upstream close callback caused by this intentional
+        // reset. Unexpected backend closes still request a downstream
+        // disconnect in the callback below.
+        session->upstreamDisconnectRequested = true;
+        session->pendingServerbound.clear();
+        session->pendingPostSpawnServerbound.clear();
+        session->pendingClientbound.clear();
+        session->heldClientboundLevelChunks.clear();
+        session->clientboundChunkReleaseAt = {};
+        session->clientboundStartGameSent = false;
+        session->clientboundPlayerSpawnSeen = false;
+        if (retainDownstream) {
+            session->upstreamOptions = baseUpstreamOptions_;
+            session->downstreamProfile = {};
+        }
     }
-    if (upstreamThread_.joinable() &&
-        upstreamThread_.get_id() != std::this_thread::get_id()) {
-        upstreamThread_.join();
+
+    if (upstream) upstream->close(reason);
+    if (upstreamThread.joinable()) {
+        if (upstreamThread.get_id() == std::this_thread::get_id()) {
+            upstreamThread.detach();
+        } else {
+            upstreamThread.join();
+        }
     }
-    upstream_.reset();
 
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        downstream_.reset();
-        pendingServerbound_.clear();
-        pendingPostSpawnServerbound_.clear();
-        pendingClientbound_.clear();
-        heldClientboundLevelChunks_.clear();
-        clientboundChunkReleaseAt_ = {};
-        downstreamProfile_ = {};
+        std::lock_guard<std::mutex> lock(session->mutex);
+        if (session->upstream == upstream) session->upstream.reset();
+        if (retainDownstream && !session->closing) {
+            session->upstreamDisconnectRequested = false;
+        }
     }
 
-    downstreamJoined_.store(false);
-    upstreamStarted_.store(false);
-    upstreamReady_.store(false);
-    clientboundStartGameSent_.store(false);
-    clientboundPlayerSpawnSeen_.store(false);
-
     if (options_.logging) {
-        relayLogLine("[relay] session reset: " + reason);
+        relayLogLine(
+            "[relay] session reset " + session->id + ": " + reason
+        );
     }
 }
 
-void BedrockLiveRelay::startUpstream() {
-    bool expected = false;
-    if (!upstreamStarted_.compare_exchange_strong(expected, true)) {
+void BedrockLiveRelay::removeRelaySession(
+    const std::shared_ptr<Session>& session,
+    const std::string& reason
+) {
+    resetRelaySession(session, reason, false);
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto found = sessions_.find(session->id);
+    if (found != sessions_.end() && found->second == session) {
+        sessions_.erase(found);
+    }
+    if (primarySessionId_ == session->id) {
+        primarySessionId_ = sessions_.empty()
+            ? std::string()
+            : sessions_.begin()->first;
+    }
+}
+
+void BedrockLiveRelay::startUpstream(const std::shared_ptr<Session>& session) {
+    BedrockNetworkClientOptions upstreamOptions;
+    {
+        std::lock_guard<std::mutex> lock(session->mutex);
+        if (session->closing || session->upstreamStarted) return;
+        session->upstreamStarted = true;
+        upstreamOptions = session->upstreamOptions;
+    }
+
+    try {
+        resolveUpstreamRealm(upstreamOptions);
+    } catch (const std::exception& error) {
+        {
+            std::lock_guard<std::mutex> lock(session->mutex);
+            session->upstreamStarted = false;
+        }
+        if (!closed_.load()) {
+            emitError("[upstream] " + std::string(error.what()));
+        }
+        emitStatus();
+        return;
+    }
+    if (closed_.load()) {
+        std::lock_guard<std::mutex> lock(session->mutex);
+        session->upstreamStarted = false;
         return;
     }
 
-    upstream_ = std::make_unique<BedrockNetworkClient>(options_.upstream);
+    {
+        std::lock_guard<std::mutex> lock(session->mutex);
+        if (session->closing) {
+            session->upstreamStarted = false;
+            return;
+        }
+        session->upstreamOptions = upstreamOptions;
+    }
+    bool publishPrimary = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        publishPrimary = primarySessionId_ == session->id;
+    }
+    if (publishPrimary) options_.upstream = upstreamOptions;
 
-    upstream_->onError([this](const std::string& message) {
-        emitError("[upstream] " + message);
+    auto upstream = std::make_shared<BedrockNetworkClient>(upstreamOptions);
+    std::weak_ptr<Session> weakSession = session;
+
+    upstream->onError([this, weakSession](const std::string& message) {
+        const auto session = weakSession.lock();
+        if (!session) return;
+        bool requestDisconnect = false;
+        {
+            std::lock_guard<std::mutex> lock(session->mutex);
+            if (!session->closing && !session->upstreamDisconnectRequested) {
+                session->upstreamDisconnectRequested = true;
+                requestDisconnect = true;
+            }
+        }
+        if (!closed_.load()) emitError("[upstream] " + message);
+        if (requestDisconnect && !closed_.load()) {
+            server_->disconnect(session->downstream, "Server error: " + message);
+        }
     });
 
-    upstream_->onClose([this](const std::string& reason) {
-        if (!closed_.load()) {
+    upstream->onClose([this, weakSession](const std::string& reason) {
+        const auto session = weakSession.lock();
+        if (!session) return;
+        bool requestDisconnect = false;
+        {
+            std::lock_guard<std::mutex> lock(session->mutex);
+            session->upstreamReady = false;
+            if (!session->closing && !session->upstreamDisconnectRequested) {
+                session->upstreamDisconnectRequested = true;
+                requestDisconnect = true;
+            }
+        }
+        if (requestDisconnect && !closed_.load()) {
             emitError("[upstream closed] " + reason);
         }
-        upstreamReady_.store(false);
+        if (requestDisconnect && !closed_.load()) {
+            server_->disconnect(
+                session->downstream,
+                "Backend server closed connection"
+            );
+        }
         emitStatus();
     });
 
-    upstream_->onAny([this](const BedrockNetworkClientPacketEvent& event) {
-        handleUpstreamPacket(event.packet);
+    upstream->onAny([this, weakSession](
+        const BedrockNetworkClientPacketEvent& event
+    ) {
+        const auto session = weakSession.lock();
+        if (session) handleUpstreamPacket(session, event.packet);
     });
 
-    upstream_->onJoin([this]() {
+    upstream->onJoin([this, weakSession, upstream]() {
+        const auto session = weakSession.lock();
+        if (!session) return;
         try {
-            upstream_->write("client_cache_status", ProtoDefValue::object({
+            upstream->write("client_cache_status", ProtoDefValue::object({
                 {"enabled", ProtoDefValue::boolean(options_.enableChunkCaching)}
             }));
         } catch (const std::exception& e) {
-            emitError("[upstream] failed to send client_cache_status: " + std::string(e.what()));
+            emitError(
+                "[upstream] failed to send client_cache_status: " +
+                std::string(e.what())
+            );
         }
-
-        upstreamReady_.store(true);
-        emitStatus();
 
         std::vector<VersionedGamePacket> queued;
         {
-            std::lock_guard<std::mutex> lock(mutex_);
-            queued = std::move(pendingServerbound_);
-            pendingServerbound_.clear();
+            std::lock_guard<std::mutex> lock(session->mutex);
+            if (session->closing || session->upstream != upstream) return;
+            session->upstreamReady = true;
+            queued = std::move(session->pendingServerbound);
+            session->pendingServerbound.clear();
         }
+        emitStatus();
         for (const auto& packet : queued) {
-            forwardServerbound(packet);
+            // RelayPlayer#flushUpQueue uses Client#write, not queue.
+            forwardServerbound(session, packet, true);
         }
     });
 
-    upstreamThread_ = std::thread([this]() {
-        upstream_->run();
-    });
+    {
+        std::lock_guard<std::mutex> lock(session->mutex);
+        if (session->closing) {
+            session->upstreamStarted = false;
+            return;
+        }
+        session->upstream = upstream;
+        session->upstreamThread = std::thread(
+            [this, weakSession, upstream]() {
+                try {
+                    (void) upstream->run();
+                } catch (const std::exception& error) {
+                    const auto session = weakSession.lock();
+                    if (session && !closed_.load()) {
+                        emitError("[upstream] " + std::string(error.what()));
+                        server_->disconnect(
+                            session->downstream,
+                            "Server error: " + std::string(error.what())
+                        );
+                    }
+                }
+            }
+        );
+    }
     emitStatus();
 }
 
-void BedrockLiveRelay::handleUpstreamPacket(const VersionedGamePacket& packet) {
+void BedrockLiveRelay::handleUpstreamPacket(
+    const std::shared_ptr<Session>& session,
+    const VersionedGamePacket& packet
+) {
     if (options_.logging && shouldLogRelayPacket("Backend -> Proxy", packet.name)) {
         std::ostringstream out;
-        out << "* Backend -> Proxy " << packet.name
+        out << "* Backend -> Proxy " << session->id << " " << packet.name
             << packetSummary(options_.server.version, packet);
         relayLogLine(out.str());
     }
@@ -775,35 +1219,48 @@ void BedrockLiveRelay::handleUpstreamPacket(const VersionedGamePacket& packet) {
         return;
     }
 
-    auto packets = applyHandlers(BedrockRelayDirection::Clientbound, packet);
+    auto packets = applyHandlers(
+        session,
+        BedrockRelayDirection::Clientbound,
+        packet
+    );
     for (const auto& candidate : packets) {
-        forwardClientbound(candidate);
+        forwardClientbound(session, candidate);
     }
 
     if (isPlayerSpawn) {
         std::vector<VersionedGamePacket> queued;
         {
-            std::lock_guard<std::mutex> lock(mutex_);
-            clientboundPlayerSpawnSeen_.store(true);
-            queued = std::move(pendingPostSpawnServerbound_);
-            pendingPostSpawnServerbound_.clear();
+            std::lock_guard<std::mutex> lock(session->mutex);
+            session->clientboundPlayerSpawnSeen = true;
+            queued = std::move(session->pendingPostSpawnServerbound);
+            session->pendingPostSpawnServerbound.clear();
         }
         for (const auto& queuedPacket : queued) {
-            forwardServerbound(queuedPacket);
+            forwardServerbound(session, queuedPacket);
         }
     }
 }
 
 void BedrockLiveRelay::handleDownstreamPacket(const BedrockServerPacketEvent& event) {
+    const auto session = findSession(event.connection);
+    if (!session) return;
+
     if (options_.logging && shouldLogRelayPacket("Client -> Proxy", event.packet.name)) {
         std::ostringstream out;
-        out << "* Client -> Proxy " << event.packet.name
-            << packetSummary(options_.upstream.version, event.packet);
+        out << "* Client -> Proxy " << session->id << " " << event.packet.name
+            << packetSummary(baseUpstreamOptions_.version, event.packet);
         relayLogLine(out.str());
     }
 
+    bool downstreamJoined = false;
+    {
+        std::lock_guard<std::mutex> lock(session->mutex);
+        if (session->closing) return;
+        downstreamJoined = session->downstreamJoined;
+    }
     if (options_.filterDownstreamHandshakePackets &&
-        !downstreamJoined_.load() &&
+        !downstreamJoined &&
         isDownstreamHandshakePacket(event.packet.name)) {
         return;
     }
@@ -812,92 +1269,119 @@ void BedrockLiveRelay::handleDownstreamPacket(const BedrockServerPacketEvent& ev
         return;
     }
 
-    auto packets = applyHandlers(BedrockRelayDirection::Serverbound, event.packet);
+    auto packets = applyHandlers(
+        session,
+        BedrockRelayDirection::Serverbound,
+        event.packet
+    );
     for (const auto& candidate : packets) {
         if (candidate.name == "client_cache_status") {
-            ProtoDefPacketEncoder encoder(options_.upstream.version);
+            ProtoDefPacketEncoder encoder(baseUpstreamOptions_.version);
             auto payload = encoder.encodePacket("client_cache_status", ProtoDefValue::object({
                 {"enabled", ProtoDefValue::boolean(options_.enableChunkCaching)}
             }));
-            VersionedMcpeCodec codec = VersionedMcpeCodec::forVersion(options_.upstream.version);
+            VersionedMcpeCodec codec = VersionedMcpeCodec::forVersion(baseUpstreamOptions_.version);
             auto forced = codec.packetCodec().makePacketByName("client_cache_status", payload);
 
-            if (!upstream_ || !upstreamReady_.load()) {
+            bool upstreamReady = false;
+            {
+                std::lock_guard<std::mutex> lock(session->mutex);
+                upstreamReady = session->upstream && session->upstreamReady;
+            }
+            if (!upstreamReady) {
                 // bedrock-protocol's Relay.flushUpQueue intentionally drops
                 // cached client_cache_status packets. It sends one forced
                 // value when the upstream client joins, then forwards later
                 // live client_cache_status packets as needed.
                 continue;
             }
-            forwardServerbound(forced);
+            forwardServerbound(session, forced);
             continue;
         }
 
-        if (candidate.name == "request_chunk_radius" &&
-            !clientboundPlayerSpawnSeen_.load()) {
-            std::lock_guard<std::mutex> lock(mutex_);
-            pendingPostSpawnServerbound_.push_back(candidate);
-            continue;
+        if (candidate.name == "request_chunk_radius") {
+            std::lock_guard<std::mutex> lock(session->mutex);
+            if (!session->clientboundPlayerSpawnSeen) {
+                session->pendingPostSpawnServerbound.push_back(candidate);
+                continue;
+            }
         }
 
-        if (candidate.name == "resource_pack_client_response" && upstream_) {
+        std::shared_ptr<BedrockNetworkClient> upstream;
+        bool upstreamReady = false;
+        {
+            std::lock_guard<std::mutex> lock(session->mutex);
+            upstream = session->upstream;
+            upstreamReady = session->upstreamReady;
+        }
+        if (candidate.name == "resource_pack_client_response" && upstream) {
             if (options_.logging) {
                 std::ostringstream out;
                 out << "* Proxy -> Backend " << candidate.name
                     << packetFingerprint(candidate);
                 relayLogLine(out.str());
             }
-            upstream_->sendPacket(candidate);
+            upstream->sendPacket(candidate);
             continue;
         }
 
-        if (!upstream_ || !upstreamReady_.load()) {
-            std::lock_guard<std::mutex> lock(mutex_);
-            pendingServerbound_.push_back(candidate);
+        if (!upstream || !upstreamReady) {
+            std::lock_guard<std::mutex> lock(session->mutex);
+            if (!session->closing) {
+                session->pendingServerbound.push_back(candidate);
+            }
             continue;
         }
-        forwardServerbound(candidate);
+        forwardServerbound(session, candidate);
     }
 }
 
-void BedrockLiveRelay::forwardClientbound(const VersionedGamePacket& packet) {
-    std::optional<BedrockServerConnection> downstream;
+void BedrockLiveRelay::forwardClientbound(
+    const std::shared_ptr<Session>& session,
+    const VersionedGamePacket& packet
+) {
+    BedrockServerConnection downstream;
     std::vector<VersionedGamePacket> heldChunks;
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        downstream = downstream_;
-        if (!downstream.has_value()) {
-            pendingClientbound_.push_back(packet);
+        std::lock_guard<std::mutex> lock(session->mutex);
+        if (session->closing) return;
+        if (!session->downstreamJoined) {
+            session->pendingClientbound.push_back(packet);
             return;
         }
+        downstream = session->downstream;
 
         const auto now = std::chrono::steady_clock::now();
         if (options_.queueClientboundLevelChunksUntilStartGame &&
             packet.name == "level_chunk" &&
-            (!clientboundStartGameSent_.load() || now < clientboundChunkReleaseAt_)) {
-            heldClientboundLevelChunks_.push_back(packet);
+            (!session->clientboundStartGameSent ||
+             now < session->clientboundChunkReleaseAt)) {
+            session->heldClientboundLevelChunks.push_back(packet);
             return;
         }
 
         if (packet.name == "start_game") {
-            clientboundStartGameSent_.store(true);
-            clientboundChunkReleaseAt_ = now + std::chrono::milliseconds(500);
+            session->clientboundStartGameSent = true;
+            session->clientboundChunkReleaseAt =
+                now + std::chrono::milliseconds(500);
         }
 
-        if (clientboundStartGameSent_.load() &&
-            now >= clientboundChunkReleaseAt_ &&
-            !heldClientboundLevelChunks_.empty()) {
-            heldChunks = std::move(heldClientboundLevelChunks_);
-            heldClientboundLevelChunks_.clear();
+        if (session->clientboundStartGameSent &&
+            now >= session->clientboundChunkReleaseAt &&
+            !session->heldClientboundLevelChunks.empty()) {
+            heldChunks = std::move(session->heldClientboundLevelChunks);
+            session->heldClientboundLevelChunks.clear();
         }
     }
     if (options_.logging && shouldLogRelayPacket("Proxy -> Client", packet.name)) {
         std::ostringstream out;
-        out << "* Proxy -> Client " << packet.name
+        out << "* Proxy -> Client " << session->id << " " << packet.name
             << packetSummary(options_.server.version, packet);
         relayLogLine(out.str());
     }
-    server_->sendPacket(*downstream, packet, options_.clientboundCompression);
+    // relay.js routes live upstream packets through Player#queue so packets
+    // observed in one batching interval share one downstream MCPE batch.
+    server_->queuePacket(downstream, packet, options_.clientboundCompression);
 
     if (!heldChunks.empty()) {
         if (options_.logging) {
@@ -905,33 +1389,52 @@ void BedrockLiveRelay::forwardClientbound(const VersionedGamePacket& packet) {
             out << "* Proxy -> Client batch level_chunk x" << heldChunks.size();
             relayLogLine(out.str());
         }
-        server_->sendPackets(*downstream, heldChunks, options_.clientboundCompression);
+        server_->queuePackets(downstream, heldChunks, options_.clientboundCompression);
     }
 }
 
-void BedrockLiveRelay::forwardServerbound(const VersionedGamePacket& packet) {
-    if (!upstream_ || !upstreamReady_.load()) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        pendingServerbound_.push_back(packet);
+void BedrockLiveRelay::forwardServerbound(
+    const std::shared_ptr<Session>& session,
+    const VersionedGamePacket& packet,
+    bool immediate
+) {
+    std::shared_ptr<BedrockNetworkClient> upstream;
+    {
+        std::lock_guard<std::mutex> lock(session->mutex);
+        if (session->closing) return;
+        if (!session->upstream || !session->upstreamReady) {
+            session->pendingServerbound.push_back(packet);
+            return;
+        }
+        upstream = session->upstream;
+    }
+    if (!upstream) {
         return;
     }
     if (options_.logging && shouldLogRelayPacket("Proxy -> Backend", packet.name)) {
         std::ostringstream out;
-        out << "* Proxy -> Backend " << packet.name
-            << packetSummary(options_.upstream.version, packet);
+        out << "* Proxy -> Backend " << session->id << " " << packet.name
+            << packetSummary(baseUpstreamOptions_.version, packet);
         relayLogLine(out.str());
     }
-    upstream_->sendPacket(packet);
+    if (immediate) {
+        upstream->sendPacket(packet);
+    } else {
+        upstream->sendBuffer(packet.fullPacket);
+    }
 }
 
 std::vector<VersionedGamePacket> BedrockLiveRelay::applyHandlers(
+    const std::shared_ptr<Session>& session,
     BedrockRelayDirection direction,
     const VersionedGamePacket& packet
 ) {
     BedrockRelayPacketEvent event;
     event.direction = direction;
+    event.sessionId = session->id;
     event.packet = packet;
 
+    std::lock_guard<std::mutex> dispatchLock(handlerDispatchMutex_);
     auto& handlers = direction == BedrockRelayDirection::Clientbound
         ? clientboundHandlers_
         : serverboundHandlers_;

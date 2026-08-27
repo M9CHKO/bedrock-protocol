@@ -1,5 +1,9 @@
 #pragma once
 
+#include <bedrock/BinaryStream.hpp>
+#include <bedrock/nbt/BedrockNbt.hpp>
+
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -22,47 +26,53 @@ struct PalettedStorageInfo {
     std::size_t totalBytes = 0;
     std::vector<uint32_t> words;
     std::vector<uint32_t> runtimePalette;
+    std::vector<NbtDocument> persistentPalette;
 
-    uint32_t getBlockRuntimeId(std::size_t blockIndex) const {
+    std::size_t getPaletteIndex(std::size_t blockIndex) const {
         if (blockIndex >= 4096) {
             throw std::runtime_error("block index outside paletted storage");
         }
-
-        if (runtimePalette.empty()) {
-            throw std::runtime_error("runtime palette is empty");
-        }
-
         if (header.bitsPerBlock == 0) {
-            return runtimePalette[0];
+            return 0;
         }
 
         const std::size_t bits = header.bitsPerBlock;
-        const std::size_t bitIndex = blockIndex * bits;
-        const std::size_t wordIndex = bitIndex / 32;
-        const std::size_t bitOffset = bitIndex % 32;
-
+        const std::size_t blocksPerWord = 32 / bits;
+        if (blocksPerWord == 0) {
+            throw std::runtime_error("invalid paletted storage bits per block");
+        }
+        const std::size_t wordIndex = blockIndex / blocksPerWord;
+        const std::size_t bitOffset = (blockIndex % blocksPerWord) * bits;
         if (wordIndex >= words.size()) {
             throw std::runtime_error("paletted storage word index outside data");
         }
 
-        uint64_t value = words[wordIndex] >> bitOffset;
+        const uint32_t mask = bits == 32
+            ? 0xffffffffu
+            : ((1u << bits) - 1u);
+        return static_cast<std::size_t>((words[wordIndex] >> bitOffset) & mask);
+    }
 
-        if (bitOffset + bits > 32) {
-            if (wordIndex + 1 >= words.size()) {
-                throw std::runtime_error("paletted storage cross-word read outside data");
-            }
-
-            value |= static_cast<uint64_t>(words[wordIndex + 1]) << (32 - bitOffset);
+    uint32_t getBlockRuntimeId(std::size_t blockIndex) const {
+        if (!header.runtime || runtimePalette.empty()) {
+            throw std::runtime_error("runtime palette is empty");
         }
-
-        const uint64_t mask = (bits >= 64) ? ~0ULL : ((1ULL << bits) - 1ULL);
-        const std::size_t paletteIndex = static_cast<std::size_t>(value & mask);
-
+        const std::size_t paletteIndex = getPaletteIndex(blockIndex);
         if (paletteIndex >= runtimePalette.size()) {
             throw std::runtime_error("palette index outside runtime palette");
         }
-
         return runtimePalette[paletteIndex];
+    }
+
+    const NbtDocument& getBlockPersistentState(std::size_t blockIndex) const {
+        if (header.runtime || persistentPalette.empty()) {
+            throw std::runtime_error("persistent palette is empty");
+        }
+        const std::size_t paletteIndex = getPaletteIndex(blockIndex);
+        if (paletteIndex >= persistentPalette.size()) {
+            throw std::runtime_error("palette index outside persistent palette");
+        }
+        return persistentPalette[paletteIndex];
     }
 };
 
@@ -80,15 +90,17 @@ public:
         if (bitsPerBlock == 0) {
             return 0;
         }
-
-        const std::size_t blocks = 4096;
-        const std::size_t bits = static_cast<std::size_t>(bitsPerBlock) * blocks;
-        return (bits + 31) / 32;
+        if (bitsPerBlock > 32) {
+            throw std::runtime_error("paletted storage bits per block exceeds 32");
+        }
+        const std::size_t blocksPerWord = 32 / bitsPerBlock;
+        return (4096 + blocksPerWord - 1) / blocksPerWord;
     }
 
     static PalettedStorageInfo scanAt(
         const std::vector<uint8_t>& data,
-        std::size_t offset
+        std::size_t offset,
+        BedrockNbtEncoding persistentEncoding = BedrockNbtEncoding::LittleVarInt
     ) {
         require(data, offset, 1, "paletted storage header");
 
@@ -113,19 +125,55 @@ public:
             offset += 4;
         }
 
-        out.paletteCount = readUVarInt(data, offset);
-
-        // Пока NBT/runtime palette полностью не декодируем.
-        // Для runtime palette entries идут как varint runtime ids.
-        // Для network-persistent NBT palette нужен полноценный NBT reader.
-        out.runtimePalette.reserve(out.paletteCount);
-
-        for (std::size_t i = 0; i < out.paletteCount; ++i) {
-            if (out.header.runtime) {
-                out.runtimePalette.push_back(readUVarInt(data, offset));
-            } else {
-                throw std::runtime_error("NBT palette scan is not implemented yet");
+        if (out.header.runtime && out.header.bitsPerBlock == 0) {
+            const int32_t runtimeId = readZigZagVarInt(data, offset);
+            if (runtimeId < 0) {
+                throw std::runtime_error("negative runtime id in paletted storage");
             }
+            out.paletteCount = 1;
+            out.runtimePalette.push_back(static_cast<uint32_t>(runtimeId));
+            out.totalBytes = offset - out.offset;
+            return out;
+        }
+        if (!out.header.runtime && out.header.bitsPerBlock == 0) {
+            throw std::runtime_error("persistent paletted storage cannot use zero bits per block");
+        }
+
+        int64_t paletteCount = 0;
+        if (!out.header.runtime && persistentEncoding == BedrockNbtEncoding::LittleEndian) {
+            paletteCount = readU32LE(data, offset);
+        } else {
+            paletteCount = readZigZagVarInt(data, offset);
+        }
+        if (paletteCount < 1 || paletteCount > 4096) {
+            throw std::runtime_error("invalid paletted storage palette count");
+        }
+        out.paletteCount = static_cast<std::size_t>(paletteCount);
+
+        const uint64_t capacity = out.header.bitsPerBlock == 32
+            ? (uint64_t{1} << 32u)
+            : (uint64_t{1} << out.header.bitsPerBlock);
+        if (out.paletteCount > capacity) {
+            throw std::runtime_error("paletted storage palette does not fit bits per block");
+        }
+
+        if (out.header.runtime) {
+            out.runtimePalette.reserve(out.paletteCount);
+            for (std::size_t i = 0; i < out.paletteCount; ++i) {
+                const int32_t runtimeId = readZigZagVarInt(data, offset);
+                if (runtimeId < 0) {
+                    throw std::runtime_error("negative runtime id in paletted storage");
+                }
+                out.runtimePalette.push_back(static_cast<uint32_t>(runtimeId));
+            }
+        } else {
+            BinaryStream stream(data);
+            stream.seek(offset);
+            out.persistentPalette.reserve(out.paletteCount);
+            for (std::size_t i = 0; i < out.paletteCount; ++i) {
+                out.persistentPalette.push_back(BedrockNbtCodec::read(stream, persistentEncoding));
+            }
+            offset = stream.offset();
         }
 
         out.totalBytes = offset - out.offset;
@@ -139,9 +187,23 @@ private:
         std::size_t size,
         const char* what
     ) {
-        if (offset + size > data.size()) {
+        if (offset > data.size() || size > data.size() - offset) {
             throw std::runtime_error(std::string("not enough bytes for ") + what);
         }
+    }
+
+    static uint32_t readU32LE(
+        const std::vector<uint8_t>& data,
+        std::size_t& offset
+    ) {
+        require(data, offset, 4, "u32le");
+        const uint32_t value =
+            static_cast<uint32_t>(data[offset]) |
+            (static_cast<uint32_t>(data[offset + 1]) << 8u) |
+            (static_cast<uint32_t>(data[offset + 2]) << 16u) |
+            (static_cast<uint32_t>(data[offset + 3]) << 24u);
+        offset += 4;
+        return value;
     }
 
     static uint32_t readUVarInt(
@@ -162,6 +224,15 @@ private:
         }
 
         throw std::runtime_error("uvarint too long");
+    }
+
+    static int32_t readZigZagVarInt(
+        const std::vector<uint8_t>& data,
+        std::size_t& offset
+    ) {
+        const uint32_t value = readUVarInt(data, offset);
+        const uint32_t decoded = (value >> 1u) ^ (0u - (value & 1u));
+        return std::bit_cast<int32_t>(decoded);
     }
 };
 

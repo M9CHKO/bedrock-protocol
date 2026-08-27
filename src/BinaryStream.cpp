@@ -177,6 +177,10 @@ std::string BinaryStream::readString() {
         throw BinaryStreamError("string length exceeds remaining buffer");
     }
 
+    if (len == 0) {
+        return {};
+    }
+
     std::string s(reinterpret_cast<const char*>(&data_[offset_]), len);
     offset_ += len;
 

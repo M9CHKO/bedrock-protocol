@@ -2,14 +2,14 @@
 
 #include <bedrock/auth/BedrockAuthJwt.hpp>
 #include <bedrock/auth/BedrockClientDataBuilder.hpp>
-#include <bedrock/auth/FileAuthCache.hpp>
+#include <bedrock/auth/NativeBedrockAuthflow.hpp>
 #include <bedrock/protocol/ProtocolDefinition.hpp>
 #include <bedrock/protodef/ProtoDefPacketDecoder.hpp>
+#include <bedrock/world/BedrockSubChunkPacket.hpp>
 
 #include <algorithm>
 #include <chrono>
 #include <cctype>
-#include <cstdlib>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
@@ -146,108 +146,6 @@ int64_t unixTimeMillis() {
     ).count();
 }
 
-std::filesystem::path defaultProfilesFolder() {
-#if defined(_WIN32)
-    std::filesystem::path root;
-    if (const char* appData = std::getenv("APPDATA")) {
-        if (*appData) root = appData;
-    }
-    if (root.empty()) {
-        if (const char* userProfile = std::getenv("USERPROFILE")) {
-            if (*userProfile) {
-                root = std::filesystem::path(userProfile) /
-                    "AppData" / "Roaming";
-            }
-        }
-    }
-    if (!root.empty()) return root / ".minecraft" / "nmp-cache";
-#elif defined(__APPLE__)
-    if (const char* home = std::getenv("HOME")) {
-        if (*home) {
-            return std::filesystem::path(home) / "Library" /
-                "Application Support" / "minecraft" / "nmp-cache";
-        }
-    }
-#else
-    if (const char* home = std::getenv("HOME")) {
-        if (*home) {
-            return std::filesystem::path(home) / ".minecraft" / "nmp-cache";
-        }
-    }
-#endif
-    // os.homedir() always supplies a directory in the supported Node
-    // environments.  This fallback is only for a native process with no home
-    // environment at all and deliberately stays local and deterministic.
-    return std::filesystem::current_path() / ".minecraft" / "nmp-cache";
-}
-
-std::filesystem::path prismarineAuthSourceDirectory() {
-    const auto findFrom = [](std::filesystem::path cursor)
-        -> std::optional<std::filesystem::path> {
-        std::error_code error;
-        if (!std::filesystem::is_directory(cursor, error)) {
-            cursor = cursor.parent_path();
-        }
-        for (int depth = 0; depth < 12 && !cursor.empty(); ++depth) {
-            auto candidate = cursor / "node_modules" /
-                "prismarine-auth" / "src";
-            error.clear();
-            if (std::filesystem::is_directory(candidate, error) && !error) {
-                return candidate.lexically_normal();
-            }
-            const auto parent = cursor.parent_path();
-            if (parent == cursor) break;
-            cursor = parent;
-        }
-        return std::nullopt;
-    };
-
-    std::error_code error;
-    auto source = std::filesystem::absolute(
-        std::filesystem::path(__FILE__),
-        error
-    );
-    if (!error) {
-        if (auto located = findFrom(std::move(source))) return *located;
-    }
-    error.clear();
-    auto current = std::filesystem::current_path(error);
-    if (!error) {
-        if (auto located = findFrom(std::move(current))) return *located;
-    }
-
-    // prismarine-auth uses its own `src` (__dirname) as this fallback.  Keep
-    // the same semantic target even when the dependency tree is unavailable
-    // at runtime (for example after moving a native installation).
-    return std::filesystem::path("node_modules") /
-        "prismarine-auth" / "src";
-}
-
-std::filesystem::path initializePrismarineAuthCacheRoot(
-    const ProfilesFolderOption& profilesFolder,
-    const std::filesystem::path& selectedRoot
-) {
-    // A truthy function is passed through as prismarine-auth's CacheFactory;
-    // no filesystem lookup, creation or fallback is attempted.
-    if (profilesFolder.isFactory()) return {};
-
-    // fs.existsSync(true) throws ERR_INVALID_ARG_TYPE. MicrosoftAuthFlow
-    // catches that error and switches its private cachePath to __dirname;
-    // auth.js's public options.profilesFolder remains Boolean(true).
-    if (profilesFolder.isBoolean() && profilesFolder.booleanValue()) {
-        return prismarineAuthSourceDirectory();
-    }
-
-    std::error_code error;
-    const bool exists = std::filesystem::exists(selectedRoot, error);
-    if (error) return prismarineAuthSourceDirectory();
-    if (!exists) {
-        std::filesystem::create_directories(selectedRoot, error);
-        if (error) return prismarineAuthSourceDirectory();
-    }
-    return selectedRoot;
-}
-
 class AuthflowPromiseRejection final : public std::runtime_error {
 public:
     explicit AuthflowPromiseRejection(const std::string& message)
@@ -289,7 +187,9 @@ BedrockNetworkClient::BedrockNetworkClient(BedrockNetworkClientOptions options)
           .clientCacheEnabled = options_.clientCacheEnabled,
           .chunkRadius = options_.chunkRadius
       }),
-      packetEncoder_(options_.version) {
+      packetVariables_(makeProtoDefVariableStore()),
+      packetEncoder_(options_.version, packetVariables_),
+      packetDecoder_(options_.version, packetVariables_) {
     compressionAlgorithm_ = versionAtLeast(options_.version, 1, 19, 30) ? "none" : "deflate";
 }
 
@@ -627,29 +527,23 @@ bool BedrockNetworkClient::prepareConnectLifecycle(bool deferQueuePump) {
             }
         } else {
             auto authOptionsSnapshot = options();
-            std::filesystem::path selectedCacheRoot;
-
-            // auth.js validateOptions mutates profilesFolder first. The
-            // resulting public property is independent of Authflow's private
-            // cachePath. Unknown extension properties are left untouched.
-            if (!authOptionsSnapshot.profilesFolder.truthy()) {
-                const auto folder = defaultProfilesFolder();
-                authOptionsSnapshot.profilesFolder.setResolved(folder);
-                selectedCacheRoot = folder;
-            } else if (!authOptionsSnapshot.profilesFolder.isBoolean()) {
-                selectedCacheRoot = authOptionsSnapshot.profilesFolder.path();
-            }
-
-            // auth.js keys solely on undefined authTitle. Unknown extension
-            // fields (including the legacy xboxClientId alias) cannot prevent
-            // these three conditional assignments.
-            if (!authOptionsSnapshot.authTitle.hasOwn() ||
-                authOptionsSnapshot.authTitle.isUndefined()) {
-                authOptionsSnapshot.authTitle =
-                    std::string(Titles::MinecraftNintendoSwitch);
-                authOptionsSnapshot.deviceType = "Nintendo";
-                authOptionsSnapshot.flow = "live";
-            }
+            NativeBedrockAuthflowOptions normalizedAuthOptions {
+                .username = authOptionsSnapshot.username,
+                .profilesFolder = authOptionsSnapshot.profilesFolder,
+                .authTitle = authOptionsSnapshot.authTitle,
+                .deviceType = authOptionsSnapshot.deviceType,
+                .flow = authOptionsSnapshot.flow,
+                .forceRefresh = authOptionsSnapshot.forceRefresh,
+                .msalConfig = authOptionsSnapshot.msalConfig,
+                .password = authOptionsSnapshot.password,
+                .onMsaCode = authOptionsSnapshot.onMsaCode
+            };
+            validateNativeBedrockAuthflowOptions(normalizedAuthOptions);
+            authOptionsSnapshot.profilesFolder =
+                normalizedAuthOptions.profilesFolder;
+            authOptionsSnapshot.authTitle = normalizedAuthOptions.authTitle;
+            authOptionsSnapshot.deviceType = normalizedAuthOptions.deviceType;
+            authOptionsSnapshot.flow = normalizedAuthOptions.flow;
 
             // validateOptions() mutates the same public object synchronously,
             // before `new PrismarineAuth(...)` can validate flow or touch its
@@ -704,97 +598,65 @@ bool BedrockNetworkClient::prepareConnectLifecycle(bool deferQueuePump) {
                     authenticationError = error.what();
                 }
             } else {
-                const XboxLiveAuthFlowOptions authFlow {
-                    .authTitle = authOptionsSnapshot.authTitle.value_or(""),
+                NativeBedrockAuthflowOptions nativeAuthOptions {
+                    .username = authOptionsSnapshot.username,
+                    .profilesFolder = authOptionsSnapshot.profilesFolder,
+                    .authTitle = authOptionsSnapshot.authTitle,
                     .deviceType = authOptionsSnapshot.deviceType,
-                    .flow = authOptionsSnapshot.flow
+                    .flow = authOptionsSnapshot.flow,
+                    .forceRefresh = authOptionsSnapshot.forceRefresh,
+                    .msalConfig = authOptionsSnapshot.msalConfig,
+                    .password = authOptionsSnapshot.password,
+                    .onMsaCode = authOptionsSnapshot.onMsaCode
                 };
 
                 try {
                     // MicrosoftAuthFlow checks flow before touching its cache.
-                    XboxLiveAuth::validatePrismarineAuthFlowPresence(authFlow);
+                    validateNativeBedrockAuthflowPresence(nativeAuthOptions);
                     const auto effectiveCacheRoot =
-                        initializePrismarineAuthCacheRoot(
-                            authOptionsSnapshot.profilesFolder,
-                            selectedCacheRoot
+                        initializeNativeBedrockAuthCacheRoot(
+                            nativeAuthOptions.profilesFolder
                         );
                     {
                         std::lock_guard<std::mutex> lock(optionsMutex_);
                         authenticationCacheRoot_ = effectiveCacheRoot;
                         authenticationMsalConfig_.reset();
+                        authenticationLiveTokenManager_.reset();
                         authenticationMsaTokenManager_.reset();
+                        authenticationXboxTokenManager_.reset();
+                        authenticationBedrockTokenManager_.reset();
+                        authenticationBedrockServicesTokenManager_.reset();
+                        authenticationPlayfabTokenManager_.reset();
+                        authenticationMicrosoftAuthFlow_.reset();
                         authenticationXboxProofKey_.reset();
                         authenticationCaches_.clear();
                     }
-
-                    // Flow-specific validation precedes evaluation of the
-                    // first CacheFactory argument. String/FileCache setup above
-                    // still happens first, matching initTokenManagers().
-                    if (authFlow.flow == "live" ||
-                        authFlow.flow == "sisu" ||
-                        authFlow.flow != "msal" ||
-                        !XboxLiveAuth::isTruthyMsalConfig(
-                            authOptionsSnapshot.msalConfig
-                        )) {
-                        XboxLiveAuth::validatePrismarineAuthFlow(authFlow);
-                    }
-
-                    std::unordered_map<std::string, AuthCachePtr> caches;
-                    const auto initializeCache = [&](const std::string& name) {
-                        AuthCacheFactoryOptions cacheOptions {
-                            .cacheName = name,
-                            .username = authOptionsSnapshot.username
-                        };
-                        if (authOptionsSnapshot.profilesFolder.isFactory()) {
-                            const auto& factory =
-                                authOptionsSnapshot.profilesFolder.factory();
-                            // A null function pointer is falsy and would have
-                            // been replaced by validateOptions' default path.
-                            caches[name] = (*factory)(cacheOptions);
-                            return;
-                        }
-                        auto cache = makeFileAuthCache(
-                            effectiveCacheRoot,
-                            std::move(cacheOptions)
-                        );
-                        if (authOptionsSnapshot.forceRefresh) {
-                            // FileCache.reset() performs writeFileSync before
-                            // returning its Promise. Authflow deliberately
-                            // does not await or observe that Promise.
-                            (void) cache->reset();
-                        }
-                        caches[name] = std::move(cache);
-                    };
-
-                    const std::string firstCache = authFlow.flow == "msal"
-                        ? "msal"
-                        : authFlow.flow;
-                    initializeCache(firstCache);
-                    auto authRuntime =
-                        XboxLiveAuth::initializePrismarineAuthFlowRuntime(
-                            authFlow,
-                            authOptionsSnapshot.msalConfig,
-                            caches[firstCache]
-                        );
-                    // MicrosoftAuthFlow generates one P-256 key immediately
-                    // after constructing its MSA manager and before it asks
-                    // CacheFactory for xbl. XboxTokenManager retains this key
-                    // for every PoP signature in the flow lifetime.
-                    auto xboxProofKey = XboxProofKey::generate();
-                    for (const char* name : {
-                            "xbl", "bed", "mca", "mcs", "pfb"
-                        }) {
-                        initializeCache(name);
-                    }
+                    auto authRuntime = createNativeBedrockAuthflow(
+                        nativeAuthOptions,
+                        effectiveCacheRoot
+                    );
                     {
                         std::lock_guard<std::mutex> lock(optionsMutex_);
                         authenticationMsalConfig_ =
                             std::move(authRuntime.effectiveMsalConfig);
+                        authenticationLiveTokenManager_ =
+                            std::move(authRuntime.live);
                         authenticationMsaTokenManager_ =
                             std::move(authRuntime.msa);
+                        authenticationXboxTokenManager_ =
+                            std::move(authRuntime.xbox);
+                        authenticationBedrockTokenManager_ =
+                            std::move(authRuntime.bedrock);
+                        authenticationBedrockServicesTokenManager_ =
+                            std::move(authRuntime.bedrockServices);
+                        authenticationPlayfabTokenManager_ =
+                            std::move(authRuntime.playfab);
+                        authenticationMicrosoftAuthFlow_ =
+                            std::move(authRuntime.microsoft);
                         authenticationXboxProofKey_ =
-                            std::move(xboxProofKey);
-                        authenticationCaches_ = std::move(caches);
+                            std::move(authRuntime.xboxProofKey);
+                        authenticationCaches_ =
+                            std::move(authRuntime.caches);
                     }
                 } catch (const std::exception& error) {
                     authenticationRejected = true;
@@ -1082,6 +944,9 @@ void BedrockNetworkClient::sendPacket(const VersionedGamePacket& packet) {
 
 void BedrockNetworkClient::sendBuffer(const std::vector<uint8_t>& buffer, bool immediate) {
     auto packet = session_.packetCodec().decodeFullPacket(buffer);
+    if (packet.name == "start_game" || packet.name == "item_registry") {
+        (void) packetDecoder_.decodePacket(packet.name, packet.payload);
+    }
     if (immediate) {
         sendPacket(packet);
         return;
@@ -1193,6 +1058,10 @@ const BedrockBlobStore& BedrockNetworkClient::blobStore() const {
 
 BedrockBlobStore& BedrockNetworkClient::blobStore() {
     return blobStore_;
+}
+
+ProtoDefVariableStorePtr BedrockNetworkClient::packetVariableStore() const {
+    return packetVariables_;
 }
 
 BedrockNetworkClientOptions BedrockNetworkClient::normalizeOptions(BedrockNetworkClientOptions options) {
@@ -1659,9 +1528,17 @@ void BedrockNetworkClient::handleRakNetPayload(const std::vector<uint8_t>& paylo
         );
     } else {
         const auto& codec = session_.mcpeCodec();
-        decoded = codec.compressorInPacketHeader() && !compressionReady_
-            ? codec.decodeUncompressedMcpePayload(payload)
-            : codec.decodeMcpePayload(payload);
+        if (codec.compressorInPacketHeader() && !compressionReady_) {
+            decoded = codec.decodeUncompressedMcpePayload(payload);
+        } else if (!codec.compressorInPacketHeader() &&
+                   compressionReady_ &&
+                   compressionAlgorithm_ == "snappy") {
+            decoded = codec.decodeMcpePayload(payload, "snappy");
+        } else {
+            // Preserve the original deflate-or-raw probe for the default,
+            // pre-negotiation and unknown-algorithm legacy paths.
+            decoded = codec.decodeMcpePayload(payload);
+        }
     }
 
     for (const auto& packet : decoded.batch.packets) {
@@ -1680,13 +1557,15 @@ void BedrockNetworkClient::handlePacket(const VersionedGamePacket& packet) {
         // pre-dispatch region; framing, decompression, internal handlers, and
         // user event callbacks remain uncaught at the transport boundary.
         if (packet.name == "network_settings" ||
-            packet.name == "server_to_client_handshake") {
-            ProtoDefPacketDecoder decoder(options_.version);
-            decodedFields = decoder.decodePacket(packet.name, packet.payload);
+            packet.name == "server_to_client_handshake" ||
+            packet.name == "start_game" ||
+            packet.name == "item_registry") {
+            decodedFields = packetDecoder_.decodePacket(packet.name, packet.payload);
             if (packet.name == "server_to_client_handshake") {
                 serverHandshakeToken = findFieldValue(decodedFields, "token");
             }
-        } else if (packet.name == "start_game") {
+        }
+        if (packet.name == "start_game") {
             (void) VersionedPayloadReader::readStartGame(packet);
         } else if (packet.name == "play_status") {
             (void) VersionedPayloadReader::readPlayStatus(packet);
@@ -1710,6 +1589,10 @@ void BedrockNetworkClient::handlePacket(const VersionedGamePacket& packet) {
                 compressionThreshold_
             );
             auto algorithm = findFieldValue(decodedFields, "compression_algorithm");
+            const auto mappedSeparator = algorithm.find('/');
+            if (mappedSeparator != std::string::npos) {
+                algorithm.erase(0, mappedSeparator + 1);
+            }
             compressionAlgorithm_ = algorithm.empty() ? "deflate" : algorithm;
             compressionReady_ = true;
         }
@@ -1740,6 +1623,10 @@ void BedrockNetworkClient::handlePacket(const VersionedGamePacket& packet) {
 
     if (packet.name == "level_chunk" && options_.trackWorld) {
         handleLevelChunk(packet);
+    }
+
+    if (packet.name == "subchunk" && options_.trackWorld) {
+        handleSubChunk(packet);
     }
 
     if (packet.name == "client_cache_miss_response" && options_.trackWorld) {
@@ -1883,19 +1770,92 @@ void BedrockNetworkClient::handleLevelChunk(const VersionedGamePacket& packet) {
     }
 }
 
+void BedrockNetworkClient::handleSubChunk(const VersionedGamePacket& packet) {
+    try {
+        const auto subChunkPacket = BedrockSubChunkPacketCodec::decodePacketPayload(
+            packet.payload,
+            options_.version
+        );
+
+        BedrockClientCacheBlobStatus cacheStatus;
+        for (const auto& entry : subChunkPacket.entries) {
+            const int32_t chunkX = subChunkPacket.originX + entry.dx;
+            const int32_t sectionY = subChunkPacket.originY + entry.dy;
+            const int32_t chunkZ = subChunkPacket.originZ + entry.dz;
+
+            if (entry.result == BedrockSubChunkResult::SuccessAllAir) {
+                ensureTrackedColumn(chunkX, chunkZ).setSection(
+                    sectionY,
+                    BedrockSubChunk::createAir(static_cast<int8_t>(sectionY), 0)
+                );
+                continue;
+            }
+            if (entry.result != BedrockSubChunkResult::Success) {
+                continue;
+            }
+
+            if (!subChunkPacket.cacheEnabled) {
+                ensureTrackedColumn(chunkX, chunkZ).networkDecodeSubChunkNoCache(
+                    sectionY,
+                    entry.payload
+                );
+                continue;
+            }
+            if (!entry.blobId.has_value()) {
+                throw BedrockChunkError("cached subchunk response is missing blob id");
+            }
+
+            PendingBlobMetadata metadata;
+            metadata.type = BlobType::ChunkSection;
+            metadata.x = chunkX;
+            metadata.y = sectionY;
+            metadata.z = chunkZ;
+            pendingBlobMetadata_[*entry.blobId] = metadata;
+
+            PendingCachedSubChunk pending;
+            pending.chunkX = chunkX;
+            pending.sectionY = sectionY;
+            pending.chunkZ = chunkZ;
+            pending.hash = *entry.blobId;
+            pending.blockEntityPayload = entry.payload;
+            if (tryStoreCachedSubChunk(pending)) {
+                cacheStatus.have.push_back(pending.hash);
+            } else {
+                cacheStatus.missing.push_back(pending.hash);
+                pendingCachedSubChunks_.push_back(std::move(pending));
+            }
+        }
+
+        if (!cacheStatus.have.empty() || !cacheStatus.missing.empty()) {
+            const auto payload = BedrockLevelChunkCodec::encodeClientCacheBlobStatusPayload(
+                cacheStatus
+            );
+            sendPacket(session_.packetCodec().makePacketByName(
+                "client_cache_blob_status",
+                payload
+            ));
+        }
+    } catch (const std::exception& error) {
+        emitError("subchunk decode failed: " + std::string(error.what()));
+    }
+}
+
 void BedrockNetworkClient::handleClientCacheMissResponse(const VersionedGamePacket& packet) {
     try {
         auto blobs = BedrockLevelChunkCodec::decodeClientCacheMissResponsePayload(packet.payload);
         for (auto& blob : blobs) {
             BlobEntry entry;
             entry.type = BlobType::Biomes;
-            auto typeIt = pendingBlobTypes_.find(blob.hash);
-            if (typeIt != pendingBlobTypes_.end()) {
-                entry.type = typeIt->second;
+            auto metadataIt = pendingBlobMetadata_.find(blob.hash);
+            if (metadataIt != pendingBlobMetadata_.end()) {
+                entry.type = metadataIt->second.type;
+                entry.x = metadataIt->second.x;
+                entry.y = metadataIt->second.y;
+                entry.z = metadataIt->second.z;
             }
             entry.buffer = std::move(blob.payload);
             blobStore_.set(blob.hash, std::move(entry));
-            pendingBlobTypes_.erase(blob.hash);
+            pendingBlobMetadata_.erase(blob.hash);
         }
 
         std::vector<BedrockLevelChunkPacket> stillPending;
@@ -1905,6 +1865,14 @@ void BedrockNetworkClient::handleClientCacheMissResponse(const VersionedGamePack
             }
         }
         pendingCachedLevelChunks_ = std::move(stillPending);
+
+        std::vector<PendingCachedSubChunk> stillPendingSubChunks;
+        for (const auto& subChunk : pendingCachedSubChunks_) {
+            if (!tryStoreCachedSubChunk(subChunk)) {
+                stillPendingSubChunks.push_back(subChunk);
+            }
+        }
+        pendingCachedSubChunks_ = std::move(stillPendingSubChunks);
     } catch (const std::exception& e) {
         emitError("client_cache_miss_response decode failed: " + std::string(e.what()));
     }
@@ -1912,14 +1880,32 @@ void BedrockNetworkClient::handleClientCacheMissResponse(const VersionedGamePack
 
 bool BedrockNetworkClient::tryStoreLevelChunk(const BedrockLevelChunkPacket& levelChunk) {
     if (!levelChunk.cacheEnabled) {
-        auto column = BedrockLevelChunkCodec::decodeNoCacheColumn(levelChunk);
+        auto column = BedrockLevelChunkCodec::decodeNoCacheColumn(
+            levelChunk,
+            versionAtLeast(options_.version, 1, 18, 0)
+        );
         world_.setLoadedColumn(levelChunk.x, levelChunk.z, std::move(column));
         return true;
     }
 
     BedrockClientCacheBlobStatus status;
-    for (auto hash : levelChunk.blobHashes) {
-        pendingBlobTypes_[hash] = BlobType::Biomes;
+    const std::size_t legacySectionCount =
+        levelChunk.subChunkCount > 0 && levelChunk.blobHashes.size() > 1
+        ? std::min<std::size_t>(
+            static_cast<std::size_t>(levelChunk.subChunkCount),
+            levelChunk.blobHashes.size() - 1
+        )
+        : 0;
+    for (std::size_t i = 0; i < levelChunk.blobHashes.size(); ++i) {
+        const auto hash = levelChunk.blobHashes[i];
+        PendingBlobMetadata metadata;
+        metadata.type = i < legacySectionCount
+            ? BlobType::ChunkSection
+            : BlobType::Biomes;
+        metadata.x = levelChunk.x;
+        metadata.y = i < legacySectionCount ? static_cast<int32_t>(i) : 0;
+        metadata.z = levelChunk.z;
+        pendingBlobMetadata_[hash] = metadata;
         if (blobStore_.has(hash)) {
             status.have.push_back(hash);
         } else {
@@ -1933,7 +1919,9 @@ bool BedrockNetworkClient::tryStoreLevelChunk(const BedrockLevelChunkPacket& lev
     }
 
     BedrockChunkColumn column(levelChunk.x, levelChunk.z);
-    column.setBounds(-4, 20);
+    if (versionAtLeast(options_.version, 1, 18, 0)) {
+        column.setBounds(-4, 20);
+    }
     auto misses = column.networkDecodeCached(levelChunk.blobHashes, blobStore_, levelChunk.payload);
     if (!misses.empty()) {
         return false;
@@ -1942,15 +1930,58 @@ bool BedrockNetworkClient::tryStoreLevelChunk(const BedrockLevelChunkPacket& lev
     return true;
 }
 
+bool BedrockNetworkClient::tryStoreCachedSubChunk(
+    const PendingCachedSubChunk& subChunk
+) {
+    const BlobEntry* blob = blobStore_.get(subChunk.hash);
+    if (blob == nullptr) {
+        return false;
+    }
+    if (blob->type != BlobType::ChunkSection) {
+        throw BedrockChunkError("cached subchunk blob has an unexpected type");
+    }
+
+    std::vector<uint8_t> payload = blob->buffer;
+    payload.insert(
+        payload.end(),
+        subChunk.blockEntityPayload.begin(),
+        subChunk.blockEntityPayload.end()
+    );
+    ensureTrackedColumn(subChunk.chunkX, subChunk.chunkZ)
+        .networkDecodeSubChunkNoCache(subChunk.sectionY, payload);
+    pendingBlobMetadata_.erase(subChunk.hash);
+    return true;
+}
+
+BedrockChunkColumn& BedrockNetworkClient::ensureTrackedColumn(
+    int32_t chunkX,
+    int32_t chunkZ
+) {
+    if (auto* column = world_.getLoadedColumn(chunkX, chunkZ)) {
+        return *column;
+    }
+
+    BedrockChunkColumn column(chunkX, chunkZ);
+    column.setBounds(-4, 20);
+    world_.setLoadedColumn(chunkX, chunkZ, std::move(column));
+    auto* inserted = world_.getLoadedColumn(chunkX, chunkZ);
+    if (inserted == nullptr) {
+        throw BedrockChunkError("failed to create tracked chunk column");
+    }
+    return *inserted;
+}
+
 void BedrockNetworkClient::prepareLoginPacket() {
     BedrockNetworkClientOptions authOptions;
     std::filesystem::path effectiveAuthenticationCacheRoot;
     MsalConfigPtr effectiveMsalConfig;
+    std::shared_ptr<MicrosoftAuthFlow> builtInMicrosoftAuthFlow;
     {
         std::lock_guard<std::mutex> lock(optionsMutex_);
         authOptions = options_;
         effectiveAuthenticationCacheRoot = authenticationCacheRoot_;
         effectiveMsalConfig = authenticationMsalConfig_;
+        builtInMicrosoftAuthFlow = authenticationMicrosoftAuthFlow_;
     }
     if (!authOptions.loginPacket.empty()) {
         if (clientKeys_.privateKeyPem.empty()) {
@@ -1996,7 +2027,15 @@ void BedrockNetworkClient::prepareLoginPacket() {
     };
 
     XboxLiveLoginPacket generated;
-    if (authOptions.authflow) {
+    if (authOptions.offline) {
+        // The offline session plugin wins before auth.js is considered. A
+        // runtime authflow property may still exist (notably after Realm
+        // address resolution), but no online Promise was started for it.
+        generated = XboxLiveAuth::makeLoginPacketFromPreparedFlow(
+            std::move(loginOptions),
+            std::move(effectiveMsalConfig)
+        );
+    } else if (authOptions.authflow) {
         std::future<std::vector<std::string>> pendingChains;
         BedrockClientKeyPair authflowKeys;
         {
@@ -2017,6 +2056,45 @@ void BedrockNetworkClient::prepareLoginPacket() {
             // for rejection of getMinecraftBedrockToken itself. Later chain
             // parsing/build failures skip that warning.
             throw AuthflowPromiseRejection(error.what());
+        }
+        generated = XboxLiveAuth::makeLoginPacketFromChains(
+            std::move(loginOptions),
+            std::move(authflowKeys),
+            std::move(chains)
+        );
+    } else if (builtInMicrosoftAuthFlow) {
+        BedrockClientKeyPair authflowKeys;
+        {
+            std::lock_guard<std::mutex> lock(optionsMutex_);
+            if (clientKeys_.privateKeyPem.empty()) {
+                clientKeys_ = BedrockAuthJwt::generateP384KeyPair();
+            }
+            authflowKeys = clientKeys_;
+        }
+        JsRuntimeValue runtimeChains;
+        try {
+            runtimeChains = builtInMicrosoftAuthFlow->
+                getMinecraftBedrockToken(JsRuntimeValue::string(
+                    authflowKeys.publicKeyDerBase64
+                )).get();
+        } catch (const std::exception& error) {
+            throw AuthflowPromiseRejection(error.what());
+        }
+        if (!runtimeChains.isArray()) {
+            throw std::runtime_error(
+                "getMinecraftBedrockToken did not return an array"
+            );
+        }
+        std::vector<std::string> chains;
+        chains.reserve(runtimeChains.length());
+        for (std::size_t index = 0; index < runtimeChains.length(); ++index) {
+            const auto* token = runtimeChains.get(index);
+            if (!token || !token->isString()) {
+                throw std::runtime_error(
+                    "Bedrock authentication chain contains a non-string token"
+                );
+            }
+            chains.push_back(token->stringValue());
         }
         generated = XboxLiveAuth::makeLoginPacketFromChains(
             std::move(loginOptions),
@@ -2327,6 +2405,11 @@ void BedrockNetworkClient::sendLocalPlayerInitialized(uint64_t runtimeEntityId) 
 }
 
 void BedrockNetworkClient::sendPackets(const std::vector<VersionedGamePacket>& packets) {
+    for (const auto& packet : packets) {
+        if (packet.name == "start_game" || packet.name == "item_registry") {
+            (void) packetDecoder_.decodePacket(packet.name, packet.payload);
+        }
+    }
     std::lock_guard<std::mutex> lock(sendMutex_);
     sendPacketsLocked(packets);
 }
@@ -2405,7 +2488,7 @@ void BedrockNetworkClient::sendReliablePayload(
 VersionedMcpeCompression BedrockNetworkClient::choosePlainCompression(
     const std::vector<VersionedGamePacket>& packets
 ) const {
-    if (compressionAlgorithm_ == "none" || compressionAlgorithm_ == "snappy") {
+    if (compressionAlgorithm_ == "none") {
         return VersionedMcpeCompression::Uncompressed;
     }
 
@@ -2415,7 +2498,9 @@ VersionedMcpeCompression BedrockNetworkClient::choosePlainCompression(
 
     auto framed = session_.batchCodec().encodeFramedBatch(packets);
     if (framed.size() > compressionThreshold_) {
-        return VersionedMcpeCompression::DeflateRaw;
+        return compressionAlgorithm_ == "snappy"
+            ? VersionedMcpeCompression::Snappy
+            : VersionedMcpeCompression::DeflateRaw;
     }
 
     return VersionedMcpeCompression::Uncompressed;

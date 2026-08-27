@@ -40,6 +40,19 @@ public:
     VersionedMcpePayload decodeMcpePayload(const std::vector<uint8_t>& mcpePayload) const;
     VersionedMcpePayload decodeCompressionPacket(const std::vector<uint8_t>& compressionPacket) const;
 
+    // Headerless protocol versions use one session-wide compressor. The
+    // overloads retain Framer.decode's fallback to an uncompressed batch when
+    // the selected decompressor rejects a packet. Modern packet headers remain
+    // authoritative and ignore this legacy selection.
+    VersionedMcpePayload decodeMcpePayload(
+        const std::vector<uint8_t>& mcpePayload,
+        const std::string& legacyCompressionAlgorithm
+    ) const;
+    VersionedMcpePayload decodeCompressionPacket(
+        const std::vector<uint8_t>& compressionPacket,
+        const std::string& legacyCompressionAlgorithm
+    ) const;
+
     // encryption.js always deflates encrypted batches. Legacy protocols have
     // no compressor byte and, unlike the ordinary unencrypted decoder, do not
     // fall back to interpreting failed deflate input as an uncompressed batch.

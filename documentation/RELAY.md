@@ -8,7 +8,13 @@ The C++ relay API follows the packet event model from:
 - `event.replace(packet)`: forward a changed packet instead.
 - `event.replace({packet1, packet2})`: forward several packets.
 
-This is currently a packet-level relay core plus `createRelayServer`, an early live relay runtime built from `createServer` and upstream `BedrockNetworkClient`. The server runtime can listen for RakNet clients, answer ping/open-connection, handle connected RakNet request flow, emit MCPE packet events, answer `request_network_settings`, complete the login encryption handshake, and emit `join`. The `relay-test-server` example exposes this runtime so a Bedrock client can join it for live testing.
+This includes the packet-level relay core plus `createRelayServer`, a live relay
+runtime built from `createServer` and upstream `BedrockNetworkClient`. The
+runtime accepts multiple RakNet clients and owns an isolated Player, upstream
+client, queues, packet variables, and lifecycle for each downstream session.
+It answers the Bedrock handshake, completes login encryption, and emits packet
+and join events. The `relay-test-server` example exposes this runtime for live
+testing.
 
 ## Basic Example
 
@@ -62,7 +68,8 @@ options.upstream.interactiveAuth = true;
 auto relay = bedrock::createRelayServer(options);
 
 relay.on("serverbound", [](bedrock::BedrockRelayPacketEvent& event) {
-    std::cout << "client -> upstream " << event.packet.name << "\n";
+    std::cout << event.sessionId << " client -> upstream "
+              << event.packet.name << "\n";
 });
 
 relay.on("clientbound", [](bedrock::BedrockRelayPacketEvent& event) {
@@ -71,6 +78,23 @@ relay.on("clientbound", [](bedrock::BedrockRelayPacketEvent& event) {
 
 relay.listen();
 ```
+
+Each accepted downstream opens its own upstream connection. Use
+`event.sessionId`, `relay.sessionCount()`, and `relay.upstreamCount()` for
+aggregate diagnostics, or `relay.upstreamShared(connection)` for an owning
+snapshot of one exact upstream client. Set `options.forceSingle = true` when a
+second transport must be rejected before it creates a Player or upstream.
+
+`BedrockLiveRelayStatus` retains the single-session boolean fields and also
+reports `downstreamConnections`, `downstreamJoinedCount`,
+`upstreamStartedCount`, and `upstreamReadyCount`. A boolean is true when at
+least one active session is in that state.
+
+For a Bedrock Realm upstream, set `options.realms.realmId`,
+`options.realms.realmInvite`, or a picker instead of relying on the configured
+upstream host/port. Realm authentication runs after the downstream identity is
+captured, resolves the join address, and stores the same Authflow in
+`options.upstream.authflow` for the game login. No Java Realms path is used.
 
 `createRelayServer` currently requires the downstream listener version and upstream client version to match. This keeps packet ids, compression shape, encryption, and schema encoding consistent while the full JS relay runtime is being ported.
 
@@ -179,14 +203,24 @@ The C++ relay core includes these behaviors from the JavaScript relay:
 | Behavior | C++ option |
 |---|---|
 | Force `client_cache_status` | `forceClientCacheStatus = true` |
-| Choose chunk cache value | `enableChunkCaching = false` |
+| Choose chunk cache value | `enableChunkCaching = false` / `true` |
 | Queue `level_chunk` before `start_game` | `queueClientboundLevelChunksUntilStartGame = true` |
 | Skip duplicate `play_status login_success` | `skipClientboundLoginSuccess = true` |
 | Skip upstream resource-pack handshake packets in live relay | `skipClientboundResourcePacks = true` |
+| Forward per-session skin and arbitrary login `clientData` | `forwardDownstreamClientData = true` |
 | Queue backend packets before downstream join | `markDownstreamJoined()` / `flushDownQueue()` |
 | Queue downstream packets before upstream join | `markUpstreamJoined()` / `flushUpQueue()` |
 | Disable serverbound forwarding | `forwardServerbound = false` |
 | Disable clientbound forwarding | `forwardClientbound = false` |
+| Reject a second live downstream | `forceSingle = true` |
+| Trace session and packet routing | high-level `RelayOptions::logging = true` |
+| Drop malformed backend packets without closing their session | high-level `RelayOptions::omitParseErrors = true` |
+
+High-level Relay always strictly parses clientbound packets before handlers.
+Malformed backend packets are canceled in both modes; the default
+`omitParseErrors = false` additionally disconnects only the matching downstream
+session. Forwarded login JSON retains custom skin, animation, device/platform,
+and unknown fields while normalizing destination- and version-specific values.
 
 ## Run The Relay Example
 
@@ -259,16 +293,20 @@ Relay tests run through every bundled protocol version in `protocol-roundtrip`. 
 Expected summary:
 
 ```text
-[ROUNDTRIP] checkedVersions=50 failures=0
+[ROUNDTRIP] checkedVersions=48 failures=0
 ```
 
 ## What Is Not Done Yet
 
-To become a full JavaScript-style network relay, the library still needs:
+Remaining JavaScript-style relay work includes:
 
-- Complete Player session state after `join`, including close/disconnect behavior, batching, compression transitions, and encrypted packet queues.
-- More complete `createRelayServer` bridge behavior for all login/resource-pack/start-game edge cases.
-- Login/resource-pack/session state mapping between downstream and upstream.
-- Live regression tests where a real Bedrock client joins the C++ proxy and the proxy joins an upstream server.
+- More `createRelayServer` edge-case parity around unusual login,
+  resource-pack, respawn, and reconnect sequences.
 
-The packet rewrite core is now in place, so the next work should build the server listener around this API instead of inventing a separate relay model.
+The native server Player now includes immediate writes, raw packet admission,
+20 ms queue batching, compression/encryption-aware batch flushes, and close
+lifecycle handling. `live-relay-smoke` exercises version and Realm paths,
+`live-relay-multi-client-smoke` verifies two isolated encrypted routes,
+single-session teardown, and `forceSingle`; `live-relay-options-smoke` verifies
+cache negotiation, custom login metadata, and both parse-error policies; and
+`server-outbound-queue-smoke` verifies the exact encrypted batch boundaries.

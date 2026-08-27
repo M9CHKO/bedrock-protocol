@@ -392,20 +392,35 @@ bool checkCompressionGoldens() {
         return false;
     }
 
-    try {
-        (void) modern.encodeCompressionPacket(
-            {modernOverBoundary},
-            "snappy",
-            7,
-            512
-        );
-        std::cerr << "[SMOKE] oversized snappy batch did not throw\n";
+    const auto modernSnappy = modern.encodeCompressionPacket(
+        {modernOverBoundary},
+        "snappy",
+        7,
+        512
+    );
+    if (modernSnappy.empty() || modernSnappy[0] != 0x01 ||
+        modernSnappy.size() >= modernAtRaw.size() ||
+        modern.decodeCompressionPacket(modernSnappy).framedBatch.size() != 513) {
+        std::cerr << "[SMOKE] oversized modern snappy batch mismatch\n";
         return false;
-    } catch (const std::exception& error) {
-        if (std::string(error.what()) != "Snappy compression not implemented") {
-            std::cerr << "[SMOKE] snappy error mismatch: " << error.what() << "\n";
-            return false;
-        }
+    }
+
+    const auto legacySnappy = legacy.encodeCompressionPacket(
+        {legacyOverBoundary},
+        "snappy",
+        7,
+        512
+    );
+    const auto legacySnappyDecoded = legacy.decodeCompressionPacket(
+        legacySnappy,
+        "snappy"
+    );
+    if (legacySnappy.empty() || legacySnappy[0] == 0x01 ||
+        legacySnappy.size() >= legacyAtFramed.size() ||
+        legacySnappyDecoded.compressionHeader != 0x01 ||
+        legacySnappyDecoded.framedBatch.size() != 513) {
+        std::cerr << "[SMOKE] oversized legacy snappy batch mismatch\n";
+        return false;
     }
 
     // Fixed Node encryption.js fixture: one framed three-byte packet becomes
@@ -1925,7 +1940,13 @@ bool checkIncomingCloseLifecycle(uint8_t closeId) {
         server.close();
         return false;
     }
-    for (int attempt = 0; attempt < 100 && closeEvents.load() == 0; ++attempt) {
+    // The close callback intentionally runs before the peer table/count is
+    // erased. Wait for both sides of that observable ordering instead of
+    // racing the worker immediately after closeEvents becomes visible.
+    for (int attempt = 0;
+         attempt < 100 &&
+         (closeEvents.load() == 0 || server.clientCount() != 0);
+         ++attempt) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
 

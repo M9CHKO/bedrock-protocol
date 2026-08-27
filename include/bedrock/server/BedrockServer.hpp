@@ -9,10 +9,12 @@
 #include <bedrock/debug/ProtocolTypeTsvIndex.hpp>
 #include <bedrock/generated/GeneratedProtocolTypes.hpp>
 #include <bedrock/protocol/ProtocolDefinition.hpp>
+#include <bedrock/protocol/SnappyCodec.hpp>
 #include <bedrock/protocol/VersionedMcpeCodec.hpp>
 #include <bedrock/protodef/ProtoDefContext.hpp>
 #include <bedrock/protodef/ProtoDefDecoder.hpp>
 #include <bedrock/protodef/ProtoDefField.hpp>
+#include <bedrock/protodef/ProtoDefPacketDecoder.hpp>
 #include <bedrock/protodef/ProtoDefPacketEncoder.hpp>
 #include <bedrock/protodef/ProtoDefReader.hpp>
 #include <bedrock/protodef/ProtoDefValue.hpp>
@@ -63,6 +65,9 @@ struct BedrockServerOptions {
     uint16_t compressionThreshold = 512;
     std::string compressionAlgorithm = "deflate";
     int compressionLevel = 7;
+    // connection.js starts one outbound queue timer per Player and uses
+    // `options.batchingInterval || 20` as its period.
+    int batchingInterval = 20;
 };
 
 class BedrockServer;
@@ -183,6 +188,7 @@ public:
         // otherwise be destroyed after those callback targets. Stop and join
         // its worker while every captured map/mutex is still alive.
         closing_ = true;
+        stopOutboundQueueScheduler();
         raknet_.close();
         stopPlayerCloseScheduler();
     }
@@ -272,6 +278,8 @@ public:
                 sessions_[key] = std::move(session);
                 ++clientCount_;
             }
+
+            ensureOutboundQueueScheduler();
 
             for (auto& handler : connectHandlers_) {
                 handler(connection);
@@ -546,13 +554,145 @@ public:
         const ProtoDefValue& value,
         VersionedMcpeCompression compression = VersionedMcpeCompression::Automatic
     ) {
-        ProtoDefPacketEncoder encoder(options_.version);
+        const auto session = sessionSnapshot(connection);
+        if (!session) return;
+        std::lock_guard<std::recursive_mutex> outboundLock(session->outboundMutex);
+        ProtoDefPacketEncoder encoder(
+            options_.version,
+            playerProtocolTypes_,
+            session->protoDefVariables
+        );
         auto payload = encoder.encodePacket(packetName, value);
         sendPacket(
             connection,
             mcpeCodec_.packetCodec().makePacketByName(packetName, payload),
             compression
         );
+    }
+
+    // Connection#write serializes and sends one packet immediately.
+    void write(
+        const BedrockServerConnection& connection,
+        const std::string& packetName,
+        const ProtoDefValue& value,
+        VersionedMcpeCompression compression = VersionedMcpeCompression::Automatic
+    ) {
+        send(connection, packetName, value, compression);
+    }
+
+    // Connection#queue serializes immediately, then lets the Player queue
+    // timer combine all pending full packets into one encrypted/compressed
+    // batch. level_chunk follows connection.js's sendBuffer(false) path and
+    // therefore remains queued as well.
+    void queue(
+        const BedrockServerConnection& connection,
+        const std::string& packetName,
+        const ProtoDefValue& value,
+        VersionedMcpeCompression compression = VersionedMcpeCompression::Automatic
+    ) {
+        const auto session = sessionSnapshot(connection);
+        if (!session) return;
+        std::lock_guard<std::recursive_mutex> outboundLock(session->outboundMutex);
+        ProtoDefPacketEncoder encoder(
+            options_.version,
+            playerProtocolTypes_,
+            session->protoDefVariables
+        );
+        auto payload = encoder.encodePacket(packetName, value);
+        queuePacket(
+            connection,
+            mcpeCodec_.packetCodec().makePacketByName(packetName, payload),
+            compression
+        );
+    }
+
+    void queuePacket(
+        const BedrockServerConnection& connection,
+        const VersionedGamePacket& packet,
+        VersionedMcpeCompression compression = VersionedMcpeCompression::Automatic
+    ) {
+        queuePackets(connection, {packet}, compression);
+    }
+
+    void queuePackets(
+        const BedrockServerConnection& connection,
+        const std::vector<VersionedGamePacket>& packets,
+        VersionedMcpeCompression compression = VersionedMcpeCompression::Automatic
+    ) {
+        if (packets.empty()) return;
+        const auto session = sessionSnapshot(connection);
+        if (!session) return;
+        std::lock_guard<std::recursive_mutex> outboundLock(session->outboundMutex);
+
+        for (const auto& packet : packets) {
+            processOutboundPacket(session, packet);
+        }
+        {
+            std::lock_guard<std::mutex> lock(session->mutex);
+            if (session->status == BedrockServerClientStatus::Disconnected) {
+                return;
+            }
+            session->queuedPackets.reserve(
+                session->queuedPackets.size() + packets.size()
+            );
+            for (const auto& packet : packets) {
+                session->queuedPackets.push_back({packet, compression});
+            }
+        }
+        ensureOutboundQueueScheduler();
+    }
+
+    // `buffer` is the serializer's complete packet buffer: packet id varuint
+    // followed by its payload, without the outer batch length prefix.
+    void sendBuffer(
+        const BedrockServerConnection& connection,
+        const std::vector<uint8_t>& buffer,
+        bool immediate = false,
+        VersionedMcpeCompression compression = VersionedMcpeCompression::Automatic
+    ) {
+        auto packet = mcpeCodec_.packetCodec().decodeFullPacket(buffer);
+        if (immediate) {
+            sendPacket(connection, packet, compression);
+        } else {
+            queuePacket(connection, packet, compression);
+        }
+    }
+
+    // Exposes Connection#_tick as a deterministic C++ flush boundary while
+    // the normal live path invokes it from the batching timer.
+    void sendQueued(const BedrockServerConnection& connection) {
+        const auto session = sessionSnapshot(connection);
+        if (!session) return;
+        std::lock_guard<std::recursive_mutex> outboundLock(session->outboundMutex);
+
+        std::vector<QueuedPacket> queued;
+        {
+            std::lock_guard<std::mutex> lock(session->mutex);
+            if (session->status == BedrockServerClientStatus::Disconnected ||
+                session->queuedPackets.empty()) {
+                return;
+            }
+            queued = std::move(session->queuedPackets);
+            session->queuedPackets.clear();
+        }
+
+        std::size_t begin = 0;
+        while (begin < queued.size()) {
+            const auto compression = queued[begin].compression;
+            std::size_t end = begin + 1;
+            while (end < queued.size() &&
+                   queued[end].compression == compression) {
+                ++end;
+            }
+
+            std::vector<VersionedGamePacket> packets;
+            packets.reserve(end - begin);
+            for (std::size_t index = begin; index < end; ++index) {
+                packets.push_back(std::move(queued[index].packet));
+            }
+            sendPackets(connection, packets, compression);
+            begin = end;
+        }
     }
 
     void sendPacket(
@@ -578,6 +718,11 @@ public:
         const auto session = sessionSnapshot(connection);
         if (!session) {
             return;
+        }
+        std::lock_guard<std::recursive_mutex> outboundLock(session->outboundMutex);
+
+        for (const auto& packet : packets) {
+            processOutboundPacket(session, packet);
         }
         std::vector<uint8_t> mcpe;
         {
@@ -666,6 +811,14 @@ public:
         schedulePlayerClose(connection, std::chrono::milliseconds(100));
     }
 
+    // Native transport drop used by Relay#forceSingle. Unlike disconnect(),
+    // this does not manufacture an MCPE disconnect packet for a connection
+    // that the relay rejected before constructing its public Player session.
+    void closeConnection(const BedrockServerConnection& connection) {
+        if (!hasActivePlayer(connection)) return;
+        closePlayer(connection);
+    }
+
     void sendDisconnectStatus(
         const BedrockServerConnection& connection,
         const std::string& playStatus
@@ -723,6 +876,11 @@ private:
     std::unordered_map<std::string, BedrockServerConnection> connections_;
     std::atomic<int> clientCount_ {0};
     std::atomic<bool> closing_ {false};
+
+    mutable std::mutex outboundQueueMutex_;
+    std::condition_variable outboundQueueCv_;
+    std::thread outboundQueueThread_;
+    bool outboundQueueStopping_ = false;
 
     struct ScheduledPlayerClose {
         std::chrono::steady_clock::time_point deadline;
@@ -1025,8 +1183,17 @@ private:
         }
     }
 
+    struct QueuedPacket {
+        VersionedGamePacket packet;
+        VersionedMcpeCompression compression = VersionedMcpeCompression::Automatic;
+    };
+
     struct SessionState {
         mutable std::mutex mutex;
+        // Node runs queue admission, _tick, and write on one event loop.
+        // Serialize those boundaries per Player while allowing sendQueued()
+        // to call the ordinary sendPackets() path recursively.
+        mutable std::recursive_mutex outboundMutex;
         BedrockClientKeyPair serverKeys;
         std::vector<uint8_t> salt;
         std::string clientPublicKeyDerBase64;
@@ -1044,7 +1211,94 @@ private:
         int compressionLevel = 7;
         uint64_t sendCounter = 0;
         uint64_t receiveCounter = 0;
+        ProtoDefVariableStorePtr protoDefVariables = makeProtoDefVariableStore();
+        std::vector<QueuedPacket> queuedPackets;
     };
+
+    std::chrono::milliseconds outboundQueueInterval() const {
+        // JavaScript's `value || 20` keeps zero on the default and Node's
+        // timer clamps a negative delay to its one-millisecond minimum.
+        if (options_.batchingInterval == 0) {
+            return std::chrono::milliseconds(20);
+        }
+        return std::chrono::milliseconds(std::max(options_.batchingInterval, 1));
+    }
+
+    void processOutboundPacket(
+        const std::shared_ptr<SessionState>& session,
+        const VersionedGamePacket& packet
+    ) {
+        if (packet.name != "start_game" && packet.name != "item_registry") {
+            return;
+        }
+        ProtoDefPacketDecoder decoder(
+            options_.version,
+            playerProtocolTypes_,
+            session->protoDefVariables
+        );
+        (void) decoder.decodePacket(packet.name, packet.payload);
+    }
+
+    void ensureOutboundQueueScheduler() {
+        std::lock_guard<std::mutex> lock(outboundQueueMutex_);
+        if (outboundQueueStopping_ || closing_.load() ||
+            outboundQueueThread_.joinable()) {
+            return;
+        }
+        outboundQueueThread_ = std::thread([this]() {
+            runOutboundQueueScheduler();
+        });
+    }
+
+    void runOutboundQueueScheduler() {
+        const auto interval = outboundQueueInterval();
+        std::unique_lock<std::mutex> lock(outboundQueueMutex_);
+        while (!outboundQueueStopping_) {
+            if (outboundQueueCv_.wait_for(lock, interval, [this]() {
+                    return outboundQueueStopping_;
+                })) {
+                break;
+            }
+
+            lock.unlock();
+            flushOutboundQueues();
+            lock.lock();
+        }
+    }
+
+    void flushOutboundQueues() {
+        std::vector<BedrockServerConnection> players;
+        {
+            std::lock_guard<std::mutex> lock(serverStateMutex_);
+            players.reserve(connections_.size());
+            for (const auto& [key, connection] : connections_) {
+                (void) key;
+                players.push_back(connection);
+            }
+        }
+
+        for (const auto& player : players) {
+            try {
+                sendQueued(player);
+            } catch (...) {
+                // Never let one malformed outbound batch terminate the
+                // process from a std::thread boundary. Serialization errors
+                // still surface synchronously from queue()/sendBuffer().
+            }
+        }
+    }
+
+    void stopOutboundQueueScheduler() {
+        {
+            std::lock_guard<std::mutex> lock(outboundQueueMutex_);
+            outboundQueueStopping_ = true;
+        }
+        outboundQueueCv_.notify_all();
+        if (outboundQueueThread_.joinable() &&
+            outboundQueueThread_.get_id() != std::this_thread::get_id()) {
+            outboundQueueThread_.join();
+        }
+    }
 
     std::unordered_map<std::string, std::shared_ptr<SessionState>> sessions_;
 
@@ -1175,7 +1429,7 @@ private:
                 return body;
             }
             if (compressor == 1) {
-                throw std::runtime_error("Snappy compression not implemented");
+                return SnappyCodec::decompress(body);
             }
             throw std::runtime_error(
                 "Unknown compression type " + std::to_string(compressor)
@@ -1184,9 +1438,23 @@ private:
 
         // Framer.decode treats failed session-wide decompression as an
         // uncompressed batch on legacy versions and before network_settings.
+        // A raw pre-negotiation batch can itself be a structurally valid
+        // Snappy block, so there is no reliable probe like zlib's checksumless
+        // stream parser. request_network_settings is always sent raw and makes
+        // the session compressor authoritative only after the response.
+        if (!compressionReady && options_.compressionAlgorithm == "snappy") {
+            return compressionPacket;
+        }
         if (options_.compressionAlgorithm == "deflate") {
             try {
                 return inflatePlayerRaw(compressionPacket);
+            } catch (const std::exception&) {
+                return compressionPacket;
+            }
+        }
+        if (options_.compressionAlgorithm == "snappy") {
+            try {
+                return SnappyCodec::decompress(compressionPacket);
             } catch (const std::exception&) {
                 return compressionPacket;
             }
@@ -1207,7 +1475,10 @@ private:
         return generatedProtocolTypeJson(typeName);
     }
 
-    void validatePlayerPacket(const VersionedGamePacket& packet) const {
+    void validatePlayerPacket(
+        const BedrockServerConnection& connection,
+        const VersionedGamePacket& packet
+    ) const {
         if (!mcpeCodec_.definition().hasPacket(packet.packetId)) {
             throw std::runtime_error("unknown packet id");
         }
@@ -1227,6 +1498,11 @@ private:
         ProtoDefDecoder decoder([this](const std::string& nestedType) {
             return resolvePlayerProtocolType(nestedType);
         });
+        const auto session = sessionSnapshot(connection);
+        if (!session) {
+            throw std::runtime_error("player session not found");
+        }
+        decoder.setVariables(session->protoDefVariables->snapshot());
         decoder.decode(*typeJson, reader, "", fields, context);
         if (std::any_of(
                 fields.begin(),
@@ -1264,7 +1540,7 @@ private:
 
             try {
                 auto packet = mcpeCodec_.packetCodec().decodeFullPacket(fullPacket);
-                validatePlayerPacket(packet);
+                validatePlayerPacket(connection, packet);
                 packets.push_back(std::move(packet));
             } catch (const std::exception&) {
                 // serverPlayer.readPacket catches only deserializer failures,
@@ -1590,7 +1866,13 @@ private:
         if (!hasActivePlayer(connection)) {
             return;
         }
-        ProtoDefPacketEncoder encoder(options_.version);
+        const auto session = sessionSnapshot(connection);
+        if (!session) return;
+        ProtoDefPacketEncoder encoder(
+            options_.version,
+            playerProtocolTypes_,
+            session->protoDefVariables
+        );
         auto payload = encoder.encodePacket(packetName, value);
         auto packet = mcpeCodec_.packetCodec().makePacketByName(packetName, payload);
         auto framed = mcpeCodec_.batchCodec().encodeFramedBatch({packet});

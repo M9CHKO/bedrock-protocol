@@ -5,6 +5,7 @@
 #include <bedrock/auth/AuthCache.hpp>
 #include <bedrock/auth/BedrockAuthJwt.hpp>
 #include <bedrock/auth/JsRuntimeValue.hpp>
+#include <bedrock/auth/LiveTokenManager.hpp>
 #include <bedrock/auth/MsaTokenManager.hpp>
 
 #include <cstdint>
@@ -97,7 +98,9 @@ struct XboxLiveLoginPacket {
 
 struct PrismarineAuthFlowRuntime {
     MsalConfigPtr effectiveMsalConfig;
+    std::shared_ptr<LiveTokenManager> live;
     std::shared_ptr<MsaTokenManager> msa;
+    bool doTitleAuth = false;
 };
 
 class XboxLiveAuth {
@@ -139,7 +142,8 @@ public:
         AuthCachePtr msaCache,
         MsalPublicClientApplicationFactory applicationFactory = {},
         std::shared_ptr<JsMicrotaskQueue> microtaskQueue = {},
-        MsaTokenManagerObservers observers = {}
+        MsaTokenManagerObservers observers = {},
+        LiveTokenManagerDependencies liveDependencies = {}
     );
 
     static bool isTruthyMsalConfig(const MsalConfigPtr& msalConfig);

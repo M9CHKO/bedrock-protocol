@@ -1,6 +1,7 @@
 #include <bedrock/protocol/BatchCodec.hpp>
 
 #include <bedrock/protocol/GamePacketCodec.hpp>
+#include <bedrock/protocol/SnappyCodec.hpp>
 
 #include <zlib.h>
 
@@ -29,6 +30,7 @@ std::vector<uint8_t> BatchCodec::encodeCompressionPacket(
     std::vector<uint8_t> out;
 
     bool useDeflate = false;
+    bool useSnappy = false;
 
     switch (mode) {
         case CompressionMode::AlwaysDeflate:
@@ -42,11 +44,23 @@ std::vector<uint8_t> BatchCodec::encodeCompressionPacket(
         case CompressionMode::Never:
             useDeflate = false;
             break;
+
+        case CompressionMode::AlwaysSnappy:
+            useSnappy = true;
+            break;
+
+        case CompressionMode::SnappyThreshold:
+            useSnappy = framedPackets.size() >= threshold;
+            break;
     }
 
     if (useDeflate) {
         out.push_back(0x00);
         auto compressed = deflateRaw(framedPackets);
+        out.insert(out.end(), compressed.begin(), compressed.end());
+    } else if (useSnappy) {
+        out.push_back(0x01);
+        auto compressed = SnappyCodec::compress(framedPackets);
         out.insert(out.end(), compressed.begin(), compressed.end());
     } else {
         out.push_back(0xff);
@@ -81,6 +95,10 @@ std::vector<uint8_t> BatchCodec::decodeCompressionPacket(
 
     if (header == 0xff) {
         return body;
+    }
+
+    if (header == 0x01) {
+        return SnappyCodec::decompress(body);
     }
 
     throw std::runtime_error(

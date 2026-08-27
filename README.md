@@ -45,17 +45,53 @@ int main() {
 - `NetworkSettingsRequest` / `NetworkSettings`.
 - Login packet generation with versioned `clientData`.
 - Xbox Live auth for online servers through profile cache and interactive device-code login.
+- Native Bedrock auth primitives include `LiveTokenManager`,
+  `MsaTokenManager`, `XboxTokenManager`, `MinecraftBedrockTokenManager`,
+  `MinecraftBedrockServicesTokenManager`, and `PlayfabTokenManager` from
+  `prismarine-auth`, with their Bedrock-only `MicrosoftAuthFlow`
+  orchestration used by online client login. The Minecraft Java manager and
+  its separate cache are intentionally outside this library.
+- Minecraft Bedrock Realms discovery and connection by numeric Realm id,
+  `realms.gg` invite, or picker callback. The native `BedrockRealmApi` also
+  ports the Bedrock worlds, invites, backups/downloads, subscriptions, slots,
+  player permissions, blocklist, texture-pack policy, and exponential 5xx
+  retry paths from `prismarine-realms`; its Java Realms API is intentionally
+  not included.
 - Offline/self-signed auth for local offline servers.
 - Resource pack response flow.
-- Compression handling for old and new Bedrock protocol shapes.
+- Deflate-raw and native raw Snappy block compression for both legacy
+  session-wide batches and modern per-packet compressor headers, with no Node
+  runtime dependency.
 - Packet id/name decoding across bundled protocol versions.
 - Schema-based packet encoding and `client.write(packetName, bedrock::object({...}))` for packets in the bundled version registry.
+- Packet-level `nbt`, `lnbt`, and `nbtLoop` encoding/decoding through the
+  native Bedrock NBT codec. Values use prismarine-nbt's
+  `{ "type", "name", "value" }` shape, cover tags 0-12, and are retained as
+  structured `ProtoDefValue` data by the packet/relay decoder.
+- ProtoDef `setVariable` switch branches and persistent item-palette state,
+  including automatic `ShieldItemID` updates from `start_game` or
+  `item_registry` and full decoding of encapsulated `Item.extra` payloads.
+- Lossless structured packet decoding for `buffer`/`ByteArray`/`restBuffer`,
+  canonical UUIDs, signed and zigzag array counts, and relay-safe restoration
+  of empty arrays, absent options, metadata loops, and `void` switch branches.
+- ProtoDef-compatible 8/16/32/64/128-bit Bedrock flag sets, including
+  `varint64` input flags, signed `zigzag64` entity metadata, composite flag
+  masks, and lossless preservation of unknown raw bits during relay rewrites.
+- Scoped ProtoDef constructor parsing for nested containers/switches, omission
+  of inactive switch placeholders in relay values, and persistent packet
+  variables in event dispatchers and packet inspectors.
 - Optional deep packet JSON decoding for debugging.
 - `bedrock-protocol`-style in-process client creation and event handlers.
 - Packet-level relay core with `clientbound` / `serverbound` events, `cancel()`, `replace()`, MCPE repacking, forced `client_cache_status`, and level chunk queueing before `start_game`.
-- Early `createServer` runtime: RakNet ping/open-connection listener, connected RakNet request handling, MCPE packet events, `request_network_settings -> network_settings`, login handshake JWT, encrypted `client_to_server_handshake`, empty resource-pack info/stack flow, and `join` event.
-- Live relay runtime (`createRelayServer`) and test listener example (`relay-test-server`) that let a Bedrock client join the C++ listener while an upstream C++ client connects to a real server.
-- Bedrock chunk/world foundation inspired by `prismarine-chunk`, including paletted subchunks, the 1.18 single-runtime-palette case, biome sections, no-cache `level_chunk`, cache blob status/miss handling, and a tracked `client.world()`.
+- Native `createServer` runtime: RakNet listener, authenticated/offline Player lifecycle, compression and encryption transitions, packet/status/login/join/spawn/close events, immediate `write`, timed `queue` batching, raw `sendBuffer`, and explicit `sendQueued` flushes. All of these paths are Bedrock-only.
+- Live relay runtime (`Relay` / `createRelayServer`) with one isolated upstream
+  C++ client, queues, packet-variable store, and lifecycle per accepted
+  downstream Bedrock player. Multiple clients are supported concurrently;
+  `forceSingle` restores the single-client rejection mode, and each destination
+  can be a real Bedrock server or Bedrock Realm. Relay login preserves custom
+  skin/client metadata per session, and high-level `logging`,
+  `enableChunkCaching`, and `omitParseErrors` match the Bedrock JavaScript path.
+- Bedrock chunk/world foundation ported from `prismarine-chunk`, including runtime and local/network-persistent paletted subchunks, full `little`/`littleVarint` NBT block-state palettes and block entities, the legacy and batched 1.18+ `subchunk` packet shapes, 2D/3D biome sections, no-cache and cached chunk-section decoding, cache blob status/miss handling, and a tracked `client.world()` that consumes standalone subchunk responses.
 - CMake package install for separate bot projects.
 - Windows through MSYS2/MinGW, Linux, and Termux builds.
 
@@ -136,6 +172,7 @@ auto client = bedrock::createClient({
 | `flow` | conditional | Becomes `live` only while applying the unset-`authTitle` default; an explicit title leaves it unchanged. |
 | `xboxClientId` | empty | Deprecated C++ compatibility alias for `authTitle`; explicit `authTitle` takes precedence. |
 | `authCacheRoot` | auto | Optional Xbox auth/key cache root. Empty uses the hidden default cache folder. |
+| `realms` | disabled | Bedrock Realm selector. Set `realms.realmId`, `realms.realmInvite`, or `realms.pickRealm`; Realm auth resolves `host`/`port` before ping and reuses the same Authflow for game login. |
 | `clientCacheEnabled` | `false` | Sends the client cache preference used by chunk cache flow. 
 | `chunkRadius` | `10` | Requested chunk radius during automatic start-game initialization. |
 | `debug` | `Off` | `Off`, `Events`, `Packets`, `Json`, or `Trace`. |
@@ -143,6 +180,26 @@ auto client = bedrock::createClient({
 | `packetDump` | `false` | Print extra packet dump output. |
 
 `bedrock::createClient()` is the normal in-process API. The old helper-process wrapper is still available as `bedrock::createExternalClient(...)` for compatibility with older local tests.
+
+Connect to a Bedrock Realm by id:
+
+```cpp
+bedrock::Options options;
+options.username = "Xbox account email";
+options.realms.realmId = 1112223;
+
+auto client = bedrock::createClient(std::move(options));
+return client.run();
+```
+
+For an invite use `options.realms.realmInvite =
+"https://realms.gg/AB1CD2EFA3B"`. A picker can return one item from the
+`std::vector<bedrock::BedrockRealm>` passed to `options.realms.pickRealm`.
+An asynchronous native picker can return `std::future<BedrockRealm>` through
+`options.realms.pickRealmAsync`. Realm ids may be assigned as integers or
+decimal strings.
+When Realms are enabled, `followPort` defaults to false, matching
+`bedrock-protocol`; an explicitly supplied `followPort` value is retained.
 
 Events:
 

@@ -3,6 +3,7 @@
 #include <bedrock/events/BedrockPacketEvent.hpp>
 #include <bedrock/events/BedrockPacketEventAdapter.hpp>
 #include <bedrock/protocol/GamePacket.hpp>
+#include <bedrock/protodef/ProtoDefVariables.hpp>
 
 #include <functional>
 #include <string>
@@ -32,8 +33,11 @@ public:
         std::vector<BedrockPacketEventHandler> anyHandlers_;
     };
 
-    explicit BedrockPacketEventDispatcher(std::string minecraftVersion)
-        : minecraftVersion_(std::move(minecraftVersion)) {}
+    explicit BedrockPacketEventDispatcher(
+        std::string minecraftVersion,
+        ProtoDefVariableStorePtr variables = {}
+    ) : minecraftVersion_(std::move(minecraftVersion)),
+        variables_(variables ? std::move(variables) : makeProtoDefVariableStore()) {}
 
     EventBus& events() {
         return events_;
@@ -47,8 +51,20 @@ public:
         namedHandlers_[packetName].push_back(std::move(handler));
     }
 
+    ProtoDefVariableStorePtr variableStore() const {
+        return variables_;
+    }
+
+    void setVariable(std::string key, std::string value) {
+        variables_->setVariable(std::move(key), std::move(value));
+    }
+
     BedrockPacketEvent dispatch(const GamePacket& packet) {
-        auto event = BedrockPacketEventAdapter::fromGamePacket(packet, minecraftVersion_);
+        auto event = BedrockPacketEventAdapter::fromGamePacket(
+            packet,
+            minecraftVersion_,
+            variables_
+        );
 
         events_.emit(event);
 
@@ -64,6 +80,7 @@ public:
 
 private:
     std::string minecraftVersion_;
+    ProtoDefVariableStorePtr variables_;
     EventBus events_;
     std::unordered_map<std::string, std::vector<BedrockPacketEventHandler>> namedHandlers_;
 };

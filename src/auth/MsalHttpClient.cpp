@@ -674,6 +674,9 @@ MsalHttpResponse sendBlocking(MsalHttpRequest request) {
     if (!isPost && !isGet) {
         throw std::invalid_argument("Unsupported MSAL HTTP method");
     }
+    if (request.maxRedirects < 0) {
+        throw std::invalid_argument("maxRedirects must not be negative");
+    }
 
     TemporaryRequestDirectory temporary;
     const auto requestBody = temporary.path() / "request.bin";
@@ -721,14 +724,24 @@ MsalHttpResponse sendBlocking(MsalHttpRequest request) {
 
     std::string config;
     config += "silent\nshow-error\nhttp1.1\ngloboff\n";
+    if (request.decompress) config += "compressed\n";
+    if (request.maxRedirects > 0) {
+        config += "location\nmax-redirs = " +
+            std::to_string(request.maxRedirects) + "\n";
+    }
     // HttpClient(proxyUrl === "") does not honor ambient proxy variables.
     config += "noproxy = \"*\"\n";
-    config += "request = " + curlConfigQuote(isPost ? "POST" : "GET") +
-        "\n";
+    // An explicit POST would force curl to retain POST across 301/302. Axios'
+    // follow-redirects adapter switches that login redirect to GET, so let
+    // data-binary select POST when redirect following is enabled.
+    if (!(isPost && request.maxRedirects > 0)) {
+        config += "request = " +
+            curlConfigQuote(isPost ? "POST" : "GET") + "\n";
+    }
     config += "dump-header = " + curlConfigQuote(responseHeaders.string()) +
         "\n";
     config += "output = " + curlConfigQuote(responseBody.string()) + "\n";
-    config += "write-out = \"%{http_code}\"\n";
+    config += "write-out = \"%{http_code}\\n%{url_effective}\"\n";
     for (const auto& [name, value] : headers) {
         // `Header:` removes curl's internal header; `Header;` asks curl to
         // transmit a deliberately empty header supplied by the caller.
@@ -768,7 +781,15 @@ MsalHttpResponse sendBlocking(MsalHttpRequest request) {
         ));
     }
 
-    const auto statusText = trimHeaderValue(readFile(statusFile));
+    const auto transportResult = readFile(statusFile);
+    const auto resultSeparator = transportResult.find('\n');
+    const auto statusText = trimHeaderValue(transportResult.substr(
+        0,
+        resultSeparator
+    ));
+    const auto effectiveUrl = resultSeparator == std::string::npos
+        ? std::string()
+        : trimHeaderValue(transportResult.substr(resultSeparator + 1));
     char* statusEnd = nullptr;
     const long status = std::strtol(statusText.c_str(), &statusEnd, 10);
     if (!statusEnd || statusEnd != statusText.c_str() + statusText.size() ||
@@ -780,6 +801,7 @@ MsalHttpResponse sendBlocking(MsalHttpRequest request) {
 
     MsalHttpResponse response;
     response.status = static_cast<int>(status);
+    response.url = effectiveUrl;
     const auto parsedHeaderBlock =
         parseFinalHeaderBlock(readFile(responseHeaders));
     auto normalizedHeaders =

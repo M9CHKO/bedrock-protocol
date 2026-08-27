@@ -10,7 +10,9 @@ namespace bedrock {
 enum class CompressionMode {
     AlwaysDeflate,
     Threshold,
-    Never
+    Never,
+    AlwaysSnappy,
+    SnappyThreshold
 };
 
 class BatchCodec {
@@ -26,6 +28,7 @@ public:
 
     // compressionPacket:
     // 0x00 + deflateRaw(framedPackets)
+    // 0x01 + snappyRaw(framedPackets)
     // 0xff + framedPackets
     static std::vector<uint8_t> encodeCompressionPacket(
         const std::vector<uint8_t>& framedPackets,

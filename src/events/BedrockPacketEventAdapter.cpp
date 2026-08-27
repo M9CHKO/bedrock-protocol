@@ -8,7 +8,8 @@ namespace bedrock {
 
 BedrockPacketEvent BedrockPacketEventAdapter::fromGamePacket(
     const GamePacket& packet,
-    const std::string& minecraftVersion
+    const std::string& minecraftVersion,
+    ProtoDefVariableStorePtr variables
 ) {
     BedrockPacketEvent event;
     event.version = minecraftVersion;
@@ -18,7 +19,7 @@ BedrockPacketEvent BedrockPacketEventAdapter::fromGamePacket(
     event.payload = packet.payload;
 
     try {
-        bedrock::ProtoDefPacketDecoder protoDecoder(minecraftVersion);
+        bedrock::ProtoDefPacketDecoder protoDecoder(minecraftVersion, std::move(variables));
         auto protoFields = protoDecoder.decodePacket(packet.name, packet.payload);
 
         for (const auto& field : protoFields) {

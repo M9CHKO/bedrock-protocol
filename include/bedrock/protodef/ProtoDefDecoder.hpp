@@ -4,11 +4,15 @@
 
 #include <bedrock/protodef/ProtoDefContext.hpp>
 #include <bedrock/protodef/ProtoDefField.hpp>
+#include <bedrock/protodef/ProtoDefJson.hpp>
+#include <bedrock/protodef/ProtoDefNbt.hpp>
 #include <bedrock/protodef/ProtoDefReader.hpp>
+#include <bedrock/protodef/ProtoDefVariables.hpp>
 #include <bedrock/generated/GeneratedProtocolTypes.hpp>
 
 #include <cctype>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -25,6 +29,46 @@ public:
 
     explicit ProtoDefDecoder(TypeResolver resolver)
         : resolver_(std::move(resolver)) {}
+
+    void setVariable(std::string key, std::string value) {
+        variables_[std::move(key)] = std::move(value);
+    }
+
+    void setVariable(std::string key, const char* value) {
+        setVariable(std::move(key), value ? std::string(value) : std::string());
+    }
+
+    void setVariable(std::string key, bool value) {
+        setVariable(std::move(key), value ? "true" : "false");
+    }
+
+    template<std::integral T>
+        requires (!std::same_as<T, bool>)
+    void setVariable(std::string key, T value) {
+        if constexpr (std::signed_integral<T>) {
+            setVariable(std::move(key), std::to_string(static_cast<long long>(value)));
+        } else {
+            setVariable(std::move(key), std::to_string(static_cast<unsigned long long>(value)));
+        }
+    }
+
+    template<std::floating_point T>
+    void setVariable(std::string key, T value) {
+        std::ostringstream out;
+        out << std::setprecision(17) << value;
+        setVariable(std::move(key), out.str());
+    }
+
+    void setVariables(const ProtoDefVariableMap& variables) {
+        variables_ = variables;
+    }
+
+    std::optional<std::string> variable(const std::string& key) const {
+        const auto found = variables_.find(key);
+        return found == variables_.end()
+            ? std::nullopt
+            : std::optional<std::string>(found->second);
+    }
 
     void decode(
         const std::string& typeJson,
@@ -222,115 +266,44 @@ private:
         return out;
     }
 
-    static void skipLittleNbtPayloadOnly(ProtoDefReader& reader) {
-        uint8_t tag = reader.u8();
-        if (tag == 0) return;
-        skipNbtPayload(reader, tag);
-    }
-
-
-    static void skipNbtPayload(ProtoDefReader& reader, uint8_t tag) {
-        switch (tag) {
-            case 0: return;
-            case 1: reader.u8(); return;
-            case 2: reader.u16le(); return;
-            case 3: reader.zigzag32(); return;
-            case 4: reader.zigzag64(); return;
-            case 5: reader.skip(4); return;
-            case 6: reader.skip(8); return;
-
-            case 7: {
-                int32_t n = reader.zigzag32();
-                if (n < 0) throw std::runtime_error("negative nbt byteArray length");
-                reader.skip(static_cast<std::size_t>(n));
-                return;
+    static int64_t readCount(
+        ProtoDefReader& reader,
+        const std::string& type,
+        bool allowRemaining,
+        const char* owner
+    ) {
+        auto checkedUnsigned = [&](uint64_t value) -> int64_t {
+            if (value > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+                throw std::runtime_error(std::string(owner) + " count exceeds int64");
             }
+            return static_cast<int64_t>(value);
+        };
 
-            case 8: {
-                reader.string();
-                return;
-            }
-
-            case 9: {
-                uint8_t inner = reader.u8();
-                int32_t n = reader.zigzag32();
-                if (n < 0) throw std::runtime_error("negative nbt list length");
-                for (int32_t i = 0; i < n; ++i) {
-                    skipNbtPayload(reader, inner);
-                }
-                return;
-            }
-
-            case 10: {
-                while (true) {
-                    std::size_t before = reader.offset();
-                    uint8_t inner = reader.u8();
-                    if (inner == 0) return;
-
-                    reader.rewindTo(before);
-                    skipNativeNbt(reader);
-                }
-            }
-
-            case 11: {
-                int32_t n = reader.zigzag32();
-                if (n < 0) throw std::runtime_error("negative nbt intArray length");
-                for (int32_t i = 0; i < n; ++i) {
-                    reader.zigzag32();
-                }
-                return;
-            }
-
-            case 12: {
-                int32_t n = reader.zigzag32();
-                if (n < 0) throw std::runtime_error("negative nbt longArray length");
-                for (int32_t i = 0; i < n; ++i) {
-                    reader.zigzag64();
-                }
-                return;
-            }
-
-            default:
-                throw std::runtime_error("unsupported nbt tag: " + std::to_string(tag));
+        if (type == "u8" || type == "lu8") return reader.u8();
+        if (type == "i8" || type == "li8") {
+            return static_cast<int8_t>(reader.u8());
         }
-    }
-
-    static void skipNativeNbt(ProtoDefReader& reader) {
-        uint8_t tag = reader.u8();
-        if (tag == 0) return;
-
-        // prismarine-nbt littleVarint: type + tagName + payload
-        reader.string();
-
-        skipNbtPayload(reader, tag);
-    }
-
-    static void skipUnnamedNativeNbt(ProtoDefReader& reader) {
-        uint8_t tag = reader.u8();
-        if (tag == 0) return;
-        skipNbtPayload(reader, tag);
-    }
-
-    static void skipAnyLittleNbt(ProtoDefReader& reader) {
-        const std::size_t before = reader.offset();
-
-        try {
-            skipLittleNbtPayloadOnly(reader);
-            return;
-        } catch (...) {
-            reader.rewindTo(before);
+        if (type == "u16") return reader.u16be();
+        if (type == "i16") return static_cast<int16_t>(reader.u16be());
+        if (type == "lu16") return reader.u16le();
+        if (type == "li16") return static_cast<int16_t>(reader.u16le());
+        if (type == "u32") return reader.u32be();
+        if (type == "i32") return reader.i32be();
+        if (type == "lu32") return reader.u32le();
+        if (type == "li32") return reader.i32le();
+        if (type == "varint" || type == "varuint") return reader.varuint32();
+        if (type == "zigzag32") return reader.zigzag32();
+        if (type == "varint64" || type == "varuint64") {
+            return checkedUnsigned(reader.varuint64());
         }
-
-        try {
-            skipNativeNbt(reader);
-            return;
-        } catch (...) {
-            reader.rewindTo(before);
+        if (type == "zigzag64") return reader.zigzag64();
+        if (allowRemaining && type == "remaining") {
+            return checkedUnsigned(reader.remaining());
         }
-
-        skipUnnamedNativeNbt(reader);
+        throw std::runtime_error(
+            std::string(owner) + " unsupported count type: " + type
+        );
     }
-
 
     void decodeEncapsulated(
         const std::string& encapsulatedJson,
@@ -340,47 +313,22 @@ private:
         ProtoDefContext& context
     ) const {
         auto lengthType = readJsonStringField(encapsulatedJson, "lengthType").value_or("varint");
-
-        const std::size_t start = reader.offset();
-
-        int64_t length = 0;
-        if (lengthType == "u8") {
-            length = reader.u8();
-        } else if (lengthType == "u16") {
-            length = reader.u16be();
-        } else if (lengthType == "i16") {
-            length = static_cast<int16_t>(reader.u16be());
-        } else if (lengthType == "lu16") {
-            length = reader.u16le();
-        } else if (lengthType == "u32") {
-            length = reader.u32be();
-        } else if (lengthType == "i32") {
-            length = reader.i32be();
-        } else if (lengthType == "lu32") {
-            length = reader.u32le();
-        } else if (lengthType == "varint" || lengthType == "varuint") {
-            length = reader.varuint32();
-        } else if (lengthType == "li32") {
-            length = reader.i32le();
-        } else {
-            throw std::runtime_error("encapsulated unsupported lengthType: " + lengthType);
+        auto innerType = readJsonValueField(encapsulatedJson, "type");
+        if (!innerType.has_value()) {
+            throw std::runtime_error("encapsulated inner type not found");
         }
+
+        const int64_t length = readCount(reader, lengthType, false, "encapsulated");
 
         if (length < 0) {
             throw std::runtime_error("encapsulated negative length");
         }
 
-        reader.skip(static_cast<std::size_t>(length));
-
-        ProtoDefField field;
-        field.path = path.empty() ? "$encapsulated" : path;
-        field.type = "encapsulated<" + lengthType + ">";
-        field.value = "<encapsulated bytes:" + std::to_string(length) + ">";
-        field.offset = start;
-        field.size = reader.offset() - start;
-
-        out.push_back(field);
-        context.set(field.path, field.value);
+        // bedrock-protocol's encapsulated reader consumes the prefix, then
+        // decodes the configured type directly. The declared length is wire
+        // metadata rather than a bounded slice on the read path.
+        (void) length;
+        decode(*innerType, reader, path, out, context);
     }
 
 
@@ -410,35 +358,15 @@ private:
             auto slash = raw.find('/');
             if (slash != std::string::npos) raw = raw.substr(0, slash);
             count = std::stoll(raw);
-        } else if (countType == "u8") {
-            count = reader.u8();
-        } else if (countType == "u16") {
-            count = reader.u16be();
-        } else if (countType == "i16") {
-            count = static_cast<int16_t>(reader.u16be());
-        } else if (countType == "lu16" || countType == "li16") {
-            count = reader.u16le();
-        } else if (countType == "u32") {
-            count = reader.u32be();
-        } else if (countType == "i32") {
-            count = reader.i32be();
-        } else if (countType == "lu32") {
-            count = reader.u32le();
-        } else if (countType == "varint" || countType == "varuint") {
-            count = reader.varuint32();
-        } else if (countType == "li32") {
-            count = reader.i32le();
-        } else if (countType == "remaining") {
-            count = reader.remaining();
         } else {
-            throw std::runtime_error("buffer unsupported countType: " + countType);
+            count = readCount(reader, countType, true, "buffer");
         }
 
         if (count < 0) {
             throw std::runtime_error("buffer negative count");
         }
 
-        reader.skip(static_cast<std::size_t>(count));
+        auto bytes = reader.readBytes(static_cast<std::size_t>(count));
 
         ProtoDefField field;
         field.path = path.empty() ? "$buffer" : path;
@@ -448,6 +376,7 @@ private:
                 ? "buffer<count:" + *countRef + ">"
                 : "buffer<" + countType + ">";
         field.value = "<Buffer bytes:" + std::to_string(count) + ">";
+        field.structuredValue = ProtoDefValue::bytes(std::move(bytes));
         field.offset = start;
         field.size = reader.offset() - start;
 
@@ -482,30 +411,7 @@ private:
 
         const std::size_t start = reader.offset();
 
-        int64_t count = 0;
-        if (countType == "u8") {
-            count = reader.u8();
-        } else if (countType == "u16") {
-            count = reader.u16be();
-        } else if (countType == "i16") {
-            count = static_cast<int16_t>(reader.u16be());
-        } else if (countType == "lu16") {
-            count = reader.u16le();
-        } else if (countType == "li16") {
-            count = static_cast<int16_t>(reader.u16le());
-        } else if (countType == "u32") {
-            count = reader.u32be();
-        } else if (countType == "i32") {
-            count = reader.i32be();
-        } else if (countType == "lu32") {
-            count = reader.u32le();
-        } else if (countType == "li32") {
-            count = reader.i32le();
-        } else if (countType == "varint" || countType == "varuint") {
-            count = reader.varuint32();
-        } else {
-            throw std::runtime_error("pstring unsupported countType: " + countType);
-        }
+        const int64_t count = readCount(reader, countType, false, "pstring");
 
         if (count < 0) {
             throw std::runtime_error("pstring negative length");
@@ -641,13 +547,15 @@ private:
         const std::size_t start = reader.offset();
 
         std::string numeric;
-        if (*baseType == "u8") {
+        if (*baseType == "u8" || *baseType == "lu8") {
             uint8_t v = 0;
             if (!reader.tryU8(v)) {
                 numeric = "<missing:u8>";
             } else {
                 numeric = std::to_string(v);
             }
+        } else if (*baseType == "i8" || *baseType == "li8") {
+            numeric = std::to_string(static_cast<int8_t>(reader.u8()));
         } else if (*baseType == "u16") {
             numeric = std::to_string(reader.u16be());
         } else if (*baseType == "lu16") {
@@ -737,32 +645,7 @@ private:
             count = std::stoll(raw);
         } else {
             countWasRead = true;
-
-            if (countType == "u8") {
-                if (reader.remaining() < 1) {
-                    count = 0;
-                } else {
-                    count = reader.u8();
-                }
-            } else if (countType == "u16") {
-                count = reader.u16be();
-            } else if (countType == "i16") {
-                count = static_cast<int16_t>(reader.u16be());
-            } else if (countType == "lu16" || countType == "li16") {
-                count = reader.u16le();
-            } else if (countType == "varint" || countType == "varuint") {
-                count = reader.varuint32();
-            } else if (countType == "li32") {
-                count = reader.i32le();
-            } else if (countType == "u32") {
-                count = reader.u32be();
-            } else if (countType == "i32") {
-                count = reader.i32be();
-            } else if (countType == "lu32") {
-                count = reader.u32le();
-            } else {
-                throw std::runtime_error("array unsupported countType: " + countType);
-            }
+            count = readCount(reader, countType, false, "array");
         }
 
         if (count < 0) {
@@ -908,32 +791,130 @@ private:
         field.offset = reader.offset();
 
         unsigned __int128 value = 0;
-        if (baseType == "u8") value = reader.u8();
-        else if (baseType == "u16") value = reader.u16be();
-        else if (baseType == "lu16" || baseType == "li16") value = reader.u16le();
-        else if (baseType == "u32") value = reader.u32be();
-        else if (baseType == "lu32" || baseType == "li32") value = reader.u32le();
-        else if (baseType == "u64") value = reader.readU64BE();
-        else if (baseType == "lu64" || baseType == "li64") value = reader.readU64LE();
-        else if (baseType == "varint128") value = readVarUInt128(reader);
-        else value = reader.varuint32();
+        ProtoDefValue rawValue;
+        if (baseType == "u8" || baseType == "lu8") {
+            const auto raw = reader.u8();
+            value = raw;
+            rawValue = ProtoDefValue::uinteger(raw);
+            field.value = std::to_string(raw);
+        } else if (baseType == "i8" || baseType == "li8") {
+            const auto raw = static_cast<int8_t>(reader.u8());
+            value = static_cast<uint8_t>(raw);
+            rawValue = ProtoDefValue::integer(raw);
+            field.value = std::to_string(raw);
+        } else if (baseType == "u16") {
+            const auto raw = reader.u16be();
+            value = raw;
+            rawValue = ProtoDefValue::uinteger(raw);
+            field.value = std::to_string(raw);
+        } else if (baseType == "lu16") {
+            const auto raw = reader.u16le();
+            value = raw;
+            rawValue = ProtoDefValue::uinteger(raw);
+            field.value = std::to_string(raw);
+        } else if (baseType == "i16") {
+            const auto raw = static_cast<int16_t>(reader.u16be());
+            value = static_cast<uint16_t>(raw);
+            rawValue = ProtoDefValue::integer(raw);
+            field.value = std::to_string(raw);
+        } else if (baseType == "li16") {
+            const auto raw = static_cast<int16_t>(reader.u16le());
+            value = static_cast<uint16_t>(raw);
+            rawValue = ProtoDefValue::integer(raw);
+            field.value = std::to_string(raw);
+        } else if (baseType == "u32") {
+            const auto raw = reader.u32be();
+            value = raw;
+            rawValue = ProtoDefValue::uinteger(raw);
+            field.value = std::to_string(raw);
+        } else if (baseType == "lu32") {
+            const auto raw = reader.u32le();
+            value = raw;
+            rawValue = ProtoDefValue::uinteger(raw);
+            field.value = std::to_string(raw);
+        } else if (baseType == "i32") {
+            const auto raw = reader.i32be();
+            value = static_cast<uint32_t>(raw);
+            rawValue = ProtoDefValue::integer(raw);
+            field.value = std::to_string(raw);
+        } else if (baseType == "li32") {
+            const auto raw = reader.i32le();
+            value = static_cast<uint32_t>(raw);
+            rawValue = ProtoDefValue::integer(raw);
+            field.value = std::to_string(raw);
+        } else if (baseType == "u64") {
+            const auto raw = reader.readU64BE();
+            value = raw;
+            rawValue = ProtoDefValue::uinteger(raw);
+            field.value = std::to_string(raw);
+        } else if (baseType == "lu64") {
+            const auto raw = reader.readU64LE();
+            value = raw;
+            rawValue = ProtoDefValue::uinteger(raw);
+            field.value = std::to_string(raw);
+        } else if (baseType == "i64") {
+            const auto raw = reader.i64be();
+            value = static_cast<uint64_t>(raw);
+            rawValue = ProtoDefValue::integer(raw);
+            field.value = std::to_string(raw);
+        } else if (baseType == "li64") {
+            const auto raw = reader.i64le();
+            value = static_cast<uint64_t>(raw);
+            rawValue = ProtoDefValue::integer(raw);
+            field.value = std::to_string(raw);
+        } else if (
+            baseType == "varint" || baseType == "varuint" ||
+            baseType == "varuint32"
+        ) {
+            const auto raw = reader.varuint32();
+            value = raw;
+            rawValue = ProtoDefValue::uinteger(raw);
+            field.value = std::to_string(raw);
+        } else if (
+            baseType == "varint64" || baseType == "varuint64" ||
+            baseType == "varlong"
+        ) {
+            const auto raw = reader.varuint64();
+            value = raw;
+            rawValue = ProtoDefValue::uinteger(raw);
+            field.value = std::to_string(raw);
+        } else if (baseType == "zigzag32") {
+            const auto raw = reader.zigzag32();
+            value = static_cast<uint32_t>(raw);
+            rawValue = ProtoDefValue::integer(raw);
+            field.value = std::to_string(raw);
+        } else if (baseType == "zigzag64") {
+            const auto raw = reader.zigzag64();
+            value = static_cast<uint64_t>(raw);
+            rawValue = ProtoDefValue::integer(raw);
+            field.value = std::to_string(raw);
+        } else if (baseType == "varint128" || baseType == "varuint128") {
+            value = readVarUInt128(reader);
+            field.value = uint128ToString(value);
+            rawValue = value <= static_cast<unsigned __int128>(UINT64_MAX)
+                ? ProtoDefValue::uinteger(static_cast<uint64_t>(value))
+                : ProtoDefValue::string(field.value);
+        } else {
+            throw std::runtime_error("bitflags unsupported base type: " + baseType);
+        }
 
-        field.value = uint128ToString(value);
+        field.structuredValue = ProtoDefValue::object({{"_value", std::move(rawValue)}});
         field.size = reader.offset() - field.offset;
 
         out.push_back(field);
         context.set(path, field.value);
 
         for (const auto& [name, bit] : readBitflagValues(bitflagsJson)) {
+            const bool enabled = (value & bit) == bit;
             ProtoDefField flagField;
             flagField.path = path.empty() ? name : path + "." + name;
             flagField.type = "bool";
-            flagField.value = (value & bit) != 0 ? "true" : "false";
+            flagField.value = enabled ? "true" : "false";
             flagField.offset = field.offset;
             flagField.size = field.size;
             out.push_back(std::move(flagField));
 
-            context.set(path.empty() ? name : path + "." + name, (value & bit) != 0 ? "true" : "false");
+            context.set(path.empty() ? name : path + "." + name, enabled ? "true" : "false");
         }
     }
 
@@ -1094,9 +1075,13 @@ private:
         } else if (typeName == "bool") {
             field.value = reader.boolean() ? "true" : "false";
         } else if (typeName == "uuid") {
-            std::string hex = "";
+            std::string hex;
+            hex.reserve(36);
             static const char* digits = "0123456789abcdef";
             for (int i = 0; i < 16; ++i) {
+                if (i == 4 || i == 6 || i == 8 || i == 10) {
+                    hex.push_back('-');
+                }
                 uint8_t b = reader.u8();
                 hex.push_back(digits[(b >> 4) & 0x0f]);
                 hex.push_back(digits[b & 0x0f]);
@@ -1110,26 +1095,35 @@ private:
                 std::to_string(reader.u8());
         } else if (typeName == "restBuffer" || typeName == "MapInfo") {
             const auto count = reader.remaining();
-            reader.skip(count);
+            field.structuredValue = ProtoDefValue::bytes(reader.readBytes(count));
             field.value = "<Buffer bytes:" + std::to_string(count) + ">";
         } else if (typeName == "byterot") {
             field.value = std::to_string(static_cast<double>(reader.u8()) * (360.0 / 256.0));
         } else if (typeName == "nbtLoop") {
+            std::vector<ProtoDefValue> values;
+            bool terminated = false;
             while (reader.remaining() > 0) {
                 std::size_t before = reader.offset();
                 uint8_t tag = reader.u8();
-                if (tag == 0) break;
+                if (tag == 0) {
+                    terminated = true;
+                    break;
+                }
                 reader.rewindTo(before);
-                skipNativeNbt(reader);
+                values.push_back(readProtoDefNbt(reader, BedrockNbtEncoding::LittleVarInt));
             }
-            field.value = "<nbtLoop>";
-        } else if (typeName == "u8" || typeName == "byte") {
+            if (!terminated) {
+                throw std::runtime_error("nbtLoop is missing its TAG_End terminator");
+            }
+            field.structuredValue = ProtoDefValue::array(std::move(values));
+            field.value = ProtoDefJson::stringify(*field.structuredValue);
+        } else if (typeName == "u8" || typeName == "lu8" || typeName == "byte") {
             if (reader.remaining() < 1) {
                 field.value = "<missing:u8>";
             } else {
                 field.value = std::to_string(reader.u8());
             }
-        } else if (typeName == "i8") {
+        } else if (typeName == "i8" || typeName == "li8") {
             field.value = std::to_string(static_cast<int8_t>(reader.u8()));
         } else if (typeName == "u16") {
             field.value = std::to_string(reader.u16be());
@@ -1209,14 +1203,14 @@ private:
                 std::to_string(y) + "," +
                 std::to_string(z);
         } else if (typeName == "native") {
-            skipNativeNbt(reader);
-            field.value = "<native>";
+            field.structuredValue = readProtoDefNbt(reader, BedrockNbtEncoding::LittleVarInt);
+            field.value = ProtoDefJson::stringify(*field.structuredValue);
         }  else if (typeName == "nbt") {
-            skipAnyLittleNbt(reader);
-            field.value = "<nbt>";
+            field.structuredValue = readProtoDefNbt(reader, BedrockNbtEncoding::LittleVarInt);
+            field.value = ProtoDefJson::stringify(*field.structuredValue);
         } else if (typeName == "lnbt") {
-            skipAnyLittleNbt(reader);
-            field.value = "<lnbt>";
+            field.structuredValue = readProtoDefNbt(reader, BedrockNbtEncoding::LittleEndian);
+            field.value = ProtoDefJson::stringify(*field.structuredValue);
         } else {
             if (resolver_) {
                 auto resolved = resolver_(typeName);
@@ -1303,12 +1297,18 @@ private:
         return currentPath.substr(0, dot + 1) + compareTo;
     }
 
-    static std::optional<std::string> findSwitchBranchType(
+    std::optional<std::string> findSwitchBranchType(
         const std::string& switchJson,
         const std::string& key
-    ) {
+    ) const {
         auto fields = readJsonValueField(switchJson, "fields");
         if (!fields.has_value()) return std::nullopt;
+
+        for (const auto& [name, value] : variables_) {
+            if (!switchValuesEqual(key, value)) continue;
+            auto branch = readJsonValueField(*fields, "/" + name);
+            if (branch.has_value()) return branch;
+        }
 
         for (const auto& candidate : switchLookupKeys(key)) {
             auto branch = readJsonValueField(*fields, candidate);
@@ -1336,6 +1336,17 @@ private:
         }
 
         return keys;
+    }
+
+    static bool switchValuesEqual(
+        const std::string& lhs,
+        const std::string& rhs
+    ) {
+        const auto lhsKeys = switchLookupKeys(lhs);
+        const auto rhsKeys = switchLookupKeys(rhs);
+        return std::any_of(lhsKeys.begin(), lhsKeys.end(), [&](const auto& left) {
+            return std::find(rhsKeys.begin(), rhsKeys.end(), left) != rhsKeys.end();
+        });
     }
 
     static std::unordered_map<std::string, unsigned __int128> readBitflagValues(const std::string& bitflagsJson) {
@@ -1652,6 +1663,7 @@ private:
 
 private:
     TypeResolver resolver_;
+    ProtoDefVariableMap variables_;
 };
 
 }

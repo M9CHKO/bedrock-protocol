@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -12,7 +13,8 @@ struct LevelChunkHeader {
     int32_t chunkX = 0;
     int32_t chunkZ = 0;
     int32_t dimension = 0;
-    uint32_t subChunkCount = 0;
+    int32_t subChunkCount = 0;
+    std::optional<uint16_t> highestSubChunkCount;
     bool cacheEnabled = false;
     std::vector<uint64_t> blobHashes;
     uint32_t dataSize = 0;
@@ -36,6 +38,15 @@ public:
 
     bool boolean() {
         return u8() != 0;
+    }
+
+    uint16_t u16le() {
+        require(2, "u16le");
+        const uint16_t value =
+            static_cast<uint16_t>(data_[offset_]) |
+            static_cast<uint16_t>(static_cast<uint16_t>(data_[offset_ + 1]) << 8u);
+        offset_ += 2;
+        return value;
     }
 
     uint64_t u64le() {
@@ -102,7 +113,10 @@ public:
         out.chunkX = cursor.svarint();
         out.chunkZ = cursor.svarint();
         out.dimension = cursor.svarint();
-        out.subChunkCount = cursor.uvarint();
+        out.subChunkCount = static_cast<int32_t>(cursor.uvarint());
+        if (out.subChunkCount == -2) {
+            out.highestSubChunkCount = cursor.u16le();
+        }
         out.cacheEnabled = cursor.boolean();
 
         if (out.cacheEnabled) {

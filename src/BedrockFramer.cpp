@@ -1,10 +1,32 @@
 #include "bedrock/BedrockFramer.hpp"
 
+#include <bedrock/protocol/SnappyCodec.hpp>
+
 #include <zlib.h>
 #include <cstring>
 #include <limits>
 
 namespace bedrock {
+
+namespace {
+
+std::vector<uint8_t> compressSnappy(const std::vector<uint8_t>& input) {
+    try {
+        return SnappyCodec::compress(input);
+    } catch (const SnappyCodecError& error) {
+        throw BedrockFramerError(error.what());
+    }
+}
+
+std::vector<uint8_t> decompressSnappy(const std::vector<uint8_t>& input) {
+    try {
+        return SnappyCodec::decompress(input);
+    } catch (const SnappyCodecError& error) {
+        throw BedrockFramerError(error.what());
+    }
+}
+
+} // namespace
 
 void BedrockFramer::writeVarUInt(std::vector<uint8_t>& out, uint32_t v) {
     while (true) {
@@ -183,12 +205,15 @@ std::vector<uint8_t> BedrockFramer::encodeBatch(
 
     if (!settings.compressorInHeader) {
         if (shouldCompress) {
-            if (settings.compressionAlgorithm != 0) {
-                throw BedrockFramerError("snappy compression is not implemented");
+            if (settings.compressionAlgorithm == 0) {
+                auto compressed = deflateRaw(framed);
+                out.insert(out.end(), compressed.begin(), compressed.end());
+            } else if (settings.compressionAlgorithm == 1) {
+                auto compressed = compressSnappy(framed);
+                out.insert(out.end(), compressed.begin(), compressed.end());
+            } else {
+                throw BedrockFramerError("unknown compression algorithm");
             }
-
-            auto compressed = deflateRaw(framed);
-            out.insert(out.end(), compressed.begin(), compressed.end());
         } else {
             out.insert(out.end(), framed.begin(), framed.end());
         }
@@ -211,7 +236,12 @@ std::vector<uint8_t> BedrockFramer::encodeBatch(
     }
 
     if (settings.compressionAlgorithm == 1) {
-        throw BedrockFramerError("snappy compression is not implemented");
+        out.push_back(COMPRESSION_SNAPPY);
+
+        auto compressed = compressSnappy(framed);
+        out.insert(out.end(), compressed.begin(), compressed.end());
+
+        return out;
     }
 
     throw BedrockFramerError("unknown compression algorithm");
@@ -240,7 +270,13 @@ std::vector<std::vector<uint8_t>> BedrockFramer::decodeBatch(
     if (!settings.compressorInHeader) {
         std::vector<uint8_t> body(batch.begin() + static_cast<std::ptrdiff_t>(off), batch.end());
         try {
-            framed = inflateRaw(body);
+            if (settings.compressionAlgorithm == 0) {
+                framed = inflateRaw(body);
+            } else if (settings.compressionAlgorithm == 1) {
+                framed = decompressSnappy(body);
+            } else {
+                throw BedrockFramerError("unknown compression algorithm");
+            }
         } catch (const std::exception&) {
             framed = std::move(body);
         }
@@ -269,7 +305,13 @@ std::vector<std::vector<uint8_t>> BedrockFramer::decodeBatch(
     }
 
     if (compressionHeader == COMPRESSION_SNAPPY) {
-        throw BedrockFramerError("snappy decompression is not implemented");
+        std::vector<uint8_t> compressed(
+            batch.begin() + static_cast<std::ptrdiff_t>(off),
+            batch.end()
+        );
+
+        framed = decompressSnappy(compressed);
+        return unframePackets(framed);
     }
 
     throw BedrockFramerError("unknown compression header");

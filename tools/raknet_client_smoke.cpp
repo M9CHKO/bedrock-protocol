@@ -10,6 +10,7 @@
 int main() {
     std::atomic<bool> connected {false};
     std::atomic<bool> gotNetworkSettings {false};
+    std::atomic<int> serverDisconnects {0};
 
     bedrock::BedrockServer server({
         .host = "127.0.0.1",
@@ -17,6 +18,9 @@ int main() {
         .version = "1.20.40",
         .motd = {{"motd", "RakNet Client Smoke"}},
         .maxPlayers = 3
+    });
+    server.onDisconnect([&](const bedrock::BedrockServerConnection&) {
+        ++serverDisconnects;
     });
     server.listen();
 
@@ -81,6 +85,17 @@ int main() {
     }
 
     client.close();
+    for (int i = 0;
+         i < 50 &&
+         (serverDisconnects.load() != 1 || server.clientCount() != 0);
+         ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    if (serverDisconnects.load() != 1 || server.clientCount() != 0) {
+        std::cerr << "[CLIENT-SMOKE] close did not notify the RakNet peer\n";
+        server.close();
+        return 1;
+    }
     server.close();
     std::cout << "[CLIENT-SMOKE] ok\n";
     return 0;

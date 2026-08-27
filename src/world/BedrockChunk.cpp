@@ -1,21 +1,35 @@
 #include <bedrock/world/BedrockChunk.hpp>
+#include <bedrock/util/XxHash64.hpp>
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <utility>
 
 namespace bedrock {
+namespace {
+
+uint8_t checkedBitsPerBlock(uint8_t bitsPerBlock) {
+    if (bitsPerBlock > 32) {
+        throw BedrockChunkError("bitsPerBlock must be <= 32");
+    }
+    return bitsPerBlock == 0 ? 1 : bitsPerBlock;
+}
+
+BedrockNbtEncoding persistenceNbtEncoding(ChunkStorageType format) {
+    return format == ChunkStorageType::LocalPersistence
+        ? BedrockNbtEncoding::LittleEndian
+        : BedrockNbtEncoding::LittleVarInt;
+}
+
+} // namespace
 
 PalettedStorage::PalettedStorage(uint8_t bitsPerBlock)
-    : bitsPerBlock_(bitsPerBlock == 0 ? 1 : bitsPerBlock),
+    : bitsPerBlock_(checkedBitsPerBlock(bitsPerBlock)),
       blocksPerWord_(32u / bitsPerBlock_),
       wordsCount_((StorageSize + blocksPerWord_ - 1u) / blocksPerWord_),
       mask_(bitsPerBlock_ >= 32 ? 0xffffffffu : ((1u << bitsPerBlock_) - 1u)),
-      words_(wordsCount_, 0) {
-    if (bitsPerBlock_ > 32) {
-        throw BedrockChunkError("bitsPerBlock must be <= 32");
-    }
-}
+      words_(wordsCount_, 0) {}
 
 uint8_t PalettedStorage::bitsPerBlock() const {
     return bitsPerBlock_;
@@ -83,9 +97,10 @@ void PalettedStorage::incrementPalette(std::vector<BedrockBlockState>& palette) 
         const uint32_t wordIndex = i / blocksPerWord_;
         const uint8_t offset = static_cast<uint8_t>((i % blocksPerWord_) * bitsPerBlock_);
         const uint32_t paletteIndex = (words_[wordIndex] >> offset) & mask_;
-        if (paletteIndex < palette.size()) {
-            palette[paletteIndex].count++;
+        if (paletteIndex >= palette.size()) {
+            throw BedrockChunkError("paletted storage index exceeds palette size");
         }
+        palette[paletteIndex].count++;
     }
 }
 
@@ -117,6 +132,7 @@ BedrockSubChunk BedrockSubChunk::createAir(int8_t y, int32_t airStateId) {
     out.airStateId_ = airStateId;
     out.ensureLayer(0);
     out.palettes_[0].clear();
+    out.blocks_[0] = PalettedStorage(1);
     out.palettes_[0].push_back({airStateId, "minecraft:air", PalettedStorage::StorageSize});
     return out;
 }
@@ -124,27 +140,30 @@ BedrockSubChunk BedrockSubChunk::createAir(int8_t y, int32_t airStateId) {
 BedrockSubChunk BedrockSubChunk::decode(
     ChunkStorageType format,
     const std::vector<uint8_t>& data,
-    int32_t airStateId
+    int32_t airStateId,
+    BedrockBlockStateResolver resolver
 ) {
     BinaryStream stream(data);
     BedrockSubChunk sub;
-    sub.decodeFrom(format, stream, airStateId);
+    sub.decodeFrom(format, stream, airStateId, std::move(resolver));
     return sub;
 }
 
 std::vector<uint8_t> BedrockSubChunk::encode(
     ChunkStorageType format,
-    bool compactStorage
+    bool compactStorage,
+    BedrockBlockStateProvider provider
 ) const {
     BinaryStream stream;
-    encodeTo(format, stream, compactStorage);
+    encodeTo(format, stream, compactStorage, std::move(provider));
     return stream.buffer();
 }
 
 void BedrockSubChunk::decodeFrom(
     ChunkStorageType format,
     BinaryStream& stream,
-    int32_t airStateId
+    int32_t airStateId,
+    BedrockBlockStateResolver resolver
 ) {
     airStateId_ = airStateId;
     palettes_.clear();
@@ -179,14 +198,15 @@ void BedrockSubChunk::decodeFrom(
             throw BedrockChunkError("expected runtime palette while decoding subchunk");
         }
         const uint8_t bitsPerBlock = static_cast<uint8_t>(paletteType >> 1u);
-        loadPalettedBlocks(layer, stream, bitsPerBlock, format);
+        loadPalettedBlocks(layer, stream, bitsPerBlock, format, resolver);
     }
 }
 
 void BedrockSubChunk::encodeTo(
     ChunkStorageType format,
     BinaryStream& stream,
-    bool compactStorage
+    bool compactStorage,
+    BedrockBlockStateProvider provider
 ) const {
     BedrockSubChunk copy = *this;
     stream.writeU8(copy.subChunkVersion_);
@@ -198,7 +218,7 @@ void BedrockSubChunk::encodeTo(
         if (compactStorage) {
             copy.compact(layer);
         }
-        copy.writeStorage(layer, stream, format);
+        copy.writeStorage(layer, stream, format, provider);
     }
 }
 
@@ -292,6 +312,28 @@ const std::vector<BedrockBlockState>& BedrockSubChunk::palette(uint8_t layer) co
     return palettes_[layer];
 }
 
+void BedrockSubChunk::setPaletteEntryDescriptor(
+    uint8_t layer,
+    std::size_t paletteIndex,
+    BedrockBlockStateDescriptor descriptor
+) {
+    if (layer >= palettes_.size() || paletteIndex >= palettes_[layer].size()) {
+        throw BedrockChunkError("palette entry out of range");
+    }
+    if (descriptor.name.empty()) {
+        throw BedrockChunkError("persistent block-state name must not be empty");
+    }
+    if (descriptor.states.type != NbtTagType::Compound) {
+        throw BedrockChunkError("persistent block-state states must be an NBT compound");
+    }
+
+    auto& entry = palettes_[layer][paletteIndex];
+    entry.name = std::move(descriptor.name);
+    entry.states = std::move(descriptor.states);
+    entry.version = descriptor.version;
+    entry.hasPersistentData = true;
+}
+
 std::vector<BedrockBlockState> BedrockSubChunk::compactedPalette(uint8_t layer) const {
     if (layer >= palettes_.size()) {
         return {};
@@ -372,7 +414,8 @@ void BedrockSubChunk::loadPalettedBlocks(
     uint8_t layer,
     BinaryStream& stream,
     uint8_t bitsPerBlock,
-    ChunkStorageType format
+    ChunkStorageType format,
+    const BedrockBlockStateResolver& resolver
 ) {
     if (format == ChunkStorageType::Runtime && bitsPerBlock == 0) {
         while (palettes_.size() <= layer) {
@@ -394,38 +437,94 @@ void BedrockSubChunk::loadPalettedBlocks(
     blocks_[layer] = PalettedStorage(std::max<uint8_t>(1, bitsPerBlock));
     blocks_[layer].read(stream);
 
-    uint32_t paletteSize = 0;
+    int64_t paletteSizeValue = 0;
     if (format == ChunkStorageType::LocalPersistence) {
-        paletteSize = stream.readU32LE();
+        paletteSizeValue = stream.readU32LE();
     } else {
-        paletteSize = static_cast<uint32_t>(readZigZagVarInt(stream));
+        paletteSizeValue = readZigZagVarInt(stream);
     }
 
-    if (paletteSize < 1) {
-        throw BedrockChunkError("invalid subchunk palette size: " + std::to_string(paletteSize));
+    if (paletteSizeValue < 1 || paletteSizeValue > PalettedStorage::StorageSize) {
+        throw BedrockChunkError("invalid subchunk palette size: " + std::to_string(paletteSizeValue));
+    }
+    const auto paletteSize = static_cast<uint32_t>(paletteSizeValue);
+    if (bitsPerBlock < 32 && paletteSize > (1u << std::max<uint8_t>(1, bitsPerBlock))) {
+        throw BedrockChunkError("subchunk palette does not fit bitsPerBlock");
     }
 
     palettes_[layer].clear();
     palettes_[layer].reserve(paletteSize);
 
-    if (format != ChunkStorageType::Runtime) {
-        throw BedrockChunkError("local/network persistence NBT palettes are not implemented yet");
-    }
+    if (format == ChunkStorageType::Runtime) {
+        for (uint32_t i = 0; i < paletteSize; ++i) {
+            const int32_t stateId = readZigZagVarInt(stream);
+            palettes_[layer].push_back({stateId, stateId == airStateId_ ? "minecraft:air" : "", 0});
+        }
+    } else {
+        const auto nbtEncoding = persistenceNbtEncoding(format);
+        for (uint32_t i = 0; i < paletteSize; ++i) {
+            NbtDocument document;
+            try {
+                document = BedrockNbtCodec::read(stream, nbtEncoding);
+            } catch (const std::exception& error) {
+                throw BedrockChunkError(
+                    "invalid persistent block-state NBT at palette index " +
+                    std::to_string(i) + ": " + error.what()
+                );
+            }
 
-    for (uint32_t i = 0; i < paletteSize; ++i) {
-        const int32_t stateId = readZigZagVarInt(stream);
-        palettes_[layer].push_back({stateId, stateId == airStateId_ ? "minecraft:air" : "", 0});
+            if (document.root.type != NbtTagType::Compound) {
+                throw BedrockChunkError("persistent block-state NBT root must be a compound");
+            }
+            const NbtValue* nameTag = document.root.find("name");
+            const NbtValue* statesTag = document.root.find("states");
+            const NbtValue* versionTag = document.root.find("version");
+            if (nameTag == nullptr || nameTag->type != NbtTagType::String) {
+                throw BedrockChunkError("persistent block-state NBT is missing string name");
+            }
+            if (statesTag != nullptr && statesTag->type != NbtTagType::Compound) {
+                throw BedrockChunkError("persistent block-state states must be an NBT compound");
+            }
+            if (versionTag == nullptr || versionTag->type != NbtTagType::Int ||
+                versionTag->integerValue < std::numeric_limits<int32_t>::min() ||
+                versionTag->integerValue > std::numeric_limits<int32_t>::max()) {
+                throw BedrockChunkError("persistent block-state NBT is missing int version");
+            }
+
+            NbtValue states = statesTag == nullptr
+                ? NbtValue::compound()
+                : *statesTag;
+            const int32_t version = static_cast<int32_t>(versionTag->integerValue);
+            int32_t stateId = airStateId_;
+            if (resolver) {
+                if (const auto resolved = resolver(nameTag->stringValue, states, version)) {
+                    stateId = *resolved;
+                }
+            }
+
+            BedrockBlockState entry;
+            entry.stateId = stateId;
+            entry.name = nameTag->stringValue;
+            entry.states = std::move(states);
+            entry.version = version;
+            entry.hasPersistentData = true;
+            palettes_[layer].push_back(std::move(entry));
+        }
     }
     blocks_[layer].incrementPalette(palettes_[layer]);
 }
 
-void BedrockSubChunk::writeStorage(uint8_t layer, BinaryStream& stream, ChunkStorageType format) const {
-    if (format != ChunkStorageType::Runtime) {
-        throw BedrockChunkError("local/network persistence NBT palettes are not implemented yet");
-    }
-
+void BedrockSubChunk::writeStorage(
+    uint8_t layer,
+    BinaryStream& stream,
+    ChunkStorageType format,
+    const BedrockBlockStateProvider& provider
+) const {
     if (layer >= blocks_.size() || layer >= palettes_.size()) {
         throw BedrockChunkError("writeStorage layer out of range");
+    }
+    if (palettes_[layer].empty() || palettes_[layer].size() > PalettedStorage::StorageSize) {
+        throw BedrockChunkError("invalid palette size while encoding subchunk");
     }
 
     if (format == ChunkStorageType::Runtime && palettes_[layer].size() == 1) {
@@ -435,12 +534,63 @@ void BedrockSubChunk::writeStorage(uint8_t layer, BinaryStream& stream, ChunkSto
     }
 
     uint8_t paletteType = static_cast<uint8_t>(blocks_[layer].bitsPerBlock() << 1u);
-    paletteType |= 1u;
+    if (format == ChunkStorageType::Runtime) {
+        paletteType |= 1u;
+    }
     stream.writeU8(paletteType);
     blocks_[layer].write(stream);
-    writeZigZagVarInt(stream, static_cast<int32_t>(palettes_[layer].size()));
+
+    if (format == ChunkStorageType::LocalPersistence) {
+        stream.writeU32LE(static_cast<uint32_t>(palettes_[layer].size()));
+    } else {
+        writeZigZagVarInt(stream, static_cast<int32_t>(palettes_[layer].size()));
+    }
+
+    if (format == ChunkStorageType::Runtime) {
+        for (const auto& block : palettes_[layer]) {
+            writeZigZagVarInt(stream, block.stateId);
+        }
+        return;
+    }
+
+    const auto nbtEncoding = persistenceNbtEncoding(format);
     for (const auto& block : palettes_[layer]) {
-        writeZigZagVarInt(stream, block.stateId);
+        BedrockBlockStateDescriptor descriptor;
+        if (block.hasPersistentData) {
+            descriptor.name = block.name;
+            descriptor.states = block.states;
+            descriptor.version = block.version;
+        } else if (provider) {
+            const auto supplied = provider(block.stateId);
+            if (!supplied.has_value()) {
+                throw BedrockChunkError(
+                    "no persistent descriptor for block state " + std::to_string(block.stateId)
+                );
+            }
+            descriptor = *supplied;
+        } else {
+            throw BedrockChunkError(
+                "persistent subchunk encoding requires block-state descriptors; missing state " +
+                std::to_string(block.stateId)
+            );
+        }
+
+        if (descriptor.name.empty()) {
+            throw BedrockChunkError("persistent block-state name must not be empty");
+        }
+        if (descriptor.states.type != NbtTagType::Compound) {
+            throw BedrockChunkError("persistent block-state states must be an NBT compound");
+        }
+
+        NbtDocument document {
+            {},
+            NbtValue::compound({
+                {"name", NbtValue::string(descriptor.name)},
+                {"states", descriptor.states},
+                {"version", NbtValue::integer(descriptor.version)}
+            })
+        };
+        BedrockNbtCodec::write(stream, document, nbtEncoding);
     }
 }
 
@@ -520,7 +670,10 @@ void BedrockBiomeSection::readLegacy2D(BinaryStream& stream) {
     proxy_ = false;
     for (uint8_t x = 0; x < 16; ++x) {
         for (uint8_t z = 0; z < 16; ++z) {
-            setBiomeId(x, 0, z, stream.readU8());
+            const uint32_t biomeId = stream.readU8();
+            for (uint8_t y = 0; y < 16; ++y) {
+                setBiomeId(x, y, z, biomeId);
+            }
         }
     }
 }
@@ -755,7 +908,11 @@ BedrockChunkColumn BedrockLevelChunkCodec::decodeNoCacheColumn(
     if (useCavesAndCliffsBounds) {
         column.setBounds(-4, 20);
     }
-    column.networkDecodeNoCache(packet.payload, packet.subChunkCount);
+    column.networkDecodeNoCache(
+        packet.payload,
+        packet.subChunkCount,
+        useCavesAndCliffsBounds
+    );
     return column;
 }
 
@@ -916,7 +1073,29 @@ void BedrockChunkColumn::setBlockStateId(const BlockPosition& pos, int32_t state
 }
 
 void BedrockChunkColumn::setBlockEntity(const BlockPosition& pos, std::vector<uint8_t> tag) {
-    blockEntities_[blockEntityKey(pos)] = std::move(tag);
+    const std::string key = blockEntityKey(pos);
+    blockEntities_[key] = std::move(tag);
+
+    try {
+        BinaryStream stream(blockEntities_[key]);
+        auto document = BedrockNbtCodec::read(stream, BedrockNbtEncoding::LittleVarInt);
+        if (!stream.eof()) {
+            throw BedrockChunkError("block entity contains trailing bytes");
+        }
+        blockEntityNbt_[key] = std::move(document);
+    } catch (const std::exception&) {
+        // Keep the backward-compatible raw tag even when the caller supplied
+        // an opaque or not-yet-complete value.
+        blockEntityNbt_.erase(key);
+    }
+}
+
+void BedrockChunkColumn::setBlockEntityNbt(const BlockPosition& pos, NbtDocument tag) {
+    const std::string key = blockEntityKey(pos);
+    BinaryStream stream;
+    BedrockNbtCodec::write(stream, tag, BedrockNbtEncoding::LittleVarInt);
+    blockEntities_[key] = stream.buffer();
+    blockEntityNbt_[key] = std::move(tag);
 }
 
 const std::vector<uint8_t>* BedrockChunkColumn::getBlockEntity(const BlockPosition& pos) const {
@@ -924,8 +1103,30 @@ const std::vector<uint8_t>* BedrockChunkColumn::getBlockEntity(const BlockPositi
     return it == blockEntities_.end() ? nullptr : &it->second;
 }
 
+const NbtDocument* BedrockChunkColumn::getBlockEntityNbt(const BlockPosition& pos) const {
+    auto it = blockEntityNbt_.find(blockEntityKey(pos));
+    return it == blockEntityNbt_.end() ? nullptr : &it->second;
+}
+
 void BedrockChunkColumn::removeBlockEntity(const BlockPosition& pos) {
-    blockEntities_.erase(blockEntityKey(pos));
+    const std::string key = blockEntityKey(pos);
+    blockEntities_.erase(key);
+    blockEntityNbt_.erase(key);
+}
+
+std::size_t BedrockChunkColumn::blockEntityCount() const {
+    return blockEntities_.size();
+}
+
+std::vector<uint8_t> BedrockChunkColumn::diskEncodeBlockEntities() const {
+    BinaryStream stream;
+    encodeBlockEntities(stream, BedrockNbtEncoding::LittleEndian);
+    return stream.buffer();
+}
+
+void BedrockChunkColumn::diskDecodeBlockEntities(const std::vector<uint8_t>& data) {
+    BinaryStream stream(data);
+    decodeBlockEntities(stream, BedrockNbtEncoding::LittleEndian);
 }
 
 const std::vector<std::optional<BedrockSubChunk>>& BedrockChunkColumn::sections() const {
@@ -964,6 +1165,11 @@ void BedrockChunkColumn::loadLegacyBiomes(const std::vector<uint8_t>& data) {
         biomes_.push_back(BedrockBiomeSection(0));
     }
     biomes_[0].readLegacy2D(stream);
+    for (std::size_t i = 1; i < biomes_.size(); ++i) {
+        biomes_[i] = BedrockBiomeSection::proxyToPrevious(
+            minCY_ + static_cast<int32_t>(i)
+        );
+    }
 }
 
 std::vector<uint8_t> BedrockChunkColumn::dumpLegacyBiomes() const {
@@ -1015,6 +1221,18 @@ void BedrockChunkColumn::writeBiomes(BinaryStream& stream) const {
 }
 
 void BedrockChunkColumn::networkDecodeNoCache(const std::vector<uint8_t>& payload, int32_t sectionCount) {
+    networkDecodeNoCache(
+        payload,
+        sectionCount,
+        minCY_ < 0 || maxCY_ > 16
+    );
+}
+
+void BedrockChunkColumn::networkDecodeNoCache(
+    const std::vector<uint8_t>& payload,
+    int32_t sectionCount,
+    bool use3DBiomes
+) {
     BinaryStream stream(payload);
 
     if (sectionCount != -1 && sectionCount != -2) {
@@ -1027,7 +1245,14 @@ void BedrockChunkColumn::networkDecodeNoCache(const std::vector<uint8_t>& payloa
         }
     }
 
-    loadBiomes(stream, ChunkStorageType::Runtime);
+    if (use3DBiomes) {
+        loadBiomes(stream, ChunkStorageType::Runtime);
+    } else {
+        if (stream.remaining() < 256) {
+            throw BedrockChunkError("legacy biome data is truncated");
+        }
+        loadLegacyBiomes(stream.readBytes(256));
+    }
 
     if (!stream.eof()) {
         const uint32_t encodedLength = stream.readVarUInt();
@@ -1042,24 +1267,175 @@ void BedrockChunkColumn::networkDecodeNoCache(const std::vector<uint8_t>& payloa
             throw BedrockChunkError("border blocks are not supported yet");
         }
     }
+
+    decodeBlockEntities(stream, BedrockNbtEncoding::LittleVarInt);
 }
 
 std::vector<uint8_t> BedrockChunkColumn::networkEncodeNoCache() const {
+    return networkEncodeNoCache(minCY_ < 0 || maxCY_ > 16);
+}
+
+std::vector<uint8_t> BedrockChunkColumn::networkEncodeNoCache(bool use3DBiomes) const {
     BinaryStream stream;
     for (const auto& section : sections_) {
         if (section.has_value()) {
             section->encodeTo(ChunkStorageType::Runtime, stream, true);
         }
     }
-    writeBiomes(stream);
+    if (use3DBiomes) {
+        writeBiomes(stream);
+    } else {
+        stream.writeBytes(dumpLegacyBiomes());
+    }
     stream.writeVarUInt(0);
+    encodeBlockEntities(stream, BedrockNbtEncoding::LittleVarInt);
     return stream.buffer();
+}
+
+void BedrockChunkColumn::networkDecodeSubChunkNoCache(
+    int32_t sectionY,
+    const std::vector<uint8_t>& payload
+) {
+    BinaryStream stream(payload);
+    BedrockSubChunk section(static_cast<int8_t>(sectionY), 9);
+    section.decodeFrom(ChunkStorageType::Runtime, stream);
+    const int32_t decodedY = section.y();
+    setSection(decodedY, std::move(section));
+    decodeBlockEntities(stream, BedrockNbtEncoding::LittleVarInt);
+}
+
+std::vector<uint8_t> BedrockChunkColumn::networkEncodeSubChunkNoCache(
+    int32_t sectionY,
+    bool compactStorage
+) const {
+    const int32_t index = co_ + sectionY;
+    if (index < 0 || static_cast<std::size_t>(index) >= sections_.size() ||
+        !sections_[static_cast<std::size_t>(index)].has_value()) {
+        throw BedrockChunkError("subchunk section is not loaded");
+    }
+
+    BinaryStream stream;
+    sections_[static_cast<std::size_t>(index)]->encodeTo(
+        ChunkStorageType::Runtime,
+        stream,
+        compactStorage
+    );
+    encodeBlockEntities(stream, BedrockNbtEncoding::LittleVarInt, sectionY);
+    return stream.buffer();
+}
+
+BedrockEncodedChunkCache BedrockChunkColumn::networkEncodeCached(
+    BedrockBlobStore& blobStore,
+    bool use3DBiomes,
+    BedrockBlockStateProvider provider
+) const {
+    BedrockEncodedChunkCache encoded;
+
+    if (!use3DBiomes) {
+        for (const auto& section : sections_) {
+            if (!section.has_value()) {
+                continue;
+            }
+            auto buffer = section->encode(
+                ChunkStorageType::NetworkPersistence,
+                true,
+                provider
+            );
+            const uint64_t hash = xxHash64(buffer);
+            BlobEntry entry;
+            entry.x = x_;
+            entry.y = section->y();
+            entry.z = z_;
+            entry.type = BlobType::ChunkSection;
+            entry.buffer = std::move(buffer);
+            blobStore.set(hash, std::move(entry));
+            encoded.blobHashes.push_back(hash);
+        }
+
+        auto biomeBuffer = dumpLegacyBiomes();
+        const uint64_t biomeHash = xxHash64(biomeBuffer);
+        BlobEntry biomeEntry;
+        biomeEntry.x = x_;
+        biomeEntry.z = z_;
+        biomeEntry.type = BlobType::Biomes;
+        biomeEntry.buffer = std::move(biomeBuffer);
+        blobStore.set(biomeHash, std::move(biomeEntry));
+        encoded.blobHashes.push_back(biomeHash);
+    } else {
+        BinaryStream biomeStream;
+        writeBiomes(biomeStream);
+        auto biomeBuffer = biomeStream.buffer();
+        const uint64_t biomeHash = xxHash64(biomeBuffer);
+        BlobEntry biomeEntry;
+        biomeEntry.x = x_;
+        biomeEntry.z = z_;
+        biomeEntry.type = BlobType::Biomes;
+        biomeEntry.buffer = std::move(biomeBuffer);
+        blobStore.set(biomeHash, std::move(biomeEntry));
+        encoded.blobHashes.push_back(biomeHash);
+    }
+
+    BinaryStream payload;
+    payload.writeVarUInt(0);
+    if (!use3DBiomes) {
+        encodeBlockEntities(payload, BedrockNbtEncoding::LittleVarInt);
+    }
+    encoded.payload = payload.buffer();
+    return encoded;
+}
+
+BedrockEncodedChunkCache BedrockChunkColumn::networkEncodeCached(
+    BedrockBlobStore& blobStore,
+    BedrockBlockStateProvider provider
+) const {
+    return networkEncodeCached(
+        blobStore,
+        minCY_ < 0 || maxCY_ > 16,
+        std::move(provider)
+    );
+}
+
+BedrockEncodedSubChunkCache BedrockChunkColumn::networkEncodeSubChunkCached(
+    int32_t sectionY,
+    BedrockBlobStore& blobStore,
+    bool compactStorage
+) const {
+    const int32_t index = co_ + sectionY;
+    if (index < 0 || static_cast<std::size_t>(index) >= sections_.size() ||
+        !sections_[static_cast<std::size_t>(index)].has_value()) {
+        throw BedrockChunkError("subchunk section is not loaded");
+    }
+
+    auto terrain = sections_[static_cast<std::size_t>(index)]->encode(
+        ChunkStorageType::Runtime,
+        compactStorage
+    );
+    BedrockEncodedSubChunkCache encoded;
+    encoded.blobHash = xxHash64(terrain);
+
+    BlobEntry entry;
+    entry.x = x_;
+    entry.y = sectionY;
+    entry.z = z_;
+    entry.type = BlobType::ChunkSection;
+    entry.buffer = std::move(terrain);
+    blobStore.set(encoded.blobHash, std::move(entry));
+
+    BinaryStream payload;
+    encodeBlockEntities(
+        payload,
+        BedrockNbtEncoding::LittleVarInt,
+        sectionY
+    );
+    encoded.payload = payload.buffer();
+    return encoded;
 }
 
 std::vector<uint64_t> BedrockChunkColumn::networkDecodeCached(
     const std::vector<uint64_t>& blobHashes,
     const BedrockBlobStore& blobStore,
-    const std::vector<uint8_t>& payload
+    const std::vector<uint8_t>& payload,
+    BedrockBlockStateResolver resolver
 ) {
     if (!payload.empty()) {
         BinaryStream stream(payload);
@@ -1074,6 +1450,7 @@ std::vector<uint64_t> BedrockChunkColumn::networkDecodeCached(
         if (!borderBlocks.empty()) {
             throw BedrockChunkError("border blocks are not supported yet");
         }
+        decodeBlockEntities(stream, BedrockNbtEncoding::LittleVarInt);
     }
 
     std::vector<uint64_t> misses;
@@ -1089,6 +1466,15 @@ std::vector<uint64_t> BedrockChunkColumn::networkDecodeCached(
     sections_.clear();
     sections_.resize(static_cast<std::size_t>(maxCY_ - minCY_));
 
+    bool hasSectionBlobs = false;
+    for (auto hash : blobHashes) {
+        const auto* entry = blobStore.get(hash);
+        if (entry != nullptr && entry->type == BlobType::ChunkSection) {
+            hasSectionBlobs = true;
+            break;
+        }
+    }
+
     for (auto hash : blobHashes) {
         const auto* entry = blobStore.get(hash);
         if (!entry) {
@@ -1096,14 +1482,147 @@ std::vector<uint64_t> BedrockChunkColumn::networkDecodeCached(
             continue;
         }
         if (entry->type == BlobType::Biomes) {
-            BinaryStream stream(entry->buffer);
-            loadBiomes(stream, ChunkStorageType::NetworkPersistence);
+            if (hasSectionBlobs) {
+                loadLegacyBiomes(entry->buffer);
+            } else {
+                BinaryStream stream(entry->buffer);
+                loadBiomes(stream, ChunkStorageType::NetworkPersistence);
+            }
         } else if (entry->type == BlobType::ChunkSection) {
-            throw BedrockChunkError("full chunk cached decode does not accept chunk section blobs");
+            BinaryStream stream(entry->buffer);
+            BedrockSubChunk section(static_cast<int8_t>(entry->y), 8);
+            section.decodeFrom(
+                ChunkStorageType::NetworkPersistence,
+                stream,
+                0,
+                resolver
+            );
+            if (!stream.eof()) {
+                throw BedrockChunkError("cached chunk-section blob has trailing bytes");
+            }
+            setSection(section.y(), std::move(section));
+        } else {
+            throw BedrockChunkError("unknown cached blob type");
         }
     }
 
     return misses;
+}
+
+void BedrockChunkColumn::decodeBlockEntities(
+    BinaryStream& stream,
+    BedrockNbtEncoding encoding
+) {
+    while (!stream.eof() &&
+        stream.buffer()[stream.offset()] == static_cast<uint8_t>(NbtTagType::Compound)) {
+        const std::size_t start = stream.offset();
+        NbtDocument document;
+        try {
+            document = BedrockNbtCodec::read(stream, encoding);
+        } catch (const std::exception& error) {
+            throw BedrockChunkError("invalid block-entity NBT: " + std::string(error.what()));
+        }
+        const std::size_t end = stream.offset();
+        const BlockPosition pos = blockEntityPosition(document);
+        const std::string key = blockEntityKey(pos);
+        blockEntityNbt_[key] = document;
+
+        if (encoding == BedrockNbtEncoding::LittleVarInt) {
+            const auto& buffer = stream.buffer();
+            blockEntities_[key] = std::vector<uint8_t>(
+                buffer.begin() + static_cast<std::ptrdiff_t>(start),
+                buffer.begin() + static_cast<std::ptrdiff_t>(end)
+            );
+        } else {
+            BinaryStream networkTag;
+            BedrockNbtCodec::write(
+                networkTag,
+                document,
+                BedrockNbtEncoding::LittleVarInt
+            );
+            blockEntities_[key] = networkTag.buffer();
+        }
+    }
+}
+
+void BedrockChunkColumn::encodeBlockEntities(
+    BinaryStream& stream,
+    BedrockNbtEncoding encoding,
+    std::optional<int32_t> sectionY
+) const {
+    std::vector<std::string> keys;
+    keys.reserve(blockEntities_.size());
+    for (const auto& item : blockEntities_) {
+        if (sectionY.has_value()) {
+            const auto firstComma = item.first.find(',');
+            const auto secondComma = firstComma == std::string::npos
+                ? std::string::npos
+                : item.first.find(',', firstComma + 1);
+            if (firstComma == std::string::npos || secondComma == std::string::npos) {
+                throw BedrockChunkError("invalid block-entity position key");
+            }
+            const int32_t y = std::stoi(item.first.substr(
+                firstComma + 1,
+                secondComma - firstComma - 1
+            ));
+            if ((y >> 4) != *sectionY) {
+                continue;
+            }
+        }
+        keys.push_back(item.first);
+    }
+    std::sort(keys.begin(), keys.end());
+
+    for (const auto& key : keys) {
+        const auto rawIt = blockEntities_.find(key);
+        if (encoding == BedrockNbtEncoding::LittleVarInt && rawIt != blockEntities_.end()) {
+            stream.writeBytes(rawIt->second);
+            continue;
+        }
+
+        auto documentIt = blockEntityNbt_.find(key);
+        if (documentIt != blockEntityNbt_.end()) {
+            BedrockNbtCodec::write(stream, documentIt->second, encoding);
+            continue;
+        }
+
+        if (rawIt == blockEntities_.end()) {
+            throw BedrockChunkError("block-entity storage is inconsistent");
+        }
+        BinaryStream rawStream(rawIt->second);
+        const auto document = BedrockNbtCodec::read(
+            rawStream,
+            BedrockNbtEncoding::LittleVarInt
+        );
+        if (!rawStream.eof()) {
+            throw BedrockChunkError("raw block entity contains trailing bytes");
+        }
+        BedrockNbtCodec::write(stream, document, encoding);
+    }
+}
+
+BlockPosition BedrockChunkColumn::blockEntityPosition(const NbtDocument& tag) {
+    if (tag.root.type != NbtTagType::Compound) {
+        throw BedrockChunkError("block-entity NBT root must be a compound");
+    }
+
+    auto coordinate = [&tag](const char* name) -> int32_t {
+        const NbtValue* value = tag.root.find(name);
+        if (value == nullptr ||
+            (value->type != NbtTagType::Byte && value->type != NbtTagType::Short &&
+             value->type != NbtTagType::Int && value->type != NbtTagType::Long) ||
+            value->integerValue < std::numeric_limits<int32_t>::min() ||
+            value->integerValue > std::numeric_limits<int32_t>::max()) {
+            throw BedrockChunkError(std::string("block-entity NBT is missing int ") + name);
+        }
+        return static_cast<int32_t>(value->integerValue);
+    };
+
+    return {
+        .x = coordinate("x"),
+        .y = coordinate("y"),
+        .z = coordinate("z")
+    };
 }
 
 int32_t BedrockChunkColumn::sectionIndexForBlockY(int32_t y) const {

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace bedrock {
 
@@ -158,8 +159,35 @@ public:
         }
     }
 
+    std::vector<uint8_t> readBytes(std::size_t count) {
+        if (count > remaining()) {
+            throw std::runtime_error(
+                "not enough bytes at offset " + std::to_string(offset()) +
+                " remaining=" + std::to_string(remaining()) +
+                " need=" + std::to_string(count)
+            );
+        }
+        std::vector<uint8_t> out;
+        out.reserve(count);
+        for (std::size_t i = 0; i < count; ++i) {
+            out.push_back(cursor_.u8());
+        }
+        return out;
+    }
+
     void rewindTo(std::size_t offset) {
         cursor_.rewindTo(offset);
+    }
+
+    std::vector<uint8_t> peekRemainingBytes() {
+        const auto before = offset();
+        std::vector<uint8_t> out;
+        out.reserve(remaining());
+        while (remaining() > 0) {
+            out.push_back(u8());
+        }
+        rewindTo(before);
+        return out;
     }
 
 private:

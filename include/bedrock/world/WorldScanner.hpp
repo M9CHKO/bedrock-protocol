@@ -86,13 +86,16 @@ public:
                     continue;
                 }
 
-                const int32_t localX = static_cast<int32_t>(i & 0x0f);
+                const int32_t localY = static_cast<int32_t>(i & 0x0f);
                 const int32_t localZ = static_cast<int32_t>((i >> 4) & 0x0f);
-                const int32_t localY = static_cast<int32_t>((i >> 8) & 0x0f);
+                const int32_t localX = static_cast<int32_t>((i >> 8) & 0x0f);
+                const int32_t sectionY = section.version >= 9
+                    ? static_cast<int32_t>(section.yIndex)
+                    : static_cast<int32_t>(sub);
 
                 return BlockPosition{
                     chunkX * 16 + localX,
-                    static_cast<int32_t>(sub * 16) + localY,
+                    sectionY * 16 + localY,
                     chunkZ * 16 + localZ
                 };
             }

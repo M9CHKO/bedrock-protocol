@@ -152,7 +152,10 @@ private:
     void runLoop();
     void handlePacket(const std::vector<uint8_t>& packet);
     void sendToTarget(const std::vector<uint8_t>& packet);
-    void sendReliableInternal(const std::vector<uint8_t>& payload);
+    void sendReliableInternal(
+        const std::vector<uint8_t>& payload,
+        bool allowDuringClose = false
+    );
     bool beginConnectActivity();
     void endConnectActivity();
     void shutdownSocket() noexcept;
