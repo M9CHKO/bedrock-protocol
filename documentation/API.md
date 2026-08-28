@@ -716,6 +716,29 @@ column.setSkyLight({.x = 3, .y = -16, .z = 5}, 15);
 auto* section = column.getSectionAtIndex(-1);
 ```
 
+Modern columns also expose the remaining `CommonChunkColumn` inspection and
+initialization surface. `initialize` visits every local X/Z coordinate across
+the configured absolute Y bounds, `getBlocks` returns the unique active
+layer-zero palette entries, `getSectionBlockEntities` filters typed NBT by
+subchunk Y, and `getSections` returns the section vector. A subchunk provides
+the matching `getPaletteEntry` and active-only `getPalette` calls:
+
+```cpp
+column.initialize(blocks, [&](int32_t x, int32_t y, int32_t z)
+    -> std::optional<bedrock::BedrockBlock> {
+    if (y == column.minY()) return blocks.fromStateId(stoneStateId);
+    return std::nullopt;
+});
+
+const auto activeStates = column.getBlocks();
+const auto sectionEntities = column.getSectionBlockEntities(-4);
+const auto& sections = column.getSections();
+```
+
+For Caves & Cliffs bounds (`-4, 20`), initialization covers block Y `-64`
+through `319`. This fixes the upstream JavaScript loop's accidental `0..383`
+range while retaining its 98,304 callback invocations.
+
 `BedrockWorld::getBlockLight` and `getSkyLight` return zero for an unloaded
 column, while their setters are no-ops, matching `prismarine-world`.
 

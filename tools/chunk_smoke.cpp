@@ -245,6 +245,23 @@ int main() {
         std::cerr << "[CHUNK-SMOKE] single-state palette size mismatch\n";
         return 1;
     }
+    if (sub.getPaletteEntry(0, 15, 15, 15).stateId != stateId ||
+        sub.getPalette().size() != 1 || sub.getPalette()[0].stateId != stateId) {
+        std::cerr << "[CHUNK-SMOKE] JS-compatible palette access mismatch\n";
+        return 1;
+    }
+    auto paletteApiSub = sub;
+    paletteApiSub.setBlockStateId(1, 2, 3, 77);
+    if (paletteApiSub.getPaletteEntry(0, 1, 2, 3).stateId != 77 ||
+        paletteApiSub.getPalette().size() != 2) {
+        std::cerr << "[CHUNK-SMOKE] palette entry insertion mismatch\n";
+        return 1;
+    }
+    paletteApiSub.setBlockStateId(1, 2, 3, stateId);
+    if (paletteApiSub.palette().size() != 2 || paletteApiSub.getPalette().size() != 1) {
+        std::cerr << "[CHUNK-SMOKE] inactive palette filtering mismatch\n";
+        return 1;
+    }
 
     auto dumped = sub.encode(bedrock::ChunkStorageType::Runtime);
     if (dumped != encoded) {
@@ -328,6 +345,14 @@ int main() {
         column.getSectionAtIndex(2) != column.getSection(32) ||
         column.getSectionAtIndex(-1) != nullptr) {
         std::cerr << "[CHUNK-SMOKE] section index lookup mismatch\n";
+        return 1;
+    }
+    const auto blocks = column.getBlocks();
+    const auto& constColumn = column;
+    if (blocks.size() != 2 || blocks[0].stateId != 0 || blocks[1].stateId != 77 ||
+        &column.getSections() != &constColumn.getSections() ||
+        &constColumn.getSections() != &constColumn.sections()) {
+        std::cerr << "[CHUNK-SMOKE] CommonChunkColumn block/section API mismatch\n";
         return 1;
     }
     column.setBlockLight({.x = 17, .y = 32, .z = -1}, 12);
@@ -422,14 +447,19 @@ int main() {
 
     bedrock::BedrockChunkColumn metadataColumn(0, 0);
     metadataColumn.addBlockEntity(blockEntityDocument());
-    if (metadataColumn.blockEntityCount() != 1 ||
+    const auto sectionBlockEntities = metadataColumn.getSectionBlockEntities(-1);
+    if (metadataColumn.blockEntityCount() != 1 || sectionBlockEntities.size() != 1 ||
+        !(sectionBlockEntities[0] == blockEntityDocument()) ||
+        !metadataColumn.getSectionBlockEntities(0).empty() ||
         metadataColumn.getBlockEntityNbt({.x = 1, .y = -16, .z = 15}) == nullptr ||
         !metadataColumn.moveBlockEntity(
             {.x = 1, .y = -16, .z = 15},
-            {.x = 2, .y = -15, .z = 14}
+            {.x = 2, .y = 0, .z = 14}
         ) ||
         metadataColumn.getBlockEntityNbt({.x = 1, .y = -16, .z = 15}) != nullptr ||
-        metadataColumn.getBlockEntityNbt({.x = 2, .y = -15, .z = 14}) == nullptr ||
+        metadataColumn.getBlockEntityNbt({.x = 2, .y = 0, .z = 14}) == nullptr ||
+        !metadataColumn.getSectionBlockEntities(-1).empty() ||
+        metadataColumn.getSectionBlockEntities(0).size() != 1 ||
         metadataColumn.moveBlockEntity(
             {.x = 3, .y = 0, .z = 3},
             {.x = 4, .y = 0, .z = 4}

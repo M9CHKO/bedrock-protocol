@@ -2,6 +2,7 @@
 #include <bedrock/world/BedrockChunk.hpp>
 #include <bedrock/world/MinecraftDataAssets.hpp>
 
+#include <algorithm>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -91,6 +92,34 @@ int main() {
         missingSectionBlock->stateId != airDefinition->defaultState ||
         missingSectionBlock->name != "air") {
         return fail("missing section did not resolve to registry air");
+    }
+
+    bedrock::BedrockChunkColumn initializedColumn(0, 0);
+    initializedColumn.setBounds(-4, 20);
+    std::size_t initializeCalls = 0;
+    int32_t minimumInitializedY = initializedColumn.maxY();
+    int32_t maximumInitializedY = initializedColumn.minY();
+    initializedColumn.initialize(
+        registry,
+        [&](int32_t x, int32_t y, int32_t z) -> std::optional<bedrock::BedrockBlock> {
+            ++initializeCalls;
+            minimumInitializedY = std::min(minimumInitializedY, y);
+            maximumInitializedY = std::max(maximumInitializedY, y);
+            if (x == 1 && y == -64 && z == 2) {
+                return stone;
+            }
+            return std::nullopt;
+        }
+    );
+    const auto initializedStone = initializedColumn.getBlock(
+        {.x = 1, .y = -64, .z = 2},
+        registry
+    );
+    if (initializeCalls != 16u * 16u * 384u || minimumInitializedY != -64 ||
+        maximumInitializedY != 319 || !initializedStone.has_value() ||
+        initializedStone->stateId != stone->stateId ||
+        initializedColumn.getSectionAtIndex(-4) == nullptr) {
+        return fail("CommonChunkColumn initialize bounds mismatch");
     }
 
     sign->light = 9;

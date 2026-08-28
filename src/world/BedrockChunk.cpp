@@ -305,6 +305,26 @@ void BedrockSubChunk::setSkyLight(uint8_t x, uint8_t y, uint8_t z, uint8_t value
     skyLight_.set(x, y, z, value & 0x0f);
 }
 
+const BedrockBlockState& BedrockSubChunk::getPaletteEntry(
+    uint8_t layer,
+    uint8_t x,
+    uint8_t y,
+    uint8_t z
+) const {
+    if (layer >= blocks_.size()) {
+        throw BedrockChunkError("palette layer out of range");
+    }
+    const uint32_t paletteIndex = blocks_[layer].get(x, y, z);
+    if (paletteIndex >= palettes_[layer].size()) {
+        throw BedrockChunkError("subchunk palette index out of range");
+    }
+    return palettes_[layer][paletteIndex];
+}
+
+std::vector<BedrockBlockState> BedrockSubChunk::getPalette(uint8_t layer) const {
+    return compactedPalette(layer);
+}
+
 const std::vector<BedrockBlockState>& BedrockSubChunk::palette(uint8_t layer) const {
     if (layer >= palettes_.size()) {
         throw BedrockChunkError("palette layer out of range");
@@ -1011,6 +1031,25 @@ int32_t BedrockChunkColumn::minY() const { return minY_; }
 int32_t BedrockChunkColumn::maxY() const { return maxY_; }
 int32_t BedrockChunkColumn::worldHeight() const { return worldHeight_; }
 
+void BedrockChunkColumn::initialize(
+    const BedrockBlockRegistry& registry,
+    const BedrockChunkInitializer& initializer
+) {
+    if (!initializer) {
+        throw BedrockChunkError("chunk initializer must not be empty");
+    }
+    for (int32_t y = minY_; y < maxY_; ++y) {
+        for (int32_t z = 0; z < 16; ++z) {
+            for (int32_t x = 0; x < 16; ++x) {
+                auto block = initializer(x, y, z);
+                if (block.has_value()) {
+                    setBlock({.x = x, .y = y, .z = z}, *block, registry);
+                }
+            }
+        }
+    }
+}
+
 BedrockSubChunk* BedrockChunkColumn::getSection(int32_t blockY) {
     const int32_t index = sectionIndexForBlockY(blockY);
     if (index < 0 || static_cast<std::size_t>(index) >= sections_.size() || !sections_[index].has_value()) {
@@ -1088,6 +1127,29 @@ void BedrockChunkColumn::setBlockStateId(const BlockPosition& pos, int32_t state
     auto& section = ensureSection(pos.y);
     const uint8_t layer = pos.layer.value_or(0);
     section.setBlockStateId(layer, localCoord(pos.x), localCoord(pos.y), localCoord(pos.z), stateId);
+}
+
+std::vector<BedrockBlockState> BedrockChunkColumn::getBlocks() const {
+    std::unordered_map<int32_t, BedrockBlockState> byStateId;
+    for (const auto& section : sections_) {
+        if (!section.has_value()) {
+            continue;
+        }
+        for (auto block : section->getPalette()) {
+            byStateId.insert_or_assign(block.stateId, std::move(block));
+        }
+    }
+
+    std::vector<BedrockBlockState> blocks;
+    blocks.reserve(byStateId.size());
+    for (auto& [stateId, block] : byStateId) {
+        (void) stateId;
+        blocks.push_back(std::move(block));
+    }
+    std::sort(blocks.begin(), blocks.end(), [](const auto& left, const auto& right) {
+        return left.stateId < right.stateId;
+    });
+    return blocks;
 }
 
 std::optional<BedrockBlock> BedrockChunkColumn::getBlock(
@@ -1312,6 +1374,37 @@ std::size_t BedrockChunkColumn::blockEntityCount() const {
     return blockEntities_.size();
 }
 
+std::vector<NbtDocument> BedrockChunkColumn::getSectionBlockEntities(
+    int32_t sectionY
+) const {
+    std::vector<std::string> keys;
+    keys.reserve(blockEntityNbt_.size());
+    for (const auto& item : blockEntityNbt_) {
+        const auto firstComma = item.first.find(',');
+        const auto secondComma = firstComma == std::string::npos
+            ? std::string::npos
+            : item.first.find(',', firstComma + 1);
+        if (firstComma == std::string::npos || secondComma == std::string::npos) {
+            throw BedrockChunkError("invalid block-entity position key");
+        }
+        const int32_t y = std::stoi(item.first.substr(
+            firstComma + 1,
+            secondComma - firstComma - 1
+        ));
+        if ((y >> 4) == sectionY) {
+            keys.push_back(item.first);
+        }
+    }
+    std::sort(keys.begin(), keys.end());
+
+    std::vector<NbtDocument> found;
+    found.reserve(keys.size());
+    for (const auto& key : keys) {
+        found.push_back(blockEntityNbt_.at(key));
+    }
+    return found;
+}
+
 std::vector<uint8_t> BedrockChunkColumn::diskEncodeBlockEntities() const {
     BinaryStream stream;
     encodeBlockEntities(stream, BedrockNbtEncoding::LittleEndian);
@@ -1405,6 +1498,14 @@ void BedrockChunkColumn::writeHeightMap(BinaryStream& stream) {
     for (const uint16_t height : *heights_) {
         stream.writeU16LE(height);
     }
+}
+
+std::vector<std::optional<BedrockSubChunk>>& BedrockChunkColumn::getSections() {
+    return sections_;
+}
+
+const std::vector<std::optional<BedrockSubChunk>>& BedrockChunkColumn::getSections() const {
+    return sections_;
 }
 
 const std::vector<std::optional<BedrockSubChunk>>& BedrockChunkColumn::sections() const {

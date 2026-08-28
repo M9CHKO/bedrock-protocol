@@ -113,6 +113,12 @@ using BedrockBlockStateProvider = std::function<std::optional<BedrockBlockStateD
     int32_t stateId
 )>;
 
+using BedrockChunkInitializer = std::function<std::optional<BedrockBlock>(
+    int32_t x,
+    int32_t y,
+    int32_t z
+)>;
+
 enum class BlobType : uint8_t {
     ChunkSection = 0,
     Biomes = 1
@@ -219,6 +225,13 @@ public:
     uint8_t getSkyLight(uint8_t x, uint8_t y, uint8_t z) const;
     void setSkyLight(uint8_t x, uint8_t y, uint8_t z, uint8_t value);
 
+    const BedrockBlockState& getPaletteEntry(
+        uint8_t layer,
+        uint8_t x,
+        uint8_t y,
+        uint8_t z
+    ) const;
+    std::vector<BedrockBlockState> getPalette(uint8_t layer = 0) const;
     const std::vector<BedrockBlockState>& palette(uint8_t layer = 0) const;
     void setPaletteEntryDescriptor(
         uint8_t layer,
@@ -375,6 +388,11 @@ public:
     int32_t maxY() const;
     int32_t worldHeight() const;
 
+    void initialize(
+        const BedrockBlockRegistry& registry,
+        const BedrockChunkInitializer& initializer
+    );
+
     BedrockSubChunk* getSection(int32_t blockY);
     const BedrockSubChunk* getSection(int32_t blockY) const;
     BedrockSubChunk* getSectionAtIndex(int32_t sectionY);
@@ -385,6 +403,7 @@ public:
 
     int32_t getBlockStateId(const BlockPosition& pos) const;
     void setBlockStateId(const BlockPosition& pos, int32_t stateId);
+    std::vector<BedrockBlockState> getBlocks() const;
 
     std::optional<BedrockBlock> getBlock(
         const BlockPosition& pos,
@@ -411,6 +430,7 @@ public:
     void removeBlockEntity(const BlockPosition& pos);
     bool moveBlockEntity(const BlockPosition& pos, const BlockPosition& newPos);
     std::size_t blockEntityCount() const;
+    std::vector<NbtDocument> getSectionBlockEntities(int32_t sectionY) const;
 
     std::vector<uint8_t> diskEncodeBlockEntities() const;
     void diskDecodeBlockEntities(const std::vector<uint8_t>& data);
@@ -430,6 +450,8 @@ public:
     const BedrockHeightMap* getHeights() const;
     void writeHeightMap(BinaryStream& stream);
 
+    std::vector<std::optional<BedrockSubChunk>>& getSections();
+    const std::vector<std::optional<BedrockSubChunk>>& getSections() const;
     const std::vector<std::optional<BedrockSubChunk>>& sections() const;
 
     uint32_t getBiomeId(const BlockPosition& pos) const;
