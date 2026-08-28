@@ -1,4 +1,5 @@
 build/
+build-msys/
 out/
 install/
 .cache/

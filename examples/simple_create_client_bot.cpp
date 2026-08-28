@@ -7,10 +7,11 @@ int main() {
         .host = "localhost",
         .port = 19132,
         .username = "Notch",
-        .version = "latest",
         .offline = true,
-        .debug = bedrock::DebugMode::Events,
-        .decodePackets = false
+        .diagnostics = {
+            .debug = bedrock::DebugMode::Events,
+            .decodePackets = false
+        }
     });
 
     client.on("start_game", [](const bedrock::Packet&) {

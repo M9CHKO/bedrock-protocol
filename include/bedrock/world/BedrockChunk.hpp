@@ -2,13 +2,17 @@
 
 #include <bedrock/BinaryStream.hpp>
 #include <bedrock/nbt/BedrockNbt.hpp>
+#include <bedrock/world/BedrockBlockRegistry.hpp>
+#include <bedrock/world/WorldIterators.hpp>
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace bedrock {
@@ -20,6 +24,28 @@ enum class ChunkStorageType {
 };
 
 enum class ChunkVersion : uint8_t {
+    V0_9_00 = 0,
+    V0_9_02 = 1,
+    V0_9_05 = 2,
+    V0_17_0 = 3,
+    V0_18_0 = 4,
+    VConsole1ToV0_18_0 = 5,
+    V1_2_0 = 6,
+    V1_2_0Bis = 7,
+    V1_4_0 = 8,
+    V1_8_0 = 9,
+    V1_9_0 = 10,
+    V1_10_0 = 11,
+    V1_11_0 = 12,
+    V1_11_1 = 13,
+    V1_11_2 = 14,
+    V1_12_0 = 15,
+    V1_15_0 = 16,
+    V1_15_1 = 17,
+    V1_16_0 = 18,
+    V1_16_1 = 19,
+    V1_16_100 = 20,
+    V1_16_200 = 21,
     V1_16_210 = 22,
     V1_17_0 = 25,
     V1_17_30 = 29,
@@ -33,6 +59,34 @@ struct BlockPosition {
     int32_t z = 0;
     std::optional<uint8_t> layer;
 };
+
+using BedrockHeightMap = std::array<uint16_t, 256>;
+using BedrockEntityMap = std::unordered_map<std::string, NbtDocument>;
+
+struct BedrockWorldRaycastHit {
+    BlockPosition position;
+    int32_t stateId = 0;
+    BlockFace face = BlockFace::Unknown;
+    WorldVec3 intersect;
+};
+
+struct BedrockWorldBlockSnapshot {
+    BlockPosition position;
+    int32_t stateId = 0;
+    uint8_t blockLight = 0;
+    uint8_t skyLight = 0;
+    uint32_t biomeId = 0;
+    std::optional<NbtDocument> blockEntity;
+};
+
+using BedrockWorldRaycastMatcher = std::function<bool(
+    int32_t stateId,
+    const BlockPosition& position
+)>;
+using BedrockWorldBlockShapeProvider = std::function<std::vector<BlockShape>(
+    int32_t stateId,
+    const BlockPosition& position
+)>;
 
 struct BedrockBlockState {
     int32_t stateId = 0;
@@ -323,6 +377,8 @@ public:
 
     BedrockSubChunk* getSection(int32_t blockY);
     const BedrockSubChunk* getSection(int32_t blockY) const;
+    BedrockSubChunk* getSectionAtIndex(int32_t sectionY);
+    const BedrockSubChunk* getSectionAtIndex(int32_t sectionY) const;
     BedrockSubChunk& ensureSection(int32_t blockY);
     BedrockSubChunk& newSection(int32_t sectionY);
     void setSection(int32_t sectionY, BedrockSubChunk section);
@@ -330,15 +386,49 @@ public:
     int32_t getBlockStateId(const BlockPosition& pos) const;
     void setBlockStateId(const BlockPosition& pos, int32_t stateId);
 
+    std::optional<BedrockBlock> getBlock(
+        const BlockPosition& pos,
+        const BedrockBlockRegistry& registry,
+        bool full = true
+    ) const;
+    void setBlock(const BlockPosition& pos, const BedrockBlock& block);
+    void setBlock(
+        const BlockPosition& pos,
+        const BedrockBlock& block,
+        const BedrockBlockRegistry& registry
+    );
+
+    uint8_t getBlockLight(const BlockPosition& pos) const;
+    void setBlockLight(const BlockPosition& pos, uint8_t value);
+    uint8_t getSkyLight(const BlockPosition& pos) const;
+    void setSkyLight(const BlockPosition& pos, uint8_t value);
+
     void setBlockEntity(const BlockPosition& pos, std::vector<uint8_t> tag);
     void setBlockEntityNbt(const BlockPosition& pos, NbtDocument tag);
+    void addBlockEntity(NbtDocument tag);
     const std::vector<uint8_t>* getBlockEntity(const BlockPosition& pos) const;
     const NbtDocument* getBlockEntityNbt(const BlockPosition& pos) const;
     void removeBlockEntity(const BlockPosition& pos);
+    bool moveBlockEntity(const BlockPosition& pos, const BlockPosition& newPos);
     std::size_t blockEntityCount() const;
 
     std::vector<uint8_t> diskEncodeBlockEntities() const;
     void diskDecodeBlockEntities(const std::vector<uint8_t>& data);
+
+    void addEntity(NbtDocument entityTag);
+    bool removeEntity(std::string_view id);
+    BedrockEntityMap& getEntities();
+    const BedrockEntityMap& getEntities() const;
+    void loadEntities(BedrockEntityMap entities);
+    void loadEntities(std::vector<NbtDocument> entities);
+    std::size_t entityCount() const;
+    std::vector<uint8_t> diskEncodeEntities() const;
+    void diskDecodeEntities(const std::vector<uint8_t>& data);
+
+    void loadHeights(BedrockHeightMap heights);
+    BedrockHeightMap* getHeights();
+    const BedrockHeightMap* getHeights() const;
+    void writeHeightMap(BinaryStream& stream);
 
     const std::vector<std::optional<BedrockSubChunk>>& sections() const;
 
@@ -397,6 +487,8 @@ private:
     std::vector<BedrockBiomeSection> biomes_;
     std::unordered_map<std::string, std::vector<uint8_t>> blockEntities_;
     std::unordered_map<std::string, NbtDocument> blockEntityNbt_;
+    BedrockEntityMap entities_;
+    std::optional<BedrockHeightMap> heights_;
 
     int32_t sectionIndexForBlockY(int32_t y) const;
     void decodeBlockEntities(BinaryStream& stream, BedrockNbtEncoding encoding);
@@ -406,6 +498,7 @@ private:
         std::optional<int32_t> sectionY = std::nullopt
     ) const;
     static BlockPosition blockEntityPosition(const NbtDocument& tag);
+    static std::string entityKey(const NbtDocument& tag);
     static uint8_t localCoord(int32_t value);
     static std::string blockEntityKey(const BlockPosition& pos);
 };
@@ -416,37 +509,123 @@ struct BedrockWorldColumnEntry {
     BedrockChunkColumn column;
 };
 
+using BedrockWorldChunkGenerator = std::function<BedrockChunkColumn(
+    int32_t chunkX,
+    int32_t chunkZ
+)>;
+using BedrockWorldColumnLoader = std::function<std::optional<BedrockChunkColumn>(
+    int32_t chunkX,
+    int32_t chunkZ
+)>;
+using BedrockWorldColumnSaver = std::function<void(
+    int32_t chunkX,
+    int32_t chunkZ,
+    const BedrockChunkColumn& column
+)>;
+
+struct BedrockWorldOptions {
+    BedrockWorldChunkGenerator chunkGenerator;
+    BedrockWorldColumnLoader loadColumn;
+    BedrockWorldColumnSaver saveColumn;
+};
+
 class BedrockWorld {
 public:
     using ColumnHandler = std::function<void(const BedrockWorldColumnEntry&)>;
+    using BlockUpdateHandler = std::function<void(
+        const BedrockWorldBlockSnapshot& oldBlock,
+        const BedrockWorldBlockSnapshot& newBlock
+    )>;
+    using VoidHandler = std::function<void()>;
+
+    explicit BedrockWorld(BedrockWorldOptions options = {});
 
     void onColumnLoad(ColumnHandler handler);
     void onColumnUnload(ColumnHandler handler);
+    void onBlockUpdate(BlockUpdateHandler handler);
+    void onBlockUpdate(const BlockPosition& pos, BlockUpdateHandler handler);
+    void onDoneSaving(VoidHandler handler);
 
     bool hasColumn(int32_t chunkX, int32_t chunkZ) const;
     BedrockChunkColumn* getLoadedColumn(int32_t chunkX, int32_t chunkZ);
     const BedrockChunkColumn* getLoadedColumn(int32_t chunkX, int32_t chunkZ) const;
     BedrockChunkColumn* getLoadedColumnAt(const BlockPosition& pos);
     const BedrockChunkColumn* getLoadedColumnAt(const BlockPosition& pos) const;
+    BedrockChunkColumn* getColumn(int32_t chunkX, int32_t chunkZ);
+    BedrockChunkColumn* getColumnAt(const BlockPosition& pos);
 
-    void setLoadedColumn(int32_t chunkX, int32_t chunkZ, BedrockChunkColumn column);
+    void setLoadedColumn(
+        int32_t chunkX,
+        int32_t chunkZ,
+        BedrockChunkColumn column,
+        bool save = true
+    );
+    void setColumn(
+        int32_t chunkX,
+        int32_t chunkZ,
+        BedrockChunkColumn column,
+        bool save = true
+    );
     void unloadColumn(int32_t chunkX, int32_t chunkZ);
+    void queueSaving(int32_t chunkX, int32_t chunkZ);
+    void saveAt(const BlockPosition& pos);
+    void saveNow();
+    void waitSaving();
+    std::size_t savingQueueSize() const;
+    std::size_t unloadQueueSize() const;
     std::vector<BedrockWorldColumnEntry> getColumns() const;
 
+    std::optional<BedrockWorldBlockSnapshot> getBlock(const BlockPosition& pos) const;
+    std::optional<BedrockBlock> getBlock(
+        const BlockPosition& pos,
+        const BedrockBlockRegistry& registry,
+        bool full = true
+    ) const;
+    void setBlock(const BlockPosition& pos, const BedrockBlock& block);
+    void setBlock(
+        const BlockPosition& pos,
+        const BedrockBlock& block,
+        const BedrockBlockRegistry& registry
+    );
     int32_t getBlockStateId(const BlockPosition& pos) const;
     void setBlockStateId(const BlockPosition& pos, int32_t stateId);
+    uint8_t getBlockLight(const BlockPosition& pos) const;
+    void setBlockLight(const BlockPosition& pos, uint8_t value);
+    uint8_t getSkyLight(const BlockPosition& pos) const;
+    void setSkyLight(const BlockPosition& pos, uint8_t value);
     uint32_t getBiomeId(const BlockPosition& pos) const;
     void setBiomeId(const BlockPosition& pos, uint32_t biomeId);
+
+    std::optional<BedrockWorldRaycastHit> raycast(
+        const WorldVec3& from,
+        const WorldVec3& direction,
+        double range,
+        BedrockWorldRaycastMatcher matcher = {},
+        BedrockWorldBlockShapeProvider shapeProvider = {}
+    ) const;
 
     std::size_t columnCount() const;
 
 private:
+    BedrockWorldOptions options_;
     std::unordered_map<std::string, BedrockChunkColumn> columns_;
+    std::unordered_map<std::string, std::pair<int32_t, int32_t>> savingQueue_;
+    std::unordered_map<std::string, std::pair<int32_t, int32_t>> unloadQueue_;
     std::vector<ColumnHandler> loadHandlers_;
     std::vector<ColumnHandler> unloadHandlers_;
+    std::vector<BlockUpdateHandler> blockUpdateHandlers_;
+    std::unordered_map<std::string, std::vector<BlockUpdateHandler>>
+        positionedBlockUpdateHandlers_;
+    std::vector<VoidHandler> doneSavingHandlers_;
 
     static std::string key(int32_t chunkX, int32_t chunkZ);
+    static std::string blockKey(const BlockPosition& pos);
     static int32_t chunkCoord(int32_t blockCoord);
+    void emitBlockUpdate(
+        const BedrockWorldBlockSnapshot& oldBlock,
+        const BedrockWorldBlockSnapshot& newBlock
+    );
+    void forceUnloadColumn(int32_t chunkX, int32_t chunkZ);
 };
 
 } // namespace bedrock

@@ -10,6 +10,7 @@
 #include <iterator>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -398,8 +399,23 @@ private:
     }
 };
 
-inline BedrockRelay createRelay(BedrockRelayOptions options = {}) {
+// Explicit name for the packet-only codec layer. The normal network Relay is
+// bedrock::Relay from <bedrock/bedrock.hpp>.
+inline BedrockRelay createPacketRelay(BedrockRelayOptions options = {}) {
     return BedrockRelay(std::move(options));
+}
+
+// Keep typed legacy calls working without making createRelay({...}) ambiguous
+// with the public JavaScript-shaped RelayOptions overload.
+template <typename PacketRelayOptions>
+requires std::is_same_v<
+    std::remove_cvref_t<PacketRelayOptions>,
+    BedrockRelayOptions
+>
+inline BedrockRelay createRelay(PacketRelayOptions&& options) {
+    return createPacketRelay(
+        BedrockRelayOptions(std::forward<PacketRelayOptions>(options))
+    );
 }
 
 } // namespace bedrock

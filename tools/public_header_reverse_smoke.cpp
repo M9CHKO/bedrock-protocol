@@ -15,6 +15,11 @@ static_assert(std::is_same_v<
     bedrock::Client
 >);
 
+static_assert(std::is_same_v<
+    decltype(bedrock::createClient(std::declval<bedrock::ClientOptions>())),
+    bedrock::Client
+>);
+
 static_assert(std::is_same_v<bedrock::Packet, bedrock::api::Packet>);
 
 int main() {

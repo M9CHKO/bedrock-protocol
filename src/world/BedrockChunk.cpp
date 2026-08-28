@@ -1027,6 +1027,24 @@ const BedrockSubChunk* BedrockChunkColumn::getSection(int32_t blockY) const {
     return &sections_[index].value();
 }
 
+BedrockSubChunk* BedrockChunkColumn::getSectionAtIndex(int32_t sectionY) {
+    const int32_t index = co_ + sectionY;
+    if (index < 0 || static_cast<std::size_t>(index) >= sections_.size() ||
+        !sections_[index].has_value()) {
+        return nullptr;
+    }
+    return &sections_[index].value();
+}
+
+const BedrockSubChunk* BedrockChunkColumn::getSectionAtIndex(int32_t sectionY) const {
+    const int32_t index = co_ + sectionY;
+    if (index < 0 || static_cast<std::size_t>(index) >= sections_.size() ||
+        !sections_[index].has_value()) {
+        return nullptr;
+    }
+    return &sections_[index].value();
+}
+
 BedrockSubChunk& BedrockChunkColumn::ensureSection(int32_t blockY) {
     const int32_t sectionY = blockY >> 4;
     const int32_t index = co_ + sectionY;
@@ -1072,6 +1090,141 @@ void BedrockChunkColumn::setBlockStateId(const BlockPosition& pos, int32_t state
     section.setBlockStateId(layer, localCoord(pos.x), localCoord(pos.y), localCoord(pos.z), stateId);
 }
 
+std::optional<BedrockBlock> BedrockChunkColumn::getBlock(
+    const BlockPosition& pos,
+    const BedrockBlockRegistry& registry,
+    bool full
+) const {
+    const auto* section = getSection(pos.y);
+    if (section == nullptr) {
+        const auto* air = registry.blockByName("air");
+        return air == nullptr
+            ? std::nullopt
+            : registry.fromStateId(air->defaultState, 0);
+    }
+
+    const uint8_t layer = pos.layer.value_or(0);
+    const int32_t stateId = section->getBlockStateId(
+        layer,
+        localCoord(pos.x),
+        localCoord(pos.y),
+        localCoord(pos.z)
+    );
+    auto block = registry.fromStateId(stateId, static_cast<int32_t>(getBiomeId(pos)));
+    if (!block.has_value()) return std::nullopt;
+
+    if (!pos.layer.has_value() && section->hasLayer(1)) {
+        const int32_t superimposedStateId = section->getBlockStateId(
+            1,
+            localCoord(pos.x),
+            localCoord(pos.y),
+            localCoord(pos.z)
+        );
+        auto superimposed = registry.fromStateId(
+            superimposedStateId,
+            static_cast<int32_t>(getBiomeId(pos))
+        );
+        if (superimposed.has_value()) {
+            if (superimposed->name.find("water") != std::string::npos) {
+                block->computedStates.insert_or_assign(
+                    "waterlogged",
+                    BedrockBlockProperty::byte(1)
+                );
+            }
+            block->superimposed = std::make_shared<BedrockBlock>(std::move(*superimposed));
+        }
+    }
+
+    if (full) {
+        block->light = section->getBlockLight(
+            localCoord(pos.x),
+            localCoord(pos.y),
+            localCoord(pos.z)
+        );
+        block->skyLight = section->getSkyLight(
+            localCoord(pos.x),
+            localCoord(pos.y),
+            localCoord(pos.z)
+        );
+        if (const auto* entity = getBlockEntityNbt(pos)) {
+            block->entity = *entity;
+        }
+    }
+    return block;
+}
+
+void BedrockChunkColumn::setBlock(const BlockPosition& pos, const BedrockBlock& block) {
+    auto& section = ensureSection(pos.y);
+    const uint8_t x = localCoord(pos.x);
+    const uint8_t y = localCoord(pos.y);
+    const uint8_t z = localCoord(pos.z);
+
+    if (pos.layer.has_value()) {
+        section.setBlockStateId(*pos.layer, x, y, z, block.stateId);
+    } else {
+        section.setBlockStateId(0, x, y, z, block.stateId);
+        if (block.superimposed) {
+            section.setBlockStateId(1, x, y, z, block.superimposed->stateId);
+        }
+    }
+    section.setBlockLight(x, y, z, block.light);
+    section.setSkyLight(x, y, z, block.skyLight);
+    if (block.entity.has_value()) {
+        setBlockEntityNbt(pos, *block.entity);
+    }
+}
+
+void BedrockChunkColumn::setBlock(
+    const BlockPosition& pos,
+    const BedrockBlock& block,
+    const BedrockBlockRegistry& registry
+) {
+    if (getSection(pos.y) == nullptr) {
+        const auto* air = registry.blockByName("air");
+        if (air == nullptr) {
+            throw BedrockChunkError("Bedrock block registry does not contain air");
+        }
+        const int32_t sectionY = pos.y >> 4;
+        setSection(
+            sectionY,
+            BedrockSubChunk::createAir(static_cast<int8_t>(sectionY), air->defaultState)
+        );
+    }
+    setBlock(pos, block);
+}
+
+uint8_t BedrockChunkColumn::getBlockLight(const BlockPosition& pos) const {
+    const auto* section = getSection(pos.y);
+    if (!section) {
+        throw BedrockChunkError("block-light section is not loaded");
+    }
+    return section->getBlockLight(localCoord(pos.x), localCoord(pos.y), localCoord(pos.z));
+}
+
+void BedrockChunkColumn::setBlockLight(const BlockPosition& pos, uint8_t value) {
+    auto* section = getSection(pos.y);
+    if (!section) {
+        throw BedrockChunkError("block-light section is not loaded");
+    }
+    section->setBlockLight(localCoord(pos.x), localCoord(pos.y), localCoord(pos.z), value);
+}
+
+uint8_t BedrockChunkColumn::getSkyLight(const BlockPosition& pos) const {
+    const auto* section = getSection(pos.y);
+    if (!section) {
+        throw BedrockChunkError("sky-light section is not loaded");
+    }
+    return section->getSkyLight(localCoord(pos.x), localCoord(pos.y), localCoord(pos.z));
+}
+
+void BedrockChunkColumn::setSkyLight(const BlockPosition& pos, uint8_t value) {
+    auto* section = getSection(pos.y);
+    if (!section) {
+        throw BedrockChunkError("sky-light section is not loaded");
+    }
+    section->setSkyLight(localCoord(pos.x), localCoord(pos.y), localCoord(pos.z), value);
+}
+
 void BedrockChunkColumn::setBlockEntity(const BlockPosition& pos, std::vector<uint8_t> tag) {
     const std::string key = blockEntityKey(pos);
     blockEntities_[key] = std::move(tag);
@@ -1098,6 +1251,11 @@ void BedrockChunkColumn::setBlockEntityNbt(const BlockPosition& pos, NbtDocument
     blockEntityNbt_[key] = std::move(tag);
 }
 
+void BedrockChunkColumn::addBlockEntity(NbtDocument tag) {
+    const BlockPosition pos = blockEntityPosition(tag);
+    setBlockEntityNbt(pos, std::move(tag));
+}
+
 const std::vector<uint8_t>* BedrockChunkColumn::getBlockEntity(const BlockPosition& pos) const {
     auto it = blockEntities_.find(blockEntityKey(pos));
     return it == blockEntities_.end() ? nullptr : &it->second;
@@ -1114,6 +1272,42 @@ void BedrockChunkColumn::removeBlockEntity(const BlockPosition& pos) {
     blockEntityNbt_.erase(key);
 }
 
+bool BedrockChunkColumn::moveBlockEntity(
+    const BlockPosition& pos,
+    const BlockPosition& newPos
+) {
+    const std::string oldKey = blockEntityKey(pos);
+    const std::string newKey = blockEntityKey(newPos);
+    if (oldKey == newKey) {
+        return blockEntities_.find(oldKey) != blockEntities_.end() ||
+            blockEntityNbt_.find(oldKey) != blockEntityNbt_.end();
+    }
+
+    std::optional<std::vector<uint8_t>> raw;
+    std::optional<NbtDocument> document;
+    if (auto it = blockEntities_.find(oldKey); it != blockEntities_.end()) {
+        raw = std::move(it->second);
+        blockEntities_.erase(it);
+    }
+    if (auto it = blockEntityNbt_.find(oldKey); it != blockEntityNbt_.end()) {
+        document = std::move(it->second);
+        blockEntityNbt_.erase(it);
+    }
+    if (!raw.has_value() && !document.has_value()) {
+        return false;
+    }
+
+    blockEntities_.erase(newKey);
+    blockEntityNbt_.erase(newKey);
+    if (raw.has_value()) {
+        blockEntities_[newKey] = std::move(*raw);
+    }
+    if (document.has_value()) {
+        blockEntityNbt_[newKey] = std::move(*document);
+    }
+    return true;
+}
+
 std::size_t BedrockChunkColumn::blockEntityCount() const {
     return blockEntities_.size();
 }
@@ -1127,6 +1321,90 @@ std::vector<uint8_t> BedrockChunkColumn::diskEncodeBlockEntities() const {
 void BedrockChunkColumn::diskDecodeBlockEntities(const std::vector<uint8_t>& data) {
     BinaryStream stream(data);
     decodeBlockEntities(stream, BedrockNbtEncoding::LittleEndian);
+}
+
+void BedrockChunkColumn::addEntity(NbtDocument entityTag) {
+    const std::string key = entityKey(entityTag);
+    entities_[key] = std::move(entityTag);
+}
+
+bool BedrockChunkColumn::removeEntity(std::string_view id) {
+    return entities_.erase(std::string(id)) != 0;
+}
+
+BedrockEntityMap& BedrockChunkColumn::getEntities() {
+    return entities_;
+}
+
+const BedrockEntityMap& BedrockChunkColumn::getEntities() const {
+    return entities_;
+}
+
+void BedrockChunkColumn::loadEntities(BedrockEntityMap entities) {
+    entities_ = std::move(entities);
+}
+
+void BedrockChunkColumn::loadEntities(std::vector<NbtDocument> entities) {
+    entities_.clear();
+    for (auto& entity : entities) {
+        addEntity(std::move(entity));
+    }
+}
+
+std::size_t BedrockChunkColumn::entityCount() const {
+    return entities_.size();
+}
+
+std::vector<uint8_t> BedrockChunkColumn::diskEncodeEntities() const {
+    std::vector<std::string> keys;
+    keys.reserve(entities_.size());
+    for (const auto& item : entities_) {
+        keys.push_back(item.first);
+    }
+    std::sort(keys.begin(), keys.end());
+
+    BinaryStream stream;
+    for (const auto& key : keys) {
+        BedrockNbtCodec::write(
+            stream,
+            entities_.at(key),
+            BedrockNbtEncoding::LittleEndian
+        );
+    }
+    return stream.buffer();
+}
+
+void BedrockChunkColumn::diskDecodeEntities(const std::vector<uint8_t>& data) {
+    BinaryStream stream(data);
+    while (!stream.eof() &&
+        stream.buffer()[stream.offset()] == static_cast<uint8_t>(NbtTagType::Compound)) {
+        try {
+            addEntity(BedrockNbtCodec::read(stream, BedrockNbtEncoding::LittleEndian));
+        } catch (const std::exception& error) {
+            throw BedrockChunkError("invalid entity NBT: " + std::string(error.what()));
+        }
+    }
+}
+
+void BedrockChunkColumn::loadHeights(BedrockHeightMap heights) {
+    heights_ = std::move(heights);
+}
+
+BedrockHeightMap* BedrockChunkColumn::getHeights() {
+    return heights_.has_value() ? &*heights_ : nullptr;
+}
+
+const BedrockHeightMap* BedrockChunkColumn::getHeights() const {
+    return heights_.has_value() ? &*heights_ : nullptr;
+}
+
+void BedrockChunkColumn::writeHeightMap(BinaryStream& stream) {
+    if (!heights_.has_value()) {
+        heights_ = BedrockHeightMap {};
+    }
+    for (const uint16_t height : *heights_) {
+        stream.writeU16LE(height);
+    }
 }
 
 const std::vector<std::optional<BedrockSubChunk>>& BedrockChunkColumn::sections() const {
@@ -1625,6 +1903,19 @@ BlockPosition BedrockChunkColumn::blockEntityPosition(const NbtDocument& tag) {
     };
 }
 
+std::string BedrockChunkColumn::entityKey(const NbtDocument& tag) {
+    if (tag.root.type != NbtTagType::Compound) {
+        throw BedrockChunkError("entity NBT root must be a compound");
+    }
+    const NbtValue* uniqueId = tag.root.find("UniqueID");
+    if (uniqueId == nullptr ||
+        (uniqueId->type != NbtTagType::Byte && uniqueId->type != NbtTagType::Short &&
+         uniqueId->type != NbtTagType::Int && uniqueId->type != NbtTagType::Long)) {
+        throw BedrockChunkError("entity NBT is missing integer UniqueID");
+    }
+    return std::to_string(uniqueId->integerValue);
+}
+
 int32_t BedrockChunkColumn::sectionIndexForBlockY(int32_t y) const {
     return co_ + (y >> 4);
 }
@@ -1639,12 +1930,30 @@ std::string BedrockChunkColumn::blockEntityKey(const BlockPosition& pos) {
         std::to_string(pos.z & 0x0f);
 }
 
+BedrockWorld::BedrockWorld(BedrockWorldOptions options)
+    : options_(std::move(options)) {}
+
 void BedrockWorld::onColumnLoad(ColumnHandler handler) {
     loadHandlers_.push_back(std::move(handler));
 }
 
 void BedrockWorld::onColumnUnload(ColumnHandler handler) {
     unloadHandlers_.push_back(std::move(handler));
+}
+
+void BedrockWorld::onBlockUpdate(BlockUpdateHandler handler) {
+    blockUpdateHandlers_.push_back(std::move(handler));
+}
+
+void BedrockWorld::onBlockUpdate(
+    const BlockPosition& pos,
+    BlockUpdateHandler handler
+) {
+    positionedBlockUpdateHandlers_[blockKey(pos)].push_back(std::move(handler));
+}
+
+void BedrockWorld::onDoneSaving(VoidHandler handler) {
+    doneSavingHandlers_.push_back(std::move(handler));
 }
 
 bool BedrockWorld::hasColumn(int32_t chunkX, int32_t chunkZ) const {
@@ -1669,7 +1978,43 @@ const BedrockChunkColumn* BedrockWorld::getLoadedColumnAt(const BlockPosition& p
     return getLoadedColumn(chunkCoord(pos.x), chunkCoord(pos.z));
 }
 
-void BedrockWorld::setLoadedColumn(int32_t chunkX, int32_t chunkZ, BedrockChunkColumn column) {
+BedrockChunkColumn* BedrockWorld::getColumn(int32_t chunkX, int32_t chunkZ) {
+    if (auto* loaded = getLoadedColumn(chunkX, chunkZ)) {
+        return loaded;
+    }
+
+    std::optional<BedrockChunkColumn> column;
+    bool loadedFromStorage = false;
+    if (options_.loadColumn) {
+        column = options_.loadColumn(chunkX, chunkZ);
+        loadedFromStorage = column.has_value();
+    }
+    if (!column.has_value() && options_.chunkGenerator) {
+        column = options_.chunkGenerator(chunkX, chunkZ);
+    }
+    if (!column.has_value()) {
+        return nullptr;
+    }
+
+    setLoadedColumn(
+        chunkX,
+        chunkZ,
+        std::move(*column),
+        !loadedFromStorage
+    );
+    return getLoadedColumn(chunkX, chunkZ);
+}
+
+BedrockChunkColumn* BedrockWorld::getColumnAt(const BlockPosition& pos) {
+    return getColumn(chunkCoord(pos.x), chunkCoord(pos.z));
+}
+
+void BedrockWorld::setLoadedColumn(
+    int32_t chunkX,
+    int32_t chunkZ,
+    BedrockChunkColumn column,
+    bool save
+) {
     columns_[key(chunkX, chunkZ)] = std::move(column);
     BedrockWorldColumnEntry entry;
     entry.chunkX = chunkX;
@@ -1678,23 +2023,79 @@ void BedrockWorld::setLoadedColumn(int32_t chunkX, int32_t chunkZ, BedrockChunkC
     for (auto& handler : loadHandlers_) {
         handler(entry);
     }
+    if (save && options_.saveColumn) {
+        queueSaving(chunkX, chunkZ);
+    }
+}
+
+void BedrockWorld::setColumn(
+    int32_t chunkX,
+    int32_t chunkZ,
+    BedrockChunkColumn column,
+    bool save
+) {
+    setLoadedColumn(chunkX, chunkZ, std::move(column), save);
 }
 
 void BedrockWorld::unloadColumn(int32_t chunkX, int32_t chunkZ) {
-    auto it = columns_.find(key(chunkX, chunkZ));
-    if (it == columns_.end()) {
+    const std::string columnKey = key(chunkX, chunkZ);
+    if (columns_.find(columnKey) == columns_.end()) {
+        return;
+    }
+    if (options_.saveColumn && savingQueue_.find(columnKey) != savingQueue_.end()) {
+        unloadQueue_[columnKey] = {chunkX, chunkZ};
+        return;
+    }
+    forceUnloadColumn(chunkX, chunkZ);
+}
+
+void BedrockWorld::queueSaving(int32_t chunkX, int32_t chunkZ) {
+    if (!options_.saveColumn || !hasColumn(chunkX, chunkZ)) {
+        return;
+    }
+    savingQueue_[key(chunkX, chunkZ)] = {chunkX, chunkZ};
+}
+
+void BedrockWorld::saveAt(const BlockPosition& pos) {
+    queueSaving(chunkCoord(pos.x), chunkCoord(pos.z));
+}
+
+void BedrockWorld::saveNow() {
+    if (savingQueue_.empty() || !options_.saveColumn) {
         return;
     }
 
-    BedrockWorldColumnEntry entry;
-    entry.chunkX = chunkX;
-    entry.chunkZ = chunkZ;
-    entry.column = it->second;
-    columns_.erase(it);
-
-    for (auto& handler : unloadHandlers_) {
-        handler(entry);
+    const auto queue = savingQueue_;
+    for (const auto& item : queue) {
+        const auto columnIt = columns_.find(item.first);
+        if (columnIt == columns_.end()) {
+            continue;
+        }
+        options_.saveColumn(item.second.first, item.second.second, columnIt->second);
     }
+    for (const auto& item : queue) {
+        savingQueue_.erase(item.first);
+    }
+
+    const auto unloads = unloadQueue_;
+    for (const auto& item : unloads) {
+        forceUnloadColumn(item.second.first, item.second.second);
+    }
+    for (auto& handler : doneSavingHandlers_) {
+        handler();
+    }
+}
+
+void BedrockWorld::waitSaving() {
+    saveNow();
+}
+
+std::size_t BedrockWorld::savingQueueSize() const {
+    return savingQueue_.size();
+}
+
+std::size_t BedrockWorld::unloadQueueSize() const {
+    return unloadQueue_.size();
 }
 
 std::vector<BedrockWorldColumnEntry> BedrockWorld::getColumns() const {
@@ -1711,6 +2112,64 @@ std::vector<BedrockWorldColumnEntry> BedrockWorld::getColumns() const {
     return out;
 }
 
+std::optional<BedrockWorldBlockSnapshot> BedrockWorld::getBlock(
+    const BlockPosition& pos
+) const {
+    const auto* column = getLoadedColumnAt(pos);
+    if (!column) {
+        return std::nullopt;
+    }
+
+    BedrockWorldBlockSnapshot block;
+    block.position = pos;
+    block.stateId = column->getBlockStateId(pos);
+    block.biomeId = column->getBiomeId(pos);
+    if (column->getSection(pos.y) != nullptr) {
+        block.blockLight = column->getBlockLight(pos);
+        block.skyLight = column->getSkyLight(pos);
+    }
+    if (const auto* entity = column->getBlockEntityNbt(pos)) {
+        block.blockEntity = *entity;
+    }
+    return block;
+}
+
+std::optional<BedrockBlock> BedrockWorld::getBlock(
+    const BlockPosition& pos,
+    const BedrockBlockRegistry& registry,
+    bool full
+) const {
+    const auto* column = getLoadedColumnAt(pos);
+    if (column == nullptr) return std::nullopt;
+    auto block = column->getBlock(pos, registry, full);
+    if (block.has_value()) {
+        block->position = WorldBlockPosition {pos.x, pos.y, pos.z};
+    }
+    return block;
+}
+
+void BedrockWorld::setBlock(const BlockPosition& pos, const BedrockBlock& block) {
+    auto* column = getLoadedColumnAt(pos);
+    if (column == nullptr) return;
+    const auto oldBlock = getBlock(pos);
+    column->setBlock(pos, block);
+    saveAt(pos);
+    emitBlockUpdate(*oldBlock, *getBlock(pos));
+}
+
+void BedrockWorld::setBlock(
+    const BlockPosition& pos,
+    const BedrockBlock& block,
+    const BedrockBlockRegistry& registry
+) {
+    auto* column = getLoadedColumnAt(pos);
+    if (column == nullptr) return;
+    const auto oldBlock = getBlock(pos);
+    column->setBlock(pos, block, registry);
+    saveAt(pos);
+    emitBlockUpdate(*oldBlock, *getBlock(pos));
+}
+
 int32_t BedrockWorld::getBlockStateId(const BlockPosition& pos) const {
     const auto* column = getLoadedColumnAt(pos);
     return column ? column->getBlockStateId(pos) : 0;
@@ -1721,7 +2180,42 @@ void BedrockWorld::setBlockStateId(const BlockPosition& pos, int32_t stateId) {
     if (!column) {
         return;
     }
+    const auto oldBlock = getBlock(pos);
     column->setBlockStateId(pos, stateId);
+    saveAt(pos);
+    emitBlockUpdate(*oldBlock, *getBlock(pos));
+}
+
+uint8_t BedrockWorld::getBlockLight(const BlockPosition& pos) const {
+    const auto* column = getLoadedColumnAt(pos);
+    return column ? column->getBlockLight(pos) : 0;
+}
+
+void BedrockWorld::setBlockLight(const BlockPosition& pos, uint8_t value) {
+    auto* column = getLoadedColumnAt(pos);
+    if (!column) {
+        return;
+    }
+    const auto oldBlock = getBlock(pos);
+    column->setBlockLight(pos, value);
+    saveAt(pos);
+    emitBlockUpdate(*oldBlock, *getBlock(pos));
+}
+
+uint8_t BedrockWorld::getSkyLight(const BlockPosition& pos) const {
+    const auto* column = getLoadedColumnAt(pos);
+    return column ? column->getSkyLight(pos) : 0;
+}
+
+void BedrockWorld::setSkyLight(const BlockPosition& pos, uint8_t value) {
+    auto* column = getLoadedColumnAt(pos);
+    if (!column) {
+        return;
+    }
+    const auto oldBlock = getBlock(pos);
+    column->setSkyLight(pos, value);
+    saveAt(pos);
+    emitBlockUpdate(*oldBlock, *getBlock(pos));
 }
 
 uint32_t BedrockWorld::getBiomeId(const BlockPosition& pos) const {
@@ -1734,7 +2228,57 @@ void BedrockWorld::setBiomeId(const BlockPosition& pos, uint32_t biomeId) {
     if (!column) {
         return;
     }
+    const auto oldBlock = getBlock(pos);
     column->setBiomeId(pos, biomeId);
+    saveAt(pos);
+    emitBlockUpdate(*oldBlock, *getBlock(pos));
+}
+
+std::optional<BedrockWorldRaycastHit> BedrockWorld::raycast(
+    const WorldVec3& from,
+    const WorldVec3& direction,
+    double range,
+    BedrockWorldRaycastMatcher matcher,
+    BedrockWorldBlockShapeProvider shapeProvider
+) const {
+    RaycastIterator iterator(from, direction, range);
+    while (const auto step = iterator.next()) {
+        const BlockPosition position {
+            .x = step->x,
+            .y = step->y,
+            .z = step->z
+        };
+        const auto* column = getLoadedColumnAt(position);
+        if (!column) {
+            continue;
+        }
+        const int32_t stateId = column->getBlockStateId(position);
+        if (matcher ? !matcher(stateId, position) : stateId == 0) {
+            continue;
+        }
+
+        const std::vector<BlockShape> shapes = shapeProvider
+            ? shapeProvider(stateId, position)
+            : std::vector<BlockShape> {FullBlockShape};
+        const auto intersection = iterator.intersect(
+            shapes,
+            WorldVec3 {
+                static_cast<double>(position.x),
+                static_cast<double>(position.y),
+                static_cast<double>(position.z)
+            }
+        );
+        if (!intersection.has_value()) {
+            continue;
+        }
+        return BedrockWorldRaycastHit {
+            position,
+            stateId,
+            intersection->face,
+            intersection->pos
+        };
+    }
+    return std::nullopt;
 }
 
 std::size_t BedrockWorld::columnCount() const {
@@ -1745,11 +2289,53 @@ std::string BedrockWorld::key(int32_t chunkX, int32_t chunkZ) {
     return std::to_string(chunkX) + "," + std::to_string(chunkZ);
 }
 
+std::string BedrockWorld::blockKey(const BlockPosition& pos) {
+    return std::to_string(pos.x) + "," + std::to_string(pos.y) + "," +
+        std::to_string(pos.z);
+}
+
 int32_t BedrockWorld::chunkCoord(int32_t blockCoord) {
     if (blockCoord >= 0) {
         return blockCoord / 16;
     }
     return -(((-blockCoord) + 15) / 16);
+}
+
+void BedrockWorld::emitBlockUpdate(
+    const BedrockWorldBlockSnapshot& oldBlock,
+    const BedrockWorldBlockSnapshot& newBlock
+) {
+    for (auto& handler : blockUpdateHandlers_) {
+        handler(oldBlock, newBlock);
+    }
+    auto it = positionedBlockUpdateHandlers_.find(blockKey(newBlock.position));
+    if (it == positionedBlockUpdateHandlers_.end()) {
+        return;
+    }
+    for (auto& handler : it->second) {
+        handler(oldBlock, newBlock);
+    }
+}
+
+void BedrockWorld::forceUnloadColumn(int32_t chunkX, int32_t chunkZ) {
+    const std::string columnKey = key(chunkX, chunkZ);
+    auto it = columns_.find(columnKey);
+    if (it == columns_.end()) {
+        unloadQueue_.erase(columnKey);
+        savingQueue_.erase(columnKey);
+        return;
+    }
+
+    BedrockWorldColumnEntry entry;
+    entry.chunkX = chunkX;
+    entry.chunkZ = chunkZ;
+    entry.column = it->second;
+    columns_.erase(it);
+    unloadQueue_.erase(columnKey);
+    savingQueue_.erase(columnKey);
+    for (auto& handler : unloadHandlers_) {
+        handler(entry);
+    }
 }
 
 } // namespace bedrock

@@ -194,6 +194,14 @@ PayloadTextPacket PacketPayloadReader::readText(const std::vector<uint8_t>& pack
 
     out.message = r.string();
 
+    if (out.type == 2 || out.type == 3 || out.type == 4) {
+        const auto count = r.uvarint();
+        out.parameters.reserve(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            out.parameters.push_back(r.string());
+        }
+    }
+
     if (!r.eof()) {
         try {
             out.xuid = r.string();
@@ -205,6 +213,14 @@ PayloadTextPacket PacketPayloadReader::readText(const std::vector<uint8_t>& pack
     if (!r.eof()) {
         try {
             out.platformChatId = r.string();
+        } catch (...) {
+            return out;
+        }
+    }
+
+    if (!r.eof()) {
+        try {
+            out.filteredMessage = r.string();
         } catch (...) {
             return out;
         }

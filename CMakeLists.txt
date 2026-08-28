@@ -45,11 +45,18 @@ add_library(bedrock_protocol
     src/auth/XboxLiveAuth.cpp
     src/auth/XboxProofKey.cpp
     src/auth/XboxTokenManager.cpp
+    src/chat/BedrockChat.cpp
     src/client/BedrockNetworkClient.cpp
     src/client/RakNetClient.cpp
     src/events/BedrockPacketEventAdapter.cpp
     src/generated/GeneratedProtocolTables.cpp
+    src/item/BedrockItem.cpp
     src/nbt/BedrockNbt.cpp
+    src/registry/BedrockDefaultSkin.cpp
+    src/registry/BedrockFeatureRegistry.cpp
+    src/registry/BedrockGameplayRegistry.cpp
+    src/registry/BedrockLootRegistry.cpp
+    src/registry/BedrockRegistry.cpp
     src/protodef/ProtoDefNbt.cpp
     src/protocol/BatchCodec.cpp
     src/protocol/BedrockPacketIO.cpp
@@ -69,8 +76,11 @@ add_library(bedrock_protocol
     src/util/BinaryStream.cpp
     src/util/VarInt.cpp
     src/util/XxHash64.cpp
+    src/world/BedrockBlockRegistry.cpp
     src/world/BedrockChunk.cpp
+    src/world/BedrockLegacyChunk.cpp
     src/world/BedrockSubChunkPacket.cpp
+    src/world/WorldIterators.cpp
 )
 add_library(BedrockProtocol::bedrock_protocol ALIAS bedrock_protocol)
 add_library(Bedrock::bedrock ALIAS bedrock_protocol)
@@ -168,6 +178,9 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
     add_executable(server-login-verifier-smoke tools/server_login_verifier_smoke.cpp)
     target_link_libraries(server-login-verifier-smoke PRIVATE BedrockProtocol::bedrock_protocol)
 
+    add_executable(server-protocol-version-smoke tools/server_protocol_version_smoke.cpp)
+    target_link_libraries(server-protocol-version-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
     add_executable(raknet-client-smoke tools/raknet_client_smoke.cpp)
     target_link_libraries(raknet-client-smoke PRIVATE BedrockProtocol::bedrock_protocol)
 
@@ -185,6 +198,39 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
 
     add_executable(chunk-smoke tools/chunk_smoke.cpp)
     target_link_libraries(chunk-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
+    add_executable(world-iterators-smoke tools/world_iterators_smoke.cpp)
+    target_link_libraries(world-iterators-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
+    add_executable(bedrock-block-registry-smoke tools/bedrock_block_registry_smoke.cpp)
+    target_link_libraries(bedrock-block-registry-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
+    add_executable(bedrock-item-smoke tools/bedrock_item_smoke.cpp)
+    target_link_libraries(bedrock-item-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
+    add_executable(bedrock-registry-smoke tools/bedrock_registry_smoke.cpp)
+    target_link_libraries(bedrock-registry-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
+    add_executable(bedrock-gameplay-registry-smoke tools/bedrock_gameplay_registry_smoke.cpp)
+    target_link_libraries(bedrock-gameplay-registry-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
+    add_executable(bedrock-feature-registry-smoke tools/bedrock_feature_registry_smoke.cpp)
+    target_link_libraries(bedrock-feature-registry-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
+    add_executable(bedrock-loot-skin-smoke tools/bedrock_loot_skin_smoke.cpp)
+    target_link_libraries(bedrock-loot-skin-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
+    add_executable(bedrock-dynamic-registry-smoke tools/bedrock_dynamic_registry_smoke.cpp)
+    target_link_libraries(bedrock-dynamic-registry-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
+    add_executable(bedrock-block-entity-smoke tools/bedrock_block_entity_smoke.cpp)
+    target_link_libraries(bedrock-block-entity-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
+    add_executable(bedrock-legacy-chunk-smoke tools/bedrock_legacy_chunk_smoke.cpp)
+    target_link_libraries(bedrock-legacy-chunk-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
+    add_executable(bedrock-chat-smoke tools/bedrock_chat_smoke.cpp)
+    target_link_libraries(bedrock-chat-smoke PRIVATE BedrockProtocol::bedrock_protocol)
 
     add_executable(public-header-smoke tools/public_header_smoke.cpp)
     target_link_libraries(public-header-smoke PRIVATE BedrockProtocol::bedrock_protocol)
@@ -215,9 +261,21 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
         add_test(NAME create-client-factory-smoke COMMAND create-client-factory-smoke)
         add_test(NAME legacy-encryption-smoke COMMAND legacy-encryption-smoke)
         add_test(NAME chunk-smoke COMMAND chunk-smoke)
+        add_test(NAME world-iterators-smoke COMMAND world-iterators-smoke)
+        add_test(NAME bedrock-block-registry-smoke COMMAND bedrock-block-registry-smoke)
+        add_test(NAME bedrock-item-smoke COMMAND bedrock-item-smoke)
+        add_test(NAME bedrock-registry-smoke COMMAND bedrock-registry-smoke)
+        add_test(NAME bedrock-gameplay-registry-smoke COMMAND bedrock-gameplay-registry-smoke)
+        add_test(NAME bedrock-feature-registry-smoke COMMAND bedrock-feature-registry-smoke)
+        add_test(NAME bedrock-loot-skin-smoke COMMAND bedrock-loot-skin-smoke)
+        add_test(NAME bedrock-dynamic-registry-smoke COMMAND bedrock-dynamic-registry-smoke)
+        add_test(NAME bedrock-block-entity-smoke COMMAND bedrock-block-entity-smoke)
+        add_test(NAME bedrock-legacy-chunk-smoke COMMAND bedrock-legacy-chunk-smoke)
+        add_test(NAME bedrock-chat-smoke COMMAND bedrock-chat-smoke)
         add_test(NAME raknet-server-smoke COMMAND raknet-server-smoke)
         add_test(NAME raknet-connection-lifecycle-smoke COMMAND raknet-connection-lifecycle-smoke)
         add_test(NAME server-login-verifier-smoke COMMAND server-login-verifier-smoke)
+        add_test(NAME server-protocol-version-smoke COMMAND server-protocol-version-smoke)
         add_test(NAME raknet-client-smoke COMMAND raknet-client-smoke)
         add_test(NAME network-client-smoke COMMAND network-client-smoke)
         add_test(NAME live-relay-smoke COMMAND live-relay-smoke)
@@ -243,9 +301,21 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
             create-client-factory-smoke
             legacy-encryption-smoke
             chunk-smoke
+            world-iterators-smoke
+            bedrock-block-registry-smoke
+            bedrock-item-smoke
+            bedrock-registry-smoke
+            bedrock-gameplay-registry-smoke
+            bedrock-feature-registry-smoke
+            bedrock-loot-skin-smoke
+            bedrock-dynamic-registry-smoke
+            bedrock-block-entity-smoke
+            bedrock-legacy-chunk-smoke
+            bedrock-chat-smoke
             raknet-server-smoke
             raknet-connection-lifecycle-smoke
             server-login-verifier-smoke
+            server-protocol-version-smoke
             raknet-client-smoke
             network-client-smoke
             live-relay-smoke
@@ -306,7 +376,7 @@ if(BEDROCK_PROTOCOL_CPP_INSTALL)
     )
 
     if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
-        install(TARGETS bedrock bedrock-session login xbox-login ping protocol-roundtrip msal-native-smoke live-token-manager-smoke bedrock-token-managers-smoke xbox-token-manager-smoke microsoft-auth-flow-smoke ping-api-smoke create-server-factory-smoke server-outbound-queue-smoke create-client-factory-smoke legacy-encryption-smoke raknet-server-smoke raknet-connection-lifecycle-smoke server-login-verifier-smoke raknet-client-smoke network-client-smoke live-relay-smoke live-relay-multi-client-smoke live-relay-options-smoke chunk-smoke
+        install(TARGETS bedrock bedrock-session login xbox-login ping protocol-roundtrip msal-native-smoke live-token-manager-smoke bedrock-token-managers-smoke xbox-token-manager-smoke microsoft-auth-flow-smoke ping-api-smoke create-server-factory-smoke server-outbound-queue-smoke create-client-factory-smoke legacy-encryption-smoke raknet-server-smoke raknet-connection-lifecycle-smoke server-login-verifier-smoke server-protocol-version-smoke raknet-client-smoke network-client-smoke live-relay-smoke live-relay-multi-client-smoke live-relay-options-smoke chunk-smoke world-iterators-smoke bedrock-block-registry-smoke bedrock-item-smoke bedrock-registry-smoke bedrock-gameplay-registry-smoke bedrock-feature-registry-smoke bedrock-chat-smoke
             RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
         )
     endif()

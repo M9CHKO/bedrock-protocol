@@ -802,6 +802,7 @@ XboxLiveLoginPacket buildLoginPacket(
     std::string xuid,
     std::optional<std::string> onlineIdentityPublicKey = std::nullopt
 ) {
+    auto accessToken = chain;
     const auto clientPayload = buildClientData(
         options,
         displayName,
@@ -880,6 +881,7 @@ XboxLiveLoginPacket buildLoginPacket(
         clientJwt
     );
     out.keyPair = std::move(keys);
+    out.accessToken = std::move(accessToken);
     out.identity = std::move(identity);
     out.displayName = std::move(displayName);
     out.xuid = std::move(xuid);

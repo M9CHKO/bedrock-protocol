@@ -80,6 +80,14 @@ public:
     using ConnectionHandler = std::function<void(const BedrockServerConnection&)>;
     using ErrorHandler = std::function<void(const std::string&)>;
     using StatusHandler = std::function<void(const BedrockLiveRelayStatus&)>;
+    using MsaCodeHandler = std::function<void(
+        const XboxDeviceCodeInfo&,
+        const BedrockServerConnection&
+    )>;
+    using UpstreamJoinHandler = std::function<void(
+        const BedrockServerConnection&,
+        const std::shared_ptr<BedrockNetworkClient>&
+    )>;
 
     explicit BedrockLiveRelay(BedrockLiveRelayOptions options = {});
     ~BedrockLiveRelay();
@@ -87,18 +95,26 @@ public:
     BedrockLiveRelay(const BedrockLiveRelay&) = delete;
     BedrockLiveRelay& operator=(const BedrockLiveRelay&) = delete;
 
-    void listen();
+    ServerListenResult listen();
     int run();
     void close(const std::string& reason = "closed");
 
     void onConnect(ConnectionHandler handler);
     void onJoin(ConnectionHandler handler);
+    // Distinct from onJoin(), which observes the downstream joining the local
+    // server. This mirrors Relay.emit('join', downstream, upstream) after the
+    // backend client is ready and the pending upstream queue has been flushed.
+    void onUpstreamJoin(UpstreamJoinHandler handler);
     void onDisconnect(ConnectionHandler handler);
     void onClientbound(PacketHandler handler);
     void onServerbound(PacketHandler handler);
     void on(const std::string& direction, PacketHandler handler);
     void onError(ErrorHandler handler);
     void onStatus(StatusHandler handler);
+    // Relay#openUpstreamConnection passes the exact downstream Player as the
+    // second onMsaCode argument. The low-level runtime exposes its stable
+    // connection identity; the high-level Relay maps it back to RelayPlayer.
+    void onMsaCode(MsaCodeHandler handler);
 
     bool listening() const;
     bool downstreamJoined() const;
@@ -144,11 +160,14 @@ private:
 
     std::vector<ConnectionHandler> connectHandlers_;
     std::vector<ConnectionHandler> joinHandlers_;
+    std::vector<UpstreamJoinHandler> upstreamJoinHandlers_;
     std::vector<ConnectionHandler> disconnectHandlers_;
     std::vector<PacketHandler> clientboundHandlers_;
     std::vector<PacketHandler> serverboundHandlers_;
     std::vector<ErrorHandler> errorHandlers_;
     std::vector<StatusHandler> statusHandlers_;
+    mutable std::mutex msaCodeHandlersMutex_;
+    std::vector<MsaCodeHandler> msaCodeHandlers_;
 
     static BedrockLiveRelayOptions normalizeOptions(BedrockLiveRelayOptions options);
     static bool isDownstreamHandshakePacket(const std::string& name);
@@ -159,6 +178,10 @@ private:
 
     void emitError(const std::string& message);
     void emitStatus();
+    bool emitMsaCode(
+        const XboxDeviceCodeInfo& code,
+        const BedrockServerConnection& connection
+    );
     std::shared_ptr<Session> findSession(
         const BedrockServerConnection& connection
     ) const;
@@ -167,6 +190,7 @@ private:
         const std::shared_ptr<Session>& session,
         const VersionedGamePacket& packet
     );
+    void handleDownstreamJoin(const std::shared_ptr<Session>& session);
     void resolveUpstreamRealm(BedrockNetworkClientOptions& upstreamOptions);
     void resetRelaySession(
         const std::shared_ptr<Session>& session,
@@ -199,8 +223,13 @@ private:
     );
 };
 
-inline BedrockLiveRelay createRelayServer(BedrockLiveRelayOptions options = {}) {
+inline BedrockLiveRelay createLiveRelay(BedrockLiveRelayOptions options = {}) {
     return BedrockLiveRelay(std::move(options));
+}
+
+// Historical spelling retained for source compatibility.
+inline BedrockLiveRelay createRelayServer(BedrockLiveRelayOptions options = {}) {
+    return createLiveRelay(std::move(options));
 }
 
 } // namespace bedrock

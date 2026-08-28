@@ -16,6 +16,7 @@
 #include <bedrock/protodef/ProtoDefField.hpp>
 #include <bedrock/protodef/ProtoDefPacketDecoder.hpp>
 #include <bedrock/protodef/ProtoDefPacketEncoder.hpp>
+#include <bedrock/protodef/ProtoDefPacketVariables.hpp>
 #include <bedrock/protodef/ProtoDefReader.hpp>
 #include <bedrock/protodef/ProtoDefValue.hpp>
 #include <bedrock/server/BedrockLoginVerifier.hpp>
@@ -31,6 +32,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <initializer_list>
 #include <iterator>
 #include <map>
 #include <memory>
@@ -40,6 +42,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -49,14 +52,164 @@ namespace bedrock {
 
 struct BedrockServerTestAccess;
 
+// Compact MOTD value for the public ServerOptions facade.  It accepts the
+// JavaScript-style title/level-name pair while remaining source-compatible
+// with the historical ServerAdvertisementObject initializer:
+//
+//   .motd = {"My server", "My world"}
+//   .motd = {{"motd", "My server"}}
+class ServerMotd : public ServerAdvertisementObject {
+public:
+    using Base = ServerAdvertisementObject;
+    using Value = Base::value_type;
+
+    ServerMotd() = default;
+
+    ServerMotd(std::initializer_list<Value> values)
+        : Base(values) {}
+
+    ServerMotd(Base values)
+        : Base(std::move(values)) {}
+
+    ServerMotd(std::string title, std::string levelName = {}) {
+        (*this)["motd"] = std::move(title);
+        if (!levelName.empty()) {
+            (*this)["levelName"] = std::move(levelName);
+        }
+    }
+
+    ServerMotd(const char* title)
+        : ServerMotd(std::string(title ? title : "")) {}
+
+    ServerMotd(const char* title, const char* levelName)
+        : ServerMotd(
+              std::string(title ? title : ""),
+              std::string(levelName ? levelName : "")
+          ) {}
+
+    ServerMotd& operator=(std::string title) {
+        clear();
+        (*this)["motd"] = std::move(title);
+        return *this;
+    }
+
+    ServerMotd& operator=(const char* title) {
+        return operator=(std::string(title ? title : ""));
+    }
+
+    ServerMotd& operator=(Base values) {
+        Base::operator=(std::move(values));
+        return *this;
+    }
+
+    ServerMotd& operator=(std::initializer_list<Value> values) {
+        Base::operator=(values);
+        return *this;
+    }
+};
+
+// JavaScript callbacks normally return a fresh ServerAdvertisement value.
+// Historical C++ releases required ServerAdvertisement&, so retain that exact
+// reference when such a callable is supplied while caching value returns long
+// enough for the existing getAdvertisement() reference API.
+class ServerAdvertisementCallback {
+public:
+    ServerAdvertisementCallback() = default;
+    ServerAdvertisementCallback(std::nullptr_t) noexcept {}
+
+    template <typename Callable>
+        requires (
+            !std::is_same_v<
+                std::remove_cvref_t<Callable>,
+                ServerAdvertisementCallback
+            > &&
+            std::is_invocable_r_v<
+                ServerAdvertisement,
+                std::remove_reference_t<Callable>&
+            >
+        )
+    ServerAdvertisementCallback(Callable&& callback) {
+        assign(std::forward<Callable>(callback));
+    }
+
+    template <typename Callable>
+        requires (
+            !std::is_same_v<
+                std::remove_cvref_t<Callable>,
+                ServerAdvertisementCallback
+            > &&
+            std::is_invocable_r_v<
+                ServerAdvertisement,
+                std::remove_reference_t<Callable>&
+            >
+        )
+    ServerAdvertisementCallback& operator=(Callable&& callback) {
+        assign(std::forward<Callable>(callback));
+        return *this;
+    }
+
+    ServerAdvertisementCallback& operator=(std::nullptr_t) noexcept {
+        referenceHandler_ = {};
+        valueHandler_ = {};
+        cachedValue_.reset();
+        return *this;
+    }
+
+    explicit operator bool() const noexcept {
+        return static_cast<bool>(referenceHandler_) ||
+            static_cast<bool>(valueHandler_);
+    }
+
+    ServerAdvertisement& operator()() const {
+        if (referenceHandler_) {
+            return referenceHandler_();
+        }
+        if (!valueHandler_) {
+            throw std::bad_function_call();
+        }
+        cachedValue_.emplace(valueHandler_());
+        return *cachedValue_;
+    }
+
+private:
+    template <typename Callable>
+    void assign(Callable&& callback) {
+        using Result = std::invoke_result_t<
+            std::remove_reference_t<Callable>&
+        >;
+        referenceHandler_ = {};
+        valueHandler_ = {};
+        cachedValue_.reset();
+        if constexpr (std::is_same_v<Result, ServerAdvertisement&>) {
+            referenceHandler_ = std::forward<Callable>(callback);
+        } else {
+            valueHandler_ = std::forward<Callable>(callback);
+        }
+    }
+
+    std::function<ServerAdvertisement&()> referenceHandler_;
+    std::function<ServerAdvertisement()> valueHandler_;
+    mutable std::optional<ServerAdvertisement> cachedValue_;
+};
+
+// Server#listen resolves to this configured address in server.js. When port
+// is zero, boundPort() remains the way to read the OS-selected UDP port.
+struct ServerListenResult {
+    std::string host;
+    uint16_t port = 0;
+};
+
+using BedrockServerListenResult = ServerListenResult;
+
 struct BedrockServerOptions {
     std::string host = "0.0.0.0";
     uint16_t port = 19132;
     std::string version = "1.26.0";
-    ServerAdvertisementObject motd;
+    ServerMotd motd;
     int maxPlayers = 3;
-    std::function<ServerAdvertisement&()> advertisementFn;
+    ServerAdvertisementCallback advertisementFn;
     bool offline = false;
+    std::string raknetBackend = "raknet-native";
     bool autoLogin = true;
     // The JavaScript server completes login at client_to_server_handshake and
     // does not run a resource-pack exchange.  Keep the previous empty-pack
@@ -70,8 +223,43 @@ struct BedrockServerOptions {
     int batchingInterval = 20;
 };
 
+// C++ lifecycle switches are intentionally separate from the ordinary
+// JavaScript-shaped server settings.
+struct ServerAdvancedOptions {
+    bool autoLogin = true;
+    // The JavaScript server does not run an empty resource-pack exchange.
+    bool autoResourcePacks = false;
+};
+
+// Public createServer({...}) surface. BedrockServerOptions remains the native
+// runtime type for direct construction and low-level relay composition.
+struct ServerOptions {
+    std::string host = "0.0.0.0";
+    uint16_t port = 19132;
+    std::string version = std::string(CURRENT_VERSION);
+    bool offline = false;
+
+    ServerMotd motd;
+    int maxPlayers = 3;
+    ServerAdvertisementCallback advertisementFn;
+
+    std::string raknetBackend = "raknet-native";
+    std::string compressionAlgorithm = "deflate";
+    int compressionLevel = 7;
+    uint16_t compressionThreshold = 512;
+    int batchingInterval = 20;
+
+    ServerAdvancedOptions advanced;
+};
+
 class BedrockServer;
-BedrockServer createServer(BedrockServerOptions options);
+BedrockServer createNativeServer(BedrockServerOptions options);
+BedrockServer createServer(ServerOptions options);
+
+enum class BedrockServerClientStatus;
+struct BedrockServerPacketEvent;
+struct BedrockServerLoggingInEvent;
+struct BedrockServerClientHandshakeEvent;
 
 class BedrockUnhandledPlayerError : public std::runtime_error {
 public:
@@ -91,6 +279,13 @@ class BedrockServerPlayerEventState {
 public:
     using ErrorHandler = std::function<void(const std::string&)>;
     using CloseHandler = std::function<void()>;
+    using VoidHandler = std::function<void()>;
+    using PacketHandler = std::function<void(const BedrockServerPacketEvent&)>;
+    using LoggingInHandler =
+        std::function<void(const BedrockServerLoggingInEvent&)>;
+    using ClientHandshakeHandler =
+        std::function<void(const BedrockServerClientHandshakeEvent&)>;
+    using StatusHandler = std::function<void(BedrockServerClientStatus)>;
 
     void onError(ErrorHandler handler) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -102,6 +297,46 @@ public:
         closeHandlers_.push_back(std::move(handler));
     }
 
+    void onLoggingIn(LoggingInHandler handler) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        loggingInHandlers_.push_back(std::move(handler));
+    }
+
+    void onClientHandshake(ClientHandshakeHandler handler) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        clientHandshakeHandlers_.push_back(std::move(handler));
+    }
+
+    void onLogin(PacketHandler handler) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        loginHandlers_.push_back(std::move(handler));
+    }
+
+    void onJoin(VoidHandler handler) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        joinHandlers_.push_back(std::move(handler));
+    }
+
+    void onSpawn(VoidHandler handler) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        spawnHandlers_.push_back(std::move(handler));
+    }
+
+    void onStatus(StatusHandler handler) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        statusHandlers_.push_back(std::move(handler));
+    }
+
+    void onAny(PacketHandler handler) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        anyPacketHandlers_.push_back(std::move(handler));
+    }
+
+    void onPacket(const std::string& packetName, PacketHandler handler) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        packetHandlers_[packetName].push_back(std::move(handler));
+    }
+
 private:
     friend class BedrockServer;
     friend struct BedrockServerTestAccess;
@@ -109,6 +344,14 @@ private:
     mutable std::mutex mutex_;
     std::vector<ErrorHandler> errorHandlers_;
     std::vector<CloseHandler> closeHandlers_;
+    std::vector<LoggingInHandler> loggingInHandlers_;
+    std::vector<ClientHandshakeHandler> clientHandshakeHandlers_;
+    std::vector<PacketHandler> loginHandlers_;
+    std::vector<VoidHandler> joinHandlers_;
+    std::vector<VoidHandler> spawnHandlers_;
+    std::vector<StatusHandler> statusHandlers_;
+    std::vector<PacketHandler> anyPacketHandlers_;
+    std::unordered_map<std::string, std::vector<PacketHandler>> packetHandlers_;
 
     std::vector<ErrorHandler> errorSnapshot() const {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -120,10 +363,61 @@ private:
         return closeHandlers_;
     }
 
+    std::vector<LoggingInHandler> loggingInSnapshot() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return loggingInHandlers_;
+    }
+
+    std::vector<ClientHandshakeHandler> clientHandshakeSnapshot() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return clientHandshakeHandlers_;
+    }
+
+    std::vector<PacketHandler> loginSnapshot() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return loginHandlers_;
+    }
+
+    std::vector<VoidHandler> joinSnapshot() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return joinHandlers_;
+    }
+
+    std::vector<VoidHandler> spawnSnapshot() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return spawnHandlers_;
+    }
+
+    std::vector<StatusHandler> statusSnapshot() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return statusHandlers_;
+    }
+
+    std::vector<PacketHandler> anyPacketSnapshot() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return anyPacketHandlers_;
+    }
+
+    std::vector<PacketHandler> packetSnapshot(const std::string& packetName) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto found = packetHandlers_.find(packetName);
+        return found == packetHandlers_.end()
+            ? std::vector<PacketHandler>{}
+            : found->second;
+    }
+
     void clear() {
         std::lock_guard<std::mutex> lock(mutex_);
         errorHandlers_.clear();
         closeHandlers_.clear();
+        loggingInHandlers_.clear();
+        clientHandshakeHandlers_.clear();
+        loginHandlers_.clear();
+        joinHandlers_.clear();
+        spawnHandlers_.clear();
+        statusHandlers_.clear();
+        anyPacketHandlers_.clear();
+        packetHandlers_.clear();
     }
 };
 
@@ -138,6 +432,12 @@ enum class BedrockServerClientStatus {
 struct BedrockServerConnection {
     using ErrorHandler = BedrockServerPlayerEventState::ErrorHandler;
     using CloseHandler = BedrockServerPlayerEventState::CloseHandler;
+    using VoidHandler = BedrockServerPlayerEventState::VoidHandler;
+    using PacketHandler = BedrockServerPlayerEventState::PacketHandler;
+    using LoggingInHandler = BedrockServerPlayerEventState::LoggingInHandler;
+    using ClientHandshakeHandler =
+        BedrockServerPlayerEventState::ClientHandshakeHandler;
+    using StatusHandler = BedrockServerPlayerEventState::StatusHandler;
 
     std::string address;
     uint16_t port = 0;
@@ -145,6 +445,16 @@ struct BedrockServerConnection {
     int mtu = 1400;
     RakNetServerPeer peer;
     std::shared_ptr<BedrockServerPlayerEventState> playerEvents;
+    // The Node Player retains its owning Server. This non-owning pointer is
+    // stable for every live connection because BedrockServer itself is not
+    // movable while its RakNet callbacks are active.
+    BedrockServer* server = nullptr;
+
+    // Same endpoint key used by Server::clients(), equivalent to conn.address
+    // in the JavaScript RakNet backend.
+    std::string key() const {
+        return address + ":" + std::to_string(port);
+    }
 
     // Player is represented by this shared connection view in the C++ API.
     // Copies retain the same EventEmitter-like listener state.
@@ -161,17 +471,210 @@ struct BedrockServerConnection {
         }
         playerEvents->onClose(std::move(handler));
     }
+
+    void onLoggingIn(LoggingInHandler handler) const {
+        requirePlayerEvents().onLoggingIn(std::move(handler));
+    }
+
+    void onServerClientHandshake(ClientHandshakeHandler handler) const {
+        requirePlayerEvents().onClientHandshake(std::move(handler));
+    }
+
+    void onLogin(PacketHandler handler) const {
+        requirePlayerEvents().onLogin(std::move(handler));
+    }
+
+    void onLogin(VoidHandler handler) const {
+        onLogin([handler = std::move(handler)](
+            const BedrockServerPacketEvent&
+        ) {
+            handler();
+        });
+    }
+
+    void onJoin(VoidHandler handler) const {
+        requirePlayerEvents().onJoin(std::move(handler));
+    }
+
+    void onSpawn(VoidHandler handler) const {
+        requirePlayerEvents().onSpawn(std::move(handler));
+    }
+
+    void onSpawn(ErrorHandler handler) const {
+        onSpawn([handler = std::move(handler)]() {
+            // The current d.ts declares a reason, while serverPlayer.js emits
+            // spawn without arguments.
+            handler("");
+        });
+    }
+
+    void onClose(ErrorHandler handler) const {
+        onClose([handler = std::move(handler)]() {
+            handler("");
+        });
+    }
+
+    void onStatus(StatusHandler handler) const {
+        requirePlayerEvents().onStatus(std::move(handler));
+    }
+
+    void onAny(PacketHandler handler) const {
+        requirePlayerEvents().onAny(std::move(handler));
+    }
+
+    void on(const std::string& eventName, VoidHandler handler) const {
+        if (eventName == "login") {
+            onLogin([handler = std::move(handler)](
+                const BedrockServerPacketEvent&
+            ) {
+                handler();
+            });
+            return;
+        }
+        if (eventName == "join") {
+            onJoin(std::move(handler));
+            return;
+        }
+        if (eventName == "spawn") {
+            onSpawn(std::move(handler));
+            return;
+        }
+        if (eventName == "close") {
+            onClose(std::move(handler));
+            return;
+        }
+        throw std::runtime_error("unknown player lifecycle event: " + eventName);
+    }
+
+    void on(const std::string& eventName, PacketHandler handler) const {
+        if (eventName == "packet") {
+            onAny(std::move(handler));
+            return;
+        }
+        if (eventName == "login") {
+            onLogin(std::move(handler));
+            return;
+        }
+        requirePlayerEvents().onPacket(eventName, std::move(handler));
+    }
+
+    void on(const std::string& eventName, LoggingInHandler handler) const {
+        if (eventName != "loggingIn") {
+            throw std::runtime_error("unknown player logging event: " + eventName);
+        }
+        onLoggingIn(std::move(handler));
+    }
+
+    void on(const std::string& eventName, ClientHandshakeHandler handler) const {
+        if (eventName != "server.client_handshake") {
+            throw std::runtime_error("unknown player handshake event: " + eventName);
+        }
+        onServerClientHandshake(std::move(handler));
+    }
+
+    void on(const std::string& eventName, StatusHandler handler) const {
+        if (eventName != "status") {
+            throw std::runtime_error("unknown player status event: " + eventName);
+        }
+        onStatus(std::move(handler));
+    }
+
+    void on(const std::string& eventName, ErrorHandler handler) const {
+        if (eventName == "error") {
+            onError(std::move(handler));
+            return;
+        }
+        if (eventName == "close") {
+            onClose([handler = std::move(handler)]() {
+                // serverPlayer.js emits close without an argument even though
+                // the current index.d.ts declares a reason string.
+                handler("");
+            });
+            return;
+        }
+        throw std::runtime_error("unknown player error event: " + eventName);
+    }
+
+    BedrockServerClientStatus status() const;
+    void setStatus(BedrockServerClientStatus status) const;
+    void updateItemPalette(const ProtoDefValue& palette) const;
+    std::optional<ProtoDefValue> getUserData() const;
+    std::optional<ProtoDefValue> skinData() const;
+    std::optional<BedrockLoginProfile> profile() const;
+    std::optional<uint32_t> version() const;
+
+    bool versionLessThan(const std::string& version) const;
+    bool versionLessThan(uint32_t protocolVersion) const;
+    bool versionGreaterThan(const std::string& version) const;
+    bool versionGreaterThan(uint32_t protocolVersion) const;
+    bool versionGreaterThanOrEqualTo(const std::string& version) const;
+    bool versionGreaterThanOrEqualTo(uint32_t protocolVersion) const;
+    bool versionLessThanOrEqualTo(const std::string& version) const;
+    bool versionLessThanOrEqualTo(uint32_t protocolVersion) const;
+
+    void write(
+        const std::string& packetName,
+        const ProtoDefValue& value,
+        VersionedMcpeCompression compression = VersionedMcpeCompression::Automatic
+    ) const;
+    void queue(
+        const std::string& packetName,
+        const ProtoDefValue& value,
+        VersionedMcpeCompression compression = VersionedMcpeCompression::Automatic
+    ) const;
+    void sendBuffer(
+        const std::vector<uint8_t>& buffer,
+        bool immediate = false,
+        VersionedMcpeCompression compression = VersionedMcpeCompression::Automatic
+    ) const;
+    void sendQueued() const;
+    void disconnect(
+        const std::string& reason = "Server closed",
+        bool hide = false
+    ) const;
+    void sendDisconnectStatus(const std::string& playStatus) const;
+    void close() const;
+
+    BedrockServer& owner() const;
+
+private:
+    BedrockServerPlayerEventState& requirePlayerEvents() const {
+        if (!playerEvents) {
+            throw std::logic_error("player event state is not initialized");
+        }
+        return *playerEvents;
+    }
 };
+
+// JavaScript-compatible public spelling. Copies are shared views of the same
+// live server-side Player and retain the same listener state.
+using Player = BedrockServerConnection;
 
 struct BedrockServerPacketEvent {
     BedrockServerConnection connection;
     VersionedGamePacket packet;
 };
 
+struct BedrockServerLoggingInEvent {
+    BedrockServerConnection connection;
+    VersionedGamePacket packet;
+    LoginPacketData login;
+};
+
+struct BedrockServerClientHandshakeEvent {
+    BedrockServerConnection connection;
+    std::string key;
+};
+
 class BedrockServer {
 public:
+    using ClientMap = std::unordered_map<std::string, Player>;
     using ConnectionHandler = std::function<void(const BedrockServerConnection&)>;
     using PacketHandler = std::function<void(const BedrockServerPacketEvent&)>;
+    using LoggingInHandler =
+        std::function<void(const BedrockServerLoggingInEvent&)>;
+    using ClientHandshakeHandler =
+        std::function<void(const BedrockServerClientHandshakeEvent&)>;
     using StatusHandler = std::function<void(
         const BedrockServerConnection&,
         BedrockServerClientStatus
@@ -197,8 +700,31 @@ public:
         connectHandlers_.push_back(std::move(handler));
     }
 
+    // Server.on('connect', player => ...) is the only Server event declared
+    // by bedrock-protocol's public TypeScript surface. Typed aliases remain
+    // available for the additional C++ lifecycle hooks below.
+    void on(const std::string& eventName, ConnectionHandler handler) {
+        if (eventName != "connect") {
+            throw std::runtime_error("unknown server connection event: " + eventName);
+        }
+        onConnect(std::move(handler));
+    }
+
     void onJoin(ConnectionHandler handler) {
         joinHandlers_.push_back(std::move(handler));
+    }
+
+    // serverPlayer.js emits this after the login packet has decoded but before
+    // protocol-version rejection or JWT verification.
+    void onLoggingIn(LoggingInHandler handler) {
+        loggingInHandlers_.push_back(std::move(handler));
+    }
+
+    // Explicit form of serverPlayer.js's internal server.client_handshake
+    // event. Encryption is active, while profile/login publication is still
+    // pending when these handlers run.
+    void onServerClientHandshake(ClientHandshakeHandler handler) {
+        clientHandshakeHandlers_.push_back(std::move(handler));
     }
 
     // Authenticated login lifecycle event. Unlike on("login"), this mirrors
@@ -238,7 +764,7 @@ public:
         return advertisement_;
     }
 
-    void listen() {
+    ServerListenResult listen() {
         closing_ = false;
         // RakServer's constructor asks Server#getAdvertisement for the initial
         // offline response before the backend starts listening.
@@ -257,6 +783,7 @@ public:
             connection.mtu = peer.mtu;
             connection.peer = peer;
             connection.playerEvents = std::make_shared<BedrockServerPlayerEventState>();
+            connection.server = this;
 
             const auto key = connectionKey(peer);
             {
@@ -292,6 +819,10 @@ public:
             handlePeerClosed(peer);
         });
         raknet_.listen();
+        return {
+            .host = options_.host,
+            .port = options_.port
+        };
     }
 
     void close(const std::string& disconnectReason = "Server closed") {
@@ -374,6 +905,21 @@ public:
         return clientCount_.load();
     }
 
+    // Node exposes Server.clients directly. Return a synchronized snapshot so
+    // callers can enumerate it safely while RakNet accepts or removes peers.
+    ClientMap clients() const {
+        std::lock_guard<std::mutex> lock(serverStateMutex_);
+        return connections_;
+    }
+
+    std::optional<Player> client(const std::string& key) const {
+        std::lock_guard<std::mutex> lock(serverStateMutex_);
+        const auto found = connections_.find(key);
+        return found == connections_.end()
+            ? std::nullopt
+            : std::optional<Player>(found->second);
+    }
+
     const BedrockServerOptions& options() const {
         return options_;
     }
@@ -411,6 +957,27 @@ public:
         return detached == detachedPlayerStatuses_.end()
             ? BedrockServerClientStatus::Disconnected
             : detached->second;
+    }
+
+    void setStatus(
+        const BedrockServerConnection& connection,
+        BedrockServerClientStatus status
+    ) {
+        transitionStatus(connection, status);
+    }
+
+    void updateItemPalette(
+        const BedrockServerConnection& connection,
+        const ProtoDefValue& palette
+    ) {
+        const auto session = sessionSnapshot(connection);
+        if (!session) {
+            throw std::runtime_error("player session not found");
+        }
+        detail::updateItemPaletteVariables(
+            palette,
+            session->protoDefVariables
+        );
     }
 
     std::optional<BedrockLoginVerificationResult> loginVerification(
@@ -546,6 +1113,22 @@ public:
         uint32_t protocolVersion
     ) const {
         return configuredPlayerProtocolVersion(connection) <= protocolVersion;
+    }
+
+    // Mirrors Player#handleClientProtocolVersion. Server.validateOptions()
+    // always resolves options.protocolVersion in JavaScript, so the active
+    // branch accepts equal/older clients and rejects only a newer protocol
+    // with failed_spawn.
+    bool handleClientProtocolVersion(
+        const BedrockServerConnection& connection,
+        int32_t clientVersion
+    ) {
+        if (static_cast<int64_t>(configuredServerProtocolVersion()) <
+            static_cast<int64_t>(clientVersion)) {
+            sendDisconnectStatus(connection, "failed_spawn");
+            return false;
+        }
+        return true;
     }
 
     void send(
@@ -856,7 +1439,7 @@ private:
         listen();
     }
 
-    friend BedrockServer createServer(BedrockServerOptions options);
+    friend BedrockServer createNativeServer(BedrockServerOptions options);
     friend struct BedrockServerTestAccess;
 
     BedrockServerOptions options_;
@@ -868,6 +1451,8 @@ private:
     std::vector<ConnectionHandler> joinHandlers_;
     std::vector<ConnectionHandler> spawnHandlers_;
     std::vector<ConnectionHandler> disconnectHandlers_;
+    std::vector<LoggingInHandler> loggingInHandlers_;
+    std::vector<ClientHandshakeHandler> clientHandshakeHandlers_;
     std::vector<PacketHandler> loginHandlers_;
     std::vector<StatusHandler> statusHandlers_;
     std::vector<PacketHandler> anyPacketHandlers_;
@@ -899,6 +1484,12 @@ private:
 
     static BedrockServerOptions normalizeOptions(BedrockServerOptions options) {
         (void) validateVersion(options.version);
+        if (options.raknetBackend != "raknet-native") {
+            throw std::runtime_error(
+                "unsupported RakNet backend in this C++ build: " +
+                options.raknetBackend
+            );
+        }
         const auto name = options.motd.find("name");
         if (name != options.motd.end() && name->second.isTruthy()) {
             // ServerAdvertisement's constructor mutates the object supplied by
@@ -1654,6 +2245,20 @@ private:
                 continue;
             }
 
+            const auto playerNamedHandlers = connection.playerEvents
+                ? connection.playerEvents->packetSnapshot(packet.name)
+                : std::vector<BedrockServerConnection::PacketHandler>{};
+            for (const auto& handler : playerNamedHandlers) {
+                handler(event);
+            }
+
+            const auto playerAnyHandlers = connection.playerEvents
+                ? connection.playerEvents->anyPacketSnapshot()
+                : std::vector<BedrockServerConnection::PacketHandler>{};
+            for (const auto& handler : playerAnyHandlers) {
+                handler(event);
+            }
+
             auto nameIt = packetHandlers_.find(packet.name);
             if (nameIt != packetHandlers_.end()) {
                 for (auto& handler : nameIt->second) {
@@ -1715,7 +2320,9 @@ private:
         const VersionedGamePacket& packet
     ) {
         if (packet.name == "request_network_settings") {
-            if (mcpeCodec_.definition().hasPacket("network_settings")) {
+            const auto clientVersion = requestNetworkSettingsProtocol(packet);
+            if (handleClientProtocolVersion(connection, clientVersion) &&
+                mcpeCodec_.definition().hasPacket("network_settings")) {
                 sendNetworkSettings(connection, true);
             }
             return true;
@@ -1744,7 +2351,7 @@ private:
                 {"status", ProtoDefValue::string("login_success")}
             }));
 
-            setStatus(connection, BedrockServerClientStatus::Initializing);
+            transitionStatus(connection, BedrockServerClientStatus::Initializing);
 
             if (options_.autoResourcePacks &&
                 mcpeCodec_.definition().hasPacket("resource_packs_info")) {
@@ -1756,7 +2363,7 @@ private:
         }
 
         if (packet.name == "set_local_player_as_initialized") {
-            setStatus(connection, BedrockServerClientStatus::Initialized);
+            transitionStatus(connection, BedrockServerClientStatus::Initialized);
             emitSpawn(connection);
             return false;
         }
@@ -1774,9 +2381,37 @@ private:
         const VersionedGamePacket& packet
     ) {
         LoginPacketData login;
-        BedrockLoginVerificationResult verifiedLogin;
         try {
             login = LoginPacketCodec::decode(packet.fullPacket);
+        } catch (const std::exception&) {
+            disconnect(connection, "Server authentication error");
+            return;
+        }
+
+        BedrockServerLoggingInEvent loggingInEvent;
+        loggingInEvent.connection = connection;
+        loggingInEvent.packet = packet;
+        loggingInEvent.login = login;
+        const auto playerLoggingInHandlers = connection.playerEvents
+            ? connection.playerEvents->loggingInSnapshot()
+            : std::vector<BedrockServerConnection::LoggingInHandler>{};
+        for (const auto& handler : playerLoggingInHandlers) {
+            handler(loggingInEvent);
+        }
+        const auto loggingInHandlers = loggingInHandlers_;
+        for (auto& handler : loggingInHandlers) {
+            handler(loggingInEvent);
+        }
+
+        if (!handleClientProtocolVersion(
+                connection,
+                static_cast<int32_t>(login.protocolVersion)
+            )) {
+            return;
+        }
+
+        BedrockLoginVerificationResult verifiedLogin;
+        try {
             verifiedLogin = BedrockLoginVerifier::verify(login, options_.offline);
         } catch (const std::exception&) {
             disconnect(connection, "Server authentication error");
@@ -1847,15 +2482,58 @@ private:
             session->encryptionEnabled = true;
             session->sendCounter = 0;
             session->receiveCounter = 0;
+        }
+
+        BedrockServerClientHandshakeEvent clientHandshakeEvent;
+        clientHandshakeEvent.connection = connection;
+        clientHandshakeEvent.key = verifiedLogin.key;
+        const auto playerHandshakeHandlers = connection.playerEvents
+            ? connection.playerEvents->clientHandshakeSnapshot()
+            : std::vector<BedrockServerConnection::ClientHandshakeHandler>{};
+        for (const auto& handler : playerHandshakeHandlers) {
+            handler(clientHandshakeEvent);
+        }
+        const auto clientHandshakeHandlers = clientHandshakeHandlers_;
+        for (auto& handler : clientHandshakeHandlers) {
+            handler(clientHandshakeEvent);
+        }
+
+        if (!hasWritablePlayer(connection)) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(session->mutex);
             session->loginVerification = std::move(verifiedLogin);
         }
 
         BedrockServerPacketEvent event;
         event.connection = connection;
         event.packet = packet;
+        const auto playerLoginHandlers = connection.playerEvents
+            ? connection.playerEvents->loginSnapshot()
+            : std::vector<BedrockServerConnection::PacketHandler>{};
+        for (const auto& handler : playerLoginHandlers) {
+            handler(event);
+        }
         for (auto& handler : loginHandlers_) {
             handler(event);
         }
+    }
+
+    static int32_t requestNetworkSettingsProtocol(
+        const VersionedGamePacket& packet
+    ) {
+        if (packet.payload.size() < 4) {
+            throw std::runtime_error(
+                "request_network_settings client_protocol is truncated"
+            );
+        }
+        const uint32_t raw =
+            (static_cast<uint32_t>(packet.payload[0]) << 24u) |
+            (static_cast<uint32_t>(packet.payload[1]) << 16u) |
+            (static_cast<uint32_t>(packet.payload[2]) << 8u) |
+            static_cast<uint32_t>(packet.payload[3]);
+        return static_cast<int32_t>(raw);
     }
 
     void sendPreCompression(
@@ -1993,18 +2671,30 @@ private:
     }
 
     void emitJoin(const BedrockServerConnection& connection) {
+        const auto playerHandlers = connection.playerEvents
+            ? connection.playerEvents->joinSnapshot()
+            : std::vector<BedrockServerConnection::VoidHandler>{};
+        for (const auto& handler : playerHandlers) {
+            handler();
+        }
         for (auto& handler : joinHandlers_) {
             handler(connection);
         }
     }
 
-    void setStatus(
+    void transitionStatus(
         const BedrockServerConnection& connection,
         BedrockServerClientStatus nextStatus
     ) {
         // Connection.status in the JavaScript implementation emits before it
         // stores, so status(connection) intentionally exposes the old value to
         // status listeners.
+        const auto playerHandlers = connection.playerEvents
+            ? connection.playerEvents->statusSnapshot()
+            : std::vector<BedrockServerConnection::StatusHandler>{};
+        for (const auto& handler : playerHandlers) {
+            handler(nextStatus);
+        }
         for (auto& handler : statusHandlers_) {
             handler(connection, nextStatus);
         }
@@ -2016,19 +2706,198 @@ private:
     }
 
     void emitSpawn(const BedrockServerConnection& connection) {
+        const auto playerHandlers = connection.playerEvents
+            ? connection.playerEvents->spawnSnapshot()
+            : std::vector<BedrockServerConnection::VoidHandler>{};
+        for (const auto& handler : playerHandlers) {
+            handler();
+        }
         for (auto& handler : spawnHandlers_) {
             handler(connection);
         }
     }
 };
 
-inline BedrockServer createServer(BedrockServerOptions options) {
+inline BedrockServer& BedrockServerConnection::owner() const {
+    if (!server) {
+        throw std::logic_error("player is not attached to a BedrockServer");
+    }
+    return *server;
+}
+
+inline BedrockServerClientStatus BedrockServerConnection::status() const {
+    return owner().status(*this);
+}
+
+inline void BedrockServerConnection::setStatus(
+    BedrockServerClientStatus status
+) const {
+    owner().setStatus(*this, status);
+}
+
+inline void BedrockServerConnection::updateItemPalette(
+    const ProtoDefValue& palette
+) const {
+    owner().updateItemPalette(*this, palette);
+}
+
+inline std::optional<ProtoDefValue> BedrockServerConnection::getUserData() const {
+    return owner().userData(*this);
+}
+
+inline std::optional<ProtoDefValue> BedrockServerConnection::skinData() const {
+    return owner().skinData(*this);
+}
+
+inline std::optional<BedrockLoginProfile> BedrockServerConnection::profile() const {
+    return owner().profile(*this);
+}
+
+inline std::optional<uint32_t> BedrockServerConnection::version() const {
+    return owner().clientVersion(*this);
+}
+
+inline bool BedrockServerConnection::versionLessThan(
+    const std::string& version
+) const {
+    return owner().versionLessThan(*this, version);
+}
+
+inline bool BedrockServerConnection::versionLessThan(
+    uint32_t protocolVersion
+) const {
+    return owner().versionLessThan(*this, protocolVersion);
+}
+
+inline bool BedrockServerConnection::versionGreaterThan(
+    const std::string& version
+) const {
+    return owner().versionGreaterThan(*this, version);
+}
+
+inline bool BedrockServerConnection::versionGreaterThan(
+    uint32_t protocolVersion
+) const {
+    return owner().versionGreaterThan(*this, protocolVersion);
+}
+
+inline bool BedrockServerConnection::versionGreaterThanOrEqualTo(
+    const std::string& version
+) const {
+    return owner().versionGreaterThanOrEqualTo(*this, version);
+}
+
+inline bool BedrockServerConnection::versionGreaterThanOrEqualTo(
+    uint32_t protocolVersion
+) const {
+    return owner().versionGreaterThanOrEqualTo(*this, protocolVersion);
+}
+
+inline bool BedrockServerConnection::versionLessThanOrEqualTo(
+    const std::string& version
+) const {
+    return owner().versionLessThanOrEqualTo(*this, version);
+}
+
+inline bool BedrockServerConnection::versionLessThanOrEqualTo(
+    uint32_t protocolVersion
+) const {
+    return owner().versionLessThanOrEqualTo(*this, protocolVersion);
+}
+
+inline void BedrockServerConnection::write(
+    const std::string& packetName,
+    const ProtoDefValue& value,
+    VersionedMcpeCompression compression
+) const {
+    owner().write(*this, packetName, value, compression);
+}
+
+inline void BedrockServerConnection::queue(
+    const std::string& packetName,
+    const ProtoDefValue& value,
+    VersionedMcpeCompression compression
+) const {
+    owner().queue(*this, packetName, value, compression);
+}
+
+inline void BedrockServerConnection::sendBuffer(
+    const std::vector<uint8_t>& buffer,
+    bool immediate,
+    VersionedMcpeCompression compression
+) const {
+    owner().sendBuffer(*this, buffer, immediate, compression);
+}
+
+inline void BedrockServerConnection::sendQueued() const {
+    owner().sendQueued(*this);
+}
+
+inline void BedrockServerConnection::disconnect(
+    const std::string& reason,
+    bool hide
+) const {
+    owner().disconnect(*this, reason, hide);
+}
+
+inline void BedrockServerConnection::sendDisconnectStatus(
+    const std::string& playStatus
+) const {
+    owner().sendDisconnectStatus(*this, playStatus);
+}
+
+inline void BedrockServerConnection::close() const {
+    owner().closeConnection(*this);
+}
+
+namespace detail {
+
+inline BedrockServerOptions expandServerOptions(ServerOptions options) {
+    BedrockServerOptions out;
+    out.host = std::move(options.host);
+    out.port = options.port;
+    out.version = std::move(options.version);
+    out.motd = std::move(options.motd);
+    out.maxPlayers = options.maxPlayers;
+    out.advertisementFn = std::move(options.advertisementFn);
+    out.offline = options.offline;
+    out.raknetBackend = std::move(options.raknetBackend);
+    out.autoLogin = options.advanced.autoLogin;
+    out.autoResourcePacks = options.advanced.autoResourcePacks;
+    out.compressionThreshold = options.compressionThreshold;
+    out.compressionAlgorithm = std::move(options.compressionAlgorithm);
+    out.compressionLevel = options.compressionLevel;
+    out.batchingInterval = options.batchingInterval;
+    return out;
+}
+
+} // namespace detail
+
+inline BedrockServer createNativeServer(BedrockServerOptions options) {
     // createServer.js treats every falsy port as the default. A uint16_t has
     // only one falsy value, so zero must not request an ephemeral port here.
     if (options.port == 0) {
         options.port = 19132;
     }
     return BedrockServer(BedrockServer::CreateServerTag{}, std::move(options));
+}
+
+inline BedrockServer createServer(ServerOptions options) {
+    return createNativeServer(detail::expandServerOptions(std::move(options)));
+}
+
+// A typed native options value remains source-compatible. Making this a
+// constrained template prevents createServer({...}) from becoming ambiguous:
+// direct brace calls always select the compact ServerOptions facade above.
+template <typename NativeOptions>
+requires std::is_same_v<
+    std::remove_cvref_t<NativeOptions>,
+    BedrockServerOptions
+>
+inline BedrockServer createServer(NativeOptions&& options) {
+    return createNativeServer(
+        BedrockServerOptions(std::forward<NativeOptions>(options))
+    );
 }
 
 } // namespace bedrock

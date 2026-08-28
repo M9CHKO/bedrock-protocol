@@ -97,6 +97,14 @@ int main() {
         .offline = true,
     });
 
+    client.onSession([](const bedrock::BedrockClientProfile& profile) {
+        std::cout << "Authenticated as " << profile.name << "\n";
+    });
+
+    client.onLoggingIn([] {
+        std::cout << "Login packet sent\n";
+    });
+
     client.on("start_game", [](const bedrock::Packet&) {
         std::cout << "Joined world\n";
     });
@@ -116,13 +124,32 @@ int main() {
 }
 ```
 
+`onSession` runs after offline/online authentication has produced the profile
+and before the RakNet transport starts. `onLoggingIn` mirrors the later
+JavaScript client event: it runs immediately after the `login` packet is
+written and observes the `Authenticating` status. The stored values remain
+available through `profile()`, `username()`, and `accessToken()`.
+
 For another version, change only this line:
 
 ```cpp
 .version = "1.21.100",
 ```
 
-Omit `version` to use the JavaScript package default, `"1.26.0"`, or pass another exact supported release. `"latest"` and `"auto"` are not valid JavaScript `Versions` keys and are rejected.
+Omit `version` to discover the server version from ping and fall back to the
+JavaScript package default, `"1.26.0"`, when the advertised release is not in
+the supported table. An explicit value must be an exact supported release;
+`"latest"` and `"auto"` are rejected.
+
+This direct brace call uses the compact `bedrock::ClientOptions` facade.
+`bedrock::BotOptions`/`createBot()` are aliases, while the old larger
+`bedrock::Options` remains available as `bedrock::LegacyClientOptions` for
+advanced native extensions. See [API.md](API.md) for matching server and Relay
+creation examples.
+
+For bots that must control the exact world-entry point, set
+`autoInitPlayer = false`. The manual init packet, retained `startGameData()`,
+and writable status sequence are documented in [API.md](API.md#create-a-bot).
 
 ## 4. Add CMake
 
@@ -189,10 +216,13 @@ Public online server:
 
 ```cpp
 .offline = false,
-.interactiveAuth = true,
 ```
 
-Online mode uses Xbox Live authentication. If the profile cache is missing, the bot prints a Microsoft device-code login URL/code, waits for you to sign in, saves the hidden auth cache, and then generates a fresh login packet for the selected version/server. Public servers usually reject offline/self-signed clients.
+Online mode uses Xbox Live authentication. Interactive device-code login is
+enabled by default; use `onMsaCode` to present the code yourself. If the profile
+cache is missing, the bot waits for sign-in, saves the hidden auth cache, and
+then generates a fresh login packet for the selected version/server. Public
+servers usually reject offline/self-signed clients.
 
 ## 8. Common Beginner Fixes
 

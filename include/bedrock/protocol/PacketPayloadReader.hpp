@@ -24,8 +24,10 @@ struct PayloadTextPacket {
     bool needsTranslation = false;
     std::string message;
     std::string sourceName;
+    std::vector<std::string> parameters;
     std::string xuid;
     std::string platformChatId;
+    std::string filteredMessage;
 };
 
 struct LevelChunkPacket {

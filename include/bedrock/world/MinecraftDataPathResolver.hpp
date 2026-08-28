@@ -15,8 +15,14 @@ struct MinecraftDataPathSet {
     std::string blockCollisionShapes;
     std::string biomes;
     std::string entities;
+    std::string enchantments;
     std::string items;
     std::string recipes;
+    std::string windows;
+    std::string instruments;
+    std::string attributes;
+    std::string blockLoot;
+    std::string entityLoot;
     std::string protocol;
     std::string proto;
     std::string types;
@@ -68,17 +74,35 @@ public:
         MinecraftDataPathSet out;
         out.version = version;
         out.blocks = stripEdition(readString(obj, "blocks").value_or("bedrock/" + version));
-        out.blockStates = stripEdition(readString(obj, "blockStates").value_or(out.blocks));
-        out.blockCollisionShapes = stripEdition(readString(obj, "blockCollisionShapes").value_or(out.blocks));
+        // These files did not exist for legacy numeric-id Bedrock chunks.
+        // Keep an absent category absent instead of guessing blocks.json's
+        // directory and manufacturing a path to a non-existent file.
+        out.blockStates = stripEdition(readString(obj, "blockStates").value_or(""));
+        out.blockCollisionShapes = stripEdition(
+            readString(obj, "blockCollisionShapes").value_or("")
+        );
         out.biomes = stripEdition(readString(obj, "biomes").value_or("bedrock/" + version));
         out.entities = stripEdition(readString(obj, "entities").value_or("bedrock/" + version));
+        out.enchantments = stripEdition(
+            readString(obj, "enchantments").value_or("bedrock/" + version)
+        );
         out.items = stripEdition(readString(obj, "items").value_or("bedrock/" + version));
-        out.recipes = stripEdition(readString(obj, "recipes").value_or("bedrock/" + version));
+        // These gameplay tables are optional in minecraft-data. An absent
+        // remap means that the category is unavailable for this version; it
+        // must not fall back to a non-existent file in the current directory.
+        out.recipes = stripEdition(readString(obj, "recipes").value_or(""));
+        out.windows = stripEdition(readString(obj, "windows").value_or(""));
+        out.instruments = stripEdition(readString(obj, "instruments").value_or(""));
+        out.attributes = stripEdition(readString(obj, "attributes").value_or(""));
+        out.blockLoot = stripEdition(readString(obj, "blockLoot").value_or(""));
+        out.entityLoot = stripEdition(readString(obj, "entityLoot").value_or(""));
         out.protocol = stripEdition(readString(obj, "protocol").value_or("bedrock/" + version));
         out.proto = stripEdition(readString(obj, "proto").value_or(out.protocol));
         out.types = stripEdition(readString(obj, "types").value_or(out.protocol));
         out.language = stripEdition(readString(obj, "language").value_or("bedrock/" + version));
-        out.steve = stripEdition(readString(obj, "steve").value_or("bedrock/" + version));
+        // Like loot and the optional gameplay tables, defaultSkin is absent
+        // when dataPaths does not explicitly map a steve.json dataset.
+        out.steve = stripEdition(readString(obj, "steve").value_or(""));
 
         return out;
     }
@@ -145,6 +169,12 @@ private:
         const std::string prefix = "bedrock/";
         if (value.rfind(prefix, 0) == 0) {
             return value.substr(prefix.size());
+        }
+
+        // dataPaths contains a few historical cross-edition fallbacks. They
+        // are deliberately unavailable in this Bedrock-only library.
+        if (value.rfind("pc/", 0) == 0 || value.rfind("java/", 0) == 0) {
+            return {};
         }
 
         return value;

@@ -13,7 +13,11 @@ auto client = bedrock::createClient({
 });
 ```
 
-The default is the JavaScript package's exact `CURRENT_VERSION`, `"1.26.0"`. Pass another exact key from the table below when needed. Values such as `"latest"`, `"auto"`, and an empty string are rejected, matching `Options.validateOptions()`.
+When `version` is omitted, `createClient` first uses the server advertisement
+and falls back to the JavaScript package's exact `CURRENT_VERSION`, `"1.26.0"`,
+if that advertised release is unavailable. Pass another exact key from the
+table below to force a version. Explicit values such as `"latest"`, `"auto"`,
+and an empty string are rejected, matching `Options.validateOptions()`.
 
 ## Version Notes
 
@@ -26,6 +30,70 @@ The default is the JavaScript package's exact `CURRENT_VERSION`, `"1.26.0"`. Pas
 | `1.26.x` | Bundled data is present and roundtrip-tested for packet encode/decode tables. |
 
 Server MOTD protocol numbers are not always reliable. Some servers advertise an old protocol while accepting newer clients. Pick the version you want the bot to speak and let the client use the matching bundled protocol data.
+
+Static Bedrock data also follows minecraft-data's category-specific remaps.
+Blocks, items, biomes, entities, recipes, windows, instruments, attributes,
+block/entity loot, the default skin, and language data therefore do not
+necessarily use the selected version's directory. Optional categories remain
+empty when no Bedrock mapping exists; they never fall back to Java Edition data
+or to a guessed local file.
+
+The bundled Bedrock loot tables are explicitly mapped for `1.18.0` (3298 block
+entries and 72 entity entries). Other releases do not silently reuse them.
+Default-skin mappings begin at `1.16.201`; current versions use the `1.21.70`
+persona skin, while historical versions without a `steve` mapping return no
+skin. Cross-edition `blockMappings`/`blocksB2J`/`blocksJ2B` datasets are
+excluded because they contain Java↔Bedrock conversion data.
+
+`MinecraftDataAssets::loadBedrockFeatureRegistryByVersion` exposes the Bedrock
+`features.json` boundaries and minecraft-data version comparisons. Its
+`supportsFeature` result should be preferred over protocol-number checks for
+format transitions such as block hashes, Item `auxiliary_value`, compressor
+headers, item-registry packets, and login identity fields. When multiple
+releases share one protocol, `resolveByProtocol` selects the newest release,
+matching minecraft-data (for example `594` -> `1.20.15`).
+
+The dynamic registry follows the same boundaries. `handleStartGame` accepts
+the legacy embedded item palette and initializes sequential or hashed block
+runtime IDs. From `1.21.60`, pass the dedicated `item_registry` packet to
+`handleItemRegistry`; its version and NBT component fields are retained when
+the palette is written again.
+
+The pre-paletted Bedrock chunk implementations are available separately:
+`BedrockChunk014` uses the fixed 128-high 83,200-byte layout and
+`BedrockChunk10` uses sixteen fixed subchunks with its 164,627-byte dump.
+Legacy block registries synthesize the 16 metadata states per numeric block ID
+that minecraft-data creates when `blockStates.json` is unavailable. No
+cross-edition biome fallback is loaded for these releases.
+
+The native server follows `serverPlayer.js` when a player reports its protocol.
+For `1.19.30` and newer this check runs on `request_network_settings`; older
+clients carry the value in `login`. A protocol newer than the configured server
+version receives `play_status: failed_spawn` and is closed before network
+settings or authentication continue. Equal and older values are accepted, as
+in JavaScript. The same decision is available directly through
+`BedrockServer::handleClientProtocolVersion(connection, protocol)`.
+
+For a schema-valid `login`, `BedrockServer::onLoggingIn` runs before that
+legacy version decision and before JWT verification. Its
+`BedrockServerLoggingInEvent` contains the connection, raw packet, and decoded
+`LoginPacketData`. `onLogin` remains the later authenticated lifecycle event.
+On the client, `Client::onLoggingIn` and
+`BedrockNetworkClient::onLoggingIn` run immediately after the login write while
+the status is `Authenticating`. A modern client rejected during
+`request_network_settings` never sends login and therefore emits neither side's
+`loggingIn` event.
+
+The earlier auth lifecycle is exposed through `onSession(profile)`. Offline
+sessions emit synchronously before the queue starts; online Authflow sessions
+emit after their token promise resolves, with the queue active but before
+RakNet transport creation. The profile, authenticated username, and original
+Mojang/Xbox token chains remain available from `profile()`, `username()`, and
+`accessToken()`. During encrypted login, the client-side
+`client.server_handshake` alias runs after `join`/`Initializing` and before the
+ordinary `server_to_client_handshake` listener. On the server,
+`onServerClientHandshake` runs after encryption starts but before `onLogin` and
+its stored verification/profile become visible.
 
 ## Version Table
 
@@ -97,5 +165,5 @@ Run packet roundtrip checks:
 Expected summary:
 
 ```text
-[ROUNDTRIP] checkedVersions=27 failures=0
+[ROUNDTRIP] checkedVersions=48 failures=0
 ```

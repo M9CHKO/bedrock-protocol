@@ -61,13 +61,16 @@ public:
     }
 
     std::optional<MinecraftDataVersionInfo> findByProtocol(int32_t protocol) const {
+        std::optional<MinecraftDataVersionInfo> result;
         for (const auto& info : versions_) {
             if (info.protocol == protocol) {
-                return info;
+                // The manifest is oldest-to-newest. minecraft-data resolves a
+                // duplicate Bedrock protocol to the newest non-snapshot
+                // release (for example 594 -> 1.20.15), so keep the last hit.
+                result = info;
             }
         }
-
-        return std::nullopt;
+        return result;
     }
 
 private:

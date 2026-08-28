@@ -398,9 +398,12 @@ BedrockLiveRelay::~BedrockLiveRelay() {
     close();
 }
 
-void BedrockLiveRelay::listen() {
+ServerListenResult BedrockLiveRelay::listen() {
     if (!closed_.exchange(false)) {
-        return;
+        return {
+            .host = options_.server.host,
+            .port = options_.server.port
+        };
     }
 
     server_->onConnect([this](const BedrockServerConnection& connection) {
@@ -431,35 +434,19 @@ void BedrockLiveRelay::listen() {
             return;
         }
 
+        // RelayPlayer installs its own one-shot join listener in the
+        // constructor, before Relay emits `connect`. Register this internal
+        // boundary before public connect handlers can add their Player join
+        // listeners, preserving that ordering for queued clientbound packets.
+        std::weak_ptr<Session> weakSession = session;
+        connection.onJoin([this, weakSession]() {
+            const auto joinedSession = weakSession.lock();
+            if (joinedSession) handleDownstreamJoin(joinedSession);
+        });
+
         for (auto& handler : connectHandlers_) {
             handler(connection);
         }
-        emitStatus();
-    });
-
-    server_->onJoin([this](const BedrockServerConnection& connection) {
-        const auto session = findSession(connection);
-        if (!session) return;
-        {
-            std::lock_guard<std::mutex> lock(session->mutex);
-            if (session->closing) return;
-            session->downstreamJoined = true;
-        }
-
-        for (auto& handler : joinHandlers_) {
-            handler(connection);
-        }
-
-        std::vector<VersionedGamePacket> queuedClientbound;
-        {
-            std::lock_guard<std::mutex> lock(session->mutex);
-            queuedClientbound = std::move(session->pendingClientbound);
-            session->pendingClientbound.clear();
-        }
-        for (const auto& packet : queuedClientbound) {
-            forwardClientbound(session, packet);
-        }
-
         emitStatus();
     });
 
@@ -502,9 +489,10 @@ void BedrockLiveRelay::listen() {
         handleDownstreamPacket(event);
     });
 
-    server_->listen();
+    const auto address = server_->listen();
     listening_.store(true);
     emitStatus();
+    return address;
 }
 
 int BedrockLiveRelay::run() {
@@ -557,6 +545,10 @@ void BedrockLiveRelay::onJoin(ConnectionHandler handler) {
     joinHandlers_.push_back(std::move(handler));
 }
 
+void BedrockLiveRelay::onUpstreamJoin(UpstreamJoinHandler handler) {
+    upstreamJoinHandlers_.push_back(std::move(handler));
+}
+
 void BedrockLiveRelay::onDisconnect(ConnectionHandler handler) {
     disconnectHandlers_.push_back(std::move(handler));
 }
@@ -587,6 +579,11 @@ void BedrockLiveRelay::onError(ErrorHandler handler) {
 
 void BedrockLiveRelay::onStatus(StatusHandler handler) {
     statusHandlers_.push_back(std::move(handler));
+}
+
+void BedrockLiveRelay::onMsaCode(MsaCodeHandler handler) {
+    std::lock_guard<std::mutex> lock(msaCodeHandlersMutex_);
+    msaCodeHandlers_.push_back(std::move(handler));
 }
 
 bool BedrockLiveRelay::listening() const {
@@ -847,6 +844,21 @@ void BedrockLiveRelay::emitStatus() {
     }
 }
 
+bool BedrockLiveRelay::emitMsaCode(
+    const XboxDeviceCodeInfo& code,
+    const BedrockServerConnection& connection
+) {
+    std::vector<MsaCodeHandler> handlers;
+    {
+        std::lock_guard<std::mutex> lock(msaCodeHandlersMutex_);
+        handlers = msaCodeHandlers_;
+    }
+    for (auto& handler : handlers) {
+        handler(code, connection);
+    }
+    return !handlers.empty();
+}
+
 std::shared_ptr<BedrockLiveRelay::Session> BedrockLiveRelay::findSession(
     const BedrockServerConnection& connection
 ) const {
@@ -923,6 +935,32 @@ void BedrockLiveRelay::captureDownstreamClientData(
     } catch (const std::exception& e) {
         emitError("[relay] failed to forward downstream clientData: " + std::string(e.what()));
     }
+}
+
+void BedrockLiveRelay::handleDownstreamJoin(
+    const std::shared_ptr<Session>& session
+) {
+    {
+        std::lock_guard<std::mutex> lock(session->mutex);
+        if (session->closing) return;
+        session->downstreamJoined = true;
+    }
+
+    for (auto& handler : joinHandlers_) {
+        handler(session->downstream);
+    }
+
+    std::vector<VersionedGamePacket> queuedClientbound;
+    {
+        std::lock_guard<std::mutex> lock(session->mutex);
+        queuedClientbound = std::move(session->pendingClientbound);
+        session->pendingClientbound.clear();
+    }
+    for (const auto& packet : queuedClientbound) {
+        forwardClientbound(session, packet);
+    }
+
+    emitStatus();
 }
 
 void BedrockLiveRelay::resolveUpstreamRealm(
@@ -1047,6 +1085,35 @@ void BedrockLiveRelay::startUpstream(const std::shared_ptr<Session>& session) {
         upstreamOptions = session->upstreamOptions;
     }
 
+    std::weak_ptr<Session> weakSession = session;
+    auto configuredMsaCode = upstreamOptions.onMsaCode;
+    upstreamOptions.onMsaCode = [
+        this,
+        weakSession,
+        configuredMsaCode = std::move(configuredMsaCode)
+    ](const XboxDeviceCodeInfo& code) {
+        const auto activeSession = weakSession.lock();
+        if (!activeSession || closed_.load()) return;
+
+        // A direct low-level upstream callback remains authoritative. The
+        // contextual Relay callback is the JS-facing high-level path.
+        if (configuredMsaCode) {
+            configuredMsaCode(code);
+            return;
+        }
+        if (emitMsaCode(code, activeSession->downstream)) {
+            return;
+        }
+
+        // relay.js disconnects only the Player whose upstream authentication
+        // requested a code when no callback was supplied.
+        server_->disconnect(
+            activeSession->downstream,
+            "It's your first time joining. Please sign in and reconnect to "
+            "join this server:\n\n" + code.message
+        );
+    };
+
     try {
         resolveUpstreamRealm(upstreamOptions);
     } catch (const std::exception& error) {
@@ -1082,8 +1149,6 @@ void BedrockLiveRelay::startUpstream(const std::shared_ptr<Session>& session) {
     if (publishPrimary) options_.upstream = upstreamOptions;
 
     auto upstream = std::make_shared<BedrockNetworkClient>(upstreamOptions);
-    std::weak_ptr<Session> weakSession = session;
-
     upstream->onError([this, weakSession](const std::string& message) {
         const auto session = weakSession.lock();
         if (!session) return;
@@ -1158,6 +1223,23 @@ void BedrockLiveRelay::startUpstream(const std::shared_ptr<Session>& session) {
         for (const auto& packet : queued) {
             // RelayPlayer#flushUpQueue uses Client#write, not queue.
             forwardServerbound(session, packet, true);
+        }
+
+        bool stillReady = false;
+        {
+            std::lock_guard<std::mutex> lock(session->mutex);
+            stillReady = !session->closing &&
+                session->upstreamReady &&
+                session->upstream == upstream;
+        }
+        if (!stillReady) return;
+
+        // relay.js emits only after client_cache_status, ds.upstream
+        // publication and flushUpQueue(). Copy the listener snapshot so a
+        // callback registered from this emission joins only the next event.
+        const auto handlers = upstreamJoinHandlers_;
+        for (auto& handler : handlers) {
+            handler(session->downstream, upstream);
         }
     });
 

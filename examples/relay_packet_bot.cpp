@@ -11,7 +11,7 @@ int main() {
     options.clientOptions.autoStartGameInit = false;
     options.enableChunkCaching = false;
 
-    auto relay = bedrock::createRelay(options);
+    auto relay = bedrock::createPacketRelay(options);
     auto codec = bedrock::VersionedMcpeCodec::forVersion(options.clientOptions.minecraftVersion);
     relay.markDownstreamJoined();
     relay.markUpstreamJoined();

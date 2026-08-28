@@ -88,7 +88,7 @@ static bool checkVersion(const std::string& version, bool useRealm = false) {
         };
     }
 
-    auto relay = bedrock::createRelayServer(std::move(relayOptions));
+    auto relay = bedrock::createLiveRelay(std::move(relayOptions));
     relay.onJoin([&](const bedrock::BedrockServerConnection&) {
         downstreamJoined = true;
     });

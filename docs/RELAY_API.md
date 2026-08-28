@@ -5,6 +5,11 @@ It creates a local Bedrock server, accepts Minecraft clients, opens one isolated
 upstream connection for each accepted client, and lets you inspect, edit,
 cancel, or inject packets in both directions.
 
+Construct it directly and then call `listen()`, just like JavaScript's
+`new Relay(options)`. `createRelay(options)` remains only as a C++ convenience;
+packet-only and direct-live runtimes use the explicit names
+`createPacketRelay` and `createLiveRelay`.
+
 ## Basic Proxy
 
 ```cpp
@@ -12,12 +17,11 @@ cancel, or inject packets in both directions.
 #include <iostream>
 
 int main() {
-    bedrock::Relay relay({
+    bedrock::Relay relay(bedrock::RelayOptions {
         .version = "1.21.2",
         .host = "0.0.0.0",
         .port = 19132,
         .motd = "Bedrock Protocol C++ Relay",
-        .username = "RelayBot",
         .offline = false,
         .destination = {
             .host = "cpe.ign.gg",
@@ -30,10 +34,34 @@ int main() {
                   << ":" << player.connection.port << "\n";
     });
 
-    relay.listen();
+    const auto listener = relay.listen();
+    std::cout << "listening on " << listener.host
+              << ":" << listener.port << "\n";
     while (true) {}
 }
 ```
+
+## Offline Mode Is Inherited
+
+Set the root `offline` field once for the normal case. When
+`destination.offline` is omitted, the upstream connection inherits it:
+
+```cpp
+options.offline = true;
+// Listener: offline. Destination: offline.
+```
+
+The nested field is only an explicit override for mixed deployments:
+
+```cpp
+options.offline = false;
+options.destination.offline = true;
+// Listener verifies online clients; destination is an offline server.
+```
+
+With root `offline = false` and no override, both sides use online
+authentication. `listenerOffline()` and `destinationOffline()` return the
+resolved modes.
 
 ## Bedrock Realm Destination
 
@@ -46,7 +74,6 @@ bedrock::RelayOptions options;
 options.version = "1.21.2";
 options.host = "0.0.0.0";
 options.port = 19132;
-options.username = "RelayBot";
 options.destination.realms.realmInvite =
     "https://realms.gg/AB1CD2EFA3B";
 
@@ -56,9 +83,28 @@ relay.listen();
 
 `destination.realms.realmId`, `realmInvite`, `pickRealm`, and
 `pickRealmAsync` use the same Bedrock-only selectors as `createClient`.
-`RelayOptions::profilesFolder`, `onMsaCode`, `authTitle`, `deviceType`,
-`flow`, `forceRefresh`, `msalConfig`, and `password` are forwarded to the
-upstream Authflow. Host and port are replaced by the Realm join address.
+`RelayOptions::profilesFolder`, `onMsaCode`, `authTitle`, `deviceType`, and
+`flow` are forwarded to the upstream Authflow. Native injection points such as
+`forceRefresh`, `msalConfig`, `authflow`, and `password` are grouped under
+`options.advanced`. Host and port are replaced by the Realm join address.
+
+`onMsaCode` follows Relay's two-argument JavaScript shape, so authentication UI
+can be routed to the correct downstream session:
+
+```cpp
+options.onMsaCode = [](
+    const bedrock::XboxDeviceCodeInfo& code,
+    bedrock::RelayPlayer& player
+) {
+    std::cout << player.sessionId() << " needs sign-in: "
+              << code.message << "\n";
+};
+```
+
+Existing one-argument callbacks still compile. If no callback is set, only the
+matching player is disconnected with the standard sign-in/reconnect prompt;
+other active players and upstreams are untouched. The direct live layer also
+offers `BedrockLiveRelay::onMsaCode(code, connection)`.
 
 ## Multiple Clients And `forceSingle`
 
@@ -80,6 +126,21 @@ handlers. `relay.playerCount()`, `relay.players()`, and
 `relay.player(connection)` expose the active high-level players. The no-argument
 `relay.player()` remains as a compatibility view for old single-client code;
 multi-client code should use the callback player or an exact connection lookup.
+
+JavaScript Relay inherits `Server.clients`. The C++ facade exposes the same
+active set as synchronized, owning snapshots:
+
+```cpp
+const auto clients = relay.clients();
+if (const auto player = relay.client(endpointKey)) {
+    player->disconnect("maintenance");
+}
+```
+
+Keys come from `player.connection.key()` (`address:port`). A Player `close`
+listener runs before its entry is removed. `Relay::listen()` returns the
+configured listener host and port; with port `0`, use
+`relay.live().boundPort()` for the OS-selected port.
 
 Set `RelayOptions::forceSingle = true` to reject a second transport while one
 accepted player is active. A rejected transport does not emit the relay
@@ -212,6 +273,13 @@ and the upstream Client queue; its default is 20 ms.
 ## Relay-Level Events
 
 ```cpp
+relay.on("join", [](
+    bedrock::RelayPlayer& player,
+    bedrock::BedrockNetworkClient& upstream
+) {
+    std::cout << player.sessionId() << " joined its destination\n";
+});
+
 relay.on("error", [](const std::string& message) {
     std::cerr << message << "\n";
 });
@@ -225,6 +293,24 @@ relay.on("disconnect", [](bedrock::RelayPlayer& player) {
     std::cout << "client disconnected\n";
 });
 ```
+
+`connect` means the downstream transport was accepted. `join` is emitted
+later with `(downstreamPlayer, upstreamClient)`, matching `relay.js`, after the
+upstream login, forced `client_cache_status`, upstream publication, and pending
+serverbound queue flush. `onJoin(handler)` is the typed alias. With multiple
+players, each event carries the corresponding isolated upstream client.
+
+At the direct live-runtime layer, `onJoin(connection)` remains the downstream
+server join boundary; use `onUpstreamJoin(connection, upstream)` for the later
+Relay-level event.
+
+Each `RelayPlayer` also carries the ordinary downstream `Player` API. Register
+`player.onLogin(...)`, `player.on("join", ...)`, `player.on("packet", ...)`,
+`player.onSpawn(...)`, or `player.onClose(...)` from the Relay `connect`
+handler; inspect `profile()`, `version()`, `getUserData()`, and `status()`; or
+disconnect only that player with `disconnect()`/`close()`. Player copies share
+the same listener state. The internal RelayPlayer join listener runs first so
+queued backend packets are released before public downstream join callbacks.
 
 The legacy boolean fields (`downstreamJoined`, `upstreamStarted`, and
 `upstreamReady`) mean that at least one active session is in that state. Use

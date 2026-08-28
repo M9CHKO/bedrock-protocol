@@ -19,8 +19,10 @@ struct VersionedTextPacket {
     bool needsTranslation = false;
     std::string sourceName;
     std::string message;
+    std::vector<std::string> parameters;
     std::string xuid;
     std::string platformChatId;
+    std::string filteredMessage;
 };
 
 struct VersionedLevelChunkPacket {
@@ -245,12 +247,24 @@ public:
             out.message = cursor.readString();
         }
 
+        if (out.type == 2 || out.type == 3 || out.type == 4) {
+            const auto count = cursor.readVarUInt();
+            out.parameters.reserve(count);
+            for (uint32_t i = 0; i < count; ++i) {
+                out.parameters.push_back(cursor.readString());
+            }
+        }
+
         if (!cursor.eof()) {
             out.xuid = cursor.readString();
         }
 
         if (!cursor.eof()) {
             out.platformChatId = cursor.readString();
+        }
+
+        if (!cursor.eof()) {
+            out.filteredMessage = cursor.readString();
         }
 
         return out;

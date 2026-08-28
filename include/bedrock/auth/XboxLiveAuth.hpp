@@ -90,6 +90,9 @@ struct XboxLiveAuthFlowOptions {
 struct XboxLiveLoginPacket {
     std::vector<uint8_t> loginPacket;
     BedrockClientKeyPair keyPair;
+    // auth.js exposes the original Mojang/Xbox chains as client.accessToken.
+    // This excludes the client-signed identity JWT prepended for the wire.
+    std::vector<std::string> accessToken;
     std::string identity;
     std::string displayName;
     std::string xuid;

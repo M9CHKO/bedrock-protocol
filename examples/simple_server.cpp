@@ -9,20 +9,31 @@ int main() {
         .host = "0.0.0.0",
         .port = 19132,
         .version = "1.20.40",
-        .motd = {{"motd", "Bedrock Protocol C++"}},
+        .motd = {"Bedrock Protocol C++", "Example world"},
         .maxPlayers = 3
     });
 
-    server.onConnect([](const bedrock::BedrockServerConnection& connection) {
-        std::cout << "connect " << connection.address << ":" << connection.port << "\n";
-    });
+    server.on("connect", [](const bedrock::Player& player) {
+        std::cout << "connect " << player.address << ":" << player.port << "\n";
 
-    server.onAny([](const bedrock::BedrockServerPacketEvent& event) {
-        std::cout << "packet " << event.packet.name << "\n";
-    });
-
-    server.onJoin([](const bedrock::BedrockServerConnection& connection) {
-        std::cout << "join " << connection.address << ":" << connection.port << "\n";
+        player.onLogin([player](const bedrock::BedrockServerPacketEvent&) {
+            const auto profile = player.profile();
+            if (profile) {
+                std::cout << "login " << profile->name
+                          << " xuid=" << profile->xuid << "\n";
+            }
+        });
+        player.on("packet", bedrock::Player::PacketHandler(
+            [](const bedrock::BedrockServerPacketEvent& event) {
+                std::cout << "packet " << event.packet.name << "\n";
+            }
+        ));
+        player.on("join", bedrock::Player::VoidHandler([player] {
+            std::cout << "join " << player.address << ":" << player.port << "\n";
+        }));
+        player.on("close", bedrock::Player::VoidHandler([player] {
+            std::cout << "close " << player.address << ":" << player.port << "\n";
+        }));
     });
 
     std::cout << "listening on port " << server.boundPort() << "\n";

@@ -2573,16 +2573,19 @@ bool checkSuppliedAuthflowBoundary() {
             "eyJleHRyYURhdGEiOnsiZGlzcGxheU5hbWUiOiJJbmplY3RlZCIs"
             "ImlkZW50aXR5IjoidXVpZCIsIlhVSUQiOiI0MiJ9fQ."
             "c2ln";
+        const std::string rootJwt =
+            "eyJhbGciOiJFUzM4NCIsIng1dSI6ImR1bW15LXJvb3Qta2V5In0."
+            "eyJjZXJ0aWZpY2F0ZUF1dGhvcml0eSI6dHJ1ZX0.c2ln";
+        const bedrock::MinecraftBedrockTokenChains expectedAccessToken {
+            rootJwt,
+            profileJwt
+        };
         std::atomic<int> invocations {0};
         const auto supplied = std::make_shared<bedrock::Authflow>(
-            [&](std::string) {
+            [&, expectedAccessToken](std::string) {
                 ++invocations;
                 return bedrock::makeReadyAuthflowFuture(
-                    bedrock::MinecraftBedrockTokenChains {
-                        "eyJhbGciOiJFUzM4NCIsIng1dSI6ImR1bW15LXJvb3Qta2V5In0."
-                        "eyJjZXJ0aWZpY2F0ZUF1dGhvcml0eSI6dHJ1ZX0.c2ln",
-                        profileJwt
-                    }
+                    expectedAccessToken
                 );
             }
         );
@@ -2590,12 +2593,39 @@ bool checkSuppliedAuthflowBoundary() {
         bedrock::Client client(std::move(options));
         client.init();
         std::atomic<int> errors {0};
+        std::atomic<int> sessionEvents {0};
+        std::atomic<int> callbackSequence {0};
+        std::atomic<int> sessionSequence {0};
+        std::atomic<int> preTransportSequence {0};
+        std::atomic<bool> sessionMismatch {false};
         client.onError([&](const std::string&) { ++errors; });
+        client.onSession([&](const bedrock::BedrockClientProfile& profile) {
+            ++sessionEvents;
+            sessionSequence = ++callbackSequence;
+            const auto stored = client.profile();
+            const auto username = client.username();
+            if (profile.name != "Injected" || profile.uuid != "uuid" ||
+                profile.xuid != "42" || !stored.has_value() ||
+                stored->name != profile.name || stored->uuid != profile.uuid ||
+                stored->xuid != profile.xuid || !username.has_value() ||
+                *username != "Injected" ||
+                client.accessToken() != expectedAccessToken ||
+                client.status() != bedrock::ClientStatus::Disconnected ||
+                !bedrock::BedrockNetworkClientTestAccess::queueRunning(
+                    client.network()
+                ) ||
+                bedrock::BedrockNetworkClientTestAccess::hasTransport(
+                    client.network()
+                ) || client.network().options().loginPacket.empty()) {
+                sessionMismatch = true;
+            }
+        });
         bool reachedPreTransport = false;
         bool loginPacketBuilt = false;
         bedrock::BedrockNetworkClientTestAccess::setBeforeTransportInstallHook(
             client.network(),
             [&]() {
+                preTransportSequence = ++callbackSequence;
                 reachedPreTransport = true;
                 loginPacketBuilt =
                     !client.network().options().loginPacket.empty();
@@ -2606,6 +2636,9 @@ bool checkSuppliedAuthflowBoundary() {
         const bool connectResult = client.connect();
         ok &= check(
             !connectResult && invocations.load() == 1 &&
+                sessionEvents.load() == 1 && !sessionMismatch.load() &&
+                sessionSequence.load() > 0 &&
+                preTransportSequence.load() > sessionSequence.load() &&
                 reachedPreTransport && loginPacketBuilt &&
                 errors.load() == 0 &&
                 client.options().authflow == supplied &&

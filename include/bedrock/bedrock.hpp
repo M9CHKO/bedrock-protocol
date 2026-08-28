@@ -13,7 +13,14 @@
 #include <bedrock/auth/PlayfabTokenManager.hpp>
 #include <bedrock/api/Client.hpp>
 #include <bedrock/RakNetPing.hpp>
+#include <bedrock/chat/BedrockChat.hpp>
 #include <bedrock/client/BedrockNetworkClient.hpp>
+#include <bedrock/item/BedrockItem.hpp>
+#include <bedrock/registry/BedrockDefaultSkin.hpp>
+#include <bedrock/registry/BedrockFeatureRegistry.hpp>
+#include <bedrock/registry/BedrockGameplayRegistry.hpp>
+#include <bedrock/registry/BedrockLootRegistry.hpp>
+#include <bedrock/registry/BedrockRegistry.hpp>
 #include <bedrock/nbt/BedrockNbt.hpp>
 #include <bedrock/protocol/ProtocolDefinition.hpp>
 #include <bedrock/protocol/SnappyCodec.hpp>
@@ -27,8 +34,11 @@
 #include <bedrock/server/BedrockServer.hpp>
 #include <bedrock/server/ServerAdvertisement.hpp>
 #include <bedrock/util/XxHash64.hpp>
+#include <bedrock/world/BedrockBlockRegistry.hpp>
 #include <bedrock/world/BedrockChunk.hpp>
+#include <bedrock/world/BedrockLegacyChunk.hpp>
 #include <bedrock/world/BedrockSubChunkPacket.hpp>
+#include <bedrock/world/MinecraftDataAssets.hpp>
 
 #include <algorithm>
 #include <cstdint>
@@ -766,12 +776,63 @@ struct Options {
     bool quiet = true;
 };
 
+// Diagnostics are useful to C++ applications, but they are not part of the
+// JavaScript ClientOptions contract. Keep them under one explicit member so
+// normal connection settings remain easy to scan and autocomplete.
+struct ClientDiagnostics {
+    DebugMode debug = DebugMode::Off;
+    bool decodePackets = true;
+    bool packetDump = false;
+    bool quiet = true;
+};
+
+// The normal createClient({...}) surface mirrors bedrock-protocol's
+// ClientOptions instead of exposing every native implementation seam. The
+// larger Options type above this facade remains available as
+// LegacyClientOptions for code that needs those extensions.
+struct ClientOptions {
+    std::string host = "localhost";
+    uint16_t port = 19132;
+    std::string username = "Bot";
+    // nullopt performs the same ping-based version discovery as an omitted JS
+    // property.  A supplied value must be an exact supported Bedrock version.
+    std::optional<std::string> version;
+    bool offline = false;
+    // When false, play_status.player_spawn leaves status at Initializing and
+    // does not emit spawn; callers can send the init packet and setStatus()
+    // manually, matching client.js.
+    bool autoInitPlayer = true;
+
+    std::optional<int32_t> viewDistance;
+    std::optional<std::string> authTitle;
+    int connectTimeout = 9000;
+    bool skipPing = false;
+    std::optional<bool> followPort;
+    std::function<void(const std::string&)> conLog = [](const std::string& message) {
+        std::cout << message << "\n";
+    };
+    BedrockRealmSelection realms;
+    ProfilesFolderOption profilesFolder;
+    std::function<void(const XboxDeviceCodeInfo&)> onMsaCode;
+
+    std::string raknetBackend = "raknet-native";
+    // Keep the spelling exported by bedrock-protocol's ClientOptions type.
+    bool useRaknetWorker = true;
+    int compressionLevel = 7;
+    int batchingInterval = 20;
+    ClientDiagnostics diagnostics;
+};
+
+using BotOptions = ClientOptions;
+using LegacyClientOptions = Options;
+
 struct ClientFactoryTestAccess;
 
 class Client {
 public:
     using PacketHandler = std::function<void(const Packet&)>;
     using TextHandler = std::function<void(const TextPacket&)>;
+    using SessionHandler = std::function<void(const BedrockClientProfile&)>;
 
 private:
     friend struct ClientFactoryTestAccess;
@@ -850,6 +911,8 @@ private:
         std::vector<std::pair<std::string, PacketHandler>> packetHandlers;
         std::vector<PacketHandler> anyHandlers;
         std::vector<TextHandler> textHandlers;
+        std::vector<SessionHandler> sessionHandlers;
+        std::vector<std::function<void()>> loggingInHandlers;
         std::vector<std::function<void()>> joinHandlers;
         std::vector<std::function<void()>> spawnHandlers;
         std::vector<std::function<void(int64_t)>> heartbeatHandlers;
@@ -1081,6 +1144,8 @@ public:
             state->packetHandlers.clear();
             state->anyHandlers.clear();
             state->textHandlers.clear();
+            state->sessionHandlers.clear();
+            state->loggingInHandlers.clear();
             state->joinHandlers.clear();
             state->spawnHandlers.clear();
             state->heartbeatHandlers.clear();
@@ -1127,12 +1192,61 @@ public:
             : ClientStatus::Disconnected;
     }
 
+    void setStatus(ClientStatus status) {
+        requireNetwork()->setStatus(status);
+    }
+
     std::optional<uint64_t> entityId() const {
         auto state = state_;
         std::lock_guard<std::mutex> lock(state->mutex);
         return state->network
             ? state->network->entityId()
             : std::nullopt;
+    }
+
+    // client.js retains the latest decoded start_game params. The C++ facade
+    // returns its normal Packet view, force-decoded even when no start_game
+    // listener was registered.
+    std::optional<Packet> startGameData() const {
+        auto state = state_;
+        std::shared_ptr<BedrockNetworkClient> network;
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            network = state->network;
+        }
+        if (!network) return std::nullopt;
+        const auto packet = network->startGameData();
+        return packet
+            ? std::optional<Packet>(toApiPacket(state, *packet, true))
+            : std::nullopt;
+    }
+
+    void updateItemPalette(const ProtoDefValue& palette) {
+        requireNetwork()->updateItemPalette(palette);
+    }
+
+    std::optional<BedrockClientProfile> profile() const {
+        auto state = state_;
+        std::lock_guard<std::mutex> lock(state->mutex);
+        return state->network
+            ? state->network->profile()
+            : std::nullopt;
+    }
+
+    std::optional<std::string> username() const {
+        auto state = state_;
+        std::lock_guard<std::mutex> lock(state->mutex);
+        return state->network
+            ? state->network->username()
+            : std::nullopt;
+    }
+
+    std::vector<std::string> accessToken() const {
+        auto state = state_;
+        std::lock_guard<std::mutex> lock(state->mutex);
+        return state->network
+            ? state->network->accessToken()
+            : std::vector<std::string>{};
     }
 
     uint32_t protocolVersion() const {
@@ -1279,6 +1393,26 @@ public:
             state->textHandlers.push_back(std::move(handler));
         }
         armPreflightLocked(state);
+    }
+
+    void onSession(SessionHandler handler) {
+        addNetworkHandler(
+            state_->sessionHandlers,
+            std::move(handler),
+            [](BedrockNetworkClient& network, SessionHandler value) {
+                network.onSession(std::move(value));
+            }
+        );
+    }
+
+    void onLoggingIn(std::function<void()> handler) {
+        addNetworkHandler(
+            state_->loggingInHandlers,
+            std::move(handler),
+            [](BedrockNetworkClient& network, std::function<void()> value) {
+                network.onLoggingIn(std::move(value));
+            }
+        );
     }
 
     void onJoin(std::function<void()> handler) {
@@ -2132,6 +2266,20 @@ private:
         };
     }
 
+    static SessionHandler guardHandler(
+        const std::shared_ptr<State>& state,
+        SessionHandler handler
+    ) {
+        std::weak_ptr<State> weak = state;
+        return [weak, handler = std::move(handler)](
+            const BedrockClientProfile& profile
+        ) {
+            auto lifetimeLease = weak.lock();
+            if (!lifetimeLease) return;
+            handler(profile);
+        };
+    }
+
     static std::function<void(int64_t)> guardHandler(
         const std::shared_ptr<State>& state,
         std::function<void(int64_t)> handler
@@ -2171,6 +2319,14 @@ private:
     static void attachPendingNetworkHandlersLocked(
         const std::shared_ptr<State>& state
     ) {
+        for (auto& handler : state->sessionHandlers) {
+            state->network->onSession(guardHandler(state, std::move(handler)));
+        }
+        state->sessionHandlers.clear();
+        for (auto& handler : state->loggingInHandlers) {
+            state->network->onLoggingIn(guardHandler(state, std::move(handler)));
+        }
+        state->loggingInHandlers.clear();
         for (auto& handler : state->joinHandlers) {
             state->network->onJoin(guardHandler(state, std::move(handler)));
         }
@@ -2235,11 +2391,7 @@ private:
         ) {
             if (auto current = weak.lock()) {
                 auto packet = toApiPacket(current, event.packet);
-                TextPacket text;
-                text.sourceName = packet.get("source_name");
-                text.message = packet.get("message");
-                text.xuid = packet.get("xuid");
-                text.platformChatId = packet.get("platform_chat_id");
+                auto text = api::textPacketFromPacket(packet);
                 handler(text);
             }
         });
@@ -2247,7 +2399,8 @@ private:
 
     static Packet toApiPacket(
         const std::shared_ptr<State>& state,
-        const VersionedGamePacket& packet
+        const VersionedGamePacket& packet,
+        bool forceDecode = false
     ) {
         std::lock_guard<std::mutex> lock(state->mutex);
         Packet out;
@@ -2255,28 +2408,39 @@ private:
         out.name = packet.name;
         out.ok = true;
 
-        if (state->options.decodePackets) {
+        if (forceDecode || state->options.decodePackets) {
             const bool shouldDecode =
-                state->decodeAnyPacket ||
+                forceDecode || state->decodeAnyPacket ||
                 state->subscribedPackets.find(packet.name) != state->subscribedPackets.end();
             if (!shouldDecode) return out;
 
             try {
                 auto fields = state->decoder->decodePacket(packet.name, packet.payload);
                 for (const auto& field : fields) {
-                    out.fields[field.path] = field.value;
-                    auto c1 = field.value.find(',');
+                    // ProtoDef's diagnostic field form retains mapper values
+                    // as `numeric/name`. JavaScript packet params expose only
+                    // the mapped enum name, so normalize at the root Client
+                    // facade while leaving low-level inspector fields intact.
+                    auto value = field.value;
+                    if (field.type.rfind("mapper<", 0) == 0) {
+                        const auto separator = value.find('/');
+                        if (separator != std::string::npos) {
+                            value = value.substr(separator + 1);
+                        }
+                    }
+                    out.fields[field.path] = value;
+                    auto c1 = value.find(',');
                     auto c2 = c1 == std::string::npos
                         ? std::string::npos
-                        : field.value.find(',', c1 + 1);
+                        : value.find(',', c1 + 1);
                     if (c1 != std::string::npos && c2 != std::string::npos) {
-                        out.fields[field.path + ".x"] = field.value.substr(0, c1);
-                        out.fields[field.path + ".y"] = field.value.substr(c1 + 1, c2 - c1 - 1);
-                        out.fields[field.path + ".z"] = field.value.substr(c2 + 1);
+                        out.fields[field.path + ".x"] = value.substr(0, c1);
+                        out.fields[field.path + ".y"] = value.substr(c1 + 1, c2 - c1 - 1);
+                        out.fields[field.path + ".z"] = value.substr(c2 + 1);
                     }
                     auto dot = field.path.rfind('.');
                     if (dot != std::string::npos) {
-                        out.fields[field.path.substr(dot + 1)] = field.value;
+                        out.fields[field.path.substr(dot + 1)] = value;
                     }
                 }
             } catch (const std::exception& e) {
@@ -2430,12 +2594,78 @@ private:
 
 
 
-inline Client createClient(Options options) {
-    return Client::createFactory(std::move(options));
+namespace detail {
+
+inline Options expandClientOptions(ClientOptions options) {
+    Options out;
+    out.host = std::move(options.host);
+    out.port = options.port;
+    out.username = std::move(options.username);
+    if (options.version.has_value()) {
+        out.version = std::move(*options.version);
+    }
+    out.offline = options.offline;
+    out.autoInitPlayer = options.autoInitPlayer;
+    if (options.viewDistance.has_value()) {
+        out.viewDistance = *options.viewDistance;
+    }
+    if (options.authTitle.has_value()) {
+        out.authTitle = std::move(*options.authTitle);
+    }
+    out.connectTimeout = options.connectTimeout;
+    out.skipPing = options.skipPing;
+    if (options.followPort.has_value()) {
+        out.followPort = *options.followPort;
+    }
+    out.conLog = std::move(options.conLog);
+    out.realms = std::move(options.realms);
+    out.profilesFolder = std::move(options.profilesFolder);
+    out.onMsaCode = std::move(options.onMsaCode);
+    out.raknetBackend = std::move(options.raknetBackend);
+    out.useRaknetWorkers = options.useRaknetWorker;
+    out.compressionLevel = options.compressionLevel;
+    out.batchingInterval = options.batchingInterval;
+    out.debug = options.diagnostics.debug;
+    out.decodePackets = options.diagnostics.decodePackets;
+    out.packetDump = options.diagnostics.packetDump;
+    out.quiet = options.diagnostics.quiet;
+    return out;
 }
 
-inline Client createNetworkClient(Options options = {}) {
+} // namespace detail
+
+inline Client createClient(ClientOptions options) {
+    return Client::createFactory(detail::expandClientOptions(std::move(options)));
+}
+
+// Typed legacy Options calls keep working.  This is intentionally a template:
+// a direct createClient({...}) cannot deduce it and therefore selects the
+// compact ClientOptions aggregate above.
+template <typename LegacyOptions>
+requires std::is_same_v<std::remove_cvref_t<LegacyOptions>, Options>
+inline Client createClient(LegacyOptions&& options) {
+    return Client::createFactory(
+        Options(std::forward<LegacyOptions>(options))
+    );
+}
+
+inline Client createBot(BotOptions options) {
+    return createClient(std::move(options));
+}
+
+// Manual root Client construction without createClient's automatic connect.
+// The explicit name avoids colliding with the native BedrockNetworkClient
+// factory exported by its own header.
+inline Client createManualClient(Options options = {}) {
     return Client(std::move(options));
+}
+
+template <typename LegacyOptions>
+requires std::is_same_v<std::remove_cvref_t<LegacyOptions>, Options>
+inline Client createNetworkClient(LegacyOptions&& options) {
+    return createManualClient(
+        Options(std::forward<LegacyOptions>(options))
+    );
 }
 
 struct PingOptions {
@@ -2467,26 +2697,137 @@ struct RelayDestination {
     std::optional<bool> offline;
 };
 
+class RelayPlayer;
+
+// Accept both the current JavaScript callback shape `(code, player)` and the
+// former C++ one-argument shape `(code)`. This keeps existing source working
+// while making the downstream session available to new code.
+class RelayMsaCodeCallback {
+public:
+    using ContextHandler = std::function<void(
+        const XboxDeviceCodeInfo&,
+        RelayPlayer&
+    )>;
+    using LegacyHandler = std::function<void(const XboxDeviceCodeInfo&)>;
+
+    RelayMsaCodeCallback() = default;
+    RelayMsaCodeCallback(std::nullptr_t) noexcept {}
+
+    RelayMsaCodeCallback(ContextHandler handler)
+        : handler_(std::move(handler)) {}
+
+    RelayMsaCodeCallback(LegacyHandler handler) {
+        assignLegacy(std::move(handler));
+    }
+
+    template <typename Handler>
+    requires (!std::is_same_v<std::remove_cvref_t<Handler>, RelayMsaCodeCallback>)
+    RelayMsaCodeCallback(Handler&& handler) {
+        assign(std::forward<Handler>(handler));
+    }
+
+    RelayMsaCodeCallback& operator=(std::nullptr_t) noexcept {
+        handler_ = {};
+        return *this;
+    }
+
+    RelayMsaCodeCallback& operator=(ContextHandler handler) {
+        handler_ = std::move(handler);
+        return *this;
+    }
+
+    RelayMsaCodeCallback& operator=(LegacyHandler handler) {
+        assignLegacy(std::move(handler));
+        return *this;
+    }
+
+    template <typename Handler>
+    requires (!std::is_same_v<std::remove_cvref_t<Handler>, RelayMsaCodeCallback>)
+    RelayMsaCodeCallback& operator=(Handler&& handler) {
+        assign(std::forward<Handler>(handler));
+        return *this;
+    }
+
+    explicit operator bool() const noexcept {
+        return static_cast<bool>(handler_);
+    }
+
+    void operator()(
+        const XboxDeviceCodeInfo& code,
+        RelayPlayer& player
+    ) const {
+        if (handler_) handler_(code, player);
+    }
+
+private:
+    ContextHandler handler_;
+
+    void assignLegacy(LegacyHandler handler) {
+        if (!handler) {
+            handler_ = {};
+            return;
+        }
+        handler_ = [handler = std::move(handler)](
+            const XboxDeviceCodeInfo& code,
+            RelayPlayer&
+        ) {
+            handler(code);
+        };
+    }
+
+    template <typename Handler>
+    void assign(Handler&& handler) {
+        using Callback = std::decay_t<Handler>;
+        if constexpr (std::is_invocable_v<
+                          Callback&,
+                          const XboxDeviceCodeInfo&,
+                          RelayPlayer&
+                      >) {
+            handler_ = std::forward<Handler>(handler);
+        } else {
+            static_assert(
+                std::is_invocable_v<Callback&, const XboxDeviceCodeInfo&>,
+                "Relay onMsaCode must accept (code) or (code, RelayPlayer&)"
+            );
+            handler_ = [handler = Callback(std::forward<Handler>(handler))](
+                const XboxDeviceCodeInfo& code,
+                RelayPlayer&
+            ) mutable {
+                handler(code);
+            };
+        }
+    }
+};
+
+// Non-standard authentication injection points stay available without
+// cluttering the normal JavaScript RelayOptions surface.
+struct RelayAdvancedOptions {
+    std::string username = "RelayBot";
+    bool forceRefresh = false;
+    MsalConfigPtr msalConfig;
+    std::shared_ptr<Authflow> authflow;
+    std::string password;
+};
+
 struct RelayOptions {
     std::string version = std::string(CURRENT_VERSION);
     std::string host = "0.0.0.0";
     uint16_t port = 19132;
-    std::string motd = "Bedrock Protocol C++ Relay";
-    std::string username = "RelayBot";
+    ServerMotd motd = ServerMotd("Bedrock Protocol C++ Relay");
     bool offline = false;
     int maxPlayers = 3;
     std::string compressionAlgorithm = "deflate";
     int compressionLevel = 7;
     uint16_t compressionThreshold = 512;
+    std::string raknetBackend = "raknet-native";
+    bool useRaknetWorker = true;
     std::optional<std::string> authTitle;
     std::string deviceType;
     std::string flow;
-    bool forceRefresh = false;
-    MsalConfigPtr msalConfig;
-    std::shared_ptr<Authflow> authflow;
-    std::string password;
     ProfilesFolderOption profilesFolder;
-    std::function<void(const XboxDeviceCodeInfo&)> onMsaCode;
+    // relay.js calls onMsaCode(code, downstreamPlayer). One-argument C++
+    // callbacks remain accepted by RelayMsaCodeCallback for compatibility.
+    RelayMsaCodeCallback onMsaCode;
     int batchingInterval = 20;
     bool logging = false;
     bool enableChunkCaching = false;
@@ -2495,6 +2836,17 @@ struct RelayOptions {
     // dropped, and normally disconnect that downstream unless this is true.
     bool omitParseErrors = false;
     RelayDestination destination;
+    RelayAdvancedOptions advanced;
+
+    // A single root offline value is the common case and applies to both
+    // sides. destination.offline exists only as an explicit upstream override.
+    bool listenerOffline() const noexcept {
+        return offline;
+    }
+
+    bool destinationOffline() const noexcept {
+        return destination.offline.value_or(offline);
+    }
 };
 
 struct RelayPacketDestination {
@@ -3143,6 +3495,13 @@ public:
 
     using PacketHandler = std::function<void(RelayPacketEvent&)>;
     using PacketWithDestinationHandler = std::function<void(RelayPacketEvent&, RelayPacketDestination&)>;
+    using PlayerPacketHandler = BedrockServerConnection::PacketHandler;
+    using PlayerVoidHandler = BedrockServerConnection::VoidHandler;
+    using LoggingInHandler = BedrockServerConnection::LoggingInHandler;
+    using ClientHandshakeHandler =
+        BedrockServerConnection::ClientHandshakeHandler;
+    using PlayerStatusHandler = BedrockServerConnection::StatusHandler;
+    using PlayerErrorHandler = BedrockServerConnection::ErrorHandler;
 
     BedrockServerConnection connection;
     Upstream upstream;
@@ -3154,6 +3513,138 @@ public:
 
     std::string sessionId() const {
         return BedrockLiveRelay::sessionId(connection);
+    }
+
+    BedrockServerClientStatus status() const {
+        return connection.status();
+    }
+
+    void setStatus(BedrockServerClientStatus status) {
+        connection.setStatus(status);
+    }
+
+    void updateItemPalette(const ProtoDefValue& palette) {
+        connection.updateItemPalette(palette);
+    }
+
+    std::optional<ProtoDefValue> getUserData() const {
+        return connection.getUserData();
+    }
+
+    std::optional<ProtoDefValue> skinData() const {
+        return connection.skinData();
+    }
+
+    std::optional<BedrockLoginProfile> profile() const {
+        return connection.profile();
+    }
+
+    std::optional<uint32_t> version() const {
+        return connection.version();
+    }
+
+    bool versionLessThan(const std::string& version) const {
+        return connection.versionLessThan(version);
+    }
+
+    bool versionLessThan(uint32_t protocolVersion) const {
+        return connection.versionLessThan(protocolVersion);
+    }
+
+    bool versionGreaterThan(const std::string& version) const {
+        return connection.versionGreaterThan(version);
+    }
+
+    bool versionGreaterThan(uint32_t protocolVersion) const {
+        return connection.versionGreaterThan(protocolVersion);
+    }
+
+    bool versionGreaterThanOrEqualTo(const std::string& version) const {
+        return connection.versionGreaterThanOrEqualTo(version);
+    }
+
+    bool versionGreaterThanOrEqualTo(uint32_t protocolVersion) const {
+        return connection.versionGreaterThanOrEqualTo(protocolVersion);
+    }
+
+    bool versionLessThanOrEqualTo(const std::string& version) const {
+        return connection.versionLessThanOrEqualTo(version);
+    }
+
+    bool versionLessThanOrEqualTo(uint32_t protocolVersion) const {
+        return connection.versionLessThanOrEqualTo(protocolVersion);
+    }
+
+    void onLoggingIn(LoggingInHandler handler) {
+        connection.onLoggingIn(std::move(handler));
+    }
+
+    void onServerClientHandshake(ClientHandshakeHandler handler) {
+        connection.onServerClientHandshake(std::move(handler));
+    }
+
+    void onLogin(PlayerPacketHandler handler) {
+        connection.onLogin(std::move(handler));
+    }
+
+    void onLogin(PlayerVoidHandler handler) {
+        connection.onLogin(std::move(handler));
+    }
+
+    void onJoin(PlayerVoidHandler handler) {
+        connection.onJoin(std::move(handler));
+    }
+
+    void onSpawn(PlayerVoidHandler handler) {
+        connection.onSpawn(std::move(handler));
+    }
+
+    void onSpawn(PlayerErrorHandler handler) {
+        connection.onSpawn(std::move(handler));
+    }
+
+    void onClose(PlayerVoidHandler handler) {
+        connection.onClose(std::move(handler));
+    }
+
+    void onClose(PlayerErrorHandler handler) {
+        connection.onClose(std::move(handler));
+    }
+
+    void onStatus(PlayerStatusHandler handler) {
+        connection.onStatus(std::move(handler));
+    }
+
+    void onError(PlayerErrorHandler handler) {
+        connection.onError(std::move(handler));
+    }
+
+    void onAny(PlayerPacketHandler handler) {
+        connection.onAny(std::move(handler));
+    }
+
+    void on(const std::string& eventName, PlayerVoidHandler handler) {
+        connection.on(eventName, std::move(handler));
+    }
+
+    void on(const std::string& eventName, PlayerPacketHandler handler) {
+        connection.on(eventName, std::move(handler));
+    }
+
+    void on(const std::string& eventName, LoggingInHandler handler) {
+        connection.on(eventName, std::move(handler));
+    }
+
+    void on(const std::string& eventName, ClientHandshakeHandler handler) {
+        connection.on(eventName, std::move(handler));
+    }
+
+    void on(const std::string& eventName, PlayerStatusHandler handler) {
+        connection.on(eventName, std::move(handler));
+    }
+
+    void on(const std::string& eventName, PlayerErrorHandler handler) {
+        connection.on(eventName, std::move(handler));
     }
 
     void on(const std::string& direction, PacketHandler handler) {
@@ -3237,6 +3728,21 @@ public:
         send(packetName, PacketValue::object(PacketObject(value)));
     }
 
+    void disconnect(
+        const std::string& reason = "Server closed",
+        bool hide = false
+    ) {
+        connection.disconnect(reason, hide);
+    }
+
+    void sendDisconnectStatus(const std::string& playStatus) {
+        connection.sendDisconnectStatus(playStatus);
+    }
+
+    void close() {
+        connection.close();
+    }
+
 private:
     friend class Relay;
     BedrockLiveRelay* relay_ = nullptr;
@@ -3290,7 +3796,15 @@ private:
 
 class Relay {
 public:
+    using ClientMap = std::unordered_map<
+        std::string,
+        std::shared_ptr<RelayPlayer>
+    >;
     using ConnectHandler = std::function<void(RelayPlayer&)>;
+    using JoinHandler = std::function<void(
+        RelayPlayer&,
+        BedrockNetworkClient&
+    )>;
     using DisconnectHandler = std::function<void(RelayPlayer&)>;
     using PacketHandler = std::function<void(RelayPacketEvent&)>;
     using PacketWithDestinationHandler = std::function<void(RelayPacketEvent&, RelayPacketDestination&)>;
@@ -3301,9 +3815,45 @@ public:
         : options_(normalizeOptions(std::move(options))),
           live_(toLiveOptions(options_)),
           fallbackPlayer_(std::make_shared<RelayPlayer>(&live_)),
-          currentPlayer_(fallbackPlayer_) {}
+          currentPlayer_(fallbackPlayer_) {
+        live_.onUpstreamJoin([this](
+            const BedrockServerConnection& connection,
+            const std::shared_ptr<BedrockNetworkClient>& upstream
+        ) {
+            const auto player = playerForSession(
+                BedrockLiveRelay::sessionId(connection)
+            );
+            if (!player || !upstream) return;
+            const auto handlers = joinHandlers_;
+            for (auto& handler : handlers) {
+                handler(*player, *upstream);
+            }
+        });
+        if (options_.onMsaCode) {
+            live_.onMsaCode([this](
+                const XboxDeviceCodeInfo& code,
+                const BedrockServerConnection& connection
+            ) {
+                const auto player = playerForSession(
+                    BedrockLiveRelay::sessionId(connection)
+                );
+                if (player) {
+                    options_.onMsaCode(code, *player);
+                    return;
+                }
+                // The low-level session normally publishes RelayPlayer during
+                // its connect callback before authentication can begin. Keep
+                // the Node fallback if a callback races an external teardown.
+                live_.server().disconnect(
+                    connection,
+                    "It's your first time joining. Please sign in and "
+                    "reconnect to join this server:\n\n" + code.message
+                );
+            });
+        }
+    }
 
-    void listen() {
+    ServerListenResult listen() {
         live_.onConnect([this](const BedrockServerConnection& connection) {
             auto player = std::make_shared<RelayPlayer>(&live_);
             player->setConnection(connection);
@@ -3415,7 +3965,7 @@ public:
             wrapped.apply(event);
         });
 
-        live_.listen();
+        return live_.listen();
     }
 
     int run() {
@@ -3437,6 +3987,13 @@ public:
             return;
         }
         throw std::runtime_error("unknown relay event: " + eventName);
+    }
+
+    void on(const std::string& eventName, JoinHandler handler) {
+        if (eventName != "join") {
+            throw std::runtime_error("unknown relay join event: " + eventName);
+        }
+        joinHandlers_.push_back(std::move(handler));
     }
 
     void on(const std::string& direction, PacketHandler handler) {
@@ -3465,6 +4022,10 @@ public:
 
     void onConnect(ConnectHandler handler) {
         on("connect", std::move(handler));
+    }
+
+    void onJoin(JoinHandler handler) {
+        on("join", std::move(handler));
     }
 
     void onDisconnect(DisconnectHandler handler) {
@@ -3561,6 +4122,31 @@ public:
         return players_.size();
     }
 
+    // Relay extends Server in JavaScript and therefore publishes clients by
+    // downstream endpoint. Owning snapshots keep RelayPlayer views valid if a
+    // disconnect races the caller's enumeration.
+    ClientMap clients() const {
+        ClientMap out;
+        std::lock_guard<std::mutex> lock(playersMutex_);
+        out.reserve(players_.size());
+        for (const auto& [sessionId, player] : players_) {
+            (void) sessionId;
+            out[player->connection.key()] = player;
+        }
+        return out;
+    }
+
+    std::shared_ptr<RelayPlayer> client(const std::string& key) const {
+        std::lock_guard<std::mutex> lock(playersMutex_);
+        for (const auto& [sessionId, player] : players_) {
+            (void) sessionId;
+            if (player->connection.key() == key) {
+                return player;
+            }
+        }
+        return {};
+    }
+
     const RelayOptions& options() const { return options_; }
 
 private:
@@ -3575,6 +4161,7 @@ private:
     std::shared_ptr<RelayPlayer> fallbackPlayer_;
     std::shared_ptr<RelayPlayer> currentPlayer_;
     std::vector<ConnectHandler> connectHandlers_;
+    std::vector<JoinHandler> joinHandlers_;
     std::vector<DisconnectHandler> disconnectHandlers_;
     std::vector<PacketHandler> clientboundHandlers_;
     std::vector<PacketHandler> serverboundHandlers_;
@@ -3604,9 +4191,10 @@ private:
         out.server.host = options.host;
         out.server.port = options.port;
         out.server.version = options.version;
-        out.server.motd = {{"motd", options.motd}};
+        out.server.motd = options.motd;
         out.server.maxPlayers = options.maxPlayers;
         out.server.offline = options.offline;
+        out.server.raknetBackend = options.raknetBackend;
         out.server.compressionAlgorithm = options.compressionAlgorithm;
         out.server.compressionLevel = options.compressionLevel;
         out.server.compressionThreshold = options.compressionThreshold;
@@ -3615,19 +4203,20 @@ private:
         out.upstream.host = options.destination.host;
         out.upstream.port = options.destination.port;
         out.upstream.version = options.version;
-        out.upstream.username = options.username;
-        out.upstream.profile = options.username;
-        out.upstream.offline = options.destination.offline.value_or(options.offline);
+        out.upstream.username = options.advanced.username;
+        out.upstream.profile = options.advanced.username;
+        out.upstream.offline = options.destinationOffline();
         out.upstream.interactiveAuth = true;
         out.upstream.authTitle = options.authTitle;
         out.upstream.deviceType = options.deviceType;
         out.upstream.flow = options.flow;
-        out.upstream.forceRefresh = options.forceRefresh;
-        out.upstream.msalConfig = options.msalConfig;
-        out.upstream.authflow = options.authflow;
-        out.upstream.password = options.password;
+        out.upstream.forceRefresh = options.advanced.forceRefresh;
+        out.upstream.msalConfig = options.advanced.msalConfig;
+        out.upstream.authflow = options.advanced.authflow;
+        out.upstream.password = options.advanced.password;
         out.upstream.profilesFolder = options.profilesFolder;
-        out.upstream.onMsaCode = options.onMsaCode;
+        out.upstream.raknetBackend = options.raknetBackend;
+        out.upstream.useRaknetWorkers = options.useRaknetWorker;
         out.upstream.batchingIntervalMs = options.batchingInterval;
         out.upstream.compressionLevel = options.compressionLevel;
         out.upstream.clientCacheEnabled = false;

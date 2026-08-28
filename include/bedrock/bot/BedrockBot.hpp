@@ -12,6 +12,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -253,8 +254,21 @@ private:
     }
 };
 
-inline BedrockBot createBot(BedrockBotOptions options = {}) {
+inline BedrockBot createBedrockBot(BedrockBotOptions options = {}) {
     return BedrockBot(std::move(options));
+}
+
+// Typed compatibility only. A direct createBot({...}) call belongs to the
+// normal in-process BotOptions facade from <bedrock/bedrock.hpp>.
+template <typename NativeBotOptions>
+requires std::is_same_v<
+    std::remove_cvref_t<NativeBotOptions>,
+    BedrockBotOptions
+>
+inline BedrockBot createBot(NativeBotOptions&& options) {
+    return createBedrockBot(
+        BedrockBotOptions(std::forward<NativeBotOptions>(options))
+    );
 }
 
 } // namespace bedrock

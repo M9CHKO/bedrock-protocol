@@ -12,6 +12,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -101,7 +102,7 @@ bedrock::RelayOptions relayOptions(
     options.motd = forceSingle
         ? "Live Relay forceSingle Smoke"
         : "Live Relay Multi-client Smoke";
-    options.username = "RelayMultiUp";
+    options.advanced.username = "RelayMultiUp";
     options.offline = true;
     options.maxPlayers = 4;
     options.batchingInterval = 5;
@@ -196,6 +197,8 @@ bool checkMultiClientRouting() {
     std::atomic<std::size_t> statusReady {0};
     std::atomic<std::size_t> maximumConnections {0};
     std::atomic<int> connectCalls {0};
+    std::atomic<int> joinCalls {0};
+    std::atomic<int> joinMismatches {0};
     std::atomic<int> disconnectCalls {0};
     std::atomic<int> playerHandlerHits {0};
     std::atomic<int> playerHandlerMismatches {0};
@@ -203,6 +206,8 @@ bool checkMultiClientRouting() {
     std::mutex downstreamMutex;
     std::unordered_map<std::string, bedrock::BedrockServerConnection> downstreamConnections;
     std::unordered_map<std::string, std::string> packetSessions;
+    std::mutex joinMutex;
+    std::unordered_set<std::string> joinedSessions;
 
     const auto isCustomRequest = [&](const bedrock::VersionedGamePacket& packet) {
         return packet.fullPacket == requestA.fullPacket ||
@@ -222,6 +227,21 @@ bool checkMultiClientRouting() {
             ++playerHandlerHits;
             if (event.sessionId != id) ++playerHandlerMismatches;
         });
+    });
+    relay.onJoin([&](
+        bedrock::RelayPlayer& player,
+        bedrock::BedrockNetworkClient& upstream
+    ) {
+        ++joinCalls;
+        const auto expected = relay.live().upstreamShared(player.connection);
+        if (!expected || expected.get() != &upstream ||
+            upstream.status() !=
+                bedrock::BedrockNetworkClientStatus::Authenticating ||
+            statusReady.load() == 0) {
+            ++joinMismatches;
+        }
+        std::lock_guard<std::mutex> lock(joinMutex);
+        joinedSessions.insert(player.sessionId());
     });
     relay.onDisconnect([&](bedrock::RelayPlayer&) {
         ++disconnectCalls;
@@ -309,6 +329,9 @@ bool checkMultiClientRouting() {
     ok &= check(connectedB, "second downstream connect failed");
     ok &= check(bothReady, "two independent relay sessions did not become ready");
     ok &= check(connectCalls.load() == 2, "connect callback count is not two");
+    ok &= check(joinCalls.load() == 2, "Relay join callback count is not two");
+    ok &= check(joinMismatches.load() == 0,
+                "Relay join did not expose the matching ready upstream boundary");
     ok &= check(relay.players().size() == 2, "players() did not expose two active players");
 
     std::vector<bedrock::BedrockServerConnection> capturedConnections;
@@ -322,6 +345,11 @@ bool checkMultiClientRouting() {
     ok &= check(capturedConnections.size() == 2, "did not capture both RelayPlayer connections");
     for (const auto& connection : capturedConnections) {
         ok &= check(relay.player(connection) != nullptr, "player(connection) lookup failed");
+        std::lock_guard<std::mutex> lock(joinMutex);
+        ok &= check(
+            joinedSessions.contains(bedrock::BedrockLiveRelay::sessionId(connection)),
+            "Relay join callback missed an accepted session"
+        );
     }
 
     if (bothReady) {
@@ -356,7 +384,28 @@ bool checkMultiClientRouting() {
     ok &= check(!upstreamA.empty() && !upstreamB.empty() && upstreamA != upstreamB,
                 "both downstreams were forwarded through one upstream connection");
 
-    clientA.close("multi-client isolation check");
+    bedrock::BedrockServerConnection connectionA;
+    bedrock::BedrockServerConnection connectionB;
+    {
+        std::lock_guard<std::mutex> lock(downstreamMutex);
+        const auto foundA = downstreamConnections.find(downstreamSessionA);
+        const auto foundB = downstreamConnections.find(downstreamSessionB);
+        if (foundA != downstreamConnections.end()) connectionA = foundA->second;
+        if (foundB != downstreamConnections.end()) connectionB = foundB->second;
+    }
+
+    // Trigger the no-callback Relay device-code policy on A. It must remove
+    // only A's downstream/upstream pair while B keeps routing.
+    auto upstreamClientA = relay.live().upstreamShared(connectionA);
+    std::function<void(const bedrock::XboxDeviceCodeInfo&)> msaCodeA;
+    if (upstreamClientA) msaCodeA = upstreamClientA->options().onMsaCode;
+    ok &= check(static_cast<bool>(msaCodeA),
+                "first upstream did not install Relay onMsaCode fallback");
+    if (msaCodeA) {
+        msaCodeA(bedrock::XboxDeviceCodeInfo {
+            .message = "multi-client device code"
+        });
+    }
     const bool oneRemains = waitFor([&]() {
         return relay.playerCount() == 1 &&
             relay.live().sessionCount() == 1 &&
@@ -368,7 +417,7 @@ bool checkMultiClientRouting() {
     });
     if (!oneRemains) {
         std::ostringstream state;
-        state << "closing one downstream did not converge: players="
+        state << "session-scoped device-code disconnect did not converge: players="
               << relay.playerCount()
               << " sessions=" << relay.live().sessionCount()
               << " upstreams=" << relay.live().upstreamCount()
@@ -379,15 +428,6 @@ bool checkMultiClientRouting() {
         ok &= check(false, state.str());
     }
 
-    bedrock::BedrockServerConnection connectionA;
-    bedrock::BedrockServerConnection connectionB;
-    {
-        std::lock_guard<std::mutex> lock(downstreamMutex);
-        const auto foundA = downstreamConnections.find(downstreamSessionA);
-        const auto foundB = downstreamConnections.find(downstreamSessionB);
-        if (foundA != downstreamConnections.end()) connectionA = foundA->second;
-        if (foundB != downstreamConnections.end()) connectionB = foundB->second;
-    }
     if (!downstreamSessionA.empty() && !downstreamSessionB.empty()) {
         ok &= check(relay.player(connectionA) == nullptr,
                     "disconnected RelayPlayer remained active");

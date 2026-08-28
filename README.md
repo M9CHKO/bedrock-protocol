@@ -70,7 +70,8 @@ int main() {
   structured `ProtoDefValue` data by the packet/relay decoder.
 - ProtoDef `setVariable` switch branches and persistent item-palette state,
   including automatic `ShieldItemID` updates from `start_game` or
-  `item_registry` and full decoding of encapsulated `Item.extra` payloads.
+  `item_registry`, public `Connection::updateItemPalette` equivalents, and full
+  decoding of encapsulated `Item.extra` payloads.
 - Lossless structured packet decoding for `buffer`/`ByteArray`/`restBuffer`,
   canonical UUIDs, signed and zigzag array counts, and relay-safe restoration
   of empty arrays, absent options, metadata loops, and `void` switch branches.
@@ -83,15 +84,47 @@ int main() {
 - Optional deep packet JSON decoding for debugging.
 - `bedrock-protocol`-style in-process client creation and event handlers.
 - Packet-level relay core with `clientbound` / `serverbound` events, `cancel()`, `replace()`, MCPE repacking, forced `client_cache_status`, and level chunk queueing before `start_game`.
-- Native `createServer` runtime: RakNet listener, authenticated/offline Player lifecycle, compression and encryption transitions, packet/status/login/join/spawn/close events, immediate `write`, timed `queue` batching, raw `sendBuffer`, and explicit `sendQueued` flushes. All of these paths are Bedrock-only.
-- Live relay runtime (`Relay` / `createRelayServer`) with one isolated upstream
+- Native `createServer` runtime: RakNet listener, authenticated/offline Player lifecycle, Node-compatible client protocol gating at `request_network_settings`/`login`, compression and encryption transitions, packet/status/`loggingIn`/login/join/spawn/close events, immediate `write`, timed `queue` batching, raw `sendBuffer`, and explicit `sendQueued` flushes. All of these paths are Bedrock-only.
+- Live relay runtime (`Relay`, with `createRelay` retained as a convenience)
+  with one isolated upstream
   C++ client, queues, packet-variable store, and lifecycle per accepted
   downstream Bedrock player. Multiple clients are supported concurrently;
   `forceSingle` restores the single-client rejection mode, and each destination
   can be a real Bedrock server or Bedrock Realm. Relay login preserves custom
   skin/client metadata per session, and high-level `logging`,
-  `enableChunkCaching`, and `omitParseErrors` match the Bedrock JavaScript path.
-- Bedrock chunk/world foundation ported from `prismarine-chunk`, including runtime and local/network-persistent paletted subchunks, full `little`/`littleVarint` NBT block-state palettes and block entities, the legacy and batched 1.18+ `subchunk` packet shapes, 2D/3D biome sections, no-cache and cached chunk-section decoding, cache blob status/miss handling, and a tracked `client.world()` that consumes standalone subchunk responses.
+  `enableChunkCaching`, `omitParseErrors`, and session-aware
+  `onMsaCode(code, player)` match the Bedrock JavaScript path. Relay
+  `onJoin(player, upstream)` exposes the exact destination-ready pair.
+- Bedrock chunk/world foundation ported from `prismarine-chunk` and
+  `prismarine-world`, including runtime and persistent paletted subchunks,
+  entities and block entities, 2D/3D biomes, cached/no-cache chunk decoding,
+  traversal/raycast helpers, block-update events, and generator/storage save
+  queues. `BedrockBlockRegistry` adds the Bedrock `prismarine-block` surface:
+  typed states/properties, Node-compatible hashes, harvest/dig helpers, and
+  state-specific collision shapes loaded directly from minecraft-data. Typed
+  column/world block access carries light, biome, position, block-entity NBT,
+  and Bedrock's superimposed layer; sign blocks expose native `Text` NBT
+  helpers compatible with `prismarine-block`. `BedrockChunk014` and
+  `BedrockChunk10` preserve the original fixed numeric-id chunk layouts,
+  nibble arrays, biome/color data, and wire dumps for early Bedrock releases.
+  `BedrockItemRegistry` ports the Bedrock `prismarine-item` object, including
+  stack IDs, modern and auxiliary-value packet conversion, exact Item NBT,
+  durability, names/lore, enchants, and adventure block lists.
+  `BedrockRegistry` adds version-aware Bedrock biome/entity metadata plus
+  recipes, inventory windows, note-block instruments, and attributes behind
+  one facade. `BedrockFeatureRegistry` adds Node-compatible Bedrock feature
+  values and version comparisons, replacing hard-coded block/item format
+  boundaries. Recipe NBT, sparse IDs, duplicate names, optional tables, and
+  old/current schemas are preserved through Bedrock-only minecraft-data remaps.
+  The dynamic `prismarine-registry` surface handles `start_game`/
+  `item_registry` item palettes and sequential or typed-state-hashed block
+  runtime IDs for custom servers.
+  Bedrock block/entity loot keeps both Node's last-write-wins indexes and every
+  state variant, while the versioned default skin exposes raw login fields plus
+  decoded RGBA, geometry, resource-patch, animation, and persona data.
+  `BedrockChat` ports the Bedrock `prismarine-chat` path with its native
+  language catalog, translation formatting, section colors, plain/MOTD/ANSI/
+  HTML output, message builder, and complete Bedrock text-packet parameters.
 - CMake package install for separate bot projects.
 - Windows through MSYS2/MinGW, Linux, and Termux builds.
 
@@ -122,6 +155,7 @@ BedrockProtocol::bedrock_protocol
 Detailed beginner instructions are here:
 
 - [Getting Started](documentation/GETTING_STARTED.md)
+- [Client, Server, And Relay Creation](documentation/API.md)
 - [Bot Packet Examples](documentation/BOT_PACKETS.md)
 - [Relay API](documentation/RELAY.md)
 - [Supported Versions](documentation/VERSIONS.md)
@@ -151,40 +185,36 @@ auto client = bedrock::createClient({
     .port = 19132,
     .username = "Notch",
     .version = "1.26.0",
-    .offline = false,
-    .interactiveAuth = true,
-    .clientCacheEnabled = false,
-    .chunkRadius = 10,
+    .offline = false
 });
 ```
 
-| Option | Default | Meaning |
-|---|---:|---|
-| `host` | `localhost` | Bedrock server address. |
-| `port` | `19132` | Bedrock server port. |
-| `username` | `Bot` | Bot name. In online mode this is also the default auth cache profile. |
-| `profile` | empty | Xbox auth cache profile. Empty means `username`. |
-| `version` | `1.26.0` | Exact Bedrock release from the JavaScript `Versions` table. Unknown values, including `latest` and `auto`, are rejected. |
-| `offline` | `false` | Use self-signed auth instead of Xbox Live. |
-| `interactiveAuth` | `true` | If the Xbox cache is missing, show a device-code login prompt and save the profile cache. |
-| `authTitle` | unset | OAuth title id. When unset, matches JavaScript by using `title.MinecraftNintendoSwitch`. |
-| `deviceType` | conditional | Becomes `Nintendo` only while applying the unset-`authTitle` default; an explicit title leaves it unchanged. |
-| `flow` | conditional | Becomes `live` only while applying the unset-`authTitle` default; an explicit title leaves it unchanged. |
-| `xboxClientId` | empty | Deprecated C++ compatibility alias for `authTitle`; explicit `authTitle` takes precedence. |
-| `authCacheRoot` | auto | Optional Xbox auth/key cache root. Empty uses the hidden default cache folder. |
-| `realms` | disabled | Bedrock Realm selector. Set `realms.realmId`, `realms.realmInvite`, or `realms.pickRealm`; Realm auth resolves `host`/`port` before ping and reuses the same Authflow for game login. |
-| `clientCacheEnabled` | `false` | Sends the client cache preference used by chunk cache flow. 
-| `chunkRadius` | `10` | Requested chunk radius during automatic start-game initialization. |
-| `debug` | `Off` | `Off`, `Events`, `Packets`, `Json`, or `Trace`. |
-| `decodePackets` | `true` | Decode packet fields into JSON-style event fields. |
-| `packetDump` | `false` | Print extra packet dump output. |
+Direct brace calls use the compact `bedrock::ClientOptions` facade. It contains
+the normal JavaScript `ClientOptions` fields; C++ logging/decoder switches are
+grouped under `.diagnostics`, without exposing login-packet and transport
+internals. `bedrock::BotOptions` and `bedrock::createBot()` are readable aliases
+for bot projects. `ServerOptions` follows the same facade rule, while Relay is
+constructed as `bedrock::Relay(options)` and started with `listen()`, matching
+JavaScript.
+
+Bots can opt out of automatic spawn initialization with
+`.autoInitPlayer = false`, inspect `entityId()` and the retained
+`startGameData()`, send `set_local_player_as_initialized`, then call
+`setStatus(ClientStatus::Initialized)`. Mapper fields in public packets use
+JavaScript enum names such as `player_spawn`. See the manual lifecycle example
+in [documentation/API.md](documentation/API.md).
+
+The complete client/server/Relay option tables and examples are in
+[documentation/API.md](documentation/API.md). Existing typed
+`bedrock::Options` calls remain supported under the clearer alias
+`bedrock::LegacyClientOptions`.
 
 `bedrock::createClient()` is the normal in-process API. The old helper-process wrapper is still available as `bedrock::createExternalClient(...)` for compatibility with older local tests.
 
 Connect to a Bedrock Realm by id:
 
 ```cpp
-bedrock::Options options;
+bedrock::ClientOptions options;
 options.username = "Xbox account email";
 options.realms.realmId = 1112223;
 
@@ -208,12 +238,47 @@ client.on("packet", [](const bedrock::Packet& packet) {});
 client.on("start_game", [](const bedrock::Packet& packet) {});
 client.on("disconnect", [](const bedrock::Packet& packet) {});
 client.onText([](const bedrock::TextPacket& text) {});
+client.onSession([](const bedrock::BedrockClientProfile& profile) {});
+client.onLoggingIn([] {});
+client.onJoin([] {});
 client.onSpawn([] {});
 client.onHeartbeat([](int64_t responseTime) {});
 ```
 
+After `session`, `client.profile()`, `client.username()`, and
+`client.accessToken()` expose the same authenticated profile and original
+Mojang/Xbox chains that JavaScript stores on the client. The internal
+`client.server_handshake` alias is also available through `client.on(...)`;
+servers can observe the matching pre-login boundary with
+`server.onServerClientHandshake(...)`.
+
+Server-side players use the same event shape as `serverPlayer.js`:
+
+```cpp
+server.on("connect", [](const bedrock::Player& player) {
+    player.onLogin([player](const bedrock::BedrockServerPacketEvent&) {
+        if (const auto profile = player.profile()) {
+            std::cout << "login " << profile->name << "\n";
+        }
+    });
+    player.on("join", bedrock::Player::VoidHandler([] {}));
+    player.on("packet", bedrock::Player::PacketHandler(
+        [](const bedrock::BedrockServerPacketEvent&) {}
+    ));
+});
+```
+
+`Player` also owns the per-session `write`, `queue`, `sendBuffer`,
+`disconnect`, status/version, profile, and close APIs. `RelayPlayer` delegates
+the same downstream lifecycle surface while retaining its Relay packet hooks.
+`server.clients()`/`server.client(key)` and the matching Relay methods expose
+thread-safe active-player snapshots. Direct `Server::listen()` and
+`Relay::listen()` return the configured host/port, and `advertisementFn` now
+accepts the normal JavaScript value-returning callback while preserving the
+older C++ reference-returning form.
+
 The root `bedrock::title` object exposes the same seven title ids as
-`prismarine-auth`'s `Titles`. Use `Options::onMsaCode` for the device-code
+`prismarine-auth`'s `Titles`. Use `ClientOptions::onMsaCode` for the device-code
 callback; the older `onDeviceCode` name remains available on the lower-level
 `XboxLiveAuthOptions` API.
 
@@ -238,7 +303,7 @@ Examples included in this repository:
 | `packet-event-bot` | Packet event logging and one outgoing schema packet. |
 | `medium-bot` | Medium bot example with packet handlers, chunk radius request, and movement packet writing. |
 | `relay-packet-bot` | Packet-level relay example with serverbound/clientbound hooks. |
-| `relay-test-server` | Runnable `createRelayServer` listener for joining from Minecraft and forwarding to an upstream server. |
+| `relay-test-server` | Runnable high-level `Relay` listener for joining from Minecraft and forwarding to an upstream server. |
 | `simple-server` | Minimal `createServer` listener with connect, packet, and join events. |
 
 

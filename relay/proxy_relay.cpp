@@ -186,7 +186,6 @@ int main() {
         .host = "0.0.0.0",
         .port = 19132,
         .motd = "Bedrock Protocol C++ Relay",
-        .username = "RelayBot",
         .offline = false,
         .destination = {
             .host = "cpe.ign.gg",

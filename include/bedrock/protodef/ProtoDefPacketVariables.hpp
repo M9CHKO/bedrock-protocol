@@ -5,11 +5,12 @@
 #include <bedrock/protodef/ProtoDefVariables.hpp>
 
 #include <cstddef>
+#include <cmath>
 #include <exception>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 #include <vector>
 
 namespace bedrock::detail {
@@ -25,12 +26,37 @@ inline std::optional<std::string> variableKey(const ProtoDefValue& value) {
         case ProtoDefValue::Kind::UInt:
             return std::to_string(value.uintValue);
         case ProtoDefValue::Kind::Double:
+            if (!std::isfinite(value.doubleValue)) return std::nullopt;
             return std::to_string(static_cast<int64_t>(value.doubleValue));
+        case ProtoDefValue::Kind::Bool:
+            return value.boolValue ? "true" : "false";
         case ProtoDefValue::Kind::String:
             return value.stringValue;
         default:
             return std::nullopt;
     }
+}
+
+inline bool isTruthyVariableValue(const ProtoDefValue& value) {
+    switch (value.kind) {
+        case ProtoDefValue::Kind::Bool:
+            return value.boolValue;
+        case ProtoDefValue::Kind::Int:
+            return value.intValue != 0;
+        case ProtoDefValue::Kind::UInt:
+            return value.uintValue != 0;
+        case ProtoDefValue::Kind::Double:
+            return value.doubleValue != 0.0 && !std::isnan(value.doubleValue);
+        case ProtoDefValue::Kind::String:
+            return !value.stringValue.empty();
+        case ProtoDefValue::Kind::Bytes:
+        case ProtoDefValue::Kind::Array:
+        case ProtoDefValue::Kind::Object:
+            return true;
+        case ProtoDefValue::Kind::Null:
+            return false;
+    }
+    return false;
 }
 
 inline bool isTruthyVariableKey(const std::string& value) {
@@ -47,8 +73,36 @@ inline void updateShieldItemId(
     const std::string& name,
     const std::string& runtimeId
 ) {
-    if (variables && name == "minecraft:shield" && isTruthyVariableKey(runtimeId)) {
+    if (variables && name == "minecraft:shield") {
         variables->setVariable("ShieldItemID", runtimeId);
+    }
+}
+
+// Connection#updateItemPalette is public in bedrock-protocol. Keep the
+// variable mutation independent from packet wrappers so Client and Player
+// facades can apply an explicitly supplied palette as well as start_game or
+// item_registry payloads.
+inline void updateItemPaletteVariables(
+    const ProtoDefValue& palette,
+    const ProtoDefVariableStorePtr& variables
+) {
+    if (!variables || palette.kind != ProtoDefValue::Kind::Array) return;
+
+    for (const auto& state : palette.arrayValue) {
+        if (state.kind != ProtoDefValue::Kind::Object) continue;
+        const auto* name = state.get("name");
+        const auto* runtimeId = state.get("runtime_id");
+        if (!name || name->kind != ProtoDefValue::Kind::String) continue;
+        if (name->stringValue == "minecraft:shield") {
+            if (runtimeId && isTruthyVariableValue(*runtimeId)) {
+                if (const auto key = variableKey(*runtimeId)) {
+                    updateShieldItemId(variables, name->stringValue, *key);
+                }
+            }
+            // connection.js breaks at the first shield before testing whether
+            // its runtime_id is truthy.
+            return;
+        }
     }
 }
 
@@ -63,18 +117,8 @@ inline void updateItemPaletteFromValue(
     }
 
     const auto* itemstates = packet.get("itemstates");
-    if (!itemstates || itemstates->kind != ProtoDefValue::Kind::Array) return;
-
-    for (const auto& state : itemstates->arrayValue) {
-        if (state.kind != ProtoDefValue::Kind::Object) continue;
-        const auto* name = state.get("name");
-        const auto* runtimeId = state.get("runtime_id");
-        if (!name || name->kind != ProtoDefValue::Kind::String || !runtimeId) continue;
-        const auto key = variableKey(*runtimeId);
-        if (!key.has_value()) continue;
-        updateShieldItemId(variables, name->stringValue, *key);
-        if (name->stringValue == "minecraft:shield" && isTruthyVariableKey(*key)) return;
-    }
+    if (!itemstates) return;
+    updateItemPaletteVariables(*itemstates, variables);
 }
 
 struct DecodedItemState {
@@ -89,7 +133,7 @@ inline void updateItemPaletteFromFields(
 ) {
     if (!variables || !packetCarriesItemPalette(packetName)) return;
 
-    std::unordered_map<std::size_t, DecodedItemState> states;
+    std::map<std::size_t, DecodedItemState> states;
     constexpr std::string_view prefix = "itemstates[";
     for (const auto& field : fields) {
         if (field.path.rfind(prefix, 0) != 0) continue;
@@ -115,9 +159,13 @@ inline void updateItemPaletteFromFields(
 
     for (const auto& [index, state] : states) {
         (void) index;
-        if (!state.name.has_value() || !state.runtimeId.has_value()) continue;
-        updateShieldItemId(variables, *state.name, *state.runtimeId);
-        if (*state.name == "minecraft:shield" && isTruthyVariableKey(*state.runtimeId)) return;
+        if (!state.name.has_value()) continue;
+        if (*state.name == "minecraft:shield") {
+            if (state.runtimeId && isTruthyVariableKey(*state.runtimeId)) {
+                updateShieldItemId(variables, *state.name, *state.runtimeId);
+            }
+            return;
+        }
     }
 }
 

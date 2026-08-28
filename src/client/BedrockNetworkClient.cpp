@@ -3,8 +3,10 @@
 #include <bedrock/auth/BedrockAuthJwt.hpp>
 #include <bedrock/auth/BedrockClientDataBuilder.hpp>
 #include <bedrock/auth/NativeBedrockAuthflow.hpp>
+#include <bedrock/auth/UuidV3.hpp>
 #include <bedrock/protocol/ProtocolDefinition.hpp>
 #include <bedrock/protodef/ProtoDefPacketDecoder.hpp>
+#include <bedrock/protodef/ProtoDefPacketVariables.hpp>
 #include <bedrock/world/BedrockSubChunkPacket.hpp>
 
 #include <algorithm>
@@ -328,6 +330,15 @@ bool BedrockNetworkClient::connect() {
     // snapshot's synchronous preparation phase.
     try {
         prepareLoginPacket();
+        if (!options().offline) {
+            const auto authenticatedProfile = profile();
+            if (!authenticatedProfile.has_value()) {
+                throw std::runtime_error(
+                    "Bedrock authentication produced no session profile"
+                );
+            }
+            emitSession(*authenticatedProfile);
+        }
     } catch (const std::exception& e) {
         const auto currentOptions = options();
         const bool promiseRejected =
@@ -525,6 +536,19 @@ bool BedrockNetworkClient::prepareConnectLifecycle(bool deferQueuePump) {
             if (options_.username.empty()) {
                 throw std::runtime_error("Must specify a valid username");
             }
+            const auto authOptions = options();
+            const auto name = authOptions.profile.empty()
+                ? authOptions.username
+                : authOptions.profile;
+            BedrockClientProfile offlineProfile {
+                .name = name,
+                .uuid = uuidFrom(name),
+                .xuid = "0"
+            };
+            setSessionData(offlineProfile, {});
+            // createOfflineSession() is synchronous: session precedes
+            // startQueue() and listener exceptions abort Client.connect().
+            emitSession(offlineProfile);
         } else {
             auto authOptionsSnapshot = options();
             NativeBedrockAuthflowOptions normalizedAuthOptions {
@@ -822,6 +846,16 @@ void BedrockNetworkClient::onAny(PacketHandler handler) {
     anyHandlers_.push_back(std::move(handler));
 }
 
+void BedrockNetworkClient::onSession(SessionHandler handler) {
+    std::lock_guard<std::mutex> lock(eventHandlersMutex_);
+    sessionHandlers_.push_back(std::move(handler));
+}
+
+void BedrockNetworkClient::onLoggingIn(std::function<void()> handler) {
+    std::lock_guard<std::mutex> lock(eventHandlersMutex_);
+    loggingInHandlers_.push_back(std::move(handler));
+}
+
 void BedrockNetworkClient::onJoin(std::function<void()> handler) {
     std::lock_guard<std::mutex> lock(eventHandlersMutex_);
     joinHandlers_.push_back(std::move(handler));
@@ -989,6 +1023,30 @@ BedrockNetworkClientStatus BedrockNetworkClient::status() const {
 std::optional<uint64_t> BedrockNetworkClient::entityId() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return runtimeEntityId_;
+}
+
+std::optional<VersionedGamePacket> BedrockNetworkClient::startGameData() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return startGameData_;
+}
+
+void BedrockNetworkClient::updateItemPalette(const ProtoDefValue& palette) {
+    detail::updateItemPaletteVariables(palette, packetVariables_);
+}
+
+std::optional<BedrockClientProfile> BedrockNetworkClient::profile() const {
+    std::lock_guard<std::mutex> lock(optionsMutex_);
+    return profile_;
+}
+
+std::optional<std::string> BedrockNetworkClient::username() const {
+    std::lock_guard<std::mutex> lock(optionsMutex_);
+    return authenticatedUsername_;
+}
+
+std::vector<std::string> BedrockNetworkClient::accessToken() const {
+    std::lock_guard<std::mutex> lock(optionsMutex_);
+    return accessToken_;
 }
 
 uint32_t BedrockNetworkClient::protocolVersion() const {
@@ -1341,6 +1399,8 @@ void BedrockNetworkClient::clearEventHandlers() {
     std::lock_guard<std::mutex> lock(eventHandlersMutex_);
     anyHandlers_.clear();
     namedHandlers_.clear();
+    sessionHandlers_.clear();
+    loggingInHandlers_.clear();
     joinHandlers_.clear();
     spawnHandlers_.clear();
     heartbeatHandlers_.clear();
@@ -1397,6 +1457,38 @@ void BedrockNetworkClient::emitNamedEvent(
         for (auto& handler : handlers) {
             handler(event);
         }
+    }
+}
+
+void BedrockNetworkClient::emitSession(const BedrockClientProfile& profile) {
+    const auto provider = callbackLifetimeProviderSnapshot();
+    auto lifetimeLease = provider
+        ? provider()
+        : std::shared_ptr<void>();
+    if (provider && !lifetimeLease) return;
+    std::vector<SessionHandler> handlers;
+    {
+        std::lock_guard<std::mutex> lock(eventHandlersMutex_);
+        handlers = sessionHandlers_;
+    }
+    for (auto& handler : handlers) {
+        handler(profile);
+    }
+}
+
+void BedrockNetworkClient::emitLoggingIn() {
+    const auto provider = callbackLifetimeProviderSnapshot();
+    auto lifetimeLease = provider
+        ? provider()
+        : std::shared_ptr<void>();
+    if (provider && !lifetimeLease) return;
+    std::vector<std::function<void()>> handlers;
+    {
+        std::lock_guard<std::mutex> lock(eventHandlersMutex_);
+        handlers = loggingInHandlers_;
+    }
+    for (auto& handler : handlers) {
+        handler();
     }
 }
 
@@ -1606,6 +1698,11 @@ void BedrockNetworkClient::handlePacket(const VersionedGamePacket& packet) {
 
     if (packet.name == "server_to_client_handshake") {
         startEncryptionFromServerHandshake(serverHandshakeToken);
+        // keyExchange.js installs its internal listener before user code.
+        // Once it has enabled encryption, sent the client handshake, emitted
+        // join, and selected Initializing, user alias listeners run before the
+        // ordinary server_to_client_handshake packet listener.
+        emitNamedEvent("client.server_handshake", packet);
         emitNamedPacket(packet);
         return;
     }
@@ -1692,6 +1789,7 @@ void BedrockNetworkClient::handleStartGame(const VersionedGamePacket& packet) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         runtimeEntityId_ = startGame.runtimeEntityId;
+        startGameData_ = packet;
         // JS installs a persistent `on("start_game")` handler for this race,
         // so every later start_game writes the initialization packet.
         sendInitialized = initializeOnNextStartGame_;
@@ -1971,6 +2069,16 @@ BedrockChunkColumn& BedrockNetworkClient::ensureTrackedColumn(
     return *inserted;
 }
 
+void BedrockNetworkClient::setSessionData(
+    BedrockClientProfile profile,
+    std::vector<std::string> accessToken
+) {
+    std::lock_guard<std::mutex> lock(optionsMutex_);
+    authenticatedUsername_ = profile.name;
+    profile_ = std::move(profile);
+    accessToken_ = std::move(accessToken);
+}
+
 void BedrockNetworkClient::prepareLoginPacket() {
     BedrockNetworkClientOptions authOptions;
     std::filesystem::path effectiveAuthenticationCacheRoot;
@@ -1984,6 +2092,19 @@ void BedrockNetworkClient::prepareLoginPacket() {
         builtInMicrosoftAuthFlow = authenticationMicrosoftAuthFlow_;
     }
     if (!authOptions.loginPacket.empty()) {
+        if (!profile().has_value()) {
+            const auto name = authOptions.profile.empty()
+                ? authOptions.username
+                : authOptions.profile;
+            setSessionData(
+                BedrockClientProfile {
+                    .name = name,
+                    .uuid = authOptions.offline ? uuidFrom(name) : std::string{},
+                    .xuid = authOptions.offline ? "0" : std::string{}
+                },
+                {}
+            );
+        }
         if (clientKeys_.privateKeyPem.empty()) {
             clientKeys_ = XboxLiveAuth::loadOrCreateProfileKeyPair(
                 authOptions.profile,
@@ -2111,6 +2232,13 @@ void BedrockNetworkClient::prepareLoginPacket() {
     {
         std::lock_guard<std::mutex> lock(optionsMutex_);
         options_.loginPacket = std::move(generated.loginPacket);
+        authenticatedUsername_ = generated.displayName;
+        profile_ = BedrockClientProfile {
+            .name = generated.displayName,
+            .uuid = generated.identity,
+            .xuid = generated.xuid
+        };
+        accessToken_ = std::move(generated.accessToken);
     }
     clientKeys_ = std::move(generated.keyPair);
 }
@@ -2122,6 +2250,7 @@ void BedrockNetworkClient::sendLogin() {
         options().loginPacket
     );
     sendPackets({packet});
+    emitLoggingIn();
 }
 
 void BedrockNetworkClient::startEncryptionFromServerHandshake(const std::string& token) {
@@ -2391,6 +2520,7 @@ void BedrockNetworkClient::resetLifecycle() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         runtimeEntityId_.reset();
+        startGameData_.reset();
         initializeOnNextStartGame_ = false;
     }
     resourcePacksInfoHandled_ = false;

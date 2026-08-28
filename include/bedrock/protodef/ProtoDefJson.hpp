@@ -168,12 +168,75 @@ private:
                     case 'n': out.push_back('\n'); break;
                     case 'r': out.push_back('\r'); break;
                     case 't': out.push_back('\t'); break;
+                    case 'u': appendUtf8(out, parseUnicodeEscape()); break;
                     default:
                         throw std::runtime_error("ProtoDefJson unsupported escape");
                 }
             }
 
             throw std::runtime_error("ProtoDefJson unterminated string");
+        }
+
+        static int hexDigit(char value) {
+            if (value >= '0' && value <= '9') return value - '0';
+            if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+            if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+            return -1;
+        }
+
+        uint32_t parseHexCodeUnit() {
+            if (pos_ + 4 > input_.size()) {
+                throw std::runtime_error("ProtoDefJson incomplete unicode escape");
+            }
+            uint32_t value = 0;
+            for (int i = 0; i < 4; ++i) {
+                const auto digit = hexDigit(input_[pos_++]);
+                if (digit < 0) {
+                    throw std::runtime_error("ProtoDefJson invalid unicode escape");
+                }
+                value = (value << 4u) | static_cast<uint32_t>(digit);
+            }
+            return value;
+        }
+
+        uint32_t parseUnicodeEscape() {
+            const auto first = parseHexCodeUnit();
+            if (first >= 0xd800 && first <= 0xdbff) {
+                if (pos_ + 2 > input_.size() || input_[pos_] != '\\' ||
+                    input_[pos_ + 1] != 'u') {
+                    throw std::runtime_error("ProtoDefJson missing low surrogate");
+                }
+                pos_ += 2;
+                const auto second = parseHexCodeUnit();
+                if (second < 0xdc00 || second > 0xdfff) {
+                    throw std::runtime_error("ProtoDefJson invalid low surrogate");
+                }
+                return 0x10000u + ((first - 0xd800u) << 10u) + (second - 0xdc00u);
+            }
+            if (first >= 0xdc00 && first <= 0xdfff) {
+                throw std::runtime_error("ProtoDefJson unexpected low surrogate");
+            }
+            return first;
+        }
+
+        static void appendUtf8(std::string& out, uint32_t value) {
+            if (value <= 0x7f) {
+                out.push_back(static_cast<char>(value));
+            } else if (value <= 0x7ff) {
+                out.push_back(static_cast<char>(0xc0u | (value >> 6u)));
+                out.push_back(static_cast<char>(0x80u | (value & 0x3fu)));
+            } else if (value <= 0xffff) {
+                out.push_back(static_cast<char>(0xe0u | (value >> 12u)));
+                out.push_back(static_cast<char>(0x80u | ((value >> 6u) & 0x3fu)));
+                out.push_back(static_cast<char>(0x80u | (value & 0x3fu)));
+            } else if (value <= 0x10ffff) {
+                out.push_back(static_cast<char>(0xf0u | (value >> 18u)));
+                out.push_back(static_cast<char>(0x80u | ((value >> 12u) & 0x3fu)));
+                out.push_back(static_cast<char>(0x80u | ((value >> 6u) & 0x3fu)));
+                out.push_back(static_cast<char>(0x80u | (value & 0x3fu)));
+            } else {
+                throw std::runtime_error("ProtoDefJson unicode code point is out of range");
+            }
         }
 
         ProtoDefValue parseArray() {

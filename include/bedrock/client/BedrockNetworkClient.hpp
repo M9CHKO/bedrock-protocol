@@ -253,9 +253,16 @@ struct BedrockNetworkClientPacketEvent {
     VersionedGamePacket packet;
 };
 
+struct BedrockClientProfile {
+    std::string name;
+    std::string uuid;
+    std::string xuid;
+};
+
 class BedrockNetworkClient {
 public:
     using PacketHandler = std::function<void(const BedrockNetworkClientPacketEvent&)>;
+    using SessionHandler = std::function<void(const BedrockClientProfile&)>;
     using StatusHandler = std::function<void(BedrockNetworkClientStatus)>;
     using ErrorHandler = std::function<void(const std::string&)>;
     using HeartbeatHandler = std::function<void(int64_t)>;
@@ -292,6 +299,8 @@ public:
 
     void on(const std::string& packetName, PacketHandler handler);
     void onAny(PacketHandler handler);
+    void onSession(SessionHandler handler);
+    void onLoggingIn(std::function<void()> handler);
     void onJoin(std::function<void()> handler);
     void onSpawn(std::function<void()> handler);
     void onHeartbeat(HeartbeatHandler handler);
@@ -327,7 +336,15 @@ public:
     void sendQueued();
 
     BedrockNetworkClientStatus status() const;
+    // Connection.status is writable in the JavaScript API. Status listeners
+    // observe the previous value during this call, matching its setter.
+    void setStatus(BedrockNetworkClientStatus status);
     std::optional<uint64_t> entityId() const;
+    std::optional<VersionedGamePacket> startGameData() const;
+    void updateItemPalette(const ProtoDefValue& palette);
+    std::optional<BedrockClientProfile> profile() const;
+    std::optional<std::string> username() const;
+    std::vector<std::string> accessToken() const;
     uint32_t protocolVersion() const;
     bool versionLessThan(const std::string& version) const;
     bool versionLessThan(uint32_t protocolVersion) const noexcept;
@@ -414,6 +431,8 @@ private:
 
     std::vector<PacketHandler> anyHandlers_;
     std::unordered_map<std::string, std::vector<PacketHandler>> namedHandlers_;
+    std::vector<SessionHandler> sessionHandlers_;
+    std::vector<std::function<void()>> loggingInHandlers_;
     std::vector<std::function<void()>> joinHandlers_;
     std::vector<std::function<void()>> spawnHandlers_;
     std::vector<HeartbeatHandler> heartbeatHandlers_;
@@ -454,6 +473,7 @@ private:
     int64_t tick_ = 0;
 
     std::optional<uint64_t> runtimeEntityId_;
+    std::optional<VersionedGamePacket> startGameData_;
     bool initializeOnNextStartGame_ = false;
     bool resourcePacksInfoHandled_ = false;
     bool resourcePackStackHandlerArmed_ = false;
@@ -469,6 +489,9 @@ private:
     std::unique_ptr<BedrockCipherStream> decryptStream_;
     BedrockClientKeyPair clientKeys_;
     mutable std::mutex optionsMutex_;
+    std::optional<BedrockClientProfile> profile_;
+    std::optional<std::string> authenticatedUsername_;
+    std::vector<std::string> accessToken_;
     // MicrosoftAuthFlow keeps its selected/fallback cache directory on the
     // Authflow instance. It never writes that private path back into the
     // caller's options object (including unknown extension properties such as
@@ -501,7 +524,6 @@ private:
     static bool versionAtLeast(const std::string& version, int major, int minor, int patch);
     static bool versionAtMost(const std::string& version, const std::string& maximum);
 
-    void setStatus(BedrockNetworkClientStatus status);
     void emitError(const std::string& message);
     enum class CloseOrigin { Public, Transport };
     void emitClose(
@@ -518,6 +540,8 @@ private:
         const std::string& eventName,
         const VersionedGamePacket& packet
     );
+    void emitSession(const BedrockClientProfile& profile);
+    void emitLoggingIn();
     void emitJoin();
     void emitSpawn();
     void emitHeartbeat(int64_t tick);
@@ -541,6 +565,10 @@ private:
     bool tryStoreCachedSubChunk(const PendingCachedSubChunk& subChunk);
     BedrockChunkColumn& ensureTrackedColumn(int32_t chunkX, int32_t chunkZ);
 
+    void setSessionData(
+        BedrockClientProfile profile,
+        std::vector<std::string> accessToken
+    );
     void prepareLoginPacket();
     void sendLogin();
     void startEncryptionFromServerHandshake(const std::string& token);

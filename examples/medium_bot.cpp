@@ -43,8 +43,10 @@ int main() {
         .username = "MediumBot",
         .version = "1.20.40",
         .offline = true,
-        .debug = bedrock::DebugMode::Events,
-        .decodePackets = true
+        .diagnostics = {
+            .debug = bedrock::DebugMode::Events,
+            .decodePackets = true
+        }
     });
 
     uint64_t runtimeId = 1;

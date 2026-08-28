@@ -1,6 +1,7 @@
 #pragma once
 
 #include <bedrock/Options.hpp>
+#include <bedrock/chat/BedrockChat.hpp>
 #include <bedrock/protocol/ProtocolDefinition.hpp>
 #include <bedrock/protodef/ProtoDefJson.hpp>
 #include <bedrock/protodef/ProtoDefValue.hpp>
@@ -157,12 +158,50 @@ struct Packet {
     }
 };
 
-struct TextPacket {
-    std::string sourceName;
-    std::string message;
-    std::string xuid;
-    std::string platformChatId;
-};
+using TextPacket = BedrockTextPacket;
+
+inline TextPacket textPacketFromPacket(const Packet& packet) {
+    TextPacket text;
+    const auto type = packet.get("type");
+    text.type = type.empty()
+        ? BedrockTextType::Raw
+        : bedrockTextTypeFromName(type);
+    const auto translation = packet.get("needs_translation");
+    text.needsTranslation = translation == "true" || translation == "1";
+    text.sourceName = packet.get("source_name");
+    text.message = packet.get("message");
+    text.xuid = packet.get("xuid");
+    text.platformChatId = packet.get("platform_chat_id");
+    text.filteredMessage = packet.get("filtered_message");
+
+    std::map<std::size_t, std::string> parameters;
+    for (const auto& [key, value] : packet.fields) {
+        std::string_view suffix;
+        if (key.rfind("parameters[", 0) == 0 && key.back() == ']') {
+            suffix = std::string_view(key).substr(11, key.size() - 12);
+        } else if (key.rfind("parameters.", 0) == 0) {
+            suffix = std::string_view(key).substr(11);
+        } else {
+            continue;
+        }
+        if (suffix.empty()) continue;
+        std::size_t index = 0;
+        bool valid = true;
+        for (const auto character : suffix) {
+            if (character < '0' || character > '9') {
+                valid = false;
+                break;
+            }
+            index = index * 10 + static_cast<std::size_t>(character - '0');
+        }
+        if (valid) parameters.insert_or_assign(index, value);
+    }
+    for (auto& [index, value] : parameters) {
+        (void) index;
+        text.parameters.push_back(std::move(value));
+    }
+    return text;
+}
 
 class Client {
 public:
@@ -523,11 +562,7 @@ private:
         }
 
         if (packet.name == "text") {
-            TextPacket text;
-            text.sourceName = packet.get("source_name");
-            text.message = packet.get("message");
-            text.xuid = packet.get("xuid");
-            text.platformChatId = packet.get("platform_chat_id");
+            auto text = textPacketFromPacket(packet);
             for (auto& h : textHandlers_) h(text);
         }
     }

@@ -9,8 +9,10 @@ int main() {
         .username = "PacketBot",
         .version = "1.20.40",
         .offline = true,
-        .debug = bedrock::DebugMode::Json,
-        .decodePackets = true
+        .diagnostics = {
+            .debug = bedrock::DebugMode::Json,
+            .decodePackets = true
+        }
     });
 
     client.on("packet", [](const bedrock::Packet& packet) {

@@ -7,43 +7,6 @@
 
 namespace {
 
-struct RelayTestSettings {
-    std::string version = "1.20.40";
-
-    std::string listenHost = "0.0.0.0";
-    uint16_t listenPort = 19132;
-    std::string motd = "Bedrock Protocol C++ Relay";
-    int maxPlayers = 3;
-
-    std::string upstreamHost = "cpe.ign.gg";
-    uint16_t upstreamPort = 19132;
-    std::string upstreamUsername = "RelayBot";
-    std::string upstreamProfile = "RelayBot";
-    bool upstreamOffline = false;
-    bool interactiveAuth = true;
-
-    bool printPackets = true;
-    bool clientCacheEnabled = false;
-    int32_t chunkRadius = 20;
-};
-
-RelayTestSettings relaySettings() {
-    RelayTestSettings settings;
-
-    // Change these values and rebuild/run relay-test-server.
-    settings.version = "1.20.40";
-    settings.listenHost = "0.0.0.0";
-    settings.listenPort = 19132;
-    settings.upstreamHost = "cpe.ign.gg";
-    settings.upstreamPort = 19132;
-    settings.upstreamUsername = "StewedV";
-    settings.upstreamProfile = "StewedV";
-    settings.upstreamOffline = false;
-    settings.interactiveAuth = true;
-
-    return settings;
-}
-
 const char* directionName(bedrock::BedrockRelayDirection direction) {
     return direction == bedrock::BedrockRelayDirection::Clientbound
         ? "upstream -> client"
@@ -53,36 +16,34 @@ const char* directionName(bedrock::BedrockRelayDirection direction) {
 } // namespace
 
 int main() {
-    const auto settings = relaySettings();
+    // One options object, matching `new Relay(options)` in bedrock-protocol.
+    // offline applies to both sides; destination.offline is only needed when
+    // the upstream server deliberately uses a different auth mode.
+    bedrock::RelayOptions options {
+        .version = "1.20.40",
+        .host = "0.0.0.0",
+        .port = 19132,
+        .motd = "Bedrock Protocol C++ Relay",
+        .offline = false,
+        .maxPlayers = 3,
+        .enableChunkCaching = false,
+        .destination = {
+            .host = "cpe.ign.gg",
+            .port = 19132
+        }
+    };
 
-    bedrock::BedrockLiveRelayOptions options;
-    options.server.host = settings.listenHost;
-    options.server.port = settings.listenPort;
-    options.server.version = settings.version;
-    options.server.motd = {{"motd", settings.motd}};
-    options.server.maxPlayers = settings.maxPlayers;
+    const bool printPackets = true;
+    const auto upstreamHost = options.destination.host;
+    const auto upstreamPort = options.destination.port;
+    const auto version = options.version;
 
-    options.upstream.host = settings.upstreamHost;
-    options.upstream.port = settings.upstreamPort;
-    options.upstream.username = settings.upstreamUsername;
-    options.upstream.profile = settings.upstreamProfile;
-    options.upstream.version = settings.version;
-    options.upstream.offline = settings.upstreamOffline;
-    options.upstream.interactiveAuth = settings.interactiveAuth;
-    options.upstream.clientCacheEnabled = settings.clientCacheEnabled;
-    options.upstream.trackWorld = true;
-    options.upstream.chunkRadius = settings.chunkRadius;
+    bedrock::Relay relay(std::move(options));
 
-    auto relay = bedrock::createRelayServer(std::move(options));
-
-    relay.onConnect([](const bedrock::BedrockServerConnection& connection) {
+    relay.onConnect([](bedrock::RelayPlayer& player) {
         std::cout << "[downstream] connect "
-                  << connection.address << ":" << connection.port << "\n";
-    });
-
-    relay.onJoin([](const bedrock::BedrockServerConnection& connection) {
-        std::cout << "[downstream] joined "
-                  << connection.address << ":" << connection.port << "\n";
+                  << player.connection.address << ":"
+                  << player.connection.port << "\n";
     });
 
     relay.onError([](const std::string& message) {
@@ -97,26 +58,26 @@ int main() {
                   << " port=" << status.boundPort << "\n";
     });
 
-    relay.on("serverbound", [&](bedrock::BedrockRelayPacketEvent& event) {
-        if (settings.printPackets) {
+    relay.on("serverbound", [&](bedrock::RelayPacketEvent& event) {
+        if (printPackets) {
             std::cout << "[" << directionName(event.direction) << "] "
-                      << event.packet.name << "\n";
+                      << event.name << "\n";
         }
     });
 
-    relay.on("clientbound", [&](bedrock::BedrockRelayPacketEvent& event) {
-        if (settings.printPackets) {
+    relay.on("clientbound", [&](bedrock::RelayPacketEvent& event) {
+        if (printPackets) {
             std::cout << "[" << directionName(event.direction) << "] "
-                      << event.packet.name << "\n";
+                      << event.name << "\n";
         }
     });
 
-    std::cout << "Relay listener: " << settings.listenHost << ":" << settings.listenPort << "\n";
-    std::cout << "Upstream: " << settings.upstreamHost << ":" << settings.upstreamPort
-              << " version=" << settings.version << "\n";
+    const auto listener = relay.listen();
+    std::cout << "Relay listener: " << listener.host << ":" << listener.port
+              << "\n";
+    std::cout << "Upstream: " << upstreamHost << ":" << upstreamPort
+              << " version=" << version << "\n";
     std::cout << "Join this relay from Minecraft, then watch packet logs here.\n";
-
-    relay.listen();
 
     while (true) {
         std::this_thread::sleep_for(std::chrono::seconds(1));

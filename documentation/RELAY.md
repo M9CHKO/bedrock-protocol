@@ -8,15 +8,77 @@ The C++ relay API follows the packet event model from:
 - `event.replace(packet)`: forward a changed packet instead.
 - `event.replace({packet1, packet2})`: forward several packets.
 
-This includes the packet-level relay core plus `createRelayServer`, a live relay
-runtime built from `createServer` and upstream `BedrockNetworkClient`. The
-runtime accepts multiple RakNet clients and owns an isolated Player, upstream
-client, queues, packet variables, and lifecycle for each downstream session.
-It answers the Bedrock handshake, completes login encryption, and emits packet
-and join events. The `relay-test-server` example exposes this runtime for live
-testing.
+The normal live proxy is `RelayOptions` plus the `Relay` constructor, matching
+JavaScript's `new Relay(options)`. It accepts multiple
+RakNet clients and owns an isolated Player, upstream client, queues, packet
+variables, and lifecycle for each downstream session. The packet-only
+`BedrockRelayOptions` and direct `BedrockLiveRelayOptions` composition remain
+available as advanced layers.
 
-## Basic Example
+## Live Relay (Recommended)
+
+```cpp
+bedrock::RelayOptions options {
+    .version = "1.20.40",
+    .host = "0.0.0.0",
+    .port = 19132,
+    .offline = true,
+    .destination = {
+        .host = "127.0.0.1",
+        .port = 19133
+    }
+};
+
+bedrock::Relay relay(std::move(options));
+relay.onJoin([](
+    bedrock::RelayPlayer& player,
+    bedrock::BedrockNetworkClient& upstream
+) {
+    std::cout << "destination ready for " << player.sessionId() << "\n";
+});
+relay.onServerbound([](bedrock::RelayPacketEvent& event) {
+    std::cout << "client -> destination " << event.name << "\n";
+});
+relay.onClientbound([](bedrock::RelayPacketEvent& event) {
+    std::cout << "destination -> client " << event.name << "\n";
+});
+relay.listen();
+```
+
+The root `offline` value applies to the listener and destination. Do not set
+`destination.offline` in the normal case. It is only an override when the two
+sides intentionally use different authentication modes. With `offline =
+false`, both sides use online authentication; with `offline = true`, both use
+offline login.
+
+For online upstream authentication, `RelayOptions::onMsaCode` accepts
+`(const XboxDeviceCodeInfo&, RelayPlayer&)`. The player is the exact downstream
+session requesting the code. The older one-argument callback remains valid;
+without either callback, Relay disconnects only that session with the standard
+sign-in prompt.
+
+High-level `onJoin(player, upstream)` mirrors `Relay.emit('join', ds, client)`.
+It runs after the destination login, forced cache-status write, upstream
+publication, and pending upstream queue flush. Low-level `onJoin(connection)`
+is the earlier downstream boundary; `onUpstreamJoin` exposes the later event.
+
+The `RelayPlayer` itself mirrors the downstream server `Player`. From
+`relay.onConnect`, register `onLogin`, `onJoin`, `onSpawn`, `onClose`, named
+packet/`packet` listeners, or inspect `profile()`, `getUserData()`, `version()`
+and `status()`. `disconnect`, `sendDisconnectStatus`, and `close` act only on
+that downstream session. The Relay's internal queue-release join listener is
+registered first, matching the constructor order in `relay.js`.
+
+`relay.clients()` and `relay.client(player.connection.key())` mirror the
+`Server.clients` surface inherited by JavaScript Relay, using synchronized
+owning snapshots in C++. `relay.listen()` returns the configured host/port;
+when port `0` requests an ephemeral socket, read the actual port from
+`relay.live().boundPort()`.
+
+The full high-level guide is [docs/RELAY_API.md](../docs/RELAY_API.md), and the
+shared creation API is [documentation/API.md](API.md).
+
+## Packet-Core Example (Advanced)
 
 ```cpp
 #include <bedrock/bedrock.hpp>
@@ -29,7 +91,7 @@ int main() {
     options.clientOptions.outgoingCompression = bedrock::VersionedMcpeCompression::Uncompressed;
     options.enableChunkCaching = false;
 
-    auto relay = bedrock::createRelay(options);
+    auto relay = bedrock::createPacketRelay(options);
     relay.markDownstreamJoined();
     relay.markUpstreamJoined();
 
@@ -47,9 +109,10 @@ int main() {
 }
 ```
 
-## Live Relay Server
+## Direct Live Runtime (Advanced)
 
-Use `createRelayServer` when you want a Bedrock client to join the C++ listener and have the C++ library connect to an upstream server.
+Use `BedrockLiveRelayOptions` and `createLiveRelay` only when you need direct
+access to the separate low-level server and upstream client options.
 
 ```cpp
 bedrock::BedrockLiveRelayOptions options;
@@ -65,7 +128,7 @@ options.upstream.version = "1.20.40";
 options.upstream.offline = false;
 options.upstream.interactiveAuth = true;
 
-auto relay = bedrock::createRelayServer(options);
+auto relay = bedrock::createLiveRelay(options);
 
 relay.on("serverbound", [](bedrock::BedrockRelayPacketEvent& event) {
     std::cout << event.sessionId << " client -> upstream "
@@ -96,7 +159,7 @@ upstream host/port. Realm authentication runs after the downstream identity is
 captured, resolves the join address, and stores the same Authflow in
 `options.upstream.authflow` for the game login. No Java Realms path is used.
 
-`createRelayServer` currently requires the downstream listener version and upstream client version to match. This keeps packet ids, compression shape, encryption, and schema encoding consistent while the full JS relay runtime is being ported.
+`createLiveRelay` currently requires the downstream listener version and upstream client version to match. This keeps packet ids, compression shape, encryption, and schema encoding consistent while the full JS relay runtime is being ported. `createRelayServer` remains as a compatibility alias.
 
 ## Packet Directions
 
@@ -269,18 +332,20 @@ Windows:
 .\build\relay-test-server.exe
 ```
 
-Edit `examples/relay_test_server.cpp` before building to change:
+Edit the `RelayOptions` object in `examples/relay_test_server.cpp` before
+building to change:
 
 | Setting | Meaning |
 |---|---|
 | `version` | Bedrock version used by the downstream listener and upstream client. |
-| `listenHost` / `listenPort` | Address Minecraft connects to. |
-| `upstreamHost` / `upstreamPort` | Real server the C++ upstream client joins. |
-| `upstreamUsername` / `upstreamProfile` | Bot display/profile name. |
-| `upstreamOffline` | Use offline auth for local offline upstream servers. |
-| `interactiveAuth` | Show device-code login when the Xbox cache is missing. |
+| `host` / `port` | Address Minecraft connects to. |
+| `destination.host` / `destination.port` | Real Bedrock server the relay joins. |
+| `offline` | Authentication mode inherited by both sides. |
+| `destination.offline` | Optional upstream-only override. |
 
-Start `relay-test-server`, add the listener address in Minecraft, and join it. The terminal prints `[client -> upstream]` and `[upstream -> client]` packet names while forwarding supported traffic through `createRelayServer`.
+Start `relay-test-server`, add the listener address in Minecraft, and join it.
+The terminal prints `[client -> upstream]` and `[upstream -> client]` packet
+names while forwarding supported traffic through the high-level `Relay`.
 
 ## Version Safety
 
@@ -300,7 +365,7 @@ Expected summary:
 
 Remaining JavaScript-style relay work includes:
 
-- More `createRelayServer` edge-case parity around unusual login,
+- More `createLiveRelay` edge-case parity around unusual login,
   resource-pack, respawn, and reconnect sequences.
 
 The native server Player now includes immediate writes, raw packet admission,

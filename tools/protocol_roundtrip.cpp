@@ -3275,6 +3275,8 @@ bool checkRelayOptionsGolden() {
         const auto& relayOptions = relay.options();
         const auto& liveOptions = relay.live().options();
         if (relayOptions.destination.offline.has_value() ||
+            relayOptions.listenerOffline() ||
+            relayOptions.destinationOffline() ||
             liveOptions.server.compressionAlgorithm != "deflate" ||
             liveOptions.server.compressionLevel != 7 ||
             liveOptions.server.compressionThreshold != 512 ||
@@ -3304,21 +3306,35 @@ bool checkRelayOptionsGolden() {
     {
         bedrock::RelayOptions options;
         options.offline = true;
+        options.motd = bedrock::ServerMotd("Relay facade", "Relay world");
         options.batchingInterval = 37;
         options.logging = true;
         options.enableChunkCaching = true;
         options.forceSingle = true;
         options.omitParseErrors = true;
+        options.useRaknetWorker = false;
         options.authTitle = std::string(bedrock::Titles::MinecraftAndroid);
         options.deviceType = "Android";
         options.flow = "sisu";
+        options.advanced.username = "ConfiguredRelayIdentity";
+        options.advanced.forceRefresh = true;
+        options.advanced.password = "configured-password";
         bedrock::Relay relay(std::move(options));
         const auto& liveOptions = relay.live().options();
         if (!liveOptions.server.offline ||
             !liveOptions.upstream.offline ||
+            !relay.options().listenerOffline() ||
+            !relay.options().destinationOffline() ||
             !liveOptions.useDownstreamDisplayNameForUpstreamUsername ||
             liveOptions.server.batchingInterval != 37 ||
             liveOptions.upstream.batchingIntervalMs != 37 ||
+            liveOptions.server.motd.at("motd") != "Relay facade" ||
+            liveOptions.server.motd.at("levelName") != "Relay world" ||
+            liveOptions.upstream.username != "ConfiguredRelayIdentity" ||
+            liveOptions.upstream.profile != "ConfiguredRelayIdentity" ||
+            liveOptions.upstream.useRaknetWorkers ||
+            !liveOptions.upstream.forceRefresh ||
+            liveOptions.upstream.password != "configured-password" ||
             !liveOptions.logging || !liveOptions.enableChunkCaching ||
             !liveOptions.forceSingle ||
             !relay.options().omitParseErrors ||
@@ -3347,6 +3363,7 @@ bool checkRelayOptionsGolden() {
         bedrock::Relay relay(std::move(options));
         const auto& liveOptions = relay.live().options();
         if (liveOptions.upstream.offline ||
+            relay.options().destinationOffline() ||
             !liveOptions.useDownstreamDisplayNameForUpstreamUsername) {
             std::cerr << "[FAIL] relay auth offline=false/displayName selection mismatch\n";
             ok = false;
@@ -3362,6 +3379,7 @@ bool checkRelayOptionsGolden() {
         const auto& liveOptions = relay.live().options();
         if (liveOptions.server.offline ||
             !liveOptions.upstream.offline ||
+            !relay.options().destinationOffline() ||
             liveOptions.useDownstreamDisplayNameForUpstreamUsername) {
             std::cerr << "[FAIL] relay auth offline=true/XUID selection mismatch\n";
             ok = false;

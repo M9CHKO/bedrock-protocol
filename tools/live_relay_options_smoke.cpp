@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <iostream>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -90,7 +91,7 @@ bedrock::RelayOptions relayOptions(
     options.host = "127.0.0.1";
     options.port = 0;
     options.motd = "Live Relay Options Smoke";
-    options.username = "RelayOptionsUp";
+    options.advanced.username = "RelayOptionsUp";
     options.offline = true;
     options.maxPlayers = 2;
     options.batchingInterval = 5;
@@ -143,6 +144,24 @@ bool runParsePolicy(bool omitParseErrors) {
         "tick_sync",
         tickValue(810001, 910001)
     );
+    const bedrock::XboxDeviceCodeInfo testMsaCode {
+        .verificationUri = "https://microsoft.com/link",
+        .userCode = "ABCD-EFGH",
+        .message = "Use ABCD-EFGH to sign in"
+    };
+    const std::string expectedMsaPrompt =
+        "It's your first time joining. Please sign in and reconnect to join "
+        "this server:\n\n" + testMsaCode.message;
+    const auto expectedMsaDisconnect = encodedPacket(
+        version,
+        "disconnect",
+        bedrock::ProtoDefValue::object({
+            {"reason", bedrock::ProtoDefValue::string("unknown")},
+            {"hide_disconnect_reason", bedrock::ProtoDefValue::boolean(false)},
+            {"message", bedrock::ProtoDefValue::string(expectedMsaPrompt)},
+            {"filtered_message", bedrock::ProtoDefValue::string("")}
+        })
+    );
 
     ErrorLog errors;
     std::mutex connectionMutex;
@@ -151,6 +170,9 @@ bool runParsePolicy(bool omitParseErrors) {
     std::atomic<bool> customSkinForwarded {false};
     std::atomic<bool> cacheEnabledForwarded {false};
     std::atomic<int> relayTextHandlers {0};
+    std::atomic<int> contextualMsaCallbacks {0};
+    std::atomic<bool> contextualMsaMismatch {false};
+    std::string expectedMsaSessionId;
 
     bedrock::BedrockServer upstreamServer({
         .host = "127.0.0.1",
@@ -200,10 +222,96 @@ bool runParsePolicy(bool omitParseErrors) {
     });
     upstreamServer.listen();
 
-    bedrock::Relay relay(relayOptions(upstreamServer.boundPort(), omitParseErrors));
+    auto options = relayOptions(upstreamServer.boundPort(), omitParseErrors);
+    if (!omitParseErrors) {
+        options.onMsaCode = [&](
+            const bedrock::XboxDeviceCodeInfo& code,
+            bedrock::RelayPlayer& player
+        ) {
+            ++contextualMsaCallbacks;
+            if (code.verificationUri != testMsaCode.verificationUri ||
+                code.userCode != testMsaCode.userCode ||
+                code.message != testMsaCode.message ||
+                player.sessionId() != expectedMsaSessionId) {
+                contextualMsaMismatch = true;
+            }
+        };
+    }
+    bedrock::Relay relay(std::move(options));
     std::atomic<std::size_t> readyCount {0};
+    std::atomic<int> relayJoinEvents {0};
+    std::atomic<bool> relayJoinMismatch {false};
+    std::atomic<int> relayPlayerLoginEvents {0};
+    std::atomic<int> relayPlayerJoinEvents {0};
+    std::atomic<int> relayPlayerCloseEvents {0};
+    std::atomic<bool> relayPlayerMismatch {false};
+    relay.onConnect([&](bedrock::RelayPlayer& player) {
+        auto* playerPtr = &player;
+        if (player.status() !=
+                bedrock::BedrockServerClientStatus::Authenticating ||
+            player.profile().has_value() || player.version().has_value()) {
+            relayPlayerMismatch = true;
+        }
+        player.on("login", bedrock::RelayPlayer::PlayerPacketHandler(
+            [&, playerPtr](const bedrock::BedrockServerPacketEvent& event) {
+                ++relayPlayerLoginEvents;
+                const auto profile = playerPtr->profile();
+                if (event.packet.name != "login" || !profile ||
+                    profile->name != "RelayOptionsDown" ||
+                    profile->xuid != "0" ||
+                    playerPtr->version() != std::optional<uint32_t>(
+                        bedrock::protocolVersionFor(version)
+                    ) || relay.live().upstreamStarted()) {
+                    relayPlayerMismatch = true;
+                }
+            }
+        ));
+        player.on("join", bedrock::RelayPlayer::PlayerVoidHandler(
+            [&, playerPtr]() {
+                ++relayPlayerJoinEvents;
+                // RelayPlayer's internal constructor listener must run first:
+                // queued backend packets are released before public join.
+                if (!relay.live().downstreamJoined() ||
+                    playerPtr->status() !=
+                        bedrock::BedrockServerClientStatus::Initializing) {
+                    relayPlayerMismatch = true;
+                }
+            }
+        ));
+        player.on("close", bedrock::RelayPlayer::PlayerVoidHandler(
+            [&, playerPtr]() {
+                ++relayPlayerCloseEvents;
+                // Node emits Player.close before Relay removes this player and
+                // its upstream from the session maps.
+                const auto clients = relay.clients();
+                const auto exactClient = relay.client(
+                    playerPtr->connection.key()
+                );
+                if (relay.playerCount() != 1 || clients.size() != 1 ||
+                    !exactClient || exactClient.get() != playerPtr ||
+                    relay.live().sessionCount() != 1 ||
+                    playerPtr->status() ==
+                        bedrock::BedrockServerClientStatus::Disconnected) {
+                    relayPlayerMismatch = true;
+                }
+            }
+        ));
+    });
     relay.onStatus([&](const bedrock::BedrockLiveRelayStatus& status) {
         readyCount = status.upstreamReadyCount;
+    });
+    relay.on("join", [&relay, &readyCount, &relayJoinEvents, &relayJoinMismatch](
+        bedrock::RelayPlayer& player,
+        bedrock::BedrockNetworkClient& upstream
+    ) {
+        ++relayJoinEvents;
+        const auto expected = relay.live().upstreamShared(player.connection);
+        if (!expected || expected.get() != &upstream ||
+            upstream.status() !=
+                bedrock::BedrockNetworkClientStatus::Authenticating ||
+            readyCount.load() != 1) {
+            relayJoinMismatch = true;
+        }
     });
     relay.onClientbound([&](bedrock::RelayPacketEvent& event) {
         if (event.name == "text") ++relayTextHandlers;
@@ -211,7 +319,7 @@ bool runParsePolicy(bool omitParseErrors) {
     relay.onError([&](const std::string& message) {
         errors.add("relay", message);
     });
-    relay.listen();
+    const auto relayAddress = relay.listen();
 
     auto downstream = bedrock::createNetworkClient(
         clientOptions(relay.live().boundPort(), marker)
@@ -219,12 +327,18 @@ bool runParsePolicy(bool omitParseErrors) {
     std::atomic<int> downstreamTextPackets {0};
     std::atomic<int> tickResponses {0};
     std::atomic<bool> downstreamClosed {false};
+    std::atomic<int> msaPromptKicks {0};
     downstream.on("text", [&](const bedrock::BedrockNetworkClientPacketEvent&) {
         ++downstreamTextPackets;
     });
     downstream.on("tick_sync", [&](const bedrock::BedrockNetworkClientPacketEvent& event) {
         if (event.packet.fullPacket == expectedTickResponse.fullPacket) {
             ++tickResponses;
+        }
+    });
+    downstream.on("kick", [&](const bedrock::BedrockNetworkClientPacketEvent& event) {
+        if (event.packet.fullPacket == expectedMsaDisconnect.fullPacket) {
+            ++msaPromptKicks;
         }
     });
     downstream.onClose([&]() {
@@ -240,19 +354,64 @@ bool runParsePolicy(bool omitParseErrors) {
         std::lock_guard<std::mutex> lock(connectionMutex);
         return hasUpstreamConnection &&
             relay.playerCount() == 1 &&
+            relay.clients().size() == 1 &&
             relay.live().sessionCount() == 1 &&
             relay.live().upstreamCount() == 1 &&
             readyCount.load() == 1 &&
+            relayJoinEvents.load() == 1 &&
+            relayPlayerLoginEvents.load() == 1 &&
+            relayPlayerJoinEvents.load() == 1 &&
             upstreamServer.clientCount() == 1 &&
             customSkinForwarded.load() &&
             cacheEnabledForwarded.load();
     });
     ok &= check(connected, "downstream connect failed");
     ok &= check(ready, "relay options/metadata session did not become ready");
+    ok &= check(
+        relayAddress.host == "127.0.0.1" && relayAddress.port == 0,
+        "Relay listen() did not return the configured host/port"
+    );
     ok &= check(relay.live().options().enableChunkCaching,
                 "enableChunkCaching was not propagated to live relay");
     ok &= check(relay.options().omitParseErrors == omitParseErrors,
                 "omitParseErrors option changed during construction");
+    ok &= check(!relayJoinMismatch.load(),
+                "Relay on(\"join\") exposed the wrong Player/upstream/order");
+    ok &= check(!relayPlayerMismatch.load(),
+                "RelayPlayer Player facade profile/status/order mismatch");
+
+    std::shared_ptr<bedrock::BedrockNetworkClient> relayUpstream;
+    std::function<void(const bedrock::XboxDeviceCodeInfo&)> msaCodeCallback;
+    if (ready) {
+        const auto downstreamConnection = relay.player().connection;
+        const auto clients = relay.clients();
+        const auto exactClient = relay.client(downstreamConnection.key());
+        ok &= check(
+            clients.size() == 1 &&
+                clients.find(downstreamConnection.key()) != clients.end() &&
+                exactClient && exactClient.get() == &relay.player(),
+            "Relay clients snapshot did not expose the exact downstream Player"
+        );
+        expectedMsaSessionId = bedrock::BedrockLiveRelay::sessionId(
+            downstreamConnection
+        );
+        relayUpstream = relay.live().upstreamShared(downstreamConnection);
+        if (relayUpstream) {
+            msaCodeCallback = relayUpstream->options().onMsaCode;
+        }
+    }
+    ok &= check(static_cast<bool>(msaCodeCallback),
+                "relay upstream did not install onMsaCode routing");
+
+    if (!omitParseErrors && msaCodeCallback) {
+        msaCodeCallback(testMsaCode);
+        ok &= check(contextualMsaCallbacks.load() == 1,
+                    "two-argument Relay onMsaCode callback did not run");
+        ok &= check(!contextualMsaMismatch.load(),
+                    "Relay onMsaCode received the wrong code/player");
+        ok &= check(!downstreamClosed.load() && msaPromptKicks.load() == 0,
+                    "custom Relay onMsaCode also ran the default disconnect");
+    }
 
     bedrock::BedrockServerConnection target;
     {
@@ -280,10 +439,27 @@ bool runParsePolicy(bool omitParseErrors) {
         });
         ok &= check(stillRoutes,
                     "omitParseErrors=true session stopped routing valid packets");
+
+        // relay.js disconnects this exact downstream with a sign-in prompt
+        // when no onMsaCode callback is configured.
+        if (stillRoutes && msaCodeCallback) {
+            msaCodeCallback(testMsaCode);
+        }
+        const bool prompted = stillRoutes && waitFor([&]() {
+            return msaPromptKicks.load() == 1 &&
+                downstreamClosed.load() &&
+                relay.playerCount() == 0 &&
+                relay.clients().empty() &&
+                relay.live().sessionCount() == 0 &&
+                relay.live().upstreamCount() == 0;
+        });
+        ok &= check(prompted,
+                    "missing Relay onMsaCode did not disconnect its session with the JS prompt");
     } else {
         const bool disconnected = ready && waitFor([&]() {
             return downstreamClosed.load() &&
                 relay.playerCount() == 0 &&
+                relay.clients().empty() &&
                 relay.live().sessionCount() == 0 &&
                 relay.live().upstreamCount() == 0 &&
                 upstreamServer.clientCount() == 0;
@@ -300,10 +476,15 @@ bool runParsePolicy(bool omitParseErrors) {
                 "custom downstream skin metadata was not forwarded upstream");
     ok &= check(cacheEnabledForwarded.load(),
                 "enableChunkCaching=true was not sent to the upstream server");
+    ok &= check(relayPlayerCloseEvents.load() == 1 &&
+                    !relayPlayerMismatch.load(),
+                "RelayPlayer close event/order mismatch");
 
     downstream.close("relay options smoke complete");
     relay.close("relay options smoke complete");
     upstreamServer.close("relay options smoke complete");
+    ok &= check(relay.clients().empty(),
+                "Relay retained clients after close");
     ok &= check(errors.empty(), "unexpected error callback: " + errors.text());
 
     if (ok) {
