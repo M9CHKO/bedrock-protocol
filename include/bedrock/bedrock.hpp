@@ -3797,12 +3797,25 @@ private:
         serverboundDestinationHandlers_.clear();
     }
 
+    bool hasPacketHandlers(BedrockRelayDirection direction) const {
+        std::lock_guard<std::recursive_mutex> lock(handlerMutex_);
+        if (direction == BedrockRelayDirection::Clientbound) {
+            return !clientboundHandlers_.empty() ||
+                !clientboundDestinationHandlers_.empty();
+        }
+        return !serverboundHandlers_.empty() ||
+            !serverboundDestinationHandlers_.empty();
+    }
+
     void dispatch(RelayPacketEvent& event) {
         std::lock_guard<std::recursive_mutex> lock(handlerMutex_);
-        if (!clientboundHandlers_.empty() ||
-            !serverboundHandlers_.empty() ||
-            !clientboundDestinationHandlers_.empty() ||
-            !serverboundDestinationHandlers_.empty()) {
+        const bool hasDirectionHandlers =
+            event.direction == BedrockRelayDirection::Clientbound
+                ? !clientboundHandlers_.empty() ||
+                    !clientboundDestinationHandlers_.empty()
+                : !serverboundHandlers_.empty() ||
+                    !serverboundDestinationHandlers_.empty();
+        if (hasDirectionHandlers) {
             (void) event.decodedParams();
         }
 
@@ -4177,10 +4190,41 @@ private:
         auto packetVariables = variablesForSession(event.sessionId);
         std::unique_ptr<RelayPacketEvent> wrapped;
         try {
+            const bool hasGlobalHandlers =
+                event.direction == BedrockRelayDirection::Clientbound
+                    ? !clientboundHandlers_.empty() ||
+                        !clientboundDestinationHandlers_.empty()
+                    : !serverboundHandlers_.empty() ||
+                        !serverboundDestinationHandlers_.empty();
+            const bool hasPlayerHandlers =
+                player && player->hasPacketHandlers(event.direction);
+
+            if (!hasGlobalHandlers && !hasPlayerHandlers) {
+                ProtoDefPacketDecoder decoder(
+                    options_.version,
+                    packetVariables
+                );
+                if (event.packet.name == "start_game" ||
+                    event.packet.name == "item_registry") {
+                    // These two packets update connection-scoped ProtoDef
+                    // variables used by later item packets.
+                    (void) decoder.decodePacketStrict(
+                        event.packet.name,
+                        event.packet.payload
+                    );
+                } else {
+                    decoder.validatePacketStrict(
+                        event.packet.name,
+                        event.packet.payload
+                    );
+                }
+                return;
+            }
+
             wrapped = std::make_unique<RelayPacketEvent>(
                 options_.version,
                 event,
-                std::move(packetVariables),
+                packetVariables,
                 true
             );
             // Structured handlers receive fields only after a complete strict

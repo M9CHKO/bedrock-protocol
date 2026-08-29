@@ -119,6 +119,63 @@ bedrock::ProtoDefValue fullMapValue() {
     });
 }
 
+bedrock::ProtoDefValue noisyMapValue(int64_t mapId, uint32_t seed) {
+    using Value = bedrock::ProtoDefValue;
+    std::vector<Value> pixels;
+    pixels.reserve(16'384);
+    uint32_t state = seed;
+    for (std::size_t index = 0; index < 16'384; ++index) {
+        state ^= state << 13u;
+        state ^= state >> 17u;
+        state ^= state << 5u;
+        pixels.push_back(Value::uinteger(state));
+    }
+    return Value::object({
+        {"map_id", Value::integer(mapId)},
+        {"update_flags", Value::object({
+            {"_value", Value::uinteger(2)},
+            {"void", Value::boolean(false)},
+            {"texture", Value::boolean(true)},
+            {"decoration", Value::boolean(false)},
+            {"initialisation", Value::boolean(false)}
+        })},
+        {"dimension", Value::uinteger(0)},
+        {"locked", Value::boolean(false)},
+        {"origin", Value::object({
+            {"x", Value::integer(0)},
+            {"y", Value::integer(0)},
+            {"z", Value::integer(0)}
+        })},
+        {"scale", Value::uinteger(0)},
+        {"texture", Value::object({
+            {"width", Value::integer(128)},
+            {"height", Value::integer(128)},
+            {"x_offset", Value::integer(0)},
+            {"y_offset", Value::integer(0)},
+            {"pixels", Value::array(std::move(pixels))}
+        })}
+    });
+}
+
+std::vector<uint8_t> unhex(const std::string& value) {
+    const auto digit = [](char ch) -> int {
+        if (ch >= '0' && ch <= '9') return ch - '0';
+        if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+        if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+        return -1;
+    };
+    if ((value.size() & 1u) != 0) return {};
+    std::vector<uint8_t> result;
+    result.reserve(value.size() / 2);
+    for (std::size_t index = 0; index < value.size(); index += 2) {
+        const int high = digit(value[index]);
+        const int low = digit(value[index + 1]);
+        if (high < 0 || low < 0) return {};
+        result.push_back(static_cast<uint8_t>((high << 4) | low));
+    }
+    return result;
+}
+
 bedrock::VersionedGamePacket encodedPacket(
     const std::string& version,
     const std::string& name,
@@ -542,6 +599,167 @@ bool checkFullMapForwarding() {
     return ok;
 }
 
+bool checkMapFloodAndItemOrdering() {
+    const std::string version = "1.21.100";
+    const auto codec = bedrock::VersionedMcpeCodec::forVersion(version);
+    const auto registry = codec.packetCodec().decodeFullPacket(unhex(
+        "a20101106d696e6563726166743a736869656c64010200040a0000"
+    ));
+    const auto inventorySlot = codec.packetCodec().decodeFullPacket(unhex(
+        "3200001d00008208010000000012000000000000000000007b00000000000000"
+    ));
+    std::vector<bedrock::VersionedGamePacket> maps;
+    maps.reserve(12);
+    for (int index = 0; index < 12; ++index) {
+        maps.push_back(encodedPacket(
+            version,
+            "clientbound_map_item_data",
+            noisyMapValue(
+                10'000 + index,
+                0x9e3779b9u ^ static_cast<uint32_t>(index * 0x85ebca6bu)
+            )
+        ));
+    }
+
+    ErrorLog errors;
+    std::mutex connectionMutex;
+    bedrock::BedrockServerConnection upstreamConnection;
+    std::atomic<bool> hasUpstreamConnection {false};
+    bedrock::BedrockServer upstream({
+        .host = "127.0.0.1",
+        .port = 0,
+        .version = version,
+        .motd = {{"motd", "Relay Map Flood Upstream"}},
+        .maxPlayers = 2,
+        .offline = true,
+        .batchingInterval = 2
+    });
+    upstream.onConnect([&](const bedrock::BedrockServerConnection& connection) {
+        connection.onError([&](const std::string& message) {
+            errors.add("upstream player", message);
+        });
+        std::lock_guard<std::mutex> lock(connectionMutex);
+        upstreamConnection = connection;
+        hasUpstreamConnection = true;
+    });
+    upstream.listen();
+
+    // A serverbound-only handler must not force structured decoding in the
+    // opposite direction. Relay still validates every clientbound packet
+    // strictly, without building 12 x 16,384 unused pixel objects.
+    bedrock::Relay relay(relayOptions(upstream.boundPort(), true));
+    std::atomic<int> joins {0};
+    std::atomic<int> parseErrors {0};
+    std::atomic<int> serverboundCallbacks {0};
+    relay.onJoin([&](bedrock::RelayPlayer&, bedrock::BedrockNetworkClient&) {
+        ++joins;
+    });
+    relay.onServerbound([&](bedrock::RelayPacketEvent&) {
+        ++serverboundCallbacks;
+    });
+    relay.onParseError([&](const bedrock::RelayParseError&) {
+        ++parseErrors;
+    });
+    relay.onError([&](const std::string& message) {
+        errors.add("relay", message);
+    });
+    relay.listen();
+
+    auto downstream = bedrock::createNetworkClient(
+        downstreamOptions(relay.live().boundPort())
+    );
+    std::atomic<int> registries {0};
+    std::atomic<int> receivedMaps {0};
+    std::atomic<int> slots {0};
+    std::atomic<bool> bytesMismatch {false};
+    std::atomic<bool> downstreamClosed {false};
+    downstream.onAny([&](const bedrock::BedrockNetworkClientPacketEvent& event) {
+        if (event.packet.name == "item_registry") {
+            ++registries;
+            if (event.packet.fullPacket != registry.fullPacket) {
+                bytesMismatch = true;
+            }
+            return;
+        }
+        if (event.packet.name == "clientbound_map_item_data") {
+            const int index = receivedMaps.fetch_add(1);
+            if (index < 0 || static_cast<std::size_t>(index) >= maps.size() ||
+                event.packet.fullPacket !=
+                    maps[static_cast<std::size_t>(index)].fullPacket) {
+                bytesMismatch = true;
+            }
+            return;
+        }
+        if (event.packet.name == "inventory_slot") {
+            ++slots;
+            if (event.packet.fullPacket != inventorySlot.fullPacket) {
+                bytesMismatch = true;
+            }
+        }
+    });
+    downstream.onClose([&]() { downstreamClosed = true; });
+    downstream.onError([&](const std::string& message) {
+        errors.add("downstream", message);
+    });
+
+    bool ok = true;
+    const bool connected = downstream.connect();
+    const bool ready = connected && waitFor([&]() {
+        return joins.load() == 1 && hasUpstreamConnection &&
+            relay.live().upstreamCount() == 1;
+    });
+    ok &= check(connected, "map-flood downstream failed to connect");
+    ok &= check(ready, "map-flood relay did not become ready");
+
+    if (ready) {
+        downstream.write("tick_sync", tickValue(827100, 0));
+    }
+    const bool serverboundHandlerReady = ready && waitFor([&]() {
+        return serverboundCallbacks.load() > 0;
+    });
+    ok &= check(
+        serverboundHandlerReady,
+        "serverbound-only regression handler was not exercised"
+    );
+
+    bedrock::BedrockServerConnection target;
+    {
+        std::lock_guard<std::mutex> lock(connectionMutex);
+        target = upstreamConnection;
+    }
+    if (ready) upstream.sendPacket(target, registry);
+    const bool paletteReady = ready && waitFor([&]() {
+        return registries.load() == 1;
+    });
+    ok &= check(paletteReady, "item_registry was not delivered before items");
+
+    if (paletteReady) {
+        upstream.queuePackets(target, maps);
+        upstream.queuePacket(target, inventorySlot);
+        upstream.sendQueued(target);
+    }
+    const bool floodDelivered = paletteReady && waitFor([&]() {
+        return receivedMaps.load() == static_cast<int>(maps.size()) &&
+            slots.load() == 1;
+    }, 20s);
+    ok &= check(floodDelivered, "map flood or following inventory item stalled");
+    ok &= check(!bytesMismatch.load(), "map/item flood changed packet bytes or order");
+    ok &= check(parseErrors.load() == 0, "map/item flood raised a parse error");
+    ok &= check(!downstreamClosed.load(), "map flood closed downstream session");
+    ok &= check(
+        relay.live().sessionCount() == 1 &&
+            relay.live().upstreamCount() == 1 &&
+            relay.live().finalSessionResetCount() == 0,
+        "map flood reset the Relay session"
+    );
+    ok &= check(errors.empty(), "map-flood callback error: " + errors.text());
+
+    downstream.close("map-flood regression complete");
+    relay.close("map-flood regression complete");
+    upstream.close("map-flood regression complete");
+    return ok;
+}
+
 bool checkForwardRawPolicy() {
     const std::string version = "1.21.100";
     const auto codec = bedrock::VersionedMcpeCodec::forVersion(version);
@@ -807,6 +1025,7 @@ bool checkDownstreamCloseLifecycle() {
 int main() {
     bool ok = checkMixedAuthenticationHandshake();
     ok = checkFullMapForwarding() && ok;
+    ok = checkMapFloodAndItemOrdering() && ok;
     ok = checkForwardRawPolicy() && ok;
     ok = checkDownstreamCloseLifecycle() && ok;
     if (ok) std::cout << "[LIVE-RELAY-REGRESSION-SMOKE] OK\n";

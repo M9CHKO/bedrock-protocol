@@ -64,6 +64,14 @@ public:
         variables_ = variables;
     }
 
+    // Strict packet validation only needs the reader/context side effects.
+    // Avoid retaining one ProtoDefField per array element (for example the
+    // 16,384 colours in clientbound_map_item_data) when no caller will read
+    // the structured result.
+    void setCollectFields(bool collectFields) {
+        collectFields_ = collectFields;
+    }
+
     std::optional<std::string> variable(const std::string& key) const {
         const auto found = variables_.find(key);
         return found == variables_.end()
@@ -175,7 +183,7 @@ public:
             field.offset = reader.offset();
             field.size = 0;
 
-            out.push_back(field);
+            appendField(out, field);
             context.set(path, field.value);
             context.set("_enum_type", field.value);
             return;
@@ -185,6 +193,39 @@ public:
     }
 
 private:
+    bool collectFields_ = true;
+
+    void appendField(
+        std::vector<ProtoDefField>& out,
+        const ProtoDefField& field
+    ) const {
+        if (collectFields_) out.push_back(field);
+    }
+
+    void appendField(
+        std::vector<ProtoDefField>& out,
+        ProtoDefField&& field
+    ) const {
+        if (collectFields_) out.push_back(std::move(field));
+    }
+
+    static bool isScalarArrayType(const std::string& typeJson) {
+        if (!isJsonString(trim(typeJson))) return false;
+        const auto type = unquote(trim(typeJson));
+        return type == "void" || type == "bool" || type == "byte" ||
+            type == "u8" || type == "lu8" || type == "i8" ||
+            type == "li8" || type == "u16" || type == "lu16" ||
+            type == "i16" || type == "li16" || type == "u32" ||
+            type == "lu32" || type == "i32" || type == "li32" ||
+            type == "u64" || type == "lu64" || type == "i64" ||
+            type == "li64" || type == "varint" || type == "varuint" ||
+            type == "varint64" || type == "varuint64" ||
+            type == "varlong" || type == "zigzag32" ||
+            type == "zigzag64" || type == "varint128" ||
+            type == "f32" || type == "lf32" || type == "f64" ||
+            type == "lf64";
+    }
+
     static std::string enumSizeBasedOnValuesLen(const ProtoDefContext& context) {
         std::string raw = context.get("values_len");
 
@@ -381,7 +422,7 @@ private:
         field.offset = start;
         field.size = reader.offset() - start;
 
-        out.push_back(field);
+        appendField(out, field);
         context.set(field.path, field.value);
     }
 
@@ -431,7 +472,7 @@ private:
         field.offset = start;
         field.size = reader.offset() - start;
 
-        out.push_back(field);
+        appendField(out, field);
         context.set(field.path, field.value);
     }
 
@@ -451,7 +492,7 @@ private:
             field.type = "option_present";
             field.value = "<missing:u8>";
             field.size = 0;
-            out.push_back(field);
+            appendField(out, field);
             return;
         }
         present = reader.u8();
@@ -462,7 +503,7 @@ private:
         flag.value = present != 0 ? "true" : "false";
         flag.offset = start;
         flag.size = reader.offset() - start;
-        out.push_back(flag);
+        appendField(out, flag);
         context.set(flag.path, flag.value);
 
         if (present == 0) {
@@ -536,7 +577,7 @@ private:
             field.value = "<no_branch:" + compareValue + ">";
             field.offset = reader.offset();
             field.size = 0;
-            out.push_back(field);
+            appendField(out, field);
             context.set(field.path, field.value);
             return;
         }
@@ -604,7 +645,7 @@ private:
         field.offset = start;
         field.size = reader.offset() - start;
 
-        out.push_back(field);
+        appendField(out, field);
 
         // В context кладём именно mapped, как protodef switch сравнивает по enum name.
         context.set(field.path, mapped);
@@ -675,15 +716,25 @@ private:
         countField.value = std::to_string(count);
         countField.offset = start;
         countField.size = countWasRead ? reader.offset() - start : 0;
-        out.push_back(countField);
+        appendField(out, countField);
         context.set(countField.path, countField.value);
 
+        const bool compactScalarValidation =
+            !collectFields_ && isScalarArrayType(*itemType);
+        const std::string validationPath = compactScalarValidation
+            ? path + "[]"
+            : std::string();
         for (int64_t i = 0; i < count; ++i) {
-            std::string childPath = path + "[" + std::to_string(i) + "]";
+            std::string childPath = compactScalarValidation
+                ? validationPath
+                : path + "[" + std::to_string(i) + "]";
             try {
                 decode(*itemType, reader, childPath, out, context);
             } catch (const std::exception& e) {
-                throw std::runtime_error("at " + childPath + ": " + e.what());
+                throw std::runtime_error(
+                    "at " + path + "[" + std::to_string(i) + "]: " +
+                    e.what()
+                );
             }
         }
     }
@@ -730,7 +781,7 @@ private:
                 field.value = std::to_string(endVal);
                 field.offset = before;
                 field.size = 1;
-                out.push_back(field);
+                appendField(out, field);
                 context.set(field.path, field.value);
                 return;
             }
@@ -914,7 +965,7 @@ private:
         field.structuredValue = ProtoDefValue::object({{"_value", std::move(rawValue)}});
         field.size = reader.offset() - field.offset;
 
-        out.push_back(field);
+        appendField(out, field);
         context.set(path, field.value);
 
         for (const auto& [name, bit] : readBitflagValues(bitflagsJson)) {
@@ -925,7 +976,7 @@ private:
             flagField.value = enabled ? "true" : "false";
             flagField.offset = field.offset;
             flagField.size = field.size;
-            out.push_back(std::move(flagField));
+            appendField(out, std::move(flagField));
 
             context.set(path.empty() ? name : path + "." + name, enabled ? "true" : "false");
         }
@@ -982,7 +1033,7 @@ private:
             field.value = std::to_string(value);
             field.offset = start;
             field.size = reader.offset() - start;
-            out.push_back(field);
+            appendField(out, field);
             context.set(field.path, field.value);
         }
     }
@@ -1246,7 +1297,7 @@ private:
 
         field.size = reader.offset() - start;
 
-        out.push_back(field);
+        appendField(out, field);
         context.set(field.path, field.value);
     }
 

@@ -130,6 +130,11 @@ private:
         std::array<std::map<uint32_t, std::vector<uint8_t>>, 32> pendingOrderedPayloads;
         std::unordered_map<uint16_t, SplitAccumulator> splits;
         std::unordered_map<uint32_t, std::vector<uint8_t>> sentReliableDatagrams;
+        std::deque<uint32_t> pendingReliableDatagrams;
+        std::unordered_map<
+            uint32_t,
+            std::chrono::steady_clock::time_point
+        > reliableDatagramSentAt;
         std::chrono::steady_clock::time_point request2AssignedAt {};
         std::chrono::steady_clock::time_point timeLastDatagramArrived {};
         std::chrono::steady_clock::time_point lastReliableSend {};
@@ -174,7 +179,14 @@ private:
     void handlePacket(const std::vector<uint8_t>& packet, const void* sender, int senderLen);
     void sendTo(const void* target, int targetLen, const std::vector<uint8_t>& packet);
     void sendConnectedFrame(const RakNetServerPeer& peer, const void* target, int targetLen, const std::vector<uint8_t>& payload, uint8_t reliability);
-    void sendReliableOrdered(const RakNetServerPeer& peer, const void* target, int targetLen, const std::vector<uint8_t>& payload);
+    void sendReliableOrdered(
+        const RakNetServerPeer& peer,
+        const void* target,
+        int targetLen,
+        const std::vector<uint8_t>& payload,
+        bool bypassCongestionWindow = false
+    );
+    void flushReliableQueue(const std::string& key);
 };
 
 } // namespace bedrock

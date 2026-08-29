@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -23,6 +24,7 @@
 #include <exception>
 #include <iostream>
 #include <iterator>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -252,6 +254,22 @@ struct BedrockServerTestAccess {
             return false;
         }
         return rawCalls == 0;
+    }
+
+    static std::array<std::size_t, 3> reliableQueueSizes(
+        RakNetServer& server,
+        const RakNetServerPeer& peer
+    ) {
+        std::lock_guard<std::mutex> lock(server.peersMutex_);
+        const auto found = server.peers_.find(
+            peer.address + ":" + std::to_string(peer.port)
+        );
+        if (found == server.peers_.end()) return {0, 0, 0};
+        return {
+            found->second.sentReliableDatagrams.size(),
+            found->second.reliableDatagramSentAt.size(),
+            found->second.pendingReliableDatagrams.size()
+        };
     }
 };
 
@@ -1135,6 +1153,17 @@ uint16_t readU16BE(const std::vector<uint8_t>& data, std::size_t& offset) {
     return value;
 }
 
+uint32_t readU32BE(const std::vector<uint8_t>& data, std::size_t& offset) {
+    if (offset + 4 > data.size()) throw std::runtime_error("readU32BE out of range");
+    const uint32_t value =
+        (static_cast<uint32_t>(data[offset]) << 24u) |
+        (static_cast<uint32_t>(data[offset + 1]) << 16u) |
+        (static_cast<uint32_t>(data[offset + 2]) << 8u) |
+        static_cast<uint32_t>(data[offset + 3]);
+    offset += 4;
+    return value;
+}
+
 uint32_t readVarUInt(const std::vector<uint8_t>& data, std::size_t& offset) {
     uint32_t result = 0;
     uint32_t shift = 0;
@@ -1260,6 +1289,10 @@ struct ParsedDatagramFrame {
     uint32_t sequence = 0;
     uint8_t reliability = 0;
     bool split = false;
+    uint32_t orderedIndex = 0;
+    uint32_t splitCount = 0;
+    uint16_t splitId = 0;
+    uint32_t splitIndex = 0;
     std::vector<uint8_t> payload;
 };
 
@@ -1284,13 +1317,19 @@ std::vector<ParsedDatagramFrame> parseDatagramFrames(const std::vector<uint8_t>&
         if (reliability == 1 || reliability == 4) {
             (void) readTriadLE(data, offset);
         }
+        uint32_t orderedIndex = 0;
         if (reliability == 3 || reliability == 4 || reliability == 7) {
-            (void) readTriadLE(data, offset);
+            orderedIndex = readTriadLE(data, offset);
             ++offset;
         }
         const bool split = (flags & 0x10u) != 0;
+        uint32_t splitCount = 0;
+        uint16_t splitId = 0;
+        uint32_t splitIndex = 0;
         if (split) {
-            offset += 10;
+            splitCount = readU32BE(data, offset);
+            splitId = readU16BE(data, offset);
+            splitIndex = readU32BE(data, offset);
         }
         if (offset + byteLength > data.size()) {
             break;
@@ -1299,6 +1338,10 @@ std::vector<ParsedDatagramFrame> parseDatagramFrames(const std::vector<uint8_t>&
         frame.sequence = sequence;
         frame.reliability = reliability;
         frame.split = split;
+        frame.orderedIndex = orderedIndex;
+        frame.splitCount = splitCount;
+        frame.splitId = splitId;
+        frame.splitIndex = splitIndex;
         frame.payload.assign(
             data.begin() + static_cast<std::ptrdiff_t>(offset),
             data.begin() + static_cast<std::ptrdiff_t>(offset + byteLength)
@@ -1424,6 +1467,173 @@ bool establishConnectedSession(
         return false;
     }
     return true;
+}
+
+bool checkReliableSendBackpressure() {
+    bedrock::RakNetServer server({
+        .host = "127.0.0.1",
+        .port = 0,
+        .maxPlayers = 1,
+        .protocolVersion = RAKNET_PROTOCOL
+    });
+    std::mutex peerMutex;
+    bedrock::RakNetServerPeer connectedPeer;
+    std::atomic<bool> opened {false};
+    server.onOpenConnection([&](const bedrock::RakNetServerPeer& peer) {
+        {
+            std::lock_guard<std::mutex> lock(peerMutex);
+            connectedPeer = peer;
+        }
+        opened = true;
+    });
+    server.listen();
+
+    sockaddr_in target {};
+    target.sin_family = AF_INET;
+    target.sin_port = htons(server.boundPort());
+    inet_pton(AF_INET, "127.0.0.1", &target.sin_addr);
+    const int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0 || !establishConnectedSession(
+            sock,
+            target,
+            server.boundPort()
+        )) {
+        if (sock >= 0) close(sock);
+        server.close();
+        std::cerr << "[SMOKE] reliable-window connection failed\n";
+        return false;
+    }
+    for (int attempt = 0; attempt < 100 && !opened.load(); ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    if (!opened.load()) {
+        close(sock);
+        server.close();
+        std::cerr << "[SMOKE] reliable-window peer was not opened\n";
+        return false;
+    }
+
+    // Drain the native-style unreliable connected ping emitted when the peer
+    // transitions to CONNECTED.
+    std::vector<uint8_t> ignored;
+    while (receivePacket(sock, ignored, 5)) {
+    }
+
+    bedrock::RakNetServerPeer peer;
+    {
+        std::lock_guard<std::mutex> lock(peerMutex);
+        peer = connectedPeer;
+    }
+    std::vector<uint8_t> payload(320'000);
+    uint32_t random = 0x9e3779b9u;
+    for (auto& byte : payload) {
+        random ^= random << 13u;
+        random ^= random >> 17u;
+        random ^= random << 5u;
+        byte = static_cast<uint8_t>(random & 0xffu);
+    }
+    server.sendReliable(peer, payload);
+
+    const auto initial =
+        bedrock::BedrockServerTestAccess::reliableQueueSizes(server, peer);
+    bool ok = initial[0] > 64 && initial[1] > 0 &&
+        initial[1] <= 64 && initial[2] > 0 &&
+        initial[0] == initial[1] + initial[2];
+    if (!ok) {
+        std::cerr << "[SMOKE] reliable congestion window mismatch: stored="
+                  << initial[0] << " in_flight=" << initial[1]
+                  << " pending=" << initial[2] << "\n";
+    }
+
+    std::map<uint32_t, std::vector<uint8_t>> parts;
+    std::optional<uint32_t> withheldSequence;
+    uint32_t expectedParts = 0;
+    uint16_t expectedSplitId = 0;
+    bool sawRetransmit = false;
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::seconds(8);
+    while (std::chrono::steady_clock::now() < deadline &&
+           (!sawRetransmit || expectedParts == 0 ||
+            parts.size() < expectedParts)) {
+        std::vector<uint8_t> datagram;
+        if (!receivePacket(sock, datagram, 100)) continue;
+        for (const auto& frame : parseDatagramFrames(datagram)) {
+            if (!frame.split || frame.splitCount == 0) continue;
+            if (expectedParts == 0) {
+                expectedParts = frame.splitCount;
+                expectedSplitId = frame.splitId;
+            }
+            if (frame.splitId != expectedSplitId ||
+                frame.splitCount != expectedParts ||
+                frame.splitIndex >= expectedParts) {
+                ok = false;
+                continue;
+            }
+
+            const bool duplicate = parts.find(frame.splitIndex) != parts.end();
+            parts.emplace(frame.splitIndex, frame.payload);
+            if (!withheldSequence.has_value()) {
+                withheldSequence = frame.sequence;
+                continue;
+            }
+            if (frame.sequence == *withheldSequence) {
+                if (duplicate) {
+                    sawRetransmit = true;
+                    (void) sendPacket(
+                        sock,
+                        target,
+                        buildAck(frame.sequence)
+                    );
+                }
+                continue;
+            }
+            (void) sendPacket(sock, target, buildAck(frame.sequence));
+        }
+    }
+
+    std::vector<uint8_t> reconstructed;
+    if (expectedParts != 0 && parts.size() == expectedParts) {
+        for (uint32_t index = 0; index < expectedParts; ++index) {
+            const auto found = parts.find(index);
+            if (found == parts.end()) {
+                ok = false;
+                break;
+            }
+            reconstructed.insert(
+                reconstructed.end(),
+                found->second.begin(),
+                found->second.end()
+            );
+        }
+    } else {
+        ok = false;
+    }
+    ok = sawRetransmit && reconstructed == payload && ok;
+    if (!sawRetransmit) {
+        std::cerr << "[SMOKE] reliable datagram was not retransmitted on timeout\n";
+    }
+    if (reconstructed != payload) {
+        std::cerr << "[SMOKE] reliable-window payload reconstruction mismatch\n";
+    }
+
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        const auto sizes =
+            bedrock::BedrockServerTestAccess::reliableQueueSizes(server, peer);
+        if (sizes[0] == 0 && sizes[1] == 0 && sizes[2] == 0) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    const auto final =
+        bedrock::BedrockServerTestAccess::reliableQueueSizes(server, peer);
+    if (final[0] != 0 || final[1] != 0 || final[2] != 0) {
+        std::cerr << "[SMOKE] reliable queue did not drain: stored="
+                  << final[0] << " in_flight=" << final[1]
+                  << " pending=" << final[2] << "\n";
+        ok = false;
+    }
+
+    close(sock);
+    server.close();
+    return ok;
 }
 
 struct LifecycleWireObservation {
@@ -2840,6 +3050,9 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (!checkServerAdvertisementSurface()) {
+        return 1;
+    }
+    if (!checkReliableSendBackpressure()) {
         return 1;
     }
 

@@ -69,7 +69,17 @@ public:
         const std::string& packetName,
         const std::vector<uint8_t>& payload
     ) const {
-        return decodePacketImpl(packetName, payload, false);
+        return decodePacketImpl(packetName, payload, false, true);
+    }
+
+    // Validate the same strict schema boundary without retaining a structured
+    // field tree. Transparent relays use this before raw forwarding when no
+    // packet handler requested decoded parameters.
+    void validatePacketStrict(
+        const std::string& packetName,
+        const std::vector<uint8_t>& payload
+    ) const {
+        (void) decodePacketImpl(packetName, payload, false, false);
     }
 
 private:
@@ -80,7 +90,8 @@ private:
     std::vector<ProtoDefField> decodePacketImpl(
         const std::string& packetName,
         const std::vector<uint8_t>& payload,
-        bool bestEffort
+        bool bestEffort,
+        bool collectFields = true
     ) const {
         auto typeJson = resolveType("packet_" + packetName);
         if (!typeJson.has_value()) {
@@ -101,6 +112,7 @@ private:
             return this->resolveType(typeName);
         });
         decoder.setVariables(variables_->snapshot());
+        decoder.setCollectFields(collectFields);
 
         if (bestEffort) {
             try {
@@ -120,7 +132,9 @@ private:
             }
         }
 
-        detail::updateItemPaletteFromFields(packetName, out, variables_);
+        if (collectFields) {
+            detail::updateItemPaletteFromFields(packetName, out, variables_);
+        }
         return out;
     }
 

@@ -40,6 +40,8 @@ constexpr uint8_t ID_NACK = 0xa0;
 constexpr uint8_t ID_ACK = 0xc0;
 
 constexpr int UDP_IPV4_HEADER_SIZE = 28;
+constexpr std::size_t RELIABLE_DATAGRAM_WINDOW = 64;
+constexpr auto RELIABLE_RETRANSMIT_TIMEOUT = std::chrono::milliseconds(500);
 
 constexpr uint8_t RAKNET_MAGIC[16] = {
     0x00, 0xff, 0xff, 0x00,
@@ -697,9 +699,15 @@ bool RakNetServer::processLifecycleDeadlines() {
         std::array<uint8_t, 128> endpoint {};
         int endpointLen = 0;
     };
+    struct ReliableWireDatagram {
+        std::array<uint8_t, 128> endpoint {};
+        int endpointLen = 0;
+        std::vector<uint8_t> data;
+    };
 
     std::vector<ScheduledPeerClose> duePeerCloses;
     std::vector<PeerWireTarget> heartbeatTargets;
+    std::vector<ReliableWireDatagram> reliableRetransmits;
     std::vector<RakNetServerPeer> timedOutPeers;
     bool shutdownDue = false;
     bool advertisementUpdateDue = false;
@@ -739,7 +747,7 @@ bool RakNetServer::processLifecycleDeadlines() {
         std::lock_guard<std::mutex> lock(peersMutex_);
         auto it = peers_.begin();
         while (it != peers_.end()) {
-            const auto& state = it->second;
+            auto& state = it->second;
             // RakPeer expires both UNVERIFIED_SENDER and
             // HANDLING_CONNECTION_REQUEST from the original Request2
             // allocation time.  The comparison is strictly greater than
@@ -764,9 +772,39 @@ bool RakNetServer::processLifecycleDeadlines() {
                         state.endpointLen
                     });
                 }
+
+                if (state.endpointLen > 0) {
+                    for (auto& [sequence, sentAt] :
+                         state.reliableDatagramSentAt) {
+                        if (now < sentAt ||
+                            now - sentAt < RELIABLE_RETRANSMIT_TIMEOUT) {
+                            continue;
+                        }
+                        const auto datagram =
+                            state.sentReliableDatagrams.find(sequence);
+                        if (datagram == state.sentReliableDatagrams.end()) {
+                            continue;
+                        }
+                        sentAt = now;
+                        state.lastReliableSend = now;
+                        reliableRetransmits.push_back({
+                            state.endpoint,
+                            state.endpointLen,
+                            datagram->second
+                        });
+                    }
+                }
                 ++it;
             }
         }
+    }
+
+    for (const auto& datagram : reliableRetransmits) {
+        sendTo(
+            datagram.endpoint.data(),
+            datagram.endpointLen,
+            datagram.data
+        );
     }
 
     for (const auto& target : heartbeatTargets) {
@@ -863,7 +901,8 @@ void RakNetServer::closePeerNow(
             peer,
             endpoint.data(),
             endpointLen,
-            std::vector<uint8_t>{ID_DISCONNECTION_NOTIFICATION}
+            std::vector<uint8_t>{ID_DISCONNECTION_NOTIFICATION},
+            true
         );
     }
 
@@ -898,7 +937,8 @@ void RakNetServer::finishShutdown() {
             entry.first,
             entry.second.first.data(),
             entry.second.second,
-            std::vector<uint8_t>{ID_DISCONNECTION_NOTIFICATION}
+            std::vector<uint8_t>{ID_DISCONNECTION_NOTIFICATION},
+            true
         );
     }
 
@@ -1092,9 +1132,10 @@ void RakNetServer::handlePacket(
         if (packetId == ID_ACK || packetId == ID_NACK) {
             auto sequences = readAckSequences(packet);
             std::vector<std::vector<uint8_t>> resend;
+            const auto key = peerKey(senderAddr);
             {
                 std::lock_guard<std::mutex> lock(peersMutex_);
-                auto it = peers_.find(peerKey(senderAddr));
+                auto it = peers_.find(key);
                 if (it == peers_.end()) {
                     return;
                 }
@@ -1102,12 +1143,22 @@ void RakNetServer::handlePacket(
                 if (packetId == ID_ACK) {
                     for (uint32_t sequence : sequences) {
                         state.sentReliableDatagrams.erase(sequence);
+                        state.reliableDatagramSentAt.erase(sequence);
                     }
                 } else {
                     for (uint32_t sequence : sequences) {
-                        auto it = state.sentReliableDatagrams.find(sequence);
-                        if (it != state.sentReliableDatagrams.end()) {
-                            resend.push_back(it->second);
+                        const auto sentAt =
+                            state.reliableDatagramSentAt.find(sequence);
+                        const auto datagram =
+                            state.sentReliableDatagrams.find(sequence);
+                        // A receiver can NACK sequence numbers that are known
+                        // but still waiting behind our congestion window. Do
+                        // not turn that NACK into an unbounded burst.
+                        if (sentAt != state.reliableDatagramSentAt.end() &&
+                            datagram != state.sentReliableDatagrams.end()) {
+                            sentAt->second = std::chrono::steady_clock::now();
+                            state.lastReliableSend = sentAt->second;
+                            resend.push_back(datagram->second);
                         }
                     }
                 }
@@ -1115,6 +1166,9 @@ void RakNetServer::handlePacket(
 
             for (const auto& datagram : resend) {
                 sendTo(sender, senderLen, datagram);
+            }
+            if (packetId == ID_ACK) {
+                flushReliableQueue(key);
             }
             return;
         }
@@ -1504,7 +1558,9 @@ void RakNetServer::sendConnectedFrame(
             return;
         }
         it->second.sentReliableDatagrams[sequence] = out;
-        it->second.lastReliableSend = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        it->second.reliableDatagramSentAt[sequence] = now;
+        it->second.lastReliableSend = now;
     }
 
     sendTo(target, targetLen, out);
@@ -1514,15 +1570,41 @@ void RakNetServer::sendReliableOrdered(
     const RakNetServerPeer& peer,
     const void* target,
     int targetLen,
-    const std::vector<uint8_t>& payload
+    const std::vector<uint8_t>& payload,
+    bool bypassCongestionWindow
 ) {
     if (payload.empty()) {
         return;
     }
 
+    const auto key = peer.address + ":" + std::to_string(peer.port);
     const std::size_t maxPayloadPerDatagram = static_cast<std::size_t>(
         std::max(128, peer.mtu > 0 ? peer.mtu - 100 : 1200)
     );
+
+    const auto admit = [&](uint32_t sequence, const std::vector<uint8_t>& out) {
+        {
+            std::lock_guard<std::mutex> lock(peersMutex_);
+            auto it = peers_.find(key);
+            if (it == peers_.end() ||
+                it->second.peer.clientGuid != peer.clientGuid) {
+                return false;
+            }
+            auto& state = it->second;
+            state.sentReliableDatagrams[sequence] = out;
+            if (bypassCongestionWindow) {
+                const auto now = std::chrono::steady_clock::now();
+                state.reliableDatagramSentAt[sequence] = now;
+                state.lastReliableSend = now;
+            } else {
+                state.pendingReliableDatagrams.push_back(sequence);
+            }
+        }
+        if (bypassCongestionWindow) {
+            sendTo(target, targetLen, out);
+        }
+        return true;
+    };
 
     if (payload.size() > maxPayloadPerDatagram) {
         uint32_t splitCount = static_cast<uint32_t>(
@@ -1533,7 +1615,7 @@ void RakNetServer::sendReliableOrdered(
         uint16_t splitId = 0;
         {
             std::lock_guard<std::mutex> lock(peersMutex_);
-            auto it = peers_.find(peer.address + ":" + std::to_string(peer.port));
+            auto it = peers_.find(key);
             if (it == peers_.end() ||
                 it->second.peer.clientGuid != peer.clientGuid) {
                 return;
@@ -1555,7 +1637,7 @@ void RakNetServer::sendReliableOrdered(
             uint32_t reliableIndex = 0;
             {
                 std::lock_guard<std::mutex> lock(peersMutex_);
-                auto it = peers_.find(peer.address + ":" + std::to_string(peer.port));
+                auto it = peers_.find(key);
                 if (it == peers_.end() ||
                     it->second.peer.clientGuid != peer.clientGuid) {
                     return;
@@ -1579,18 +1661,9 @@ void RakNetServer::sendReliableOrdered(
             writeU32BE(out, splitIndex);
             out.insert(out.end(), chunk.begin(), chunk.end());
 
-            {
-                std::lock_guard<std::mutex> lock(peersMutex_);
-                auto it = peers_.find(peer.address + ":" + std::to_string(peer.port));
-                if (it == peers_.end() ||
-                    it->second.peer.clientGuid != peer.clientGuid) {
-                    return;
-                }
-                it->second.sentReliableDatagrams[sequence] = out;
-                it->second.lastReliableSend = std::chrono::steady_clock::now();
-            }
-            sendTo(target, targetLen, out);
+            if (!admit(sequence, out)) return;
         }
+        if (!bypassCongestionWindow) flushReliableQueue(key);
         return;
     }
 
@@ -1599,7 +1672,7 @@ void RakNetServer::sendReliableOrdered(
     uint32_t orderedIndex = 0;
     {
         std::lock_guard<std::mutex> lock(peersMutex_);
-        auto it = peers_.find(peer.address + ":" + std::to_string(peer.port));
+        auto it = peers_.find(key);
         if (it == peers_.end() ||
             it->second.peer.clientGuid != peer.clientGuid) {
             return;
@@ -1621,17 +1694,44 @@ void RakNetServer::sendReliableOrdered(
     out.push_back(0);
     out.insert(out.end(), payload.begin(), payload.end());
 
+    if (!admit(sequence, out)) return;
+    if (!bypassCongestionWindow) flushReliableQueue(key);
+}
+
+void RakNetServer::flushReliableQueue(const std::string& key) {
+    std::array<uint8_t, 128> endpoint {};
+    int endpointLen = 0;
+    std::vector<std::vector<uint8_t>> outgoing;
     {
         std::lock_guard<std::mutex> lock(peersMutex_);
-        auto it = peers_.find(peer.address + ":" + std::to_string(peer.port));
-        if (it == peers_.end() ||
-            it->second.peer.clientGuid != peer.clientGuid) {
-            return;
+        auto it = peers_.find(key);
+        if (it == peers_.end() || it->second.endpointLen <= 0) return;
+
+        auto& state = it->second;
+        endpoint = state.endpoint;
+        endpointLen = state.endpointLen;
+        const auto now = std::chrono::steady_clock::now();
+        while (
+            state.reliableDatagramSentAt.size() < RELIABLE_DATAGRAM_WINDOW &&
+            !state.pendingReliableDatagrams.empty()
+        ) {
+            const auto sequence = state.pendingReliableDatagrams.front();
+            state.pendingReliableDatagrams.pop_front();
+            const auto datagram = state.sentReliableDatagrams.find(sequence);
+            if (datagram == state.sentReliableDatagrams.end() ||
+                state.reliableDatagramSentAt.find(sequence) !=
+                    state.reliableDatagramSentAt.end()) {
+                continue;
+            }
+            state.reliableDatagramSentAt[sequence] = now;
+            state.lastReliableSend = now;
+            outgoing.push_back(datagram->second);
         }
-        it->second.sentReliableDatagrams[sequence] = out;
-        it->second.lastReliableSend = std::chrono::steady_clock::now();
     }
-    sendTo(target, targetLen, out);
+
+    for (const auto& datagram : outgoing) {
+        sendTo(endpoint.data(), endpointLen, datagram);
+    }
 }
 
 } // namespace bedrock
