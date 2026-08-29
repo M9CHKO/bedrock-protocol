@@ -53,6 +53,7 @@ add_library(bedrock_protocol
     src/generated/GeneratedProtocolTypes.cpp
     src/item/BedrockItem.cpp
     src/nbt/BedrockNbt.cpp
+    src/nbt/BedrockNbtFile.cpp
     src/registry/BedrockDefaultSkin.cpp
     src/registry/BedrockFeatureRegistry.cpp
     src/registry/BedrockGameplayRegistry.cpp
@@ -152,6 +153,9 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
 
     add_executable(nbt-codec-smoke tools/nbt_codec_smoke.cpp)
     target_link_libraries(nbt-codec-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
+    add_executable(bedrock-nbt-file-smoke tools/bedrock_nbt_file_smoke.cpp)
+    target_link_libraries(bedrock-nbt-file-smoke PRIVATE BedrockProtocol::bedrock_protocol)
 
     add_executable(protodef-nbt-smoke tools/protodef_nbt_smoke.cpp)
     target_link_libraries(protodef-nbt-smoke PRIVATE BedrockProtocol::bedrock_protocol)
@@ -295,6 +299,7 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
         endif()
         add_test(NAME snappy-codec-smoke COMMAND snappy-codec-smoke)
         add_test(NAME nbt-codec-smoke COMMAND nbt-codec-smoke)
+        add_test(NAME bedrock-nbt-file-smoke COMMAND bedrock-nbt-file-smoke)
         add_test(NAME protodef-nbt-smoke COMMAND protodef-nbt-smoke)
         add_test(NAME protodef-variables-smoke COMMAND protodef-variables-smoke)
         add_test(NAME protodef-structured-smoke COMMAND protodef-structured-smoke)
@@ -338,6 +343,7 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
         set_tests_properties(
             protocol-roundtrip
             take-item-entity-schema-smoke
+            bedrock-nbt-file-smoke
             protodef-nbt-smoke
             protodef-variables-smoke
             protodef-structured-smoke

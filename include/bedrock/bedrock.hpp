@@ -22,6 +22,7 @@
 #include <bedrock/registry/BedrockLootRegistry.hpp>
 #include <bedrock/registry/BedrockRegistry.hpp>
 #include <bedrock/nbt/BedrockNbt.hpp>
+#include <bedrock/nbt/BedrockNbtFile.hpp>
 #include <bedrock/protocol/ProtocolDefinition.hpp>
 #include <bedrock/protocol/SnappyCodec.hpp>
 #include <bedrock/protodef/ProtoDefNbt.hpp>

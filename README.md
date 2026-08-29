@@ -68,6 +68,11 @@ int main() {
   native Bedrock NBT codec. Values use prismarine-nbt's
   `{ "type", "name", "value" }` shape, cover tags 0-12, and are retained as
   structured `ProtoDefValue` data by the packet/relay decoder.
+- Bedrock file-level `prismarine-nbt` equivalents: `writeUncompressed`,
+  `parseUncompressed`, `parseAs`, `hasBedrockLevelHeader`, automatic
+  Little/LittleVarInt detection, `simplify`, semantic `equal`, and strict
+  eight-byte `level.dat` header reading/writing. Java Edition's
+  big-endian/GZIP branch is intentionally excluded.
 - ProtoDef `setVariable` switch branches and persistent item-palette state,
   including automatic `ShieldItemID` updates from `start_game` or
   `item_registry`, public `Connection::updateItemPalette` equivalents, and full

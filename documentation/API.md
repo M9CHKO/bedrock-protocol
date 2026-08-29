@@ -319,6 +319,54 @@ The former one-argument C++ callback remains valid. Without any callback, the
 Relay disconnects only that player with the JavaScript sign-in-and-reconnect
 message; other relay sessions keep running.
 
+## Bedrock NBT Buffers And level.dat
+
+`BedrockNbt` provides the Bedrock branches of the file-level
+`prismarine-nbt` API in addition to the lower-level `BedrockNbtCodec` used by
+packet and chunk code:
+
+```cpp
+#include <bedrock/nbt/BedrockNbtFile.hpp>
+
+bedrock::NbtDocument tag {
+    "",
+    bedrock::NbtValue::compound({
+        {"LevelName", bedrock::NbtValue::string("My World")},
+        {"GameType", bedrock::NbtValue::integer(1)}
+    })
+};
+
+auto raw = bedrock::BedrockNbt::writeUncompressed(tag);
+auto detected = bedrock::BedrockNbt::parse(raw);
+auto simple = bedrock::BedrockNbt::simplify(detected.parsed);
+
+auto levelDat = bedrock::BedrockNbt::writeLevelDat(tag, 8);
+auto level = bedrock::BedrockNbt::parseLevelDat(std::move(levelDat));
+```
+
+`parse()` automatically distinguishes Bedrock Little Endian and Little
+VarInt NBT. It also recognises the eight-byte `level.dat` prefix and reports
+the version, declared payload length, start offset, consumed size, and complete
+input buffer through `BedrockNbtParseResult`. `parseAs()` uses an explicit
+encoding and permits trailing bytes so callers can walk concatenated NBT;
+automatic detection only accepts EOF or another compound root. The dedicated
+`parseLevelDat()` helper additionally requires the declared payload length and
+the decoded root length to match the file exactly.
+
+`hasBedrockLevelHeader()` retains the JavaScript API name;
+`hasLevelHeader()` is its shorter native alias. Both perform a bounds-safe
+check on short input.
+
+`BedrockNbt::equal()` mirrors JavaScript object semantics for compounds: field
+order and the root name are ignored. The existing `operator==` remains a
+strict structural comparison. `NbtValue::byte`, `shortInteger`, `integer`,
+`longInteger`, `floating`, `doubleFloating`, `string`, `list`, `compound`, and
+array helpers are the native builder API.
+
+Only Bedrock's Little Endian and Little VarInt formats are supported here.
+Big Endian NBT and GZIP probing are Java Edition functionality and are not
+included.
+
 ## Bedrock Block Registry
 
 `MinecraftDataAssets` loads the complete Bedrock block registry directly from
