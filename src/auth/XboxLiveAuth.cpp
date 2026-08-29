@@ -1252,14 +1252,17 @@ XboxLiveLoginPacket XboxLiveAuth::makeLoginPacketFromChains(
     options.offline = false;
 
     auto profile = extractAuthflowProfile(chains);
+    // A supplied Authflow owns its chain. Deriving the root from chains[0]
+    // keeps the normal Xbox chain identical (its x5u is Mojang's key) while
+    // allowing deterministic private-CA integration tests and custom
+    // Authflow implementations to remain cryptographically self-consistent.
     return buildLoginPacket(
         options,
         std::move(keyPair),
         std::move(chains),
         std::move(profile.identity),
         std::move(profile.displayName),
-        std::move(profile.xuid),
-        std::string(BedrockProtocolPublicKey)
+        std::move(profile.xuid)
     );
 }
 

@@ -1158,7 +1158,9 @@ private:
         ) {
             field.value = std::to_string(reader.varuint64());
         } else if (typeName == "varint64") {
-            field.value = std::to_string(reader.varint64());
+            // Bedrock's ProtoDef varint64 is the unsigned runtime-id wire
+            // format. Signed 64-bit values use zigzag64 instead.
+            field.value = std::to_string(reader.varuint64());
         } else if (typeName == "varint" || typeName == "varuint") {
             if (
                 path.find("runtime_id") != std::string::npos ||

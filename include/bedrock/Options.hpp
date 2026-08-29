@@ -18,9 +18,11 @@ struct BedrockVersionEntry {
 };
 
 inline constexpr std::string_view MIN_VERSION = "1.16.201";
-inline constexpr std::string_view CURRENT_VERSION = "1.26.0";
+inline constexpr std::string_view CURRENT_VERSION = "1.26.20";
 
-inline constexpr std::array<BedrockVersionEntry, 48> VERSION_ENTRIES {{
+inline constexpr std::array<BedrockVersionEntry, 50> VERSION_ENTRIES {{
+    {"1.26.20", 975u},
+    {"1.26.10", 944u},
     {"1.26.0", 924u},
     {"1.21.130", 898u},
     {"1.21.124", 860u},

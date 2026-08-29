@@ -74,4 +74,17 @@ For generated lookup tables used by the C++ decoder:
 
 ```text
 data/generated/protocol-types/bedrock/
+data/generated/packet-schema/bedrock/
+include/bedrock/generated/GeneratedProtocolTypes.hpp
+src/generated/GeneratedProtocolTypes.cpp
+```
+
+`GeneratedProtocolTypes.cpp` is version-aware: the encoder and decoder select
+the type definition for the negotiated Minecraft version instead of applying
+the latest schema to every connection. Regenerate and verify all derived data
+with:
+
+```bash
+python scripts/generate_protocol_artifacts.py
+python scripts/generate_protocol_artifacts.py --check
 ```

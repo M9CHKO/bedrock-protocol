@@ -84,6 +84,11 @@ private:
     ) const {
         auto typeJson = resolveType("packet_" + packetName);
         if (!typeJson.has_value()) {
+            if (!bestEffort) {
+                throw std::runtime_error(
+                    "packet schema not found: " + packetName
+                );
+            }
             return {};
         }
 
@@ -106,6 +111,13 @@ private:
             }
         } else {
             decoder.decode(*typeJson, reader, "", out, context);
+            if (reader.remaining() != 0) {
+                throw std::runtime_error(
+                    "packet " + packetName + " has " +
+                    std::to_string(reader.remaining()) +
+                    " unread byte(s)"
+                );
+            }
         }
 
         detail::updateItemPaletteFromFields(packetName, out, variables_);
@@ -118,7 +130,7 @@ private:
             return fromIndex;
         }
 
-        return bedrock::generatedProtocolTypeJson(typeName);
+        return bedrock::generatedProtocolTypeJson(version_, typeName);
     }
 };
 

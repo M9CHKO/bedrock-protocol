@@ -86,7 +86,7 @@ private:
             return fromIndex;
         }
 
-        return bedrock::generatedProtocolTypeJson(typeName);
+        return bedrock::generatedProtocolTypeJson(version_, typeName);
     }
 };
 

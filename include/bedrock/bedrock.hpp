@@ -2809,6 +2809,31 @@ struct RelayAdvancedOptions {
     std::string password;
 };
 
+enum class RelayParseErrorPolicy {
+    Disconnect,
+    Drop,
+    ForwardRaw
+};
+
+inline const char* relayParseErrorPolicyName(
+    RelayParseErrorPolicy policy
+) noexcept {
+    switch (policy) {
+        case RelayParseErrorPolicy::Disconnect: return "disconnect";
+        case RelayParseErrorPolicy::Drop: return "drop";
+        case RelayParseErrorPolicy::ForwardRaw: return "forward_raw";
+    }
+    return "disconnect";
+}
+
+struct RelayParseError {
+    BedrockRelayDirection direction = BedrockRelayDirection::Clientbound;
+    std::string sessionId;
+    std::string packetName;
+    std::string message;
+    RelayParseErrorPolicy policy = RelayParseErrorPolicy::Disconnect;
+};
+
 struct RelayOptions {
     std::string version = std::string(CURRENT_VERSION);
     std::string host = "0.0.0.0";
@@ -2837,6 +2862,11 @@ struct RelayOptions {
     bool omitParseErrors = false;
     RelayDestination destination;
     RelayAdvancedOptions advanced;
+    // When omitted, the historical API is preserved: omitParseErrors=false
+    // disconnects and omitParseErrors=true drops only the malformed packet.
+    // ForwardRaw keeps the original VersionedGamePacket byte-for-byte and
+    // deliberately skips field handlers for that packet.
+    std::optional<RelayParseErrorPolicy> parseErrorPolicy;
 
     // A single root offline value is the common case and applies to both
     // sides. destination.offline exists only as an explicit upstream override.
@@ -3362,7 +3392,7 @@ private:
             type == "i32" || type == "li32" ||
             type == "i64" || type == "li64" ||
             type == "zigzag32" || type == "zigzag64" ||
-            type == "varint" || type == "varint64";
+            type == "varint";
     }
 
     static bool isUnsignedType(const std::string& type) {
@@ -3370,7 +3400,8 @@ private:
             type == "u32" || type == "lu32" ||
             type == "u64" || type == "lu64" ||
             type == "varuint" || type == "varuint32" ||
-            type == "varuint64" || type == "varint128";
+            type == "varuint64" || type == "varint64" ||
+            type == "varint128";
     }
 
     static bool valueEqual(const PacketValue& a, const PacketValue& b) {
@@ -3810,6 +3841,7 @@ public:
     using PacketWithDestinationHandler = std::function<void(RelayPacketEvent&, RelayPacketDestination&)>;
     using ErrorHandler = std::function<void(const std::string&)>;
     using StatusHandler = std::function<void(const BedrockLiveRelayStatus&)>;
+    using ParseErrorHandler = std::function<void(const RelayParseError&)>;
 
     explicit Relay(RelayOptions options)
         : options_(normalizeOptions(std::move(options))),
@@ -3897,72 +3929,11 @@ public:
         });
 
         live_.on("clientbound", [this](BedrockRelayPacketEvent& event) {
-            const auto player = playerForSession(event.sessionId);
-            auto packetVariables = variablesForSession(event.sessionId);
-            std::unique_ptr<RelayPacketEvent> wrapped;
-            try {
-                wrapped = std::make_unique<RelayPacketEvent>(
-                    options_.version,
-                    event,
-                    std::move(packetVariables),
-                    true
-                );
-                // relay.js parses every upstream packet before deciding
-                // whether user handlers exist. Keep parse-error behavior
-                // observable even for a transparent high-level Relay.
-                (void) wrapped->decodedParams();
-            } catch (const std::exception& error) {
-                std::cerr << "[relay] clientbound parse error session="
-                          << event.sessionId
-                          << " packet=" << event.packet.name
-                          << ": " << error.what() << "\n";
-                event.cancel();
-                if (!options_.omitParseErrors && player) {
-                    live_.server().disconnect(
-                        player->connection,
-                        "Server packet parse error"
-                    );
-                }
-                return;
-            }
-            if (player) player->dispatch(*wrapped);
-            for (auto& handler : clientboundHandlers_) {
-                handler(*wrapped);
-            }
-            RelayPacketDestination des;
-            for (auto& handler : clientboundDestinationHandlers_) {
-                handler(*wrapped, des);
-                if (des.canceled) {
-                    wrapped->cancel();
-                }
-            }
-            wrapped->apply(event);
+            handleLivePacket(event);
         });
 
         live_.on("serverbound", [this](BedrockRelayPacketEvent& event) {
-            const auto player = playerForSession(event.sessionId);
-            auto packetVariables = variablesForSession(event.sessionId);
-            RelayPacketEvent wrapped(
-                options_.version,
-                event,
-                std::move(packetVariables),
-                true
-            );
-            // RelayPlayer.readPacket also deserializes before dispatch. Unlike
-            // readUpstream, Node deliberately does not catch this direction.
-            (void) wrapped.decodedParams();
-            if (player) player->dispatch(wrapped);
-            for (auto& handler : serverboundHandlers_) {
-                handler(wrapped);
-            }
-            RelayPacketDestination des;
-            for (auto& handler : serverboundDestinationHandlers_) {
-                handler(wrapped, des);
-                if (des.canceled) {
-                    wrapped.cancel();
-                }
-            }
-            wrapped.apply(event);
+            handleLivePacket(event);
         });
 
         return live_.listen();
@@ -4054,6 +4025,10 @@ public:
 
     void onStatus(StatusHandler handler) {
         live_.onStatus(std::move(handler));
+    }
+
+    void onParseError(ParseErrorHandler handler) {
+        parseErrorHandlers_.push_back(std::move(handler));
     }
 
     void on(const std::string& eventName, ErrorHandler handler) {
@@ -4167,6 +4142,7 @@ private:
     std::vector<PacketHandler> serverboundHandlers_;
     std::vector<PacketWithDestinationHandler> clientboundDestinationHandlers_;
     std::vector<PacketWithDestinationHandler> serverboundDestinationHandlers_;
+    std::vector<ParseErrorHandler> parseErrorHandlers_;
 
     std::shared_ptr<RelayPlayer> playerForSession(const std::string& id) const {
         std::lock_guard<std::mutex> lock(playersMutex_);
@@ -4184,6 +4160,89 @@ private:
     static RelayOptions normalizeOptions(RelayOptions options) {
         (void) validateVersion(options.version);
         return options;
+    }
+
+    RelayParseErrorPolicy effectiveParseErrorPolicy() const noexcept {
+        if (options_.parseErrorPolicy.has_value()) {
+            return *options_.parseErrorPolicy;
+        }
+        return options_.omitParseErrors
+            ? RelayParseErrorPolicy::Drop
+            : RelayParseErrorPolicy::Disconnect;
+    }
+
+    void handleLivePacket(BedrockRelayPacketEvent& event) {
+        const auto player = playerForSession(event.sessionId);
+        auto packetVariables = variablesForSession(event.sessionId);
+        std::unique_ptr<RelayPacketEvent> wrapped;
+        try {
+            wrapped = std::make_unique<RelayPacketEvent>(
+                options_.version,
+                event,
+                std::move(packetVariables),
+                true
+            );
+            // Structured handlers receive fields only after a complete strict
+            // decode. The low-level event still owns the untouched raw packet.
+            (void) wrapped->decodedParams();
+        } catch (const std::exception& error) {
+            const auto policy = effectiveParseErrorPolicy();
+            RelayParseError parseError {
+                .direction = event.direction,
+                .sessionId = event.sessionId,
+                .packetName = event.packet.name,
+                .message = error.what(),
+                .policy = policy
+            };
+            std::cerr << "[relay] "
+                      << (event.direction == BedrockRelayDirection::Clientbound
+                              ? "clientbound"
+                              : "serverbound")
+                      << " parse error session=" << event.sessionId
+                      << " packet=" << event.packet.name
+                      << " policy=" << relayParseErrorPolicyName(policy)
+                      << ": " << error.what() << "\n";
+            const auto handlers = parseErrorHandlers_;
+            for (auto& handler : handlers) {
+                handler(parseError);
+            }
+
+            if (policy == RelayParseErrorPolicy::ForwardRaw) {
+                // Do not expose partial params and do not call apply(): the
+                // original packet continues through BedrockLiveRelay unchanged.
+                return;
+            }
+
+            event.cancel();
+            if (policy == RelayParseErrorPolicy::Disconnect && player) {
+                live_.disconnectDownstream(
+                    player->connection,
+                    "Server packet parse error"
+                );
+            }
+            return;
+        }
+
+        if (player) player->dispatch(*wrapped);
+        auto& handlers = event.direction == BedrockRelayDirection::Clientbound
+            ? clientboundHandlers_
+            : serverboundHandlers_;
+        for (auto& handler : handlers) {
+            handler(*wrapped);
+        }
+
+        auto& destinationHandlers =
+            event.direction == BedrockRelayDirection::Clientbound
+                ? clientboundDestinationHandlers_
+                : serverboundDestinationHandlers_;
+        RelayPacketDestination destination;
+        for (auto& handler : destinationHandlers) {
+            handler(*wrapped, destination);
+            if (destination.canceled) {
+                wrapped->cancel();
+            }
+        }
+        wrapped->apply(event);
     }
 
     static BedrockLiveRelayOptions toLiveOptions(const RelayOptions& options) {

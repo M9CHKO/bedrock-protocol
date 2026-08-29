@@ -773,7 +773,7 @@ subchunk_request	origin	"vec3i"
 subchunk_request	requests	["array",{"countType":"lu32","type":["container",[{"name":"dx","type":"i8"},{"name":"dy","type":"i8"},{"name":"dz","type":"i8"}]]}]
 sync_entity_property	nbt	"nbt"
 take_item_entity	runtime_entity_id	"varint64"
-take_item_entity	target	"varint"
+take_item_entity	target	"varint64"
 text	needs_translation	"bool"
 text	category	["mapper",{"type":"u8","mappings":{"0":"message_only","1":"authored","2":"parameters"}}]
 text		["switch",{"compareTo":"category","fields":{"message_only":["container",[{"name":"raw","type":"string"},{"name":"tip","type":"string"},{"name":"system_message","type":"string"},{"name":"text_object_whisper","type":"string"},{"name":"text_object_announcement","type":"string"},{"name":"text_object","type":"string"}]],"authored":["container",[{"name":"chat","type":"string"},{"name":"whisper","type":"string"},{"name":"announcement","type":"string"}]],"parameters":["container",[{"name":"translate","type":"string"},{"name":"popup","type":"string"},{"name":"jukebox_popup","type":"string"}]]}}]

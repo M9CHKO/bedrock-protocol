@@ -36,6 +36,8 @@ struct BedrockLiveRelayOptions {
     bool forwardClientbound = true;
     bool skipClientboundLoginSuccess = true;
     bool skipClientboundResourcePacks = false;
+    // Deprecated compatibility switches. Negotiation/encryption packets are
+    // session-local and are always consumed by their owning endpoint.
     bool skipClientboundHandshake = true;
     bool forwardDownstreamClientData = true;
     bool queueClientboundLevelChunksUntilStartGame = true;
@@ -138,6 +140,14 @@ public:
         const BedrockServerConnection& connection,
         const std::string& reason = "closed"
     );
+    // Starts relay teardown immediately, before the server's delayed
+    // protocol-level disconnect finishes. This prevents backend packets from
+    // reaching callbacks or queues after the downstream has been rejected.
+    void disconnectDownstream(
+        const BedrockServerConnection& connection,
+        const std::string& reason = "closed"
+    );
+    uint64_t finalSessionResetCount() const noexcept;
 
     static std::string sessionId(const BedrockServerConnection& connection);
 
@@ -153,10 +163,11 @@ private:
     std::unordered_map<std::string, std::shared_ptr<Session>> sessions_;
     std::unordered_set<std::string> rejectedConnections_;
     std::string primarySessionId_;
-    mutable std::mutex handlerDispatchMutex_;
+    mutable std::recursive_mutex handlerDispatchMutex_;
 
     std::atomic<bool> closed_ {true};
     std::atomic<bool> listening_ {false};
+    std::atomic<uint64_t> finalSessionResetCount_ {0};
 
     std::vector<ConnectionHandler> connectHandlers_;
     std::vector<ConnectionHandler> joinHandlers_;
@@ -192,12 +203,12 @@ private:
     );
     void handleDownstreamJoin(const std::shared_ptr<Session>& session);
     void resolveUpstreamRealm(BedrockNetworkClientOptions& upstreamOptions);
-    void resetRelaySession(
+    bool resetRelaySession(
         const std::shared_ptr<Session>& session,
         const std::string& reason,
         bool retainDownstream
     );
-    void removeRelaySession(
+    bool removeRelaySession(
         const std::shared_ptr<Session>& session,
         const std::string& reason
     );

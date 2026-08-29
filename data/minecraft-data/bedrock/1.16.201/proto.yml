@@ -452,8 +452,8 @@ packet_add_item_entity:
 packet_take_item_entity:
    !id: 0x11
    !bound: client
-   runtime_entity_id: varint
-   target: varint
+   runtime_entity_id: varint64
+   target: varint64
 
 packet_move_entity:
    !id: 0x12

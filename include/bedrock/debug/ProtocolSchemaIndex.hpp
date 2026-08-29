@@ -50,33 +50,42 @@ public:
 
     std::optional<PacketSchemaInfo> findPacket(const std::string& packetName) const {
         const std::string key = "\"packet_" + packetName + "\"";
-        auto keyPos = json_.find(key);
-        if (keyPos == std::string::npos) {
-            return std::nullopt;
+        std::size_t searchFrom = 0;
+        while (true) {
+            const auto keyPos = json_.find(key, searchFrom);
+            if (keyPos == std::string::npos) return std::nullopt;
+            searchFrom = keyPos + key.size();
+
+            // The same string also appears as a switch mapping value. Only a
+            // JSON object key may introduce the packet schema.
+            auto colon = searchFrom;
+            while (colon < json_.size() &&
+                   std::isspace(static_cast<unsigned char>(json_[colon]))) {
+                ++colon;
+            }
+            if (colon >= json_.size() || json_[colon] != ':') continue;
+
+            auto arrayStart = colon + 1;
+            while (arrayStart < json_.size() &&
+                   std::isspace(static_cast<unsigned char>(json_[arrayStart]))) {
+                ++arrayStart;
+            }
+            if (arrayStart >= json_.size() || json_[arrayStart] != '[') {
+                continue;
+            }
+
+            const auto arrayEnd = findMatchingBracket(arrayStart);
+            if (arrayEnd == std::string::npos) return std::nullopt;
+
+            PacketSchemaInfo out;
+            out.packetName = packetName;
+            const std::string array = json_.substr(
+                arrayStart,
+                arrayEnd - arrayStart + 1
+            );
+            out.fields = parseFields(array);
+            if (!out.fields.empty()) return out;
         }
-
-        auto colon = json_.find(':', keyPos);
-        if (colon == std::string::npos) {
-            return std::nullopt;
-        }
-
-        auto arrayStart = json_.find('[', colon);
-        if (arrayStart == std::string::npos) {
-            return std::nullopt;
-        }
-
-        auto arrayEnd = findMatchingBracket(arrayStart);
-        if (arrayEnd == std::string::npos) {
-            return std::nullopt;
-        }
-
-        PacketSchemaInfo out;
-        out.packetName = packetName;
-
-        std::string array = json_.substr(arrayStart, arrayEnd - arrayStart + 1);
-        out.fields = parseFields(array);
-
-        return out;
     }
 
 private:

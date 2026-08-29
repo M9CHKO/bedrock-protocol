@@ -67,7 +67,7 @@ function listVersions (root, requested) {
     }
 
     const dataPaths = exists(dataPathsPath) ? readJson(dataPathsPath) : null
-    return releases.map(entry => {
+    const registered = releases.map(entry => {
       const minecraftVersion = entry.minecraftVersion
       let schemaVersion = minecraftVersion
       if (!exists(path.join(root, schemaVersion, 'protocol.json'))) {
@@ -88,6 +88,32 @@ function listVersions (root, requested) {
         protocolVersion: Number(entry.version)
       }
     })
+
+    if (requested !== 'all') return registered
+
+    // Preserve standalone historical schemas (currently 0.14 and 0.15) in
+    // the low-level generated registry even though options.Versions exposes
+    // only the modern release list. Aliased modern releases above still use
+    // their dataPaths.json source.
+    const registeredNames = new Set(registered.map(v => v.minecraftVersion))
+    const historical = fs.readdirSync(root)
+      .filter(v => !registeredNames.has(v) &&
+        exists(path.join(root, v, 'protocol.json')) &&
+        exists(path.join(root, v, 'version.json')))
+      .map(minecraftVersion => ({
+        minecraftVersion,
+        schemaVersion: minecraftVersion,
+        protocolVersion: Number(
+          readJson(path.join(root, minecraftVersion, 'version.json')).version || 0
+        )
+      }))
+
+    return [...registered, ...historical]
+      .sort((a, b) => a.minecraftVersion.localeCompare(
+        b.minecraftVersion,
+        undefined,
+        { numeric: true }
+      ))
   }
 
   // Fallback for standalone extracted data sets without minecraft-data's
@@ -189,6 +215,17 @@ namespace bedrock {
 
   for (const v of versionData) {
     const id = ident(v.minecraftVersion)
+    if (v.schemaVersion !== v.minecraftVersion) {
+      const schemaId = ident(v.schemaVersion)
+      cpp += `// ${v.minecraftVersion} aliases the ${v.schemaVersion} packet schema.\n`
+      cpp += `static const ProtocolVersionInfo VERSION_${id} = {\n`
+      cpp += `    "${esc(v.minecraftVersion)}",\n`
+      cpp += `    ${v.protocolVersion}u,\n`
+      cpp += `    PACKETS_${schemaId},\n`
+      cpp += `    sizeof(PACKETS_${schemaId}) / sizeof(PACKETS_${schemaId}[0])\n`
+      cpp += `};\n\n`
+      continue
+    }
     cpp += `static const ProtocolPacketInfo PACKETS_${id}[] = {\n`
     for (const p of v.packets) {
       cpp += `    { ${p.id}u, "${esc(p.name)}", "${esc(p.paramsType)}" },\n`

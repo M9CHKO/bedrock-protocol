@@ -50,6 +50,7 @@ add_library(bedrock_protocol
     src/client/RakNetClient.cpp
     src/events/BedrockPacketEventAdapter.cpp
     src/generated/GeneratedProtocolTables.cpp
+    src/generated/GeneratedProtocolTypes.cpp
     src/item/BedrockItem.cpp
     src/nbt/BedrockNbt.cpp
     src/registry/BedrockDefaultSkin.cpp
@@ -102,6 +103,25 @@ target_include_directories(bedrock_protocol
 target_link_libraries(bedrock_protocol PUBLIC ZLIB::ZLIB OpenSSL::Crypto)
 target_compile_definitions(bedrock_protocol PUBLIC _DEFAULT_SOURCE)
 
+find_package(Python3 QUIET COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND)
+    add_custom_target(generate-protocol-artifacts
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/generate_protocol_artifacts.py
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        COMMENT "Regenerating Bedrock protocol C++ and TSV artifacts"
+        VERBATIM
+    )
+    add_custom_target(check-protocol-artifacts
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/scripts/generate_protocol_artifacts.py
+            --check
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        COMMENT "Checking generated Bedrock protocol artifacts"
+        VERBATIM
+    )
+endif()
+
 if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
     add_executable(bedrock tools/bedrock.cpp)
     target_link_libraries(bedrock PRIVATE BedrockProtocol::bedrock_protocol)
@@ -117,6 +137,15 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
 
     add_executable(protocol-roundtrip tools/protocol_roundtrip.cpp)
     target_link_libraries(protocol-roundtrip PRIVATE BedrockProtocol::bedrock_protocol)
+
+    add_executable(
+        take-item-entity-schema-smoke
+        tools/take_item_entity_schema_smoke.cpp
+    )
+    target_link_libraries(
+        take-item-entity-schema-smoke
+        PRIVATE BedrockProtocol::bedrock_protocol
+    )
 
     add_executable(snappy-codec-smoke tools/snappy_codec_smoke.cpp)
     target_link_libraries(snappy-codec-smoke PRIVATE BedrockProtocol::bedrock_protocol)
@@ -196,6 +225,15 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
     add_executable(live-relay-options-smoke tools/live_relay_options_smoke.cpp)
     target_link_libraries(live-relay-options-smoke PRIVATE BedrockProtocol::bedrock_protocol)
 
+    add_executable(
+        live-relay-regression-smoke
+        tools/live_relay_regression_smoke.cpp
+    )
+    target_link_libraries(
+        live-relay-regression-smoke
+        PRIVATE BedrockProtocol::bedrock_protocol
+    )
+
     add_executable(chunk-smoke tools/chunk_smoke.cpp)
     target_link_libraries(chunk-smoke PRIVATE BedrockProtocol::bedrock_protocol)
 
@@ -243,6 +281,18 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
 
     if(BUILD_TESTING)
         add_test(NAME protocol-roundtrip COMMAND protocol-roundtrip)
+        add_test(
+            NAME take-item-entity-schema-smoke
+            COMMAND take-item-entity-schema-smoke
+        )
+        if(Python3_Interpreter_FOUND)
+            add_test(
+                NAME generated-protocol-consistency
+                COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/scripts/generate_protocol_artifacts.py
+                    --check
+            )
+        endif()
         add_test(NAME snappy-codec-smoke COMMAND snappy-codec-smoke)
         add_test(NAME nbt-codec-smoke COMMAND nbt-codec-smoke)
         add_test(NAME protodef-nbt-smoke COMMAND protodef-nbt-smoke)
@@ -281,11 +331,13 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
         add_test(NAME live-relay-smoke COMMAND live-relay-smoke)
         add_test(NAME live-relay-multi-client-smoke COMMAND live-relay-multi-client-smoke)
         add_test(NAME live-relay-options-smoke COMMAND live-relay-options-smoke)
+        add_test(NAME live-relay-regression-smoke COMMAND live-relay-regression-smoke)
         add_test(NAME public-header-smoke COMMAND public-header-smoke)
         add_test(NAME public-header-reverse-smoke COMMAND public-header-reverse-smoke)
         add_test(NAME xbox-proof-key-smoke COMMAND xbox-proof-key-smoke)
         set_tests_properties(
             protocol-roundtrip
+            take-item-entity-schema-smoke
             protodef-nbt-smoke
             protodef-variables-smoke
             protodef-structured-smoke
@@ -321,6 +373,7 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
             live-relay-smoke
             live-relay-multi-client-smoke
             live-relay-options-smoke
+            live-relay-regression-smoke
             public-header-smoke
             public-header-reverse-smoke
             xbox-proof-key-smoke
@@ -328,6 +381,14 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
                 TIMEOUT 120
         )
+        if(TEST generated-protocol-consistency)
+            set_tests_properties(
+                generated-protocol-consistency
+                PROPERTIES
+                    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+                    TIMEOUT 180
+            )
+        endif()
     endif()
 
     # Runtime helper used by the public API and the bedrock launcher.

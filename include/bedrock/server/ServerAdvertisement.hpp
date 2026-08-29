@@ -132,7 +132,7 @@ using ServerAdvertisementObject =
 
 class ServerAdvertisement {
 public:
-    inline static constexpr std::string_view CURRENT_VERSION = "1.26.0";
+    inline static constexpr std::string_view CURRENT_VERSION = "1.26.20";
 
     // Public field names mirror src/server/advertisement.js. `header` only
     // records parsed input; just like the JavaScript implementation, output

@@ -265,9 +265,23 @@ The nested value is therefore an override, not a second required setting.
 If both endpoints use the same mode, leave `destination.offline` omitted.
 
 The high-level relay accepts multiple downstream players by default. Set
-`forceSingle = true` for one player. `logging`, `enableChunkCaching`, and
-`omitParseErrors` map to the JavaScript Relay behavior. A Realm destination is
-selected through `destination.realms`.
+`forceSingle = true` for one player. `logging` and `enableChunkCaching` map to
+the JavaScript Relay behavior. A Realm destination is selected through
+`destination.realms`.
+
+Parse failures have an explicit transport policy:
+
+```cpp
+options.parseErrorPolicy = bedrock::RelayParseErrorPolicy::ForwardRaw;
+relay.onParseError([](const bedrock::RelayParseError& error) {
+    std::cerr << error.packetName << ": " << error.message << "\n";
+});
+```
+
+`Disconnect` closes the matching session, `Drop` discards only the malformed
+packet, and `ForwardRaw` forwards its original bytes without exposing partial
+fields. The older `omitParseErrors` option remains compatible when no explicit
+policy is set (`false` means `Disconnect`, `true` means `Drop`).
 
 `onConnect(player)` runs when Minecraft opens the downstream connection.
 `onJoin(player, upstream)` is the later JavaScript Relay `join` event: the

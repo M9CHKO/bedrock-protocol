@@ -3844,11 +3844,11 @@
       [
         {
           "name": "runtime_entity_id",
-          "type": "varint"
+          "type": "varint64"
         },
         {
           "name": "target",
-          "type": "varint"
+          "type": "varint64"
         }
       ]
     ],

@@ -9,6 +9,8 @@ install/
 !.vscode/tasks.json
 !.vscode/launch.json
 node_modules/
+__pycache__/
+*.py[cod]
 node-*-cache/
 *-auth-cache/
 dumps/

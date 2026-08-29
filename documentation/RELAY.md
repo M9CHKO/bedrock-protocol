@@ -277,13 +277,28 @@ The C++ relay core includes these behaviors from the JavaScript relay:
 | Disable clientbound forwarding | `forwardClientbound = false` |
 | Reject a second live downstream | `forceSingle = true` |
 | Trace session and packet routing | high-level `RelayOptions::logging = true` |
-| Drop malformed backend packets without closing their session | high-level `RelayOptions::omitParseErrors = true` |
+| Disconnect on a parse error | `parseErrorPolicy = RelayParseErrorPolicy::Disconnect` |
+| Drop only a packet that cannot be parsed | `parseErrorPolicy = RelayParseErrorPolicy::Drop` |
+| Forward the original packet bytes after a parse error | `parseErrorPolicy = RelayParseErrorPolicy::ForwardRaw` |
 
-High-level Relay always strictly parses clientbound packets before handlers.
-Malformed backend packets are canceled in both modes; the default
-`omitParseErrors = false` additionally disconnects only the matching downstream
-session. Forwarded login JSON retains custom skin, animation, device/platform,
-and unknown fields while normalizing destination- and version-specific values.
+High-level Relay strictly parses a packet before exposing structured fields to
+handlers. Transport forwarding remains independent: `ForwardRaw` reports the
+error through `onParseError`, skips structured handlers, and forwards the
+original `VersionedGamePacket` without decoding or re-encoding it. `Drop`
+discards only that packet, while `Disconnect` tears down the matching
+downstream and upstream session immediately. For source compatibility,
+omitting `parseErrorPolicy` maps `omitParseErrors = false` to `Disconnect` and
+`omitParseErrors = true` to `Drop`.
+
+Downstream `request_network_settings`, `login`, and
+`client_to_server_handshake` packets are always consumed by the downstream
+server session. Upstream `network_settings` and
+`server_to_client_handshake` packets are likewise consumed by the independently
+authenticated upstream client. Neither session's negotiation packets enter the
+opposite game stream.
+
+Forwarded login JSON retains custom skin, animation, device/platform, and
+unknown fields while normalizing destination- and version-specific values.
 
 ## Run The Relay Example
 
@@ -358,7 +373,7 @@ Relay tests run through every bundled protocol version in `protocol-roundtrip`. 
 Expected summary:
 
 ```text
-[ROUNDTRIP] checkedVersions=48 failures=0
+[ROUNDTRIP] checkedVersions=50 failures=0
 ```
 
 ## What Is Not Done Yet

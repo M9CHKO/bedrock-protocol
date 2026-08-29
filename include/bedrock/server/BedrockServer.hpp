@@ -204,7 +204,7 @@ using BedrockServerListenResult = ServerListenResult;
 struct BedrockServerOptions {
     std::string host = "0.0.0.0";
     uint16_t port = 19132;
-    std::string version = "1.26.0";
+    std::string version = std::string(CURRENT_VERSION);
     ServerMotd motd;
     int maxPlayers = 3;
     ServerAdvertisementCallback advertisementFn;

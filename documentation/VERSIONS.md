@@ -14,7 +14,7 @@ auto client = bedrock::createClient({
 ```
 
 When `version` is omitted, `createClient` first uses the server advertisement
-and falls back to the JavaScript package's exact `CURRENT_VERSION`, `"1.26.0"`,
+and falls back to the bundled release registry's exact `CURRENT_VERSION`, `"1.26.20"`,
 if that advertised release is unavailable. Pass another exact key from the
 table below to force a version. Explicit values such as `"latest"`, `"auto"`,
 and an empty string are rejected, matching `Options.validateOptions()`.
@@ -147,6 +147,8 @@ its stored verification/profile become visible.
 | `1.21.124` | 1.21.124 | 860 |
 | `1.21.130` | 1.21.130 | 898 |
 | `1.26.0` | 1.26.0 | 924 |
+| `1.26.10` | 1.26.10 | 944 |
+| `1.26.20` | 1.26.20 | 975 |
 
 ## How To Check Locally
 
@@ -165,5 +167,5 @@ Run packet roundtrip checks:
 Expected summary:
 
 ```text
-[ROUNDTRIP] checkedVersions=48 failures=0
+[ROUNDTRIP] checkedVersions=50 failures=0
 ```

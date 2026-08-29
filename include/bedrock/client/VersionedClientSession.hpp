@@ -1,5 +1,6 @@
 #pragma once
 
+#include <bedrock/Options.hpp>
 #include <bedrock/protocol/VersionedMcpeCodec.hpp>
 #include <bedrock/protocol/VersionedPayloadReader.hpp>
 
@@ -15,7 +16,7 @@
 namespace bedrock {
 
 struct VersionedClientSessionOptions {
-    std::string minecraftVersion = "1.26.0";
+    std::string minecraftVersion = std::string(CURRENT_VERSION);
     VersionedMcpeCompression outgoingCompression = VersionedMcpeCompression::DeflateRaw;
 
     bool autoResourcePackResponses = true;

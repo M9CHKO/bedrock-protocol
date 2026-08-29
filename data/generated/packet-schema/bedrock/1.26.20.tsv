@@ -809,7 +809,7 @@ sync_entity_property	nbt	"nbt"
 sync_world_clocks	payload_type	["mapper",{"type":"varint","mappings":{"0":"sync_state","1":"initialize_registry","2":"add_time_marker","3":"remove_time_marker"}}]
 sync_world_clocks		["switch",{"compareTo":"payload_type","fields":{"sync_state":["container",[{"name":"sync_states","type":["array",{"countType":"varint","type":"SyncWorldClockStateData"}]}]],"initialize_registry":["container",[{"name":"clocks","type":["array",{"countType":"varint","type":"WorldClockData"}]}]],"add_time_marker":["container",[{"name":"add_clock_id","type":"varint64"},{"name":"add_time_markers","type":["array",{"countType":"varint","type":"TimeMarkerData"}]}]],"remove_time_marker":["container",[{"name":"remove_clock_id","type":"varint64"},{"name":"remove_time_marker_ids","type":["array",{"countType":"varint","type":"varint64"}]}]]}}]
 take_item_entity	runtime_entity_id	"varint64"
-take_item_entity	target	"varint"
+take_item_entity	target	"varint64"
 text	needs_translation	"bool"
 text	category	["mapper",{"type":"u8","mappings":{"0":"message_only","1":"authored","2":"parameters"}}]
 text	type	["mapper",{"type":"u8","mappings":{"0":"raw","1":"chat","2":"translation","3":"popup","4":"jukebox_popup","5":"tip","6":"system","7":"whisper","8":"announcement","9":"json_whisper","10":"json","11":"json_announcement"}}]

@@ -359,14 +359,14 @@ move_entity_delta	z	["switch",{"compareTo":"flags.has_z","fields":{"true":"lf32"
 move_entity_delta	rot_x	["switch",{"compareTo":"flags.has_rot_x","fields":{"true":"u8"}}]
 move_entity_delta	rot_y	["switch",{"compareTo":"flags.has_rot_y","fields":{"true":"u8"}}]
 move_entity_delta	rot_z	["switch",{"compareTo":"flags.has_rot_z","fields":{"true":"u8"}}]
-move_player	runtime_id	"varint"
+move_player	runtime_id	"varint64"
 move_player	position	"vec3f"
 move_player	pitch	"lf32"
 move_player	yaw	"lf32"
 move_player	head_yaw	"lf32"
 move_player	mode	["mapper",{"type":"u8","mappings":{"0":"normal","1":"reset","2":"teleport","3":"rotation"}}]
 move_player	on_ground	"bool"
-move_player	ridden_runtime_id	"varint"
+move_player	ridden_runtime_id	"varint64"
 move_player	teleport	["switch",{"compareTo":"mode","fields":{"teleport":["container",[{"name":"cause","type":["mapper",{"type":"li32","mappings":{"0":"unknown","1":"projectile","2":"chorus_fruit","3":"command","4":"behavior"}}]},{"name":"source_entity_type","type":"LegacyEntityType"}]]}}]
 move_player	tick	"varint64"
 multiplayer_settings	action_type	["mapper",{"type":"zigzag32","mappings":{"0":"enable_multiplayer","1":"disable_multiplayer","2":"refresh_join_code"}}]
@@ -674,7 +674,7 @@ subchunk_request	origin	"vec3i"
 subchunk_request	requests	["array",{"countType":"lu32","type":["container",[{"name":"dx","type":"i8"},{"name":"dy","type":"i8"},{"name":"dz","type":"i8"}]]}]
 sync_entity_property	nbt	"nbt"
 take_item_entity	runtime_entity_id	"varint64"
-take_item_entity	target	"varint"
+take_item_entity	target	"varint64"
 text	type	["mapper",{"type":"u8","mappings":{"0":"raw","1":"chat","2":"translation","3":"popup","4":"jukebox_popup","5":"tip","6":"system","7":"whisper","8":"announcement","9":"json_whisper","10":"json","11":"json_announcement"}}]
 text	needs_translation	"bool"
 text		["switch",{"compareTo":"type","fields":{"chat":["container",[{"name":"source_name","type":"string"},{"name":"message","type":"string"}]],"whisper":["container",[{"name":"source_name","type":"string"},{"name":"message","type":"string"}]],"announcement":["container",[{"name":"source_name","type":"string"},{"name":"message","type":"string"}]],"raw":["container",[{"name":"message","type":"string"}]],"tip":["container",[{"name":"message","type":"string"}]],"system":["container",[{"name":"message","type":"string"}]],"json_whisper":["container",[{"name":"message","type":"string"}]],"json":["container",[{"name":"message","type":"string"}]],"json_announcement":["container",[{"name":"message","type":"string"}]],"translation":["container",[{"name":"message","type":"string"},{"name":"parameters","type":["array",{"countType":"varint","type":"string"}]}]],"popup":["container",[{"name":"message","type":"string"},{"name":"parameters","type":["array",{"countType":"varint","type":"string"}]}]],"jukebox_popup":["container",[{"name":"message","type":"string"},{"name":"parameters","type":["array",{"countType":"varint","type":"string"}]}]]}}]

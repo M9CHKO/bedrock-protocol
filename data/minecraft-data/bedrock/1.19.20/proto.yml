@@ -546,7 +546,7 @@ packet_take_item_entity:
    !id: 0x11
    !bound: client
    runtime_entity_id: varint64
-   target: varint
+   target: varint64
 
 # MoveActorAbsolute is sent by the server to move an entity to an absolute position. It is typically used
 # for movements where high accuracy isn't needed, such as for long range teleporting.

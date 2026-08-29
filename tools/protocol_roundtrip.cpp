@@ -907,6 +907,8 @@ bool checkClientLifecycleGolden() {
 bool checkVersionContractGolden() {
     bool ok = true;
     const std::vector<std::pair<std::string, uint32_t>> expected {
+        {"1.26.20", 975u},
+        {"1.26.10", 944u},
         {"1.26.0", 924u},
         {"1.21.130", 898u},
         {"1.21.124", 860u},
@@ -957,7 +959,7 @@ bool checkVersionContractGolden() {
         {"1.16.201", 422u}
     };
 
-    if (bedrock::CURRENT_VERSION != "1.26.0" ||
+    if (bedrock::CURRENT_VERSION != "1.26.20" ||
         bedrock::MIN_VERSION != "1.16.201" ||
         bedrock::Versions.size() != expected.size() ||
         bedrock::VERSION_ENTRIES.size() != expected.size()) {
@@ -988,7 +990,7 @@ bool checkVersionContractGolden() {
     }
 
     const std::vector<std::string> rejected {
-        "", "auto", "latest", "0.14", "0.15", "1.26.10", "1.26.20"
+        "", "auto", "latest", "0.14", "0.15"
     };
     for (const auto& version : rejected) {
         if (bedrock::supportsVersion(version) ||
@@ -1246,8 +1248,12 @@ bool checkVersionContractGolden() {
     try {
         bedrock::BedrockNetworkClient client;
         if (client.options().version != std::string(bedrock::CURRENT_VERSION) ||
-            client.protocolVersion() != 924u ||
-            client.options().protocolVersion != 924u) {
+            client.protocolVersion() != bedrock::protocolVersionFor(
+                bedrock::CURRENT_VERSION
+            ) ||
+            client.options().protocolVersion != bedrock::protocolVersionFor(
+                bedrock::CURRENT_VERSION
+            )) {
             std::cerr << "[FAIL] default client version is not CURRENT_VERSION\n";
             ok = false;
         }
