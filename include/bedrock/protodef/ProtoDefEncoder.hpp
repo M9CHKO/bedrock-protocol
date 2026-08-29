@@ -1,5 +1,6 @@
 #pragma once
 
+#include <bedrock/protodef/ProtoDefCompareExpression.hpp>
 #include <bedrock/protodef/ProtoDefNbt.hpp>
 #include <bedrock/protodef/ProtoDefValue.hpp>
 #include <bedrock/protodef/ProtoDefVariables.hpp>
@@ -1237,31 +1238,25 @@ private:
         const ProtoDefValue& object,
         const std::string& expression
     ) {
-        auto orPos = expression.find("||");
-        if (orPos != std::string::npos) {
-            std::size_t start = 0;
-            while (start < expression.size()) {
-                auto next = expression.find("||", start);
-                std::string part = trim(expression.substr(
-                    start,
-                    next == std::string::npos ? std::string::npos : next - start
-                ));
-
-                if (const ProtoDefValue* value = getPath(object, part)) {
-                    if (asBool(*value)) {
-                        return std::string("true");
-                    }
-                }
-
-                if (next == std::string::npos) break;
-                start = next + 2;
+        const bool booleanExpression =
+            detail::hasProtoDefLogicalOr(expression);
+        return detail::evaluateProtoDefCompareExpression(
+            expression,
+            [&](std::string_view atom)
+                -> std::optional<detail::ProtoDefCompareAtom> {
+                const ProtoDefValue* value = getPath(
+                    object,
+                    std::string(atom)
+                );
+                if (!value) return std::nullopt;
+                return detail::ProtoDefCompareAtom {
+                    booleanExpression
+                        ? std::string()
+                        : valueToSwitchKey(*value),
+                    booleanExpression ? asBool(*value) : false
+                };
             }
-            return std::string("false");
-        }
-
-        const ProtoDefValue* value = getPath(object, expression);
-        if (!value) return std::nullopt;
-        return valueToSwitchKey(*value);
+        );
     }
 
     static const ProtoDefValue* getPath(const ProtoDefValue& object, const std::string& path) {

@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -82,6 +83,39 @@ bedrock::ProtoDefValue tickValue(int64_t request, int64_t response) {
 bedrock::ProtoDefValue timeValue(int32_t value) {
     return bedrock::ProtoDefValue::object({
         {"time", bedrock::ProtoDefValue::integer(value)}
+    });
+}
+
+bedrock::ProtoDefValue fullMapValue() {
+    using Value = bedrock::ProtoDefValue;
+    std::vector<Value> pixels(
+        16'384,
+        Value::uinteger(std::numeric_limits<std::uint32_t>::max())
+    );
+    return Value::object({
+        {"map_id", Value::integer(0)},
+        {"update_flags", Value::object({
+            {"_value", Value::uinteger(2)},
+            {"void", Value::boolean(false)},
+            {"texture", Value::boolean(true)},
+            {"decoration", Value::boolean(false)},
+            {"initialisation", Value::boolean(false)}
+        })},
+        {"dimension", Value::uinteger(0)},
+        {"locked", Value::boolean(false)},
+        {"origin", Value::object({
+            {"x", Value::integer(0)},
+            {"y", Value::integer(0)},
+            {"z", Value::integer(0)}
+        })},
+        {"scale", Value::uinteger(0)},
+        {"texture", Value::object({
+            {"width", Value::integer(128)},
+            {"height", Value::integer(128)},
+            {"x_offset", Value::integer(0)},
+            {"y_offset", Value::integer(0)},
+            {"pixels", Value::array(std::move(pixels))}
+        })}
     });
 }
 
@@ -376,6 +410,138 @@ bool checkMixedAuthenticationHandshake() {
     return ok;
 }
 
+bool checkFullMapForwarding() {
+    const std::string version = "1.21.100";
+    const auto mapPacket = encodedPacket(
+        version,
+        "clientbound_map_item_data",
+        fullMapValue()
+    );
+
+    ErrorLog errors;
+    std::mutex connectionMutex;
+    bedrock::BedrockServerConnection upstreamConnection;
+    std::atomic<bool> hasUpstreamConnection {false};
+    bedrock::BedrockServer upstream({
+        .host = "127.0.0.1",
+        .port = 0,
+        .version = version,
+        .motd = {{"motd", "Relay Full Map Upstream"}},
+        .maxPlayers = 2,
+        .offline = true,
+        .batchingInterval = 2
+    });
+    upstream.onConnect([&](const bedrock::BedrockServerConnection& connection) {
+        connection.onError([&](const std::string& message) {
+            errors.add("upstream player", message);
+        });
+        std::lock_guard<std::mutex> lock(connectionMutex);
+        upstreamConnection = connection;
+        hasUpstreamConnection = true;
+    });
+    upstream.listen();
+
+    // Keep the default strict/disconnect policy: this packet must parse and
+    // travel through the normal structured Relay path.
+    bedrock::Relay relay(relayOptions(upstream.boundPort(), true));
+    std::atomic<int> joins {0};
+    std::atomic<int> relayMapCallbacks {0};
+    std::atomic<bool> relayFieldsMismatch {false};
+    relay.onJoin([&](bedrock::RelayPlayer&, bedrock::BedrockNetworkClient&) {
+        ++joins;
+    });
+    relay.onClientbound([&](bedrock::RelayPacketEvent& event) {
+        if (event.name != "clientbound_map_item_data") return;
+        ++relayMapCallbacks;
+        const auto* pixels = event.value("texture.pixels");
+        bool lastPixelMatches = false;
+        if (pixels && pixels->kind == bedrock::ProtoDefValue::Kind::Array &&
+            pixels->arrayValue.size() == 16'384) {
+            const auto& last = pixels->arrayValue.back();
+            lastPixelMatches =
+                (last.kind == bedrock::ProtoDefValue::Kind::UInt &&
+                    last.uintValue ==
+                        std::numeric_limits<std::uint32_t>::max()) ||
+                (last.kind == bedrock::ProtoDefValue::Kind::Int &&
+                    last.intValue ==
+                        std::numeric_limits<std::uint32_t>::max());
+        }
+        if (event.getUInt("scale", 1) != 0 ||
+            event.getInt("texture.width") != 128 ||
+            event.getInt("texture.height") != 128 ||
+            event.getInt("texture.x_offset", 1) != 0 ||
+            event.getInt("texture.y_offset", 1) != 0 ||
+            !pixels || pixels->kind != bedrock::ProtoDefValue::Kind::Array ||
+            pixels->arrayValue.size() != 16'384 ||
+            !lastPixelMatches) {
+            relayFieldsMismatch = true;
+        }
+    });
+    relay.onError([&](const std::string& message) {
+        errors.add("relay", message);
+    });
+    relay.listen();
+
+    auto downstream = bedrock::createNetworkClient(
+        downstreamOptions(relay.live().boundPort())
+    );
+    std::atomic<int> downstreamMaps {0};
+    std::atomic<bool> downstreamBytesMismatch {false};
+    std::atomic<bool> downstreamClosed {false};
+    downstream.onAny([&](const bedrock::BedrockNetworkClientPacketEvent& event) {
+        if (event.packet.name != "clientbound_map_item_data") return;
+        ++downstreamMaps;
+        if (event.packet.fullPacket != mapPacket.fullPacket ||
+            event.packet.payload != mapPacket.payload) {
+            downstreamBytesMismatch = true;
+        }
+    });
+    downstream.onClose([&]() { downstreamClosed = true; });
+    downstream.onError([&](const std::string& message) {
+        errors.add("downstream", message);
+    });
+
+    bool ok = true;
+    ok &= check(
+        mapPacket.payload.size() == 81'937,
+        "full map regression payload is not 81937 bytes"
+    );
+    const bool connected = downstream.connect();
+    const bool ready = connected && waitFor([&]() {
+        return joins.load() == 1 && hasUpstreamConnection &&
+            relay.live().sessionCount() == 1 &&
+            relay.live().upstreamCount() == 1 && upstream.clientCount() == 1;
+    });
+    ok &= check(connected, "full-map downstream failed to connect");
+    ok &= check(ready, "full-map relay did not become ready");
+
+    bedrock::BedrockServerConnection target;
+    {
+        std::lock_guard<std::mutex> lock(connectionMutex);
+        target = upstreamConnection;
+    }
+    if (ready) upstream.sendPacket(target, mapPacket);
+    const bool forwarded = ready && waitFor([&]() {
+        return relayMapCallbacks.load() == 1 && downstreamMaps.load() == 1;
+    }, 12s);
+    ok &= check(forwarded, "full map was not forwarded to downstream");
+    ok &= check(!relayFieldsMismatch.load(), "full map decoded fields mismatch");
+    ok &= check(!downstreamBytesMismatch.load(), "Relay changed full map bytes");
+    ok &= check(!downstreamClosed.load(), "full map closed downstream session");
+    ok &= check(
+        relay.live().sessionCount() == 1 &&
+            relay.live().upstreamCount() == 1 &&
+            relay.live().finalSessionResetCount() == 0,
+        "full map caused a Relay session reset"
+    );
+    ok &= check(errors.empty(), "full-map callback error: " + errors.text());
+
+    downstream.close("full-map regression complete");
+    relay.close("full-map regression complete");
+    upstream.close("full-map regression complete");
+    return ok;
+}
+
 bool checkForwardRawPolicy() {
     const std::string version = "1.21.100";
     const auto codec = bedrock::VersionedMcpeCodec::forVersion(version);
@@ -640,6 +806,7 @@ bool checkDownstreamCloseLifecycle() {
 
 int main() {
     bool ok = checkMixedAuthenticationHandshake();
+    ok = checkFullMapForwarding() && ok;
     ok = checkForwardRawPolicy() && ok;
     ok = checkDownstreamCloseLifecycle() && ok;
     if (ok) std::cout << "[LIVE-RELAY-REGRESSION-SMOKE] OK\n";

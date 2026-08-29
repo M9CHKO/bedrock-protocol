@@ -2,6 +2,7 @@
 
 #include <algorithm>
 
+#include <bedrock/protodef/ProtoDefCompareExpression.hpp>
 #include <bedrock/protodef/ProtoDefContext.hpp>
 #include <bedrock/protodef/ProtoDefField.hpp>
 #include <bedrock/protodef/ProtoDefJson.hpp>
@@ -495,20 +496,32 @@ private:
                 throw std::runtime_error("switch compareTo not found");
             }
 
-            std::string comparePath = resolveComparePath(path, *compareTo);
-            compareValue = context.get(comparePath);
+            const auto resolved = detail::evaluateProtoDefCompareExpression(
+                *compareTo,
+                [&](std::string_view atom)
+                    -> std::optional<detail::ProtoDefCompareAtom> {
+                    const std::string name(atom);
+                    std::optional<std::string> value;
+                    const auto readContext = [&](const std::string& key) {
+                        if (!value.has_value() && context.has(key)) {
+                            value = context.get(key);
+                        }
+                    };
 
-            if (compareValue.empty() && compareTo->find("_enum_type") != std::string::npos) {
-                compareValue = context.get("_enum_type");
-            }
-
-            if (compareValue.empty()) {
-                compareValue = context.get(*compareTo);
-            }
-
-            if (compareValue.empty() && !path.empty()) {
-                compareValue = context.get(path + "." + *compareTo);
-            }
+                    readContext(resolveComparePath(path, name));
+                    if (name.find("_enum_type") != std::string::npos) {
+                        readContext("_enum_type");
+                    }
+                    readContext(name);
+                    if (!path.empty()) readContext(path + "." + name);
+                    if (!value.has_value()) return std::nullopt;
+                    return detail::ProtoDefCompareAtom {
+                        *value,
+                        contextValueTruthy(*value)
+                    };
+                }
+            );
+            compareValue = resolved.value_or(std::string());
         }
 
         auto branch = findSwitchBranchType(switchJson, compareValue);
@@ -1297,6 +1310,11 @@ private:
         }
 
         return currentPath.substr(0, dot + 1) + compareTo;
+    }
+
+    static bool contextValueTruthy(std::string_view value) {
+        return !value.empty() && value != "false" && value != "0" &&
+            value != "null" && value != "undefined" && value != "NaN";
     }
 
     std::optional<std::string> findSwitchBranchType(

@@ -244,6 +244,9 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
     add_executable(world-iterators-smoke tools/world_iterators_smoke.cpp)
     target_link_libraries(world-iterators-smoke PRIVATE BedrockProtocol::bedrock_protocol)
 
+    add_executable(map-item-data-smoke tools/map_item_data_smoke.cpp)
+    target_link_libraries(map-item-data-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
     add_executable(bedrock-block-registry-smoke tools/bedrock_block_registry_smoke.cpp)
     target_link_libraries(bedrock-block-registry-smoke PRIVATE BedrockProtocol::bedrock_protocol)
 
@@ -317,6 +320,7 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
         add_test(NAME legacy-encryption-smoke COMMAND legacy-encryption-smoke)
         add_test(NAME chunk-smoke COMMAND chunk-smoke)
         add_test(NAME world-iterators-smoke COMMAND world-iterators-smoke)
+        add_test(NAME map-item-data-smoke COMMAND map-item-data-smoke)
         add_test(NAME bedrock-block-registry-smoke COMMAND bedrock-block-registry-smoke)
         add_test(NAME bedrock-item-smoke COMMAND bedrock-item-smoke)
         add_test(NAME bedrock-registry-smoke COMMAND bedrock-registry-smoke)
@@ -360,6 +364,7 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
             legacy-encryption-smoke
             chunk-smoke
             world-iterators-smoke
+            map-item-data-smoke
             bedrock-block-registry-smoke
             bedrock-item-smoke
             bedrock-registry-smoke

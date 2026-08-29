@@ -135,6 +135,83 @@ bool checkPrimitiveStructure() {
             std::cerr << "[FAIL] canonical UUID decode\n";
             ok = false;
         }
+
+        const std::string expressionType =
+            R"(["container",[{"name":"a","type":"bool"},{"name":"b","type":"bool"},{"name":"c","type":"bool"},{"name":"selected","type":["switch",{"compareTo":"a || b || c","fields":{"true":"u8","false":"u16"}}]}]])";
+        const auto trueExpression = Value::object({
+            {"a", Value::boolean(false)},
+            {"b", Value::boolean(true)},
+            {"c", Value::boolean(false)},
+            {"selected", Value::uinteger(0x7f)}
+        });
+        const auto falseExpression = Value::object({
+            {"a", Value::boolean(false)},
+            {"b", Value::boolean(false)},
+            {"c", Value::boolean(false)},
+            {"selected", Value::uinteger(0x1234)}
+        });
+        const auto multipleTrueExpression = Value::object({
+            {"a", Value::boolean(true)},
+            {"b", Value::boolean(true)},
+            {"c", Value::boolean(false)},
+            {"selected", Value::uinteger(0x55)}
+        });
+        const auto trueBytes = encodePrimitive(expressionType, trueExpression);
+        const auto falseBytes = encodePrimitive(expressionType, falseExpression);
+        const auto multipleTrueBytes = encodePrimitive(
+            expressionType,
+            multipleTrueExpression
+        );
+        ok = sameBytes(
+            "compareTo boolean expression true branch",
+            trueBytes,
+            {0x00, 0x01, 0x00, 0x7f}
+        ) && ok;
+        ok = sameBytes(
+            "compareTo boolean expression false branch",
+            falseBytes,
+            {0x00, 0x00, 0x00, 0x12, 0x34}
+        ) && ok;
+        ok = sameBytes(
+            "compareTo boolean expression multiple-true branch",
+            multipleTrueBytes,
+            {0x01, 0x01, 0x00, 0x55}
+        ) && ok;
+        const auto trueFields = decodePrimitive(
+            expressionType,
+            trueBytes,
+            &remaining
+        );
+        if (remaining != 0 || !field(trueFields, "value.selected") ||
+            field(trueFields, "value.selected")->value != "127") {
+            std::cerr << "[FAIL] compareTo boolean expression decode\n";
+            ok = false;
+        }
+
+        const std::string scalarSwitchType =
+            R"(["container",[{"name":"selected","type":"bool"},{"name":"value","type":["switch",{"compareTo":"selected","fields":{"true":"u8","false":"u16"}}]}]])";
+        const auto scalarBytes = encodePrimitive(
+            scalarSwitchType,
+            Value::object({
+                {"selected", Value::boolean(false)},
+                {"value", Value::uinteger(0x4567)}
+            })
+        );
+        ok = sameBytes(
+            "ordinary scalar compareTo",
+            scalarBytes,
+            {0x00, 0x45, 0x67}
+        ) && ok;
+        const auto scalarFields = decodePrimitive(
+            scalarSwitchType,
+            scalarBytes,
+            &remaining
+        );
+        if (remaining != 0 || !field(scalarFields, "value.value") ||
+            field(scalarFields, "value.value")->value != "17767") {
+            std::cerr << "[FAIL] ordinary scalar compareTo decode\n";
+            ok = false;
+        }
     } catch (const std::exception& error) {
         std::cerr << "[FAIL] primitive structured decode: " << error.what() << "\n";
         ok = false;
