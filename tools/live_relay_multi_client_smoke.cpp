@@ -572,6 +572,10 @@ bool checkForceSingle() {
             upstreamServer.clientCount() == 1 &&
             connectCalls.load() == 1;
     }, 4s);
+    const bool secondTransportClosed = rejectionSettled && waitFor([&]() {
+        return secondClosed.load() ||
+            second.status() == bedrock::BedrockNetworkClientStatus::Disconnected;
+    }, 4s);
 
     ok &= check(connectedFirst, "forceSingle first downstream connect failed");
     ok &= check(firstReady, "forceSingle first relay session did not become ready");
@@ -579,8 +583,7 @@ bool checkForceSingle() {
     ok &= check(connectCalls.load() == 1, "forceSingle emitted connect for rejected transport");
     ok &= check(maximumConnections.load() == 1,
                 "forceSingle status exposed more than one accepted connection");
-    ok &= check(secondClosed.load() ||
-                    second.status() == bedrock::BedrockNetworkClientStatus::Disconnected,
+    ok &= check(secondTransportClosed,
                 "forceSingle second transport was not closed");
 
     if (rejectionSettled) {

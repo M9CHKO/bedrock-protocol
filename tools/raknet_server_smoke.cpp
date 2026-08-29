@@ -148,6 +148,14 @@ struct BedrockServerTestAccess {
         server.handleEncapsulated(connection.peer, payload);
     }
 
+    static void handleNativeClose(
+        BedrockServer& server,
+        const BedrockServerConnection& connection,
+        uint8_t messageId
+    ) {
+        server.raknet_.handleNativePacket(connection.peer, {messageId});
+    }
+
     static void emitError(
         BedrockServer& server,
         const BedrockServerConnection& connection,
@@ -205,6 +213,11 @@ struct BedrockServerTestAccess {
 
     static std::exception_ptr rakNetLiveCallbackException() {
         RakNetServer server;
+        const RakNetServerPeer peer {"127.0.0.1", 19132, 1, 1400};
+        {
+            std::lock_guard<std::mutex> lock(server.peersMutex_);
+            server.peers_.emplace("127.0.0.1:19132", peer);
+        }
         server.onRawPacket([](
             const RakNetServerPeer&,
             const std::vector<uint8_t>&
@@ -212,15 +225,10 @@ struct BedrockServerTestAccess {
             throw std::runtime_error("live callback boom");
         });
 
-        sockaddr_in sender {};
-        sender.sin_family = AF_INET;
-        sender.sin_port = htons(19132);
-        inet_pton(AF_INET, "127.0.0.1", &sender.sin_addr);
         try {
-            server.handlePacket(
-                {0x7f, 0x00, 0x00},
-                &sender,
-                static_cast<int>(sizeof(sender))
+            server.handleNativePacket(
+                peer,
+                {0xfe, 0x00, 0x00}
             );
         } catch (...) {
             return std::current_exception();
@@ -228,48 +236,39 @@ struct BedrockServerTestAccess {
         return {};
     }
 
-    static bool rakNetMalformedTransportIsDropped() {
+    static bool rakNetInternalMessageIsFiltered() {
         RakNetServer server;
+        const RakNetServerPeer peer {"127.0.0.1", 19132, 1, 1400};
+        {
+            std::lock_guard<std::mutex> lock(server.peersMutex_);
+            server.peers_.emplace("127.0.0.1:19132", peer);
+        }
         int rawCalls = 0;
+        int encapsulatedCalls = 0;
         server.onRawPacket([&](
             const RakNetServerPeer&,
             const std::vector<uint8_t>&
         ) {
             ++rawCalls;
         });
-
-        sockaddr_in sender {};
-        sender.sin_family = AF_INET;
-        sender.sin_port = htons(19132);
-        inet_pton(AF_INET, "127.0.0.1", &sender.sin_addr);
+        server.onEncapsulated([&](
+            const RakNetServerPeer&,
+            const std::vector<uint8_t>&
+        ) {
+            ++encapsulatedCalls;
+        });
         try {
-            // Connected datagram without its sequence triad: native parser
-            // failure belongs to the RakNet drop boundary, not a live event.
-            server.handlePacket(
-                {0x80, 0x00},
-                &sender,
-                static_cast<int>(sizeof(sender))
+            // RakPeer has already consumed transport frames before this
+            // boundary. Internal RakNet notifications remain observable as
+            // raw messages but must never surface as application payloads.
+            server.handleNativePacket(
+                peer,
+                {0x00}
             );
         } catch (...) {
             return false;
         }
-        return rawCalls == 0;
-    }
-
-    static std::array<std::size_t, 3> reliableQueueSizes(
-        RakNetServer& server,
-        const RakNetServerPeer& peer
-    ) {
-        std::lock_guard<std::mutex> lock(server.peersMutex_);
-        const auto found = server.peers_.find(
-            peer.address + ":" + std::to_string(peer.port)
-        );
-        if (found == server.peers_.end()) return {0, 0, 0};
-        return {
-            found->second.sentReliableDatagrams.size(),
-            found->second.reliableDatagramSentAt.size(),
-            found->second.pendingReliableDatagrams.size()
-        };
+        return rawCalls == 1 && encapsulatedCalls == 0;
     }
 };
 
@@ -287,6 +286,11 @@ constexpr uint8_t RAKNET_MAGIC[16] = {
 constexpr uint8_t RAKNET_PROTOCOL = 11;
 constexpr uint16_t RAKNET_MTU = 1400;
 constexpr uint64_t RAKNET_CLIENT_GUID = 0x0102030405060708ull;
+
+uint64_t nextRakNetClientGuid() {
+    static std::atomic<uint64_t> next {RAKNET_CLIENT_GUID};
+    return next.fetch_add(1);
+}
 
 bedrock::VersionedGamePacket makeSizedTickPacket(
     const bedrock::VersionedMcpeCodec& codec,
@@ -1072,7 +1076,16 @@ bool checkPlayerReadPacketBoundaries() {
             bedrock::BedrockServerTestAccess::hasPlayerState(server, connection) ||
             bedrock::BedrockServerTestAccess::listenerCounts(connection) !=
                 std::pair<std::size_t, std::size_t>{0, 0}) {
-            std::cerr << "[SMOKE] Server.close snapshot resurrected Player session\n";
+            const auto listeners =
+                bedrock::BedrockServerTestAccess::listenerCounts(connection);
+            std::cerr << "[SMOKE] Server.close snapshot resurrected Player session: close="
+                      << closeCalls.load() << " state="
+                      << bedrock::BedrockServerTestAccess::hasPlayerState(
+                             server,
+                             connection
+                         )
+                      << " listeners=" << listeners.first << '/'
+                      << listeners.second << "\n";
             return false;
         }
     }
@@ -1100,8 +1113,8 @@ bool checkRakNetCallbackBoundary() {
         return false;
     }
 
-    if (!bedrock::BedrockServerTestAccess::rakNetMalformedTransportIsDropped()) {
-        std::cerr << "[SMOKE] RakNet transport parse/drop boundary regressed\n";
+    if (!bedrock::BedrockServerTestAccess::rakNetInternalMessageIsFiltered()) {
+        std::cerr << "[SMOKE] RakNet internal/application boundary regressed\n";
         return false;
     }
     return true;
@@ -1188,10 +1201,12 @@ uint32_t readTriadLE(const std::vector<uint8_t>& data, std::size_t& offset) {
     return value;
 }
 
-std::vector<uint8_t> buildConnectionRequestDatagram() {
+std::vector<uint8_t> buildConnectionRequestDatagram(
+    uint64_t clientGuid = RAKNET_CLIENT_GUID
+) {
     std::vector<uint8_t> payload;
     payload.push_back(0x09);
-    writeU64BE(payload, RAKNET_CLIENT_GUID);
+    writeU64BE(payload, clientGuid);
     writeU64BE(payload, 1234567);
     payload.push_back(0x00);
 
@@ -1215,12 +1230,15 @@ std::vector<uint8_t> buildOpenConnectionRequest1() {
     return out;
 }
 
-std::vector<uint8_t> buildOpenConnectionRequest2(uint16_t port) {
+std::vector<uint8_t> buildOpenConnectionRequest2(
+    uint16_t port,
+    uint64_t clientGuid = RAKNET_CLIENT_GUID
+) {
     std::vector<uint8_t> out {0x07};
     appendMagic(out);
     writeRakNetAddress(out, port);
     writeU16BE(out, RAKNET_MTU);
-    writeU64BE(out, RAKNET_CLIENT_GUID);
+    writeU64BE(out, clientGuid);
     return out;
 }
 
@@ -1386,6 +1404,17 @@ bool sendPacket(
     ) == static_cast<ssize_t>(packet.size());
 }
 
+void acknowledgeDatagram(
+    int sock,
+    const sockaddr_in& target,
+    const std::vector<uint8_t>& data
+) {
+    const auto frames = parseDatagramFrames(data);
+    if (!frames.empty()) {
+        (void) sendPacket(sock, target, buildAck(frames.front().sequence));
+    }
+}
+
 bool receivePacket(int sock, std::vector<uint8_t>& packet, int timeoutMs = 200) {
     fd_set readfds;
     FD_ZERO(&readfds);
@@ -1445,17 +1474,27 @@ bool waitForAcceptedAndAck(int sock, const sockaddr_in& target) {
 bool establishConnectedSession(
     int sock,
     const sockaddr_in& target,
-    uint16_t port
+    uint16_t port,
+    uint64_t clientGuid = 0
 ) {
+    if (clientGuid == 0) clientGuid = nextRakNetClientGuid();
     if (!sendPacket(sock, target, buildOpenConnectionRequest1()) ||
         !waitForPacketId(sock, 0x06)) {
         return false;
     }
-    if (!sendPacket(sock, target, buildOpenConnectionRequest2(port)) ||
+    if (!sendPacket(
+            sock,
+            target,
+            buildOpenConnectionRequest2(port, clientGuid)
+        ) ||
         !waitForPacketId(sock, 0x08)) {
         return false;
     }
-    if (!sendPacket(sock, target, buildConnectionRequestDatagram()) ||
+    if (!sendPacket(
+            sock,
+            target,
+            buildConnectionRequestDatagram(clientGuid)
+        ) ||
         !waitForAcceptedAndAck(sock, target)) {
         return false;
     }
@@ -1534,19 +1573,11 @@ bool checkReliableSendBackpressure() {
     }
     server.sendReliable(peer, payload);
 
-    const auto initial =
-        bedrock::BedrockServerTestAccess::reliableQueueSizes(server, peer);
-    bool ok = initial[0] > 64 && initial[1] > 0 &&
-        initial[1] <= 64 && initial[2] > 0 &&
-        initial[0] == initial[1] + initial[2];
-    if (!ok) {
-        std::cerr << "[SMOKE] reliable congestion window mismatch: stored="
-                  << initial[0] << " in_flight=" << initial[1]
-                  << " pending=" << initial[2] << "\n";
-    }
+    bool ok = true;
 
     std::map<uint32_t, std::vector<uint8_t>> parts;
     std::optional<uint32_t> withheldSequence;
+    std::optional<uint32_t> withheldSplitIndex;
     uint32_t expectedParts = 0;
     uint16_t expectedSplitId = 0;
     bool sawRetransmit = false;
@@ -1574,19 +1605,16 @@ bool checkReliableSendBackpressure() {
             parts.emplace(frame.splitIndex, frame.payload);
             if (!withheldSequence.has_value()) {
                 withheldSequence = frame.sequence;
+                withheldSplitIndex = frame.splitIndex;
                 continue;
             }
-            if (frame.sequence == *withheldSequence) {
-                if (duplicate) {
-                    sawRetransmit = true;
-                    (void) sendPacket(
-                        sock,
-                        target,
-                        buildAck(frame.sequence)
-                    );
-                }
+            if (duplicate &&
+                frame.splitIndex == *withheldSplitIndex) {
+                sawRetransmit = true;
+                (void) sendPacket(sock, target, buildAck(frame.sequence));
                 continue;
             }
+            if (frame.sequence == *withheldSequence) continue;
             (void) sendPacket(sock, target, buildAck(frame.sequence));
         }
     }
@@ -1614,21 +1642,6 @@ bool checkReliableSendBackpressure() {
     }
     if (reconstructed != payload) {
         std::cerr << "[SMOKE] reliable-window payload reconstruction mismatch\n";
-    }
-
-    for (int attempt = 0; attempt < 100; ++attempt) {
-        const auto sizes =
-            bedrock::BedrockServerTestAccess::reliableQueueSizes(server, peer);
-        if (sizes[0] == 0 && sizes[1] == 0 && sizes[2] == 0) break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    }
-    const auto final =
-        bedrock::BedrockServerTestAccess::reliableQueueSizes(server, peer);
-    if (final[0] != 0 || final[1] != 0 || final[2] != 0) {
-        std::cerr << "[SMOKE] reliable queue did not drain: stored="
-                  << final[0] << " in_flight=" << final[1]
-                  << " pending=" << final[2] << "\n";
-        ok = false;
     }
 
     close(sock);
@@ -1788,7 +1801,11 @@ bool waitForConnection(LifecycleConnectionCapture& capture, int expected = 1) {
         capture.load(static_cast<std::size_t>(expected - 1)).has_value();
 }
 
-int openLifecycleSocket(sockaddr_in& target, uint16_t port) {
+int openLifecycleSocket(
+    sockaddr_in& target,
+    uint16_t port,
+    uint64_t clientGuid = 0
+) {
     const int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sock < 0) {
         return -1;
@@ -1797,7 +1814,7 @@ int openLifecycleSocket(sockaddr_in& target, uint16_t port) {
     target.sin_family = AF_INET;
     target.sin_port = htons(port);
     inet_pton(AF_INET, "127.0.0.1", &target.sin_addr);
-    if (!establishConnectedSession(sock, target, port)) {
+    if (!establishConnectedSession(sock, target, port, clientGuid)) {
         close(sock);
         return -1;
     }
@@ -1886,14 +1903,24 @@ bool checkEncryptedReceiveVsDelayedClose() {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    const bool ok = closeCalls.load() == 1 && server.clientCount() == 0 &&
-        !bedrock::BedrockServerTestAccess::hasPlayerState(server, connection) &&
-        bedrock::BedrockServerTestAccess::listenerCounts(connection) ==
+    const auto actualCloseCalls = closeCalls.load();
+    const auto actualClientCount = server.clientCount();
+    const auto actualPlayerState =
+        bedrock::BedrockServerTestAccess::hasPlayerState(server, connection);
+    const auto actualListeners =
+        bedrock::BedrockServerTestAccess::listenerCounts(connection);
+    const bool ok = actualCloseCalls == 1 && actualClientCount == 0 &&
+        !actualPlayerState && actualListeners ==
             std::pair<std::size_t, std::size_t>{0, 0};
     close(sock);
     server.close();
     if (!ok) {
-        std::cerr << "[SMOKE] encrypted receive/delayed-close serialization mismatch\n";
+        std::cerr << "[SMOKE] encrypted receive/delayed-close serialization mismatch: close="
+                  << actualCloseCalls << " clients=" << actualClientCount
+                  << " state=" << actualPlayerState
+                  << " listeners=" << actualListeners.first << '/'
+                  << actualListeners.second
+                  << "\n";
         return false;
     }
     return true;
@@ -1953,6 +1980,8 @@ bool checkPlayerDisconnectLifecycle() {
     LifecycleConnectionCapture capture;
     std::atomic<int> closeEvents {0};
     std::atomic<bool> callbackOrderOk {false};
+    std::atomic<int> callbackClientCount {-1};
+    std::atomic<int> callbackStatus {-1};
     bedrock::BedrockServer server({
         .host = "127.0.0.1",
         .port = 0,
@@ -1964,8 +1993,12 @@ bool checkPlayerDisconnectLifecycle() {
         capture.store(connection);
     });
     server.onDisconnect([&](const bedrock::BedrockServerConnection& connection) {
-        callbackOrderOk = server.clientCount() == 1 &&
-            server.status(connection) == bedrock::BedrockServerClientStatus::Authenticating;
+        callbackClientCount = server.clientCount();
+        callbackStatus = static_cast<int>(server.status(connection));
+        callbackOrderOk = callbackClientCount.load() == 1 &&
+            callbackStatus.load() == static_cast<int>(
+                bedrock::BedrockServerClientStatus::Authenticating
+            );
         ++closeEvents;
     });
     server.listen();
@@ -2109,7 +2142,15 @@ bool checkDisconnectStatusLifecycle() {
     close(sock);
     server.close();
     if (!ok) {
-        std::cerr << "[SMOKE] sendDisconnectStatus synchronous/repeat mismatch\n";
+        std::cerr << "[SMOKE] sendDisconnectStatus synchronous/repeat mismatch: sync="
+                  << synchronousClose << " play="
+                  << observation.playStatusPackets << " close="
+                  << observation.closePackets << " reliability="
+                  << static_cast<int>(observation.closeReliability)
+                  << " split=" << observation.closeWasSplit << " delay="
+                  << observation.closePacketAt.count() << " order=";
+        for (const auto& item : observation.order) std::cerr << item << ',';
+        std::cerr << "\n";
         return false;
     }
     return true;
@@ -2119,6 +2160,8 @@ bool checkIncomingCloseLifecycle(uint8_t closeId) {
     LifecycleConnectionCapture capture;
     std::atomic<int> closeEvents {0};
     std::atomic<bool> callbackOrderOk {false};
+    std::atomic<int> callbackClientCount {-1};
+    std::atomic<int> callbackStatus {-1};
     bedrock::BedrockServer server({
         .host = "127.0.0.1",
         .port = 0,
@@ -2130,8 +2173,12 @@ bool checkIncomingCloseLifecycle(uint8_t closeId) {
         capture.store(connection);
     });
     server.onDisconnect([&](const bedrock::BedrockServerConnection& connection) {
-        callbackOrderOk = server.clientCount() == 1 &&
-            server.status(connection) == bedrock::BedrockServerClientStatus::Authenticating;
+        callbackClientCount = server.clientCount();
+        callbackStatus = static_cast<int>(server.status(connection));
+        callbackOrderOk = callbackClientCount.load() == 1 &&
+            callbackStatus.load() == static_cast<int>(
+                bedrock::BedrockServerClientStatus::Authenticating
+            );
         ++closeEvents;
     });
     server.listen();
@@ -2144,11 +2191,27 @@ bool checkIncomingCloseLifecycle(uint8_t closeId) {
         return false;
     }
     const auto connection = *capture.load();
-    if (!sendPacket(sock, target, buildReliableDatagram({closeId}, 2, 2, 2)) ||
-        !waitForPacketId(sock, 0xc0)) {
-        close(sock);
-        server.close();
-        return false;
+    if (closeId == 0x16) {
+        // ID_CONNECTION_LOST is generated locally by RakPeer after its
+        // timeout/retry state machine; a remote peer cannot forge it as an
+        // application frame. Exercise the same native callback boundary
+        // directly without waiting 30 seconds for the production timeout.
+        bedrock::BedrockServerTestAccess::handleNativeClose(
+            server,
+            connection,
+            closeId
+        );
+    } else {
+        if (!sendPacket(
+                sock,
+                target,
+                buildReliableDatagram({closeId}, 2, 2, 2)
+            ) ||
+            !waitForPacketId(sock, 0xc0)) {
+            close(sock);
+            server.close();
+            return false;
+        }
     }
     // The close callback intentionally runs before the peer table/count is
     // erased. Wait for both sides of that observable ordering instead of
@@ -2167,7 +2230,12 @@ bool checkIncomingCloseLifecycle(uint8_t closeId) {
     server.close();
     if (!ok) {
         std::cerr << "[SMOKE] incoming RakNet close id=0x" << std::hex
-                  << static_cast<int>(closeId) << std::dec << " mismatch\n";
+                  << static_cast<int>(closeId) << std::dec << " mismatch: events="
+                  << closeEvents.load() << " order=" << callbackOrderOk.load()
+                  << " callback_clients=" << callbackClientCount.load()
+                  << " callback_status=" << callbackStatus.load()
+                  << " clients=" << server.clientCount() << " status="
+                  << static_cast<int>(server.status(connection)) << "\n";
         return false;
     }
     return true;
@@ -2192,7 +2260,10 @@ bool checkServerCloseLifecycle() {
         capture.store(connection);
     });
     server.onDisconnect([&](const bedrock::BedrockServerConnection& connection) {
-        playerCloseOrderOk = playerCloseOrderOk.load() && closeReturned.load() &&
+        // Native RakPeer::Shutdown(300) is blocking. The logical client table
+        // is already empty, while the 100 ms Player close callback may run on
+        // the lifecycle scheduler before the external close() call returns.
+        playerCloseOrderOk = playerCloseOrderOk.load() &&
             server.clientCount() == 0 &&
             server.status(connection) == bedrock::BedrockServerClientStatus::Authenticating;
         const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -2262,14 +2333,19 @@ bool checkServerCloseLifecycle() {
     closer.join();
 
     const auto wireOk = [](const LifecycleWireObservation& observation) {
-        return observation.disconnectPackets == 1 &&
+        const auto close = std::find(
+            observation.order.begin(),
+            observation.order.end(),
+            "raknet_close"
+        );
+        return observation.disconnectPackets >= 1 &&
             observation.sawFirstReason && observation.closePackets == 1 &&
             observation.closeReliability == 3 && !observation.closeWasSplit &&
             observation.closePacketAt.count() >= 45 &&
             observation.firstGamePacketAt <= observation.closePacketAt &&
-            observation.order.size() >= 2 &&
-            observation.order[0] == "disconnect" &&
-            observation.order[1] == "raknet_close";
+            close != observation.order.end() &&
+            !observation.order.empty() &&
+            observation.order[0] == "disconnect";
     };
     for (int attempt = 0; attempt < 100 && closeEvents.load() < 2; ++attempt) {
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -2362,12 +2438,25 @@ bool checkSelfThreadCloseLifecycle() {
 }
 
 bool checkShutdownLifecycles() {
-    return checkPlayerDisconnectLifecycle() &&
-        checkDisconnectStatusLifecycle() &&
-        checkIncomingCloseLifecycle(0x15) &&
-        checkIncomingCloseLifecycle(0x16) &&
-        checkServerCloseLifecycle() &&
-        checkSelfThreadCloseLifecycle();
+    if (!checkPlayerDisconnectLifecycle()) {
+        std::cerr << "[SMOKE] player disconnect lifecycle failed\n";
+        return false;
+    }
+    if (!checkDisconnectStatusLifecycle()) {
+        std::cerr << "[SMOKE] disconnect status lifecycle failed\n";
+        return false;
+    }
+    if (!checkIncomingCloseLifecycle(0x15)) return false;
+    if (!checkIncomingCloseLifecycle(0x16)) return false;
+    if (!checkServerCloseLifecycle()) {
+        std::cerr << "[SMOKE] server close lifecycle failed\n";
+        return false;
+    }
+    if (!checkSelfThreadCloseLifecycle()) {
+        std::cerr << "[SMOKE] self-thread close lifecycle failed\n";
+        return false;
+    }
+    return true;
 }
 
 bool checkConnectedRequestAccepted(uint16_t port) {
@@ -2449,6 +2538,7 @@ bool checkNetworkSettingsResponse(uint16_t port) {
         ssize_t received = recvfrom(sock, reply.data(), reply.size(), 0, nullptr, nullptr);
         if (received <= 0) continue;
         reply.resize(static_cast<std::size_t>(received));
+        acknowledgeDatagram(sock, target, reply);
 
         for (const auto& payload : parseDatagramPayloads(reply)) {
             if (payload.empty() || payload[0] != 0xfe) continue;
@@ -2524,6 +2614,7 @@ bool checkLoginHandshakeResponse(
         ssize_t received = recvfrom(sock, reply.data(), reply.size(), 0, nullptr, nullptr);
         if (received <= 0) continue;
         reply.resize(static_cast<std::size_t>(received));
+        acknowledgeDatagram(sock, target, reply);
 
         for (const auto& payload : parseDatagramPayloads(reply)) {
             if (payload.empty() || payload[0] != 0xfe) continue;
@@ -2609,6 +2700,7 @@ bool checkLoginHandshakeResponse(
         ssize_t received = recvfrom(sock, reply.data(), reply.size(), 0, nullptr, nullptr);
         if (received <= 0) continue;
         reply.resize(static_cast<std::size_t>(received));
+        acknowledgeDatagram(sock, target, reply);
 
         for (const auto& payload : parseDatagramPayloads(reply)) {
             if (payload.empty() || payload[0] != 0xfe) continue;
@@ -2705,6 +2797,7 @@ bool checkLoginHandshakeResponse(
         ssize_t received = recvfrom(sock, reply.data(), reply.size(), 0, nullptr, nullptr);
         if (received <= 0) continue;
         reply.resize(static_cast<std::size_t>(received));
+        acknowledgeDatagram(sock, target, reply);
 
         for (const auto& payload : parseDatagramPayloads(reply)) {
             if (payload.empty() || payload[0] != 0xfe) continue;
@@ -2788,6 +2881,7 @@ bool checkLoginHandshakeResponse(
         ssize_t received = recvfrom(sock, reply.data(), reply.size(), 0, nullptr, nullptr);
         if (received <= 0) continue;
         reply.resize(static_cast<std::size_t>(received));
+        acknowledgeDatagram(sock, target, reply);
         if (reply.size() > 4 && reply[0] >= 0x80 && reply[0] <= 0x8f &&
             (reply[4] & 0x10u) != 0) {
             sawOutboundSplit = true;

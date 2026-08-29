@@ -251,7 +251,11 @@ struct BedrockNetworkClientTestAccess {
 
 struct RakNetClientTestAccess {
     static void dispatch(RakNetClient& client, const std::vector<uint8_t>& packet) {
-        client.handlePacket(packet);
+        client.handleNativePacket(packet);
+    }
+
+    static void markConnected(RakNetClient& client) {
+        client.connected_.store(true);
     }
 
     static void setBeforeRunningCommitHook(
@@ -312,24 +316,6 @@ std::vector<uint8_t> makePong(
     writeU64BE(out, 0x0102030405060708ULL);
     out.insert(out.end(), std::begin(kMagic), std::end(kMagic));
     const auto payload = prefixedAdvertisement(advertisement(version, portV4));
-    out.insert(out.end(), payload.begin(), payload.end());
-    return out;
-}
-
-std::vector<uint8_t> connectedDatagram(
-    uint32_t sequence,
-    std::vector<uint8_t> payload
-) {
-    const auto bitLength = static_cast<uint16_t>(payload.size() * 8u);
-    std::vector<uint8_t> out {
-        0x80,
-        static_cast<uint8_t>(sequence & 0xffu),
-        static_cast<uint8_t>((sequence >> 8u) & 0xffu),
-        static_cast<uint8_t>((sequence >> 16u) & 0xffu),
-        0x00,
-        static_cast<uint8_t>((bitLength >> 8u) & 0xffu),
-        static_cast<uint8_t>(bitLength & 0xffu)
-    };
     out.insert(out.end(), payload.begin(), payload.end());
     return out;
 }
@@ -3490,11 +3476,12 @@ bool checkEventLifetimeAndRakNetBoundaries() {
     throwingRakNet.onEncapsulated([](const std::vector<uint8_t>&) {
         throw std::runtime_error("live listener boom");
     });
+    bedrock::RakNetClientTestAccess::markConnected(throwingRakNet);
     bool liveThrowEscaped = false;
     try {
         bedrock::RakNetClientTestAccess::dispatch(
             throwingRakNet,
-            connectedDatagram(1, {0xfe})
+            {0xfe}
         );
     } catch (const std::exception& e) {
         liveThrowEscaped = std::string(e.what()) == "live listener boom";
@@ -3507,8 +3494,8 @@ bool checkEventLifetimeAndRakNetBoundaries() {
     } catch (...) {
         malformedEscaped = true;
     }
-    ok &= check(!malformedEscaped && !throwingRakNet.error().empty(),
-                "native RakNet parse error crossed the callback boundary");
+    ok &= check(!malformedEscaped && throwingRakNet.error().empty(),
+                "internal RakNet message crossed the callback boundary");
 
     bedrock::RakNetClient disconnectRakNet;
     std::vector<std::string> closeReasons;
@@ -3519,20 +3506,18 @@ bool checkEventLifetimeAndRakNetBoundaries() {
     disconnectRakNet.onEncapsulated(
         [&](const std::vector<uint8_t>&) { ++leakedPayloads; }
     );
+    bedrock::RakNetClientTestAccess::markConnected(disconnectRakNet);
     const std::vector<uint8_t> disconnectIds {21, 22, 23, 25};
-    for (std::size_t i = 0; i < disconnectIds.size(); ++i) {
+    for (const auto id : disconnectIds) {
         bedrock::RakNetClientTestAccess::dispatch(
             disconnectRakNet,
-            connectedDatagram(
-                static_cast<uint32_t>(10 + i),
-                {disconnectIds[i]}
-            )
+            {id}
         );
     }
     ok &= check(
-        closeReasons == std::vector<std::string>({"21", "22", "23", "25"}) &&
+        closeReasons == std::vector<std::string>({"21"}) &&
             leakedPayloads.load() == 0,
-        "RakNet disconnect MessageIDs leaked into the MCPE callback"
+        "RakNet disconnect MessageIDs leaked or closed more than once"
     );
     return ok;
 }

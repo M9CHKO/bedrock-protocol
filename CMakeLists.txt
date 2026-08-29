@@ -15,8 +15,40 @@ option(BEDROCK_PROTOCOL_CPP_INSTALL "Enable install rules" ON)
 
 find_package(ZLIB REQUIRED)
 find_package(OpenSSL REQUIRED)
+find_package(Threads REQUIRED)
+
+# bedrock-protocol's JavaScript implementation delegates RakNet reliability,
+# ordering, fragmentation, retransmission and congestion control to
+# raknet-native. Build the same RakNet ReliabilityLayer into the C++ library
+# instead of maintaining a second wire implementation here.
+file(GLOB BEDROCK_RAKNET_SOURCES CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/raknet/Source/*.cpp"
+)
+add_library(bedrock_raknet_objects OBJECT ${BEDROCK_RAKNET_SOURCES})
+set_target_properties(bedrock_raknet_objects PROPERTIES
+    CXX_STANDARD 14
+    CXX_STANDARD_REQUIRED ON
+    # The upstream RakNet snapshot predates strict ISO feature-test defaults
+    # and expects POSIX declarations such as gethostname() to be visible.
+    CXX_EXTENSIONS ON
+    POSITION_INDEPENDENT_CODE ON
+)
+target_include_directories(bedrock_raknet_objects PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/raknet/Source
+)
+target_compile_definitions(bedrock_raknet_objects PRIVATE
+    _RAKNET_LIB
+    MAXIMUM_NUMBER_OF_INTERNAL_IDS=20
+)
+if(WIN32)
+    # DR_SHA1's legacy compiler check recognizes MSVC but not MinGW. Use the
+    # platform TCHAR header instead of defining a macro that collides with
+    # Windows SDK typedefs.
+    target_compile_definitions(bedrock_raknet_objects PRIVATE SHA1_HAS_TCHAR)
+endif()
 
 add_library(bedrock_protocol
+    $<TARGET_OBJECTS:bedrock_raknet_objects>
     src/BinaryStream.cpp
     src/RakNetPing.cpp
     src/RakNetConnect.cpp
@@ -101,8 +133,23 @@ target_include_directories(bedrock_protocol
         $<INSTALL_INTERFACE:include>
 )
 
-target_link_libraries(bedrock_protocol PUBLIC ZLIB::ZLIB OpenSSL::Crypto)
-target_compile_definitions(bedrock_protocol PUBLIC _DEFAULT_SOURCE)
+target_include_directories(bedrock_protocol PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/raknet/Source
+)
+
+target_link_libraries(bedrock_protocol
+    PUBLIC
+        ZLIB::ZLIB
+        OpenSSL::Crypto
+        Threads::Threads
+)
+if(WIN32)
+    target_link_libraries(bedrock_protocol PUBLIC ws2_32)
+endif()
+target_compile_definitions(bedrock_protocol
+    PUBLIC _DEFAULT_SOURCE
+    PRIVATE MAXIMUM_NUMBER_OF_INTERNAL_IDS=20
+)
 
 find_package(Python3 QUIET COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
@@ -216,6 +263,15 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
 
     add_executable(raknet-client-smoke tools/raknet_client_smoke.cpp)
     target_link_libraries(raknet-client-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
+    add_executable(
+        raknet-ordered-encryption-flood-smoke
+        tools/raknet_ordered_encryption_flood_smoke.cpp
+    )
+    target_link_libraries(
+        raknet-ordered-encryption-flood-smoke
+        PRIVATE BedrockProtocol::bedrock_protocol
+    )
 
     add_executable(network-client-smoke tools/network_client_smoke.cpp)
     target_link_libraries(network-client-smoke PRIVATE BedrockProtocol::bedrock_protocol)
@@ -336,6 +392,10 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
         add_test(NAME server-login-verifier-smoke COMMAND server-login-verifier-smoke)
         add_test(NAME server-protocol-version-smoke COMMAND server-protocol-version-smoke)
         add_test(NAME raknet-client-smoke COMMAND raknet-client-smoke)
+        add_test(
+            NAME raknet-ordered-encryption-flood-smoke
+            COMMAND raknet-ordered-encryption-flood-smoke
+        )
         add_test(NAME network-client-smoke COMMAND network-client-smoke)
         add_test(NAME live-relay-smoke COMMAND live-relay-smoke)
         add_test(NAME live-relay-multi-client-smoke COMMAND live-relay-multi-client-smoke)
@@ -380,6 +440,7 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
             server-login-verifier-smoke
             server-protocol-version-smoke
             raknet-client-smoke
+            raknet-ordered-encryption-flood-smoke
             network-client-smoke
             live-relay-smoke
             live-relay-multi-client-smoke

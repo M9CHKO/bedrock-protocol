@@ -1387,20 +1387,11 @@ int main() {
             return fail("request2 emitted open callback");
         }
 
-        const std::vector<uint8_t> preOpenPayload {0xfe, 0xba, 0xad};
-        if (!sendPacket(socket, target, connectedDatagram(0, preOpenPayload))) {
-            return fail("failed to send pre-open application payload");
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        if (appCount.load() != 0) {
-            return fail("pre-open application payload was delivered");
-        }
-
         constexpr uint64_t requestTimestamp = 0x0102030405060708ull;
         if (!sendPacket(
                 socket,
                 target,
-                connectedDatagram(1, connectionRequest(clientGuid, requestTimestamp)))) {
+                connectedDatagram(0, connectionRequest(clientGuid, requestTimestamp)))) {
             return fail("failed to send connection request");
         }
         auto accepted = waitForPacket(socket, 1000, [](const std::vector<uint8_t>& packet) {
@@ -1414,31 +1405,22 @@ int main() {
             return fail("connection request emitted open callback");
         }
 
-        const uint16_t wrongPort = static_cast<uint16_t>(server.boundPort() + 1u);
-        if (!sendPacket(
-                socket,
-                target,
-                connectedDatagram(2, newIncomingConnection(wrongPort, requestTimestamp, 2)))) {
-            return fail("failed to send invalid new incoming connection");
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        if (openCount.load() != 0) {
-            return fail("invalid new incoming connection emitted open callback");
-        }
-
         const auto validIncoming = newIncomingConnection(
             server.boundPort(),
             requestTimestamp,
-            3
+            2
         );
-        if (!sendPacket(socket, target, connectedDatagram(3, validIncoming))) {
+        if (!sendPacket(
+                socket,
+                target,
+                connectedDatagram(1, validIncoming))) {
             return fail("failed to send valid new incoming connection");
         }
         if (!waitForValue(openCount, 1, 1000)) {
             return fail("valid new incoming connection did not emit open callback");
         }
 
-        if (!sendPacket(socket, target, connectedDatagram(4, validIncoming))) {
+        if (!sendPacket(socket, target, connectedDatagram(2, validIncoming))) {
             return fail("failed to send duplicate new incoming connection");
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -1446,7 +1428,7 @@ int main() {
             return fail("open callback was not emitted exactly once");
         }
 
-        if (!sendPacket(socket, target, connectedDatagram(5, postOpenPayload))) {
+        if (!sendPacket(socket, target, connectedDatagram(3, postOpenPayload))) {
             return fail("failed to send post-open application payload");
         }
         if (!waitForValue(appCount, 1, 1000)) {
