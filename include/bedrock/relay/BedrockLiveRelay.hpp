@@ -44,6 +44,10 @@ struct BedrockLiveRelayOptions {
     bool enableChunkCaching = false;
     bool filterDownstreamHandshakePackets = true;
     bool logging = false;
+    // Opt-in, secret-safe diagnostics for resource-pack negotiation and item
+    // palette/order issues. This never changes packet forwarding or parsing
+    // policy and does not print content keys or CDN URLs.
+    bool itemResourceDiagnostics = false;
     // Relay#forceSingle rejects a second transport while any accepted
     // downstream Player session is still present.
     bool forceSingle = false;
@@ -82,6 +86,7 @@ public:
     using ConnectionHandler = std::function<void(const BedrockServerConnection&)>;
     using ErrorHandler = std::function<void(const std::string&)>;
     using StatusHandler = std::function<void(const BedrockLiveRelayStatus&)>;
+    using DiagnosticHandler = std::function<void(const std::string&)>;
     using MsaCodeHandler = std::function<void(
         const XboxDeviceCodeInfo&,
         const BedrockServerConnection&
@@ -113,6 +118,7 @@ public:
     void on(const std::string& direction, PacketHandler handler);
     void onError(ErrorHandler handler);
     void onStatus(StatusHandler handler);
+    void onDiagnostic(DiagnosticHandler handler);
     // Relay#openUpstreamConnection passes the exact downstream Player as the
     // second onMsaCode argument. The low-level runtime exposes its stable
     // connection identity; the high-level Relay maps it back to RelayPlayer.
@@ -177,6 +183,7 @@ private:
     std::vector<PacketHandler> serverboundHandlers_;
     std::vector<ErrorHandler> errorHandlers_;
     std::vector<StatusHandler> statusHandlers_;
+    std::vector<DiagnosticHandler> diagnosticHandlers_;
     mutable std::mutex msaCodeHandlersMutex_;
     std::vector<MsaCodeHandler> msaCodeHandlers_;
 
@@ -189,6 +196,7 @@ private:
 
     void emitError(const std::string& message);
     void emitStatus();
+    void emitDiagnostic(const std::string& message);
     bool emitMsaCode(
         const XboxDeviceCodeInfo& code,
         const BedrockServerConnection& connection
@@ -218,6 +226,11 @@ private:
         const VersionedGamePacket& packet
     );
     void handleDownstreamPacket(const BedrockServerPacketEvent& event);
+    void diagnosePacket(
+        const std::shared_ptr<Session>& session,
+        BedrockRelayDirection direction,
+        const VersionedGamePacket& packet
+    );
     void forwardClientbound(
         const std::shared_ptr<Session>& session,
         const VersionedGamePacket& packet

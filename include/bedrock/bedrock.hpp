@@ -2856,6 +2856,9 @@ struct RelayOptions {
     RelayMsaCodeCallback onMsaCode;
     int batchingInterval = 20;
     bool logging = false;
+    // Secret-safe resource-pack/item palette diagnostics. Disabled by
+    // default and independent from packet parse-error policy.
+    bool itemResourceDiagnostics = false;
     bool enableChunkCaching = false;
     bool forceSingle = false;
     // Match RelayPlayer.readUpstream: malformed backend packets are always
@@ -3856,6 +3859,7 @@ public:
     using ErrorHandler = std::function<void(const std::string&)>;
     using StatusHandler = std::function<void(const BedrockLiveRelayStatus&)>;
     using ParseErrorHandler = std::function<void(const RelayParseError&)>;
+    using DiagnosticHandler = BedrockLiveRelay::DiagnosticHandler;
 
     explicit Relay(RelayOptions options)
         : options_(normalizeOptions(std::move(options))),
@@ -4039,6 +4043,10 @@ public:
 
     void onStatus(StatusHandler handler) {
         live_.onStatus(std::move(handler));
+    }
+
+    void onDiagnostic(DiagnosticHandler handler) {
+        live_.onDiagnostic(std::move(handler));
     }
 
     void onParseError(ParseErrorHandler handler) {
@@ -4330,6 +4338,7 @@ private:
 
         out.enableChunkCaching = options.enableChunkCaching;
         out.logging = options.logging;
+        out.itemResourceDiagnostics = options.itemResourceDiagnostics;
         out.forceSingle = options.forceSingle;
         out.useDownstreamDisplayNameForUpstreamUsername = options.offline;
         return out;

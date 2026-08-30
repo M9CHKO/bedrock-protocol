@@ -11,6 +11,7 @@
 #include <bedrock/protodef/ProtoDefValue.hpp>
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <iostream>
@@ -183,6 +184,202 @@ std::string findFieldValue(
 bool fieldIsTrue(const std::vector<ProtoDefField>& fields, const std::string& path) {
     const auto value = findFieldValue(fields, path);
     return value == "true" || value == "1";
+}
+
+const ProtoDefField* findField(
+    const std::vector<ProtoDefField>& fields,
+    const std::string& path
+) {
+    for (const auto& field : fields) {
+        if (field.path == path) return &field;
+    }
+    return nullptr;
+}
+
+bool endsWith(const std::string& value, const std::string& suffix) {
+    return value.size() >= suffix.size() &&
+        value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+std::optional<int64_t> integerField(
+    const std::vector<ProtoDefField>& fields,
+    const std::string& path
+) {
+    const auto* field = findField(fields, path);
+    if (!field) return std::nullopt;
+    auto text = field->value;
+    const auto slash = text.find('/');
+    if (slash != std::string::npos) text.resize(slash);
+    try {
+        std::size_t consumed = 0;
+        const auto value = std::stoll(text, &consumed, 10);
+        if (consumed == text.size()) return value;
+    } catch (const std::exception&) {
+    }
+    return std::nullopt;
+}
+
+std::optional<std::size_t> indexedField(
+    const std::string& path,
+    const std::string& root,
+    const std::string& suffix
+) {
+    const auto prefix = root + "[";
+    if (path.rfind(prefix, 0) != 0) return std::nullopt;
+    const auto close = path.find(']', prefix.size());
+    if (close == std::string::npos || path.substr(close + 1) != suffix) {
+        return std::nullopt;
+    }
+    try {
+        return static_cast<std::size_t>(std::stoull(
+            path.substr(prefix.size(), close - prefix.size())
+        ));
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+
+std::vector<std::size_t> fieldIndexes(
+    const std::vector<ProtoDefField>& fields,
+    const std::string& root,
+    const std::string& suffix
+) {
+    std::vector<std::size_t> out;
+    for (const auto& field : fields) {
+        const auto index = indexedField(field.path, root, suffix);
+        if (!index.has_value() ||
+            std::find(out.begin(), out.end(), *index) != out.end()) {
+            continue;
+        }
+        out.push_back(*index);
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+bool versionUsesItemRegistry(const std::string& version) {
+    try {
+        return ProtocolDefinition::forVersion(version).hasPacket("item_registry");
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+bool isItemBearingPacket(const std::string& name) {
+    return name == "inventory_content" ||
+        name == "inventory_slot" ||
+        name == "mob_equipment" ||
+        name == "add_item_entity";
+}
+
+bool isItemResourceDiagnosticPacket(const std::string& name) {
+    return name == "resource_packs_info" ||
+        name == "resource_pack_data_info" ||
+        name == "resource_pack_chunk_data" ||
+        name == "resource_pack_stack" ||
+        name == "resource_pack_client_response" ||
+        name == "resource_pack_chunk_request" ||
+        name == "start_game" ||
+        name == "item_registry" ||
+        name == "creative_content" ||
+        isItemBearingPacket(name);
+}
+
+bool needsStructuredDiagnostic(
+    const std::string& version,
+    const std::string& name
+) {
+    if (name == "start_game") {
+        return !versionUsesItemRegistry(version);
+    }
+    return name != "creative_content";
+}
+
+std::vector<std::pair<int64_t, std::string>> paletteEntries(
+    const std::vector<ProtoDefField>& fields
+) {
+    struct Entry {
+        std::optional<int64_t> runtimeId;
+        std::string name;
+    };
+
+    std::unordered_map<std::size_t, Entry> byIndex;
+    std::vector<std::size_t> indexes;
+    for (const auto& field : fields) {
+        const auto nameIndex = indexedField(field.path, "itemstates", ".name");
+        const auto runtimeIndex = indexedField(
+            field.path,
+            "itemstates",
+            ".runtime_id"
+        );
+        const auto index = nameIndex.has_value() ? nameIndex : runtimeIndex;
+        if (!index.has_value()) continue;
+
+        auto [entry, inserted] = byIndex.try_emplace(*index);
+        if (inserted) indexes.push_back(*index);
+        if (nameIndex.has_value()) {
+            entry->second.name = field.value;
+        } else {
+            auto text = field.value;
+            if (const auto slash = text.find('/'); slash != std::string::npos) {
+                text.resize(slash);
+            }
+            try {
+                std::size_t consumed = 0;
+                const auto value = std::stoll(text, &consumed, 10);
+                if (consumed == text.size()) entry->second.runtimeId = value;
+            } catch (const std::exception&) {
+            }
+        }
+    }
+
+    std::sort(indexes.begin(), indexes.end());
+    std::vector<std::pair<int64_t, std::string>> out;
+    out.reserve(indexes.size());
+    for (const auto index : indexes) {
+        const auto found = byIndex.find(index);
+        if (found != byIndex.end() && found->second.runtimeId.has_value() &&
+            !found->second.name.empty()) {
+            out.emplace_back(*found->second.runtimeId, found->second.name);
+        }
+    }
+    return out;
+}
+
+std::vector<std::string> itemPrefixes(
+    const std::string& packetName,
+    const std::vector<ProtoDefField>& fields
+) {
+    std::vector<std::string> out;
+    for (const auto& field : fields) {
+        if (!endsWith(field.path, ".network_id")) continue;
+        const auto prefix = field.path.substr(
+            0,
+            field.path.size() - std::string(".network_id").size()
+        );
+        const bool allowed = packetName == "inventory_content"
+            ? prefix.rfind("input[", 0) == 0 || prefix == "storage_item"
+            : packetName == "inventory_slot"
+                ? prefix == "item" || prefix == "storage_item"
+                : prefix == "item";
+        if (allowed && std::find(out.begin(), out.end(), prefix) == out.end()) {
+            out.push_back(prefix);
+        }
+    }
+    return out;
+}
+
+bool itemNbtPresent(
+    const std::vector<ProtoDefField>& fields,
+    const std::string& prefix
+) {
+    const auto nbtPrefix = prefix + ".extra.nbt";
+    for (const auto& field : fields) {
+        if (field.path.rfind(nbtPrefix, 0) == 0 && field.type != "void") {
+            return true;
+        }
+    }
+    return false;
 }
 
 std::string packetFingerprint(const VersionedGamePacket& packet);
@@ -396,6 +593,12 @@ struct BedrockLiveRelay::Session {
     bool clientboundStartGameSent = false;
     bool clientboundPlayerSpawnSeen = false;
     bool upstreamDisconnectRequested = false;
+    uint64_t diagnosticSequence = 0;
+    std::size_t diagnosticItemRegistryCount = 0;
+    bool diagnosticStartGameSeen = false;
+    bool diagnosticItemBearingSeen = false;
+    ProtoDefVariableStorePtr diagnosticVariables = makeProtoDefVariableStore();
+    std::unordered_map<int64_t, std::string> diagnosticItemsByRuntimeId;
 };
 
 namespace {
@@ -624,6 +827,10 @@ void BedrockLiveRelay::onError(ErrorHandler handler) {
 
 void BedrockLiveRelay::onStatus(StatusHandler handler) {
     statusHandlers_.push_back(std::move(handler));
+}
+
+void BedrockLiveRelay::onDiagnostic(DiagnosticHandler handler) {
+    diagnosticHandlers_.push_back(std::move(handler));
 }
 
 void BedrockLiveRelay::onMsaCode(MsaCodeHandler handler) {
@@ -911,6 +1118,16 @@ void BedrockLiveRelay::emitStatus() {
 
     for (auto& handler : statusHandlers_) {
         handler(status);
+    }
+}
+
+void BedrockLiveRelay::emitDiagnostic(const std::string& message) {
+    if (!options_.itemResourceDiagnostics) return;
+    const auto line = "[relay-diagnostic] " + message;
+    relayLogLine(line);
+    const auto handlers = diagnosticHandlers_;
+    for (auto& handler : handlers) {
+        handler(line);
     }
 }
 
@@ -1419,6 +1636,262 @@ void BedrockLiveRelay::startUpstream(const std::shared_ptr<Session>& session) {
     emitStatus();
 }
 
+void BedrockLiveRelay::diagnosePacket(
+    const std::shared_ptr<Session>& session,
+    BedrockRelayDirection direction,
+    const VersionedGamePacket& packet
+) {
+    if (!options_.itemResourceDiagnostics ||
+        !isItemResourceDiagnosticPacket(packet.name)) {
+        return;
+    }
+
+    const auto& version = direction == BedrockRelayDirection::Clientbound
+        ? options_.server.version
+        : baseUpstreamOptions_.version;
+    ProtoDefVariableStorePtr variables;
+    {
+        std::lock_guard<std::mutex> lock(session->mutex);
+        if (!relaySessionAcceptsPackets(*session)) return;
+        variables = session->diagnosticVariables;
+    }
+
+    std::vector<ProtoDefField> fields;
+    std::string decodeError;
+    if (needsStructuredDiagnostic(version, packet.name)) {
+        try {
+            ProtoDefPacketDecoder decoder(version, variables);
+            fields = decoder.decodePacketStrict(packet.name, packet.payload);
+        } catch (const std::exception& error) {
+            decodeError = error.what();
+        }
+    }
+    const auto entries = paletteEntries(fields);
+
+    uint64_t sequence = 0;
+    std::size_t registryOccurrence = 0;
+    bool startGameSeen = false;
+    bool itemBearingSeenBefore = false;
+    std::unordered_map<int64_t, std::string> itemsByRuntimeId;
+    {
+        std::lock_guard<std::mutex> lock(session->mutex);
+        if (!relaySessionAcceptsPackets(*session)) return;
+        sequence = ++session->diagnosticSequence;
+        itemBearingSeenBefore = session->diagnosticItemBearingSeen;
+
+        if (direction == BedrockRelayDirection::Clientbound &&
+            packet.name == "start_game") {
+            session->diagnosticStartGameSeen = true;
+            if (!entries.empty()) {
+                session->diagnosticItemsByRuntimeId.clear();
+                for (const auto& [runtimeId, name] : entries) {
+                    session->diagnosticItemsByRuntimeId[runtimeId] = name;
+                }
+            }
+        }
+        if (direction == BedrockRelayDirection::Clientbound &&
+            packet.name == "item_registry") {
+            registryOccurrence = ++session->diagnosticItemRegistryCount;
+            if (!entries.empty()) {
+                session->diagnosticItemsByRuntimeId.clear();
+                for (const auto& [runtimeId, name] : entries) {
+                    session->diagnosticItemsByRuntimeId[runtimeId] = name;
+                }
+            }
+        }
+        startGameSeen = session->diagnosticStartGameSeen;
+        if (direction == BedrockRelayDirection::Clientbound &&
+            isItemBearingPacket(packet.name)) {
+            session->diagnosticItemBearingSeen = true;
+        }
+        itemsByRuntimeId = session->diagnosticItemsByRuntimeId;
+    }
+
+    std::ostringstream header;
+    header << "session=" << session->id
+           << " direction="
+           << (direction == BedrockRelayDirection::Clientbound
+                   ? "clientbound"
+                   : "serverbound")
+           << " sequence=" << sequence
+           << " packet=" << packet.name
+           << packetFingerprint(packet);
+    emitDiagnostic(header.str());
+
+    if (!decodeError.empty()) {
+        emitDiagnostic(
+            "session=" + session->id + " packet=" + packet.name +
+            " diagnostic_decode_error=" + decodeError
+        );
+        return;
+    }
+
+    if (packet.name == "start_game") {
+        emitDiagnostic(
+            "session=" + session->id +
+            " start_game item_palette_source=" +
+            (versionUsesItemRegistry(version)
+                ? "item_registry"
+                : "start_game")
+        );
+        return;
+    }
+
+    if (packet.name == "resource_packs_info") {
+        const auto indexes = fieldIndexes(fields, "texture_packs", ".uuid");
+        emitDiagnostic(
+            "session=" + session->id + " resource_packs_info count=" +
+            std::to_string(indexes.size())
+        );
+        for (const auto index : indexes) {
+            const auto base = "texture_packs[" + std::to_string(index) + "]";
+            const bool hasCdn = !findFieldValue(fields, base + ".cdn_url").empty();
+            emitDiagnostic(
+                "session=" + session->id + " resource_pack index=" +
+                std::to_string(index) + " uuid=" +
+                findFieldValue(fields, base + ".uuid") + " version=" +
+                findFieldValue(fields, base + ".version") + " size=" +
+                findFieldValue(fields, base + ".size") + " has_cdn_url=" +
+                (hasCdn ? "true" : "false")
+            );
+        }
+        return;
+    }
+
+    if (packet.name == "resource_pack_stack") {
+        for (const auto root : {std::string("behavior_packs"), std::string("resource_packs")}) {
+            const auto indexes = fieldIndexes(fields, root, ".uuid");
+            for (const auto index : indexes) {
+                const auto base = root + "[" + std::to_string(index) + "]";
+                emitDiagnostic(
+                    "session=" + session->id + " resource_pack_stack list=" +
+                    root + " index=" + std::to_string(index) + " uuid=" +
+                    findFieldValue(fields, base + ".uuid") + " version=" +
+                    findFieldValue(fields, base + ".version") + " subpack=" +
+                    findFieldValue(fields, base + ".name")
+                );
+            }
+        }
+        return;
+    }
+
+    if (packet.name == "resource_pack_client_response") {
+        emitDiagnostic(
+            "session=" + session->id + " resource_pack_client_response status=" +
+            findFieldValue(fields, "response_status")
+        );
+        for (const auto index : fieldIndexes(fields, "resourcepackids", "")) {
+            emitDiagnostic(
+                "session=" + session->id + " resource_pack_client_response index=" +
+                std::to_string(index) + " id=" + findFieldValue(
+                    fields,
+                    "resourcepackids[" + std::to_string(index) + "]"
+                )
+            );
+        }
+        return;
+    }
+
+    if (packet.name == "resource_pack_chunk_request") {
+        emitDiagnostic(
+            "session=" + session->id + " resource_pack_chunk_request uuid=" +
+            findFieldValue(fields, "pack_id") + " chunk_index=" +
+            findFieldValue(fields, "chunk_index")
+        );
+        return;
+    }
+
+    if (packet.name == "resource_pack_data_info") {
+        emitDiagnostic(
+            "session=" + session->id + " resource_pack_data_info uuid=" +
+            findFieldValue(fields, "pack_id") + " max_chunk_size=" +
+            findFieldValue(fields, "max_chunk_size") + " chunk_count=" +
+            findFieldValue(fields, "chunk_count") + " size=" +
+            findFieldValue(fields, "size")
+        );
+        return;
+    }
+
+    if (packet.name == "resource_pack_chunk_data") {
+        std::size_t payloadSize = 0;
+        if (const auto* payload = findField(fields, "payload")) {
+            if (payload->structuredValue.has_value() &&
+                payload->structuredValue->kind == ProtoDefValue::Kind::Bytes) {
+                payloadSize = payload->structuredValue->bytesValue.size();
+            }
+        }
+        emitDiagnostic(
+            "session=" + session->id + " resource_pack_chunk_data uuid=" +
+            findFieldValue(fields, "pack_id") + " chunk_index=" +
+            findFieldValue(fields, "chunk_index") + " progress=" +
+            findFieldValue(fields, "progress") + " payload_size=" +
+            std::to_string(payloadSize)
+        );
+        return;
+    }
+
+    if (packet.name == "item_registry") {
+        emitDiagnostic(
+            "session=" + session->id + " item_registry count=" +
+            std::to_string(entries.size()) + " occurrence=" +
+            std::to_string(registryOccurrence) + " after_start_game=" +
+            (startGameSeen ? "true" : "false") + " before_first_item=" +
+            (!itemBearingSeenBefore ? "true" : "false")
+        );
+        static constexpr const char* targets[] = {
+            "minecraft:firework_rocket",
+            "minecraft:diamond_sword",
+            "minecraft:netherite_sword",
+            "minecraft:sand",
+            "minecraft:shulker_box"
+        };
+        for (const auto* target : targets) {
+            std::optional<int64_t> runtimeId;
+            for (const auto& [candidateId, name] : entries) {
+                if (name == target) {
+                    runtimeId = candidateId;
+                    break;
+                }
+            }
+            emitDiagnostic(
+                "session=" + session->id + " item_registry name=" + target +
+                " present=" + (runtimeId.has_value() ? "true" : "false") +
+                (runtimeId.has_value()
+                    ? " runtime_id=" + std::to_string(*runtimeId)
+                    : std::string())
+            );
+        }
+        return;
+    }
+
+    if (isItemBearingPacket(packet.name)) {
+        const auto window = findFieldValue(fields, "window_id");
+        const auto packetSlot = findFieldValue(fields, "slot");
+        for (const auto& prefix : itemPrefixes(packet.name, fields)) {
+            const auto networkId = integerField(fields, prefix + ".network_id");
+            if (!networkId.has_value() || *networkId == 0) continue;
+            const auto known = itemsByRuntimeId.find(*networkId);
+            std::ostringstream item;
+            item << "session=" << session->id
+                 << " packet=" << packet.name;
+            if (!window.empty()) item << " window=" << window;
+            if (!packetSlot.empty()) item << " slot=" << packetSlot;
+            if (const auto inputIndex = indexedField(prefix + ".network_id", "input", ".network_id")) {
+                item << " item_index=" << *inputIndex;
+            }
+            item << " network_id=" << *networkId
+                 << " block_runtime_id="
+                 << findFieldValue(fields, prefix + ".block_runtime_id")
+                 << " count=" << findFieldValue(fields, prefix + ".count")
+                 << " nbt_present=" << (itemNbtPresent(fields, prefix) ? "true" : "false")
+                 << " registry_present="
+                 << (known != itemsByRuntimeId.end() ? "true" : "false");
+            if (known != itemsByRuntimeId.end()) item << " registry_name=" << known->second;
+            emitDiagnostic(item.str());
+        }
+    }
+}
+
 void BedrockLiveRelay::handleUpstreamPacket(
     const std::shared_ptr<Session>& session,
     const VersionedGamePacket& packet
@@ -1440,6 +1913,8 @@ void BedrockLiveRelay::handleUpstreamPacket(
     if (isClientboundHandshakePacket(packet.name)) {
         return;
     }
+
+    diagnosePacket(session, BedrockRelayDirection::Clientbound, packet);
 
     const bool isPlayerSpawn = isPlayStatusPlayerSpawn(options_.server.version, packet);
 
@@ -1503,6 +1978,8 @@ void BedrockLiveRelay::handleDownstreamPacket(const BedrockServerPacketEvent& ev
         return;
     }
 
+    diagnosePacket(session, BedrockRelayDirection::Serverbound, event.packet);
+
     if (!options_.forwardServerbound) {
         return;
     }
@@ -1555,25 +2032,6 @@ void BedrockLiveRelay::handleDownstreamPacket(const BedrockServerPacketEvent& ev
             upstream = session->upstream;
             upstreamReady = relayUpstreamReady(*session);
         }
-        if (candidate.name == "resource_pack_client_response" && upstream) {
-            if (options_.logging) {
-                std::ostringstream out;
-                out << "* Proxy -> Backend " << candidate.name
-                    << packetFingerprint(candidate);
-                relayLogLine(out.str());
-            }
-            std::lock_guard<std::recursive_mutex> dispatchLock(
-                handlerDispatchMutex_
-            );
-            {
-                std::lock_guard<std::mutex> lock(session->mutex);
-                if (!relaySessionAcceptsPackets(*session) ||
-                    session->upstream != upstream) return;
-            }
-            upstream->sendPacket(candidate);
-            continue;
-        }
-
         if (!upstream || !upstreamReady) {
             std::lock_guard<std::mutex> lock(session->mutex);
             if (relaySessionAcceptsPackets(*session)) {

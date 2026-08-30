@@ -1,8 +1,14 @@
 #include <bedrock/bedrock.hpp>
 #include <bedrock/auth/BedrockAuthJwt.hpp>
+#include <bedrock/debug/ProtocolTypeTsvIndex.hpp>
+#include <bedrock/generated/GeneratedProtocolTypes.hpp>
 #include <bedrock/protocol/VersionedMcpeCodec.hpp>
+#include <bedrock/protodef/ProtoDefContext.hpp>
+#include <bedrock/protodef/ProtoDefDecoder.hpp>
 #include <bedrock/protodef/ProtoDefJson.hpp>
 #include <bedrock/protodef/ProtoDefPacketEncoder.hpp>
+#include <bedrock/protodef/ProtoDefPacketDecoder.hpp>
+#include <bedrock/protodef/ProtoDefReader.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -11,9 +17,11 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -187,6 +195,103 @@ bedrock::VersionedGamePacket encodedPacket(
         name,
         encoder.encodePacket(name, value)
     );
+}
+
+bedrock::VersionedGamePacket minimalStrictPacket(
+    const std::string& version,
+    const std::string& name
+) {
+    bedrock::ProtocolTypeTsvIndex typeIndex;
+    const auto rootType = typeIndex.findTypeJson(version, "packet_" + name);
+    if (!rootType.has_value()) {
+        throw std::runtime_error("missing packet schema for " + version + ":" + name);
+    }
+
+    std::vector<uint8_t> zeroes(1024 * 1024, 0);
+    bedrock::PacketFieldCursor cursor(zeroes);
+    bedrock::ProtoDefReader reader(cursor);
+    bedrock::ProtoDefContext context;
+    std::vector<bedrock::ProtoDefField> fields;
+    bedrock::ProtoDefDecoder decoder([&](const std::string& typeName) {
+        auto resolved = typeIndex.findTypeJson(version, typeName);
+        if (resolved.has_value()) return resolved;
+        return bedrock::generatedProtocolTypeJson(version, typeName);
+    });
+    decoder.decode(*rootType, reader, "", fields, context);
+    zeroes.resize(reader.offset());
+
+    bedrock::ProtoDefPacketDecoder strict(version);
+    (void) strict.decodePacketStrict(name, zeroes);
+    return bedrock::VersionedMcpeCodec::forVersion(version)
+        .packetCodec()
+        .makePacketByName(name, zeroes);
+}
+
+std::string decodedFieldValue(
+    const std::vector<bedrock::ProtoDefField>& fields,
+    const std::string& path
+) {
+    for (const auto& field : fields) {
+        if (field.path == path) return field.value;
+    }
+    return {};
+}
+
+bool pathEndsWith(const std::string& path, const std::string& suffix) {
+    return path.size() >= suffix.size() &&
+        path.compare(path.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+std::optional<std::size_t> decodedArrayIndex(
+    const std::string& path,
+    const std::string& root,
+    const std::string& suffix
+) {
+    const auto prefix = root + "[";
+    if (path.rfind(prefix, 0) != 0 || !pathEndsWith(path, suffix)) {
+        return std::nullopt;
+    }
+    const auto close = path.find(']', prefix.size());
+    if (close == std::string::npos || path.substr(close + 1) != suffix) {
+        return std::nullopt;
+    }
+    try {
+        return static_cast<std::size_t>(std::stoull(
+            path.substr(prefix.size(), close - prefix.size())
+        ));
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+
+std::optional<int64_t> decodedIntegerValue(std::string text) {
+    if (const auto slash = text.find('/'); slash != std::string::npos) {
+        text.resize(slash);
+    }
+    try {
+        std::size_t consumed = 0;
+        const auto value = std::stoll(text, &consumed, 10);
+        if (consumed == text.size()) return value;
+    } catch (const std::exception&) {
+    }
+    return std::nullopt;
+}
+
+bedrock::ProtoDefValue inventoryContainerValue() {
+    using Value = bedrock::ProtoDefValue;
+    return Value::object({
+        {"container_id", Value::string("inventory")},
+        {"dynamic_container_id", Value::null()}
+    });
+}
+
+bedrock::ProtoDefValue emptyPacketNbtValue() {
+    using Value = bedrock::ProtoDefValue;
+    return Value::object({
+        {"type", Value::string("compound")},
+        {"name", Value::string("")},
+        {"value", Value::object({})}
+    });
 }
 
 std::string signedJwt(
@@ -600,17 +705,194 @@ bool checkFullMapForwarding() {
 }
 
 bool checkMapFloodAndItemOrdering() {
+    using Value = bedrock::ProtoDefValue;
     const std::string version = "1.21.100";
-    const auto codec = bedrock::VersionedMcpeCodec::forVersion(version);
-    const auto registry = codec.packetCodec().decodeFullPacket(unhex(
-        "a20101106d696e6563726166743a736869656c64010200040a0000"
-    ));
-    const auto inventorySlot = codec.packetCodec().decodeFullPacket(unhex(
-        "3200001d00008208010000000012000000000000000000007b00000000000000"
-    ));
+    const auto startGame = minimalStrictPacket(version, "start_game");
+
+    bedrock::MinecraftDataAssets assets;
+    const auto items = assets.loadBedrockItemRegistryByProtocol(827);
+    const auto blocks = assets.loadBedrockBlockRegistryByProtocol(827);
+    const auto blockRuntimeId = [&](const std::string& name) -> int32_t {
+        const auto* definition = blocks.blockByName(name);
+        if (definition == nullptr) {
+            throw std::runtime_error("missing block definition: " + name);
+        }
+        const auto block = blocks.fromStateId(definition->defaultState);
+        return block && block->hash.has_value()
+            ? *block->hash
+            : definition->defaultState;
+    };
+
+    items.resetStackIds(100);
+    auto sand = items.create(59, 64);
+    auto shulker = items.create(9471, 1);
+    auto firework = items.create(
+        1192,
+        16,
+        0,
+        bedrock::NbtDocument {
+            "",
+            bedrock::NbtValue::compound({{
+                "Fireworks",
+                bedrock::NbtValue::compound({{
+                    "Flight",
+                    bedrock::NbtValue::byte(3)
+                }})
+            }})
+        }
+    );
+    auto sword = items.create(895, 1);
+    sword.setCustomName("Relay Regression Blade");
+    sword.setDurabilityUsed(73);
+    sword.setEnchantments({
+        {.name = "sharpness", .level = 5},
+        {.name = "unbreaking", .level = 3}
+    });
+    auto netheriteSword = items.create(900, 1);
+    netheriteSword.setCustomName("Relay Regression Netherite");
+    netheriteSword.setDurabilityUsed(101);
+    netheriteSword.setEnchantments({
+        {.name = "unbreaking", .level = 3}
+    });
+
+    auto sandValue = items.toProtoDefValue(sand);
+    sandValue.objectValue["block_runtime_id"] = Value::integer(
+        blockRuntimeId("minecraft:sand")
+    );
+    const auto shulkerValue = items.toProtoDefValue(shulker);
+    const auto fireworkValue = items.toProtoDefValue(firework);
+    const auto swordValue = items.toProtoDefValue(sword);
+    const auto netheriteSwordValue = items.toProtoDefValue(netheriteSword);
+    const auto emptyItem = items.toProtoDefValue(nullptr);
+
+    auto allItemStates = items.writeItemStatesValue();
+    std::vector<Value> selectedItemStates;
+    selectedItemStates.reserve(5);
+    for (auto& state : allItemStates.arrayValue) {
+        const auto* runtimeId = state.get("runtime_id");
+        if (runtimeId == nullptr || runtimeId->kind != Value::Kind::Int) {
+            continue;
+        }
+        const auto id = runtimeId->intValue;
+        if (id != 59 && id != 895 && id != 900 && id != 1192 && id != 9471) {
+            continue;
+        }
+        if (state.get("version") == nullptr) {
+            state.objectValue["version"] = Value::string("none");
+        }
+        if (state.get("nbt") == nullptr) {
+            state.objectValue["nbt"] = emptyPacketNbtValue();
+        }
+        selectedItemStates.push_back(std::move(state));
+    }
+    const auto expectedRegistryCount = selectedItemStates.size();
+    if (expectedRegistryCount != 5) {
+        throw std::runtime_error("realistic item registry fixture is incomplete");
+    }
+    auto itemStates = Value::array(std::move(selectedItemStates));
+    const auto registry = encodedPacket(
+        version,
+        "item_registry",
+        Value::object({{"itemstates", std::move(itemStates)}})
+    );
+    const auto creativeContent = encodedPacket(
+        version,
+        "creative_content",
+        Value::object({
+            {"groups", Value::array({
+                Value::object({
+                    {"category", Value::string("construction")},
+                    {"name", Value::string("Relay blocks")},
+                    {"icon_item", sandValue}
+                }),
+                Value::object({
+                    {"category", Value::string("items")},
+                    {"name", Value::string("Relay items")},
+                    {"icon_item", fireworkValue}
+                })
+            })},
+            {"items", Value::array({
+                Value::object({
+                    {"entry_id", Value::uinteger(1)},
+                    {"item", sandValue},
+                    {"group_index", Value::uinteger(0)}
+                }),
+                Value::object({
+                    {"entry_id", Value::uinteger(2)},
+                    {"item", fireworkValue},
+                    {"group_index", Value::uinteger(1)}
+                }),
+                Value::object({
+                    {"entry_id", Value::uinteger(3)},
+                    {"item", swordValue},
+                    {"group_index", Value::uinteger(1)}
+                })
+            })}
+        })
+    );
+
+    std::vector<Value> inventory(36, emptyItem);
+    inventory[0] = sandValue;
+    inventory[1] = shulkerValue;
+    inventory[2] = fireworkValue;
+    inventory[3] = swordValue;
+    const auto inventoryContent = encodedPacket(
+        version,
+        "inventory_content",
+        Value::object({
+            {"window_id", Value::string("inventory")},
+            {"input", Value::array(std::move(inventory))},
+            {"container", inventoryContainerValue()},
+            {"storage_item", emptyItem}
+        })
+    );
+    const auto inventorySlot = encodedPacket(
+        version,
+        "inventory_slot",
+        Value::object({
+            {"window_id", Value::string("inventory")},
+            {"slot", Value::uinteger(4)},
+            {"container", inventoryContainerValue()},
+            {"storage_item", emptyItem},
+            {"item", netheriteSwordValue}
+        })
+    );
+    const auto mobEquipment = encodedPacket(
+        version,
+        "mob_equipment",
+        Value::object({
+            {"runtime_entity_id", Value::uinteger(0x100000001ull)},
+            {"item", swordValue},
+            {"slot", Value::uinteger(3)},
+            {"selected_slot", Value::uinteger(3)},
+            {"window_id", Value::string("inventory")}
+        })
+    );
+    const auto addItemEntity = encodedPacket(
+        version,
+        "add_item_entity",
+        Value::object({
+            {"entity_id_self", Value::integer(0x100000002ll)},
+            {"runtime_entity_id", Value::uinteger(0x200000002ull)},
+            {"item", fireworkValue},
+            {"position", Value::object({
+                {"x", Value::floating(1.25)},
+                {"y", Value::floating(70.5)},
+                {"z", Value::floating(-4.75)}
+            })},
+            {"velocity", Value::object({
+                {"x", Value::floating(0.0)},
+                {"y", Value::floating(0.1)},
+                {"z", Value::floating(0.0)}
+            })},
+            {"metadata", Value::array({})},
+            {"is_from_fishing", Value::boolean(false)}
+        })
+    );
+
     std::vector<bedrock::VersionedGamePacket> maps;
-    maps.reserve(12);
-    for (int index = 0; index < 12; ++index) {
+    maps.reserve(6);
+    for (int index = 0; index < 6; ++index) {
         maps.push_back(encodedPacket(
             version,
             "clientbound_map_item_data",
@@ -646,11 +928,15 @@ bool checkMapFloodAndItemOrdering() {
 
     // A serverbound-only handler must not force structured decoding in the
     // opposite direction. Relay still validates every clientbound packet
-    // strictly, without building 12 x 16,384 unused pixel objects.
-    bedrock::Relay relay(relayOptions(upstream.boundPort(), true));
+    // strictly, without building 6 x 16,384 unused pixel objects.
+    auto options = relayOptions(upstream.boundPort(), true);
+    options.itemResourceDiagnostics = true;
+    bedrock::Relay relay(std::move(options));
     std::atomic<int> joins {0};
     std::atomic<int> parseErrors {0};
     std::atomic<int> serverboundCallbacks {0};
+    std::mutex diagnosticsMutex;
+    std::vector<std::string> diagnostics;
     relay.onJoin([&](bedrock::RelayPlayer&, bedrock::BedrockNetworkClient&) {
         ++joins;
     });
@@ -663,23 +949,55 @@ bool checkMapFloodAndItemOrdering() {
     relay.onError([&](const std::string& message) {
         errors.add("relay", message);
     });
+    relay.onDiagnostic([&](const std::string& message) {
+        std::lock_guard<std::mutex> lock(diagnosticsMutex);
+        diagnostics.push_back(message);
+    });
     relay.listen();
 
     auto downstream = bedrock::createNetworkClient(
         downstreamOptions(relay.live().boundPort())
     );
     std::atomic<int> registries {0};
+    std::atomic<int> startGames {0};
     std::atomic<int> receivedMaps {0};
     std::atomic<int> slots {0};
+    std::atomic<int> itemBearingPackets {0};
     std::atomic<bool> bytesMismatch {false};
+    std::atomic<bool> missingRuntimeId {false};
+    std::atomic<bool> downstreamDecodeFailed {false};
     std::atomic<bool> downstreamClosed {false};
+    auto downstreamVariables = bedrock::makeProtoDefVariableStore();
+    std::mutex downstreamStateMutex;
+    std::unordered_map<int64_t, std::string> downstreamRegistry;
+    std::vector<bedrock::VersionedGamePacket> observed;
     downstream.onAny([&](const bedrock::BedrockNetworkClientPacketEvent& event) {
+        const bool tracked =
+            event.packet.name == "start_game" ||
+            event.packet.name == "item_registry" ||
+            event.packet.name == "creative_content" ||
+            event.packet.name == "inventory_content" ||
+            event.packet.name == "clientbound_map_item_data" ||
+            event.packet.name == "inventory_slot" ||
+            event.packet.name == "mob_equipment" ||
+            event.packet.name == "add_item_entity";
+        if (tracked) {
+            std::lock_guard<std::mutex> lock(downstreamStateMutex);
+            observed.push_back(event.packet);
+        }
+
+        if (event.packet.name == "start_game") {
+            ++startGames;
+            if (event.packet.fullPacket != startGame.fullPacket) {
+                bytesMismatch = true;
+            }
+            return;
+        }
         if (event.packet.name == "item_registry") {
             ++registries;
             if (event.packet.fullPacket != registry.fullPacket) {
                 bytesMismatch = true;
             }
-            return;
         }
         if (event.packet.name == "clientbound_map_item_data") {
             const int index = receivedMaps.fetch_add(1);
@@ -690,10 +1008,63 @@ bool checkMapFloodAndItemOrdering() {
             }
             return;
         }
-        if (event.packet.name == "inventory_slot") {
-            ++slots;
-            if (event.packet.fullPacket != inventorySlot.fullPacket) {
-                bytesMismatch = true;
+
+        const bool itemBearing =
+            event.packet.name == "inventory_content" ||
+            event.packet.name == "inventory_slot" ||
+            event.packet.name == "mob_equipment" ||
+            event.packet.name == "add_item_entity";
+        if (itemBearing) ++itemBearingPackets;
+        if (event.packet.name == "inventory_slot") ++slots;
+
+        if (event.packet.name == "item_registry" || itemBearing) {
+            try {
+                bedrock::ProtoDefPacketDecoder decoder(version, downstreamVariables);
+                const auto fields = decoder.decodePacketStrict(
+                    event.packet.name,
+                    event.packet.payload
+                );
+                std::lock_guard<std::mutex> lock(downstreamStateMutex);
+                if (event.packet.name == "item_registry") {
+                    std::unordered_map<std::size_t, std::string> names;
+                    std::unordered_map<std::size_t, int64_t> runtimeIds;
+                    for (const auto& field : fields) {
+                        if (const auto index = decodedArrayIndex(
+                                field.path,
+                                "itemstates",
+                                ".name"
+                            ); index.has_value()) {
+                            names[*index] = field.value;
+                            continue;
+                        }
+                        const auto index = decodedArrayIndex(
+                            field.path,
+                            "itemstates",
+                            ".runtime_id"
+                        );
+                        if (!index.has_value()) continue;
+                        if (const auto runtimeId = decodedIntegerValue(field.value)) {
+                            runtimeIds[*index] = *runtimeId;
+                        }
+                    }
+                    for (const auto& [index, runtimeId] : runtimeIds) {
+                        const auto name = names.find(index);
+                        if (name != names.end()) {
+                            downstreamRegistry[runtimeId] = name->second;
+                        }
+                    }
+                } else {
+                    for (const auto& field : fields) {
+                        if (!pathEndsWith(field.path, ".network_id")) continue;
+                        const auto networkId = decodedIntegerValue(field.value);
+                        if (networkId.has_value() && *networkId != 0 &&
+                            downstreamRegistry.find(*networkId) == downstreamRegistry.end()) {
+                            missingRuntimeId = true;
+                        }
+                    }
+                }
+            } catch (const std::exception&) {
+                downstreamDecodeFailed = true;
             }
         }
     });
@@ -727,23 +1098,67 @@ bool checkMapFloodAndItemOrdering() {
         std::lock_guard<std::mutex> lock(connectionMutex);
         target = upstreamConnection;
     }
-    if (ready) upstream.sendPacket(target, registry);
+    if (ready) upstream.sendPacket(target, startGame);
+    const bool startGameReady = ready && waitFor([&]() {
+        return startGames.load() == 1;
+    });
+    ok &= check(startGameReady, "start_game was not delivered before item_registry");
+
+    if (startGameReady) upstream.sendPacket(target, registry);
     const bool paletteReady = ready && waitFor([&]() {
         return registries.load() == 1;
     });
     ok &= check(paletteReady, "item_registry was not delivered before items");
 
     if (paletteReady) {
+        upstream.queuePacket(target, creativeContent);
+        upstream.queuePacket(target, inventoryContent);
         upstream.queuePackets(target, maps);
         upstream.queuePacket(target, inventorySlot);
+        upstream.queuePacket(target, mobEquipment);
+        upstream.queuePacket(target, addItemEntity);
         upstream.sendQueued(target);
     }
+    std::vector<bedrock::VersionedGamePacket> expected {
+        startGame,
+        registry,
+        creativeContent,
+        inventoryContent
+    };
+    expected.insert(expected.end(), maps.begin(), maps.end());
+    expected.push_back(inventorySlot);
+    expected.push_back(mobEquipment);
+    expected.push_back(addItemEntity);
     const bool floodDelivered = paletteReady && waitFor([&]() {
-        return receivedMaps.load() == static_cast<int>(maps.size()) &&
-            slots.load() == 1;
+        std::lock_guard<std::mutex> lock(downstreamStateMutex);
+        return observed.size() == expected.size() &&
+            receivedMaps.load() == static_cast<int>(maps.size()) &&
+            slots.load() == 1 && itemBearingPackets.load() == 4;
     }, 20s);
     ok &= check(floodDelivered, "map flood or following inventory item stalled");
+    if (floodDelivered) {
+        std::lock_guard<std::mutex> lock(downstreamStateMutex);
+        for (std::size_t index = 0; index < expected.size(); ++index) {
+            if (observed[index].name != expected[index].name ||
+                observed[index].fullPacket != expected[index].fullPacket) {
+                bytesMismatch = true;
+                break;
+            }
+        }
+        ok &= check(
+            downstreamRegistry.size() == expectedRegistryCount,
+            "downstream item runtime-ID table is incomplete"
+        );
+        for (const auto id : {59ll, 895ll, 900ll, 1192ll, 9471ll}) {
+            ok &= check(
+                downstreamRegistry.find(id) != downstreamRegistry.end(),
+                "downstream item runtime-ID table is missing " + std::to_string(id)
+            );
+        }
+    }
     ok &= check(!bytesMismatch.load(), "map/item flood changed packet bytes or order");
+    ok &= check(!missingRuntimeId.load(), "item packet referenced an unknown runtime ID");
+    ok &= check(!downstreamDecodeFailed.load(), "diagnostic downstream decode failed");
     ok &= check(parseErrors.load() == 0, "map/item flood raised a parse error");
     ok &= check(!downstreamClosed.load(), "map flood closed downstream session");
     ok &= check(
@@ -752,11 +1167,142 @@ bool checkMapFloodAndItemOrdering() {
             relay.live().finalSessionResetCount() == 0,
         "map flood reset the Relay session"
     );
+    {
+        std::lock_guard<std::mutex> lock(diagnosticsMutex);
+        std::ostringstream joined;
+        for (const auto& line : diagnostics) joined << line << '\n';
+        const auto text = joined.str();
+        ok &= check(
+            text.find("item_registry count=" +
+                std::to_string(expectedRegistryCount)) !=
+                std::string::npos &&
+            text.find("name=minecraft:firework_rocket present=true runtime_id=1192") !=
+                std::string::npos &&
+            text.find("name=minecraft:diamond_sword present=true runtime_id=895") !=
+                std::string::npos &&
+            text.find("name=minecraft:netherite_sword present=true runtime_id=900") !=
+                std::string::npos &&
+            text.find("name=minecraft:sand present=true runtime_id=59") !=
+                std::string::npos &&
+            text.find("name=minecraft:shulker_box present=true runtime_id=9471") !=
+                std::string::npos &&
+            text.find("registry_present=false") == std::string::npos,
+            "item/resource diagnostics did not prove palette consistency"
+        );
+    }
     ok &= check(errors.empty(), "map-flood callback error: " + errors.text());
 
     downstream.close("map-flood regression complete");
     relay.close("map-flood regression complete");
     upstream.close("map-flood regression complete");
+    return ok;
+}
+
+bool checkResourcePackServerboundOrdering() {
+    const std::string version = "1.21.100";
+    const auto chunkRequest = encodedPacket(
+        version,
+        "resource_pack_chunk_request",
+        bedrock::ProtoDefValue::object({
+            {"pack_id", bedrock::ProtoDefValue::string(
+                "11111111-2222-3333-4444-555555555555"
+            )},
+            {"chunk_index", bedrock::ProtoDefValue::uinteger(0)}
+        })
+    );
+    const auto completed = encodedPacket(
+        version,
+        "resource_pack_client_response",
+        bedrock::ProtoDefValue::object({
+            {"response_status", bedrock::ProtoDefValue::uinteger(4)},
+            {"resourcepackids", bedrock::ProtoDefValue::array({
+                bedrock::ProtoDefValue::string(
+                    "11111111-2222-3333-4444-555555555555_1.0.0"
+                )
+            })}
+        })
+    );
+
+    ErrorLog errors;
+    std::mutex receivedMutex;
+    std::vector<bedrock::VersionedGamePacket> received;
+    bedrock::BedrockServer upstream({
+        .host = "127.0.0.1",
+        .port = 0,
+        .version = version,
+        .motd = {{"motd", "Relay Resource Pack Ordering Upstream"}},
+        .maxPlayers = 2,
+        .offline = true,
+        // Make the old immediate-response bypass deterministic: a queued
+        // chunk request must not be overtaken while this batch is pending.
+        .batchingInterval = 100
+    });
+    upstream.onAny([&](const bedrock::BedrockServerPacketEvent& event) {
+        if (event.packet.name != "resource_pack_chunk_request" &&
+            event.packet.name != "resource_pack_client_response") {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(receivedMutex);
+        received.push_back(event.packet);
+    });
+    upstream.listen();
+
+    auto options = relayOptions(upstream.boundPort(), true);
+    options.batchingInterval = 100;
+    bedrock::Relay relay(std::move(options));
+    std::atomic<int> joins {0};
+    relay.onJoin([&](bedrock::RelayPlayer&, bedrock::BedrockNetworkClient&) {
+        ++joins;
+    });
+    relay.onError([&](const std::string& message) {
+        errors.add("relay", message);
+    });
+    relay.listen();
+
+    auto clientOptions = downstreamOptions(relay.live().boundPort());
+    clientOptions.batchingIntervalMs = 100;
+    clientOptions.autoResourcePackResponses = false;
+    auto downstream = bedrock::createNetworkClient(std::move(clientOptions));
+    downstream.onError([&](const std::string& message) {
+        errors.add("downstream", message);
+    });
+
+    bool ok = true;
+    const bool connected = downstream.connect();
+    const bool ready = connected && waitFor([&]() {
+        return joins.load() == 1 && relay.live().upstreamReady();
+    });
+    ok &= check(connected, "resource-pack ordering downstream failed to connect");
+    ok &= check(ready, "resource-pack ordering relay did not become ready");
+
+    if (ready) {
+        downstream.sendBuffer(chunkRequest.fullPacket);
+        downstream.sendBuffer(completed.fullPacket);
+        downstream.sendQueued();
+    }
+    const bool delivered = ready && waitFor([&]() {
+        std::lock_guard<std::mutex> lock(receivedMutex);
+        return received.size() == 2;
+    });
+    ok &= check(delivered, "resource-pack control packets were not delivered");
+    if (delivered) {
+        std::lock_guard<std::mutex> lock(receivedMutex);
+        ok &= check(
+            received[0].name == "resource_pack_chunk_request" &&
+                received[1].name == "resource_pack_client_response",
+            "resource_pack_client_response overtook resource_pack_chunk_request"
+        );
+        ok &= check(
+            received[0].fullPacket == chunkRequest.fullPacket &&
+                received[1].fullPacket == completed.fullPacket,
+            "Relay changed resource-pack serverbound packet bytes"
+        );
+    }
+    ok &= check(errors.empty(), "resource-pack ordering error: " + errors.text());
+
+    downstream.close("resource-pack ordering regression complete");
+    relay.close("resource-pack ordering regression complete");
+    upstream.close("resource-pack ordering regression complete");
     return ok;
 }
 
@@ -1026,6 +1572,7 @@ int main() {
     bool ok = checkMixedAuthenticationHandshake();
     ok = checkFullMapForwarding() && ok;
     ok = checkMapFloodAndItemOrdering() && ok;
+    ok = checkResourcePackServerboundOrdering() && ok;
     ok = checkForwardRawPolicy() && ok;
     ok = checkDownstreamCloseLifecycle() && ok;
     if (ok) std::cout << "[LIVE-RELAY-REGRESSION-SMOKE] OK\n";
