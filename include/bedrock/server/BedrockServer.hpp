@@ -1273,7 +1273,7 @@ public:
             for (std::size_t index = begin; index < end; ++index) {
                 packets.push_back(std::move(queued[index].packet));
             }
-            sendPackets(connection, packets, compression);
+            sendPacketsInternal(connection, packets, compression, false);
             begin = end;
         }
     }
@@ -1291,80 +1291,7 @@ public:
         const std::vector<VersionedGamePacket>& packets,
         VersionedMcpeCompression compression = VersionedMcpeCompression::Automatic
     ) {
-        if (packets.empty()) {
-            return;
-        }
-
-        // connection.js drops writes once its native connection is closed.
-        // In particular, a retained Player/close-listener snapshot must not
-        // manufacture a new plaintext session after Server#close cleared it.
-        const auto session = sessionSnapshot(connection);
-        if (!session) {
-            return;
-        }
-        std::lock_guard<std::recursive_mutex> outboundLock(session->outboundMutex);
-
-        for (const auto& packet : packets) {
-            processOutboundPacket(session, packet);
-        }
-        std::vector<uint8_t> mcpe;
-        {
-            std::lock_guard<std::mutex> lock(session->mutex);
-            if (session->status == BedrockServerClientStatus::Disconnected) {
-                return;
-            }
-            if (session->encryptionEnabled && session->hasEncryptionKeys) {
-                if (!session->encryptStream) {
-                    throw std::runtime_error("server encrypt stream is not initialized");
-                }
-                // encryption.js receives the raw framed batch from Framer and
-                // always deflates it itself. Its wire format is independent of
-                // threshold, compressor selection, compressionReady, and the
-                // low-level compression override accepted by this C++ method.
-                auto compressionPacket = mcpeCodec_.encodeEncryptedCompressionPacket(
-                    packets,
-                    session->compressionLevel
-                );
-                auto aesPlaintext = BedrockEncryption::makeAesPlaintext(
-                    compressionPacket,
-                    session->sendCounter++,
-                    session->encryptionKeys.secretKeyBytes
-                );
-                auto encryptedOnly = session->encryptStream->process(aesPlaintext);
-                mcpe.reserve(1 + encryptedOnly.size());
-                mcpe.push_back(0xfe);
-                mcpe.insert(mcpe.end(), encryptedOnly.begin(), encryptedOnly.end());
-            } else {
-                auto compressionPacket = compression == VersionedMcpeCompression::Automatic
-                    ? mcpeCodec_.encodeCompressionPacket(
-                        packets,
-                        options_.compressionAlgorithm,
-                        options_.compressionLevel,
-                        options_.compressionThreshold
-                    )
-                    : mcpeCodec_.encodeCompressionPacket(
-                        packets,
-                        compression,
-                        options_.compressionLevel
-                    );
-                if (compression == VersionedMcpeCompression::Automatic &&
-                    mcpeCodec_.compressorInPacketHeader() &&
-                    !session->compressionReady) {
-                    if (compressionPacket.empty()) {
-                        throw std::runtime_error("modern compression packet missing mode byte");
-                    }
-                    compressionPacket.erase(compressionPacket.begin());
-                }
-
-                mcpe.reserve(1 + compressionPacket.size());
-                mcpe.push_back(0xfe);
-                mcpe.insert(mcpe.end(), compressionPacket.begin(), compressionPacket.end());
-            }
-        }
-
-        if (hasWritablePlayer(connection)) {
-            raknet_.sendReliable(connection.peer, mcpe);
-        }
+        sendPacketsInternal(connection, packets, compression, true);
     }
 
     void disconnect(
@@ -1813,6 +1740,94 @@ private:
             return std::chrono::milliseconds(20);
         }
         return std::chrono::milliseconds(std::max(options_.batchingInterval, 1));
+    }
+
+    void sendPacketsInternal(
+        const BedrockServerConnection& connection,
+        const std::vector<VersionedGamePacket>& packets,
+        VersionedMcpeCompression compression,
+        bool processOutbound
+    ) {
+        if (packets.empty()) {
+            return;
+        }
+
+        // connection.js drops writes once its native connection is closed.
+        // In particular, a retained Player/close-listener snapshot must not
+        // manufacture a new plaintext session after Server#close cleared it.
+        const auto session = sessionSnapshot(connection);
+        if (!session) {
+            return;
+        }
+        std::lock_guard<std::recursive_mutex> outboundLock(session->outboundMutex);
+
+        // queuePackets() already ran this state update when it admitted each
+        // packet. Node's Player#_tick writes those prepared buffers directly;
+        // do the same instead of decoding start_game/item_registry twice.
+        if (processOutbound) {
+            for (const auto& packet : packets) {
+                processOutboundPacket(session, packet);
+            }
+        }
+
+        std::vector<uint8_t> mcpe;
+        {
+            std::lock_guard<std::mutex> lock(session->mutex);
+            if (session->status == BedrockServerClientStatus::Disconnected) {
+                return;
+            }
+            if (session->encryptionEnabled && session->hasEncryptionKeys) {
+                if (!session->encryptStream) {
+                    throw std::runtime_error("server encrypt stream is not initialized");
+                }
+                // encryption.js receives the raw framed batch from Framer and
+                // always deflates it itself. Its wire format is independent of
+                // threshold, compressor selection, compressionReady, and the
+                // low-level compression override accepted by this C++ method.
+                auto compressionPacket = mcpeCodec_.encodeEncryptedCompressionPacket(
+                    packets,
+                    session->compressionLevel
+                );
+                auto aesPlaintext = BedrockEncryption::makeAesPlaintext(
+                    compressionPacket,
+                    session->sendCounter++,
+                    session->encryptionKeys.secretKeyBytes
+                );
+                auto encryptedOnly = session->encryptStream->process(aesPlaintext);
+                mcpe.reserve(1 + encryptedOnly.size());
+                mcpe.push_back(0xfe);
+                mcpe.insert(mcpe.end(), encryptedOnly.begin(), encryptedOnly.end());
+            } else {
+                auto compressionPacket = compression == VersionedMcpeCompression::Automatic
+                    ? mcpeCodec_.encodeCompressionPacket(
+                        packets,
+                        options_.compressionAlgorithm,
+                        options_.compressionLevel,
+                        options_.compressionThreshold
+                    )
+                    : mcpeCodec_.encodeCompressionPacket(
+                        packets,
+                        compression,
+                        options_.compressionLevel
+                    );
+                if (compression == VersionedMcpeCompression::Automatic &&
+                    mcpeCodec_.compressorInPacketHeader() &&
+                    !session->compressionReady) {
+                    if (compressionPacket.empty()) {
+                        throw std::runtime_error("modern compression packet missing mode byte");
+                    }
+                    compressionPacket.erase(compressionPacket.begin());
+                }
+
+                mcpe.reserve(1 + compressionPacket.size());
+                mcpe.push_back(0xfe);
+                mcpe.insert(mcpe.end(), compressionPacket.begin(), compressionPacket.end());
+            }
+        }
+
+        if (hasWritablePlayer(connection)) {
+            raknet_.sendReliable(connection.peer, mcpe);
+        }
     }
 
     void processOutboundPacket(

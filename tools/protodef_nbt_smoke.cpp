@@ -1,9 +1,11 @@
+#include <bedrock/BinaryStream.hpp>
 #include <bedrock/protocol/VersionedPacketCodec.hpp>
 #include <bedrock/protodef/ProtoDefContext.hpp>
 #include <bedrock/protodef/ProtoDefDecoder.hpp>
 #include <bedrock/protodef/ProtoDefEncoder.hpp>
 #include <bedrock/protodef/ProtoDefPacketDecoder.hpp>
 #include <bedrock/protodef/ProtoDefPacketEncoder.hpp>
+#include <bedrock/protodef/ProtoDefNbt.hpp>
 #include <bedrock/protodef/ProtoDefReader.hpp>
 #include <bedrock/protodef/ProtoDefValue.hpp>
 #include <bedrock/protodef/ProtoDefWriter.hpp>
@@ -228,6 +230,51 @@ bool checkRichPrimitiveVectors() {
     return ok;
 }
 
+bool checkBorrowedNbtInput() {
+    const std::vector<uint8_t> source {
+        0xaa,
+        0x00, 0x00, // littleVarint TAG_End plus empty root name
+        0xbb
+    };
+    bedrock::PacketFieldCursor cursor(source);
+    cursor.skip(1);
+    bedrock::ProtoDefReader reader(cursor);
+
+    const auto decoded = bedrock::readProtoDefNbt(
+        reader,
+        bedrock::BedrockNbtEncoding::LittleVarInt
+    );
+    const auto* type = child(decoded, "type");
+    const auto* name = child(decoded, "name");
+    bool ok = true;
+    if (reader.offset() != 3 || reader.remaining() != 1 ||
+        !type || type->kind != Value::Kind::String ||
+        type->stringValue != "end" ||
+        !name || name->kind != Value::Kind::String ||
+        !name->stringValue.empty()) {
+        std::cerr << "[FAIL] borrowed NBT reader offset/value mismatch\n";
+        ok = false;
+    }
+
+    auto view = bedrock::BinaryStream::view(source, 1);
+    const auto& readOnlyView = std::as_const(view);
+    if (&readOnlyView.buffer() != &source ||
+        view.readU8() != 0x00 ||
+        source != std::vector<uint8_t>({0xaa, 0x00, 0x00, 0xbb})) {
+        std::cerr << "[FAIL] BinaryStream read view copied or changed its source\n";
+        ok = false;
+    }
+
+    auto& writable = view.buffer();
+    writable[0] = 0xcc;
+    if (&writable == &source || source.front() != 0xaa ||
+        readOnlyView.buffer().front() != 0xcc) {
+        std::cerr << "[FAIL] BinaryStream read view copy-on-write mismatch\n";
+        ok = false;
+    }
+    return ok;
+}
+
 bool checkPacketVectors() {
     bool ok = true;
     const std::string version = "1.21.100";
@@ -313,6 +360,7 @@ bool checkPacketVectors() {
 int main() {
     bool ok = true;
     ok = checkRichPrimitiveVectors() && ok;
+    ok = checkBorrowedNbtInput() && ok;
     ok = checkPacketVectors() && ok;
 
     if (!ok) return 1;

@@ -22,6 +22,10 @@ public:
         return cursor_.remaining();
     }
 
+    const std::vector<uint8_t>& data() const {
+        return cursor_.data();
+    }
+
     uint8_t u8() {
         if (remaining() < 1) {
             throw std::runtime_error("not enough bytes for u8 at offset " + std::to_string(offset()));
@@ -154,9 +158,7 @@ public:
     }
 
     void skip(std::size_t n) {
-        for (std::size_t i = 0; i < n; ++i) {
-            cursor_.u8();
-        }
+        cursor_.skip(n);
     }
 
     std::vector<uint8_t> readBytes(std::size_t count) {

@@ -20,6 +20,11 @@ public:
     explicit BinaryStream(const std::vector<uint8_t>& data);
     explicit BinaryStream(std::vector<uint8_t>&& data);
 
+    // Read directly from an existing buffer without copying it. The source
+    // must outlive the returned stream. Any later mutable buffer access or
+    // write materializes an owned copy first.
+    static BinaryStream view(const std::vector<uint8_t>& data, size_t offset = 0);
+
     const std::vector<uint8_t>& buffer() const;
     std::vector<uint8_t>& buffer();
 
@@ -82,9 +87,16 @@ public:
     void writeBytes(const uint8_t* data, size_t len);
 
 private:
+    struct ViewTag {};
+
+    BinaryStream(const std::vector<uint8_t>& data, size_t offset, ViewTag);
+
     std::vector<uint8_t> data_;
+    const std::vector<uint8_t>* view_ = nullptr;
     size_t offset_ = 0;
 
+    const std::vector<uint8_t>& readableBuffer() const;
+    std::vector<uint8_t>& writableBuffer();
     void require(size_t len) const;
 };
 

@@ -21,6 +21,11 @@ public:
         : data_(data) {}
 
     std::size_t offset() const { return offset_; }
+    const std::vector<uint8_t>& data() const { return data_; }
+    void skip(std::size_t size) {
+        require(size, "skip");
+        offset_ += size;
+    }
     void rewindTo(std::size_t offset) {
         if (offset > data_.size()) {
             throw std::runtime_error("PacketFieldCursor::rewindTo out of bounds");

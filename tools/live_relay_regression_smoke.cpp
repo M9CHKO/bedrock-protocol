@@ -6,13 +6,17 @@
 #include <bedrock/protodef/ProtoDefContext.hpp>
 #include <bedrock/protodef/ProtoDefDecoder.hpp>
 #include <bedrock/protodef/ProtoDefJson.hpp>
+#include <bedrock/protodef/ProtoDefNbt.hpp>
 #include <bedrock/protodef/ProtoDefPacketEncoder.hpp>
 #include <bedrock/protodef/ProtoDefPacketDecoder.hpp>
 #include <bedrock/protodef/ProtoDefReader.hpp>
+#include <bedrock/protodef/ProtoDefWriter.hpp>
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstdint>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -44,6 +48,147 @@ bool check(bool condition, const std::string& message) {
         std::cerr << "[LIVE-RELAY-REGRESSION-SMOKE] " << message << "\n";
     }
     return condition;
+}
+
+bool packetSequenceEquals(
+    const std::vector<bedrock::VersionedGamePacket>& actual,
+    const std::vector<bedrock::VersionedGamePacket>& expected,
+    std::string& mismatch
+) {
+    if (actual.size() != expected.size()) {
+        mismatch = "packet count " + std::to_string(actual.size()) +
+            " != " + std::to_string(expected.size());
+        return false;
+    }
+    for (std::size_t index = 0; index < actual.size(); ++index) {
+        if (actual[index].name != expected[index].name) {
+            mismatch = "packet[" + std::to_string(index) + "] name " +
+                actual[index].name + " != " + expected[index].name;
+            return false;
+        }
+        if (actual[index].fullPacket == expected[index].fullPacket) continue;
+        std::size_t byteIndex = 0;
+        while (
+            byteIndex < actual[index].fullPacket.size() &&
+            byteIndex < expected[index].fullPacket.size() &&
+            actual[index].fullPacket[byteIndex] == expected[index].fullPacket[byteIndex]
+        ) {
+            ++byteIndex;
+        }
+        mismatch = "packet[" + std::to_string(index) + "] " + actual[index].name +
+            " differs at full-packet byte " + std::to_string(byteIndex) +
+            " (sizes " + std::to_string(actual[index].fullPacket.size()) +
+            " and " + std::to_string(expected[index].fullPacket.size()) + ")";
+        return false;
+    }
+    mismatch.clear();
+    return true;
+}
+
+std::optional<std::size_t> decodedArrayIndex(
+    const std::string& path,
+    const std::string& root,
+    const std::string& suffix
+);
+std::optional<int64_t> decodedIntegerValue(std::string text);
+
+std::optional<bedrock::VersionedGamePacket> capturedItemRegistry() {
+    const char* path = std::getenv("BEDROCK_REAL_ITEM_REGISTRY");
+    if (path == nullptr || *path == '\0') return std::nullopt;
+
+    std::ifstream stream(path, std::ios::binary);
+    std::vector<uint8_t> bytes {
+        std::istreambuf_iterator<char>(stream),
+        std::istreambuf_iterator<char>()
+    };
+    if (!stream.is_open() || bytes.empty()) {
+        throw std::runtime_error("could not read captured item_registry");
+    }
+
+    const std::string version = "1.21.100";
+    auto packet = bedrock::VersionedMcpeCodec::forVersion(version)
+        .packetCodec()
+        .decodeFullPacket(bytes);
+    if (packet.name != "item_registry") {
+        throw std::runtime_error("capture is not item_registry");
+    }
+    return packet;
+}
+
+std::unordered_map<std::string, int64_t> itemRuntimeIdsByName(
+    const bedrock::VersionedGamePacket& packet,
+    std::size_t* fieldCount = nullptr
+) {
+    const auto fields = bedrock::ProtoDefPacketDecoder("1.21.100")
+        .decodePacketStrict(packet.name, packet.payload);
+    if (fieldCount != nullptr) *fieldCount = fields.size();
+    std::unordered_map<std::size_t, std::string> names;
+    std::unordered_map<std::size_t, int64_t> runtimeIds;
+    for (const auto& field : fields) {
+        if (const auto index = decodedArrayIndex(field.path, "itemstates", ".name")) {
+            names[*index] = field.value;
+        } else if (const auto index = decodedArrayIndex(
+                       field.path,
+                       "itemstates",
+                       ".runtime_id"
+                   )) {
+            if (const auto id = decodedIntegerValue(field.value)) {
+                runtimeIds[*index] = *id;
+            }
+        }
+    }
+    std::unordered_map<std::string, int64_t> byName;
+    for (const auto& [index, id] : runtimeIds) {
+        if (const auto found = names.find(index); found != names.end()) {
+            byName[found->second] = id;
+        }
+    }
+    return byName;
+}
+
+bool checkCapturedItemRegistry() {
+    const auto captured = capturedItemRegistry();
+    if (!captured.has_value()) return true;
+    const auto& packet = *captured;
+    const auto& bytes = packet.fullPacket;
+
+    const auto validationStarted = std::chrono::steady_clock::now();
+    bedrock::ProtoDefPacketDecoder("1.21.100")
+        .validatePacketStrict(packet.name, packet.payload);
+    const auto validationElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - validationStarted
+    ).count();
+    const auto started = std::chrono::steady_clock::now();
+    std::size_t fieldCount = 0;
+    const auto byName = itemRuntimeIdsByName(packet, &fieldCount);
+    const auto decodeElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started
+    ).count();
+    std::cerr << "[captured-registry] bytes=" << bytes.size()
+              << " entries=" << byName.size()
+              << " fields=" << fieldCount
+              << " validation_ms=" << validationElapsed
+              << " decode_ms=" << decodeElapsed
+              << "\n";
+    bool ok = check(byName.size() == 1'836, "captured registry count mismatch");
+    ok &= check(
+        validationElapsed < 2'000 && decodeElapsed < 2'000,
+        "captured registry decode regressed above two seconds"
+    );
+    const std::unordered_map<std::string, int64_t> expected {
+        {"minecraft:firework_rocket", 552},
+        {"minecraft:diamond_sword", 340},
+        {"minecraft:netherite_sword", 640},
+        {"minecraft:sand", 12},
+        {"minecraft:shulker_box", 810}
+    };
+    for (const auto& [name, id] : expected) {
+        ok &= check(
+            byName.find(name) != byName.end() && byName.at(name) == id,
+            "captured registry runtime ID mismatch for " + name
+        );
+    }
+    return ok;
 }
 
 class ErrorLog {
@@ -292,6 +437,108 @@ bedrock::ProtoDefValue emptyPacketNbtValue() {
         {"name", Value::string("")},
         {"value", Value::object({})}
     });
+}
+
+int32_t itemStateVersion(const std::optional<bedrock::ProtoDefValue>& version) {
+    if (!version.has_value()) return 2;
+    const auto& value = *version;
+    if (value.kind == bedrock::ProtoDefValue::Kind::String) {
+        if (value.stringValue == "legacy") return 0;
+        if (value.stringValue == "data_driven") return 1;
+        if (value.stringValue == "none") return 2;
+    }
+    if (value.kind == bedrock::ProtoDefValue::Kind::Int) {
+        return static_cast<int32_t>(value.intValue);
+    }
+    if (value.kind == bedrock::ProtoDefValue::Kind::UInt) {
+        return static_cast<int32_t>(value.uintValue);
+    }
+    throw std::runtime_error("unsupported item-state version fixture");
+}
+
+bedrock::VersionedGamePacket itemRegistryPacket(
+    const std::string& version,
+    const std::vector<bedrock::BedrockItemState>& states
+) {
+    bedrock::ProtoDefWriter payload;
+    payload.varuint32(static_cast<uint32_t>(states.size()));
+    for (const auto& state : states) {
+        payload.string(state.name);
+        payload.u16le(static_cast<uint16_t>(state.runtimeId));
+        payload.boolValue(state.componentBased);
+        payload.zigzag32(itemStateVersion(state.version));
+        bedrock::writeProtoDefNbt(
+            payload,
+            state.nbt.value_or(emptyPacketNbtValue()),
+            bedrock::BedrockNbtEncoding::LittleVarInt
+        );
+    }
+    return bedrock::VersionedMcpeCodec::forVersion(version)
+        .packetCodec()
+        .makePacketByName("item_registry", payload.take());
+}
+
+bool checkItemRegistryVersionBoundary() {
+    const std::string beforeVersion = "1.21.50";
+    const std::string afterVersion = "1.21.60";
+    const auto beforeStart = minimalStrictPacket(beforeVersion, "start_game");
+    const auto afterStart = minimalStrictPacket(afterVersion, "start_game");
+    const auto beforeFields = bedrock::ProtoDefPacketDecoder(beforeVersion)
+        .decodePacketStrict("start_game", beforeStart.payload);
+    const auto afterFields = bedrock::ProtoDefPacketDecoder(afterVersion)
+        .decodePacketStrict("start_game", afterStart.payload);
+    const auto hasPath = [](const auto& fields, const std::string& path) {
+        for (const auto& field : fields) {
+            if (field.path == path) return true;
+        }
+        return false;
+    };
+
+    bool ok = true;
+    ok &= check(
+        !bedrock::ProtocolDefinition::forVersion(beforeVersion)
+             .hasPacket("item_registry") &&
+            hasPath(beforeFields, "itemstates.$count"),
+        "1.21.50 must carry itemstates in start_game"
+    );
+    ok &= check(
+        bedrock::ProtocolDefinition::forVersion(afterVersion)
+                .hasPacket("item_registry") &&
+            !hasPath(afterFields, "itemstates.$count"),
+        "1.21.60 must move itemstates out of start_game"
+    );
+
+    const std::vector<bedrock::BedrockItemState> states {{
+        .name = "minecraft:firework_rocket",
+        .runtimeId = 552,
+        .componentBased = false,
+        .version = bedrock::ProtoDefValue::string("none"),
+        .nbt = emptyPacketNbtValue()
+    }};
+    const auto registry = itemRegistryPacket(afterVersion, states);
+    const auto registryFields = bedrock::ProtoDefPacketDecoder(afterVersion)
+        .decodePacketStrict("item_registry", registry.payload);
+    const bedrock::ProtoDefField* runtimeId = nullptr;
+    for (const auto& field : registryFields) {
+        if (field.path == "itemstates[0].runtime_id") {
+            runtimeId = &field;
+            break;
+        }
+    }
+    const auto decoded = bedrock::VersionedMcpeCodec::forVersion(afterVersion)
+        .packetCodec()
+        .decodeFullPacket(registry.fullPacket);
+    ok &= check(
+        runtimeId != nullptr && runtimeId->type == "li16" &&
+            runtimeId->size == 2 && runtimeId->value == "552",
+        "1.21.60 item_registry runtime_id is not signed little-endian 16-bit"
+    );
+    ok &= check(
+        decoded.name == "item_registry" &&
+            decoded.fullPacket == registry.fullPacket,
+        "1.21.60 item_registry full-packet identity failed"
+    );
+    return ok;
 }
 
 std::string signedJwt(
@@ -712,6 +959,24 @@ bool checkMapFloodAndItemOrdering() {
     bedrock::MinecraftDataAssets assets;
     const auto items = assets.loadBedrockItemRegistryByProtocol(827);
     const auto blocks = assets.loadBedrockBlockRegistryByProtocol(827);
+    const auto capturedRegistry = capturedItemRegistry();
+    std::unordered_map<std::string, int64_t> expectedItemIds {
+        {"minecraft:firework_rocket", 1192},
+        {"minecraft:diamond_sword", 895},
+        {"minecraft:netherite_sword", 900},
+        {"minecraft:sand", 59},
+        {"minecraft:shulker_box", 9471}
+    };
+    if (capturedRegistry.has_value()) {
+        expectedItemIds = itemRuntimeIdsByName(*capturedRegistry);
+    }
+    const auto itemId = [&](const std::string& name) -> int64_t {
+        const auto found = expectedItemIds.find(name);
+        if (found == expectedItemIds.end()) {
+            throw std::runtime_error("missing item registry definition: " + name);
+        }
+        return found->second;
+    };
     const auto blockRuntimeId = [&](const std::string& name) -> int32_t {
         const auto* definition = blocks.blockByName(name);
         if (definition == nullptr) {
@@ -759,42 +1024,72 @@ bool checkMapFloodAndItemOrdering() {
     sandValue.objectValue["block_runtime_id"] = Value::integer(
         blockRuntimeId("minecraft:sand")
     );
-    const auto shulkerValue = items.toProtoDefValue(shulker);
-    const auto fireworkValue = items.toProtoDefValue(firework);
-    const auto swordValue = items.toProtoDefValue(sword);
-    const auto netheriteSwordValue = items.toProtoDefValue(netheriteSword);
+    auto shulkerValue = items.toProtoDefValue(shulker);
+    auto fireworkValue = items.toProtoDefValue(firework);
+    auto swordValue = items.toProtoDefValue(sword);
+    auto netheriteSwordValue = items.toProtoDefValue(netheriteSword);
+    sandValue.objectValue["network_id"] = Value::integer(itemId("minecraft:sand"));
+    shulkerValue.objectValue["network_id"] = Value::integer(
+        itemId("minecraft:shulker_box")
+    );
+    fireworkValue.objectValue["network_id"] = Value::integer(
+        itemId("minecraft:firework_rocket")
+    );
+    swordValue.objectValue["network_id"] = Value::integer(
+        itemId("minecraft:diamond_sword")
+    );
+    netheriteSwordValue.objectValue["network_id"] = Value::integer(
+        itemId("minecraft:netherite_sword")
+    );
     const auto emptyItem = items.toProtoDefValue(nullptr);
 
-    auto allItemStates = items.writeItemStatesValue();
-    std::vector<Value> selectedItemStates;
-    selectedItemStates.reserve(5);
-    for (auto& state : allItemStates.arrayValue) {
-        const auto* runtimeId = state.get("runtime_id");
-        if (runtimeId == nullptr || runtimeId->kind != Value::Kind::Int) {
-            continue;
-        }
-        const auto id = runtimeId->intValue;
+    const auto registryStates = items.writeItemStates();
+    const auto expectedRegistryCount = registryStates.size();
+    if (expectedRegistryCount < 1'000) {
+        throw std::runtime_error("full item registry fixture is unexpectedly small");
+    }
+
+    std::vector<bedrock::BedrockItemState> selectedStates;
+    std::vector<Value> selectedStateValues;
+    const auto allItemStateValues = items.writeItemStatesValue();
+    for (std::size_t index = 0; index < registryStates.size(); ++index) {
+        const auto id = registryStates[index].runtimeId;
         if (id != 59 && id != 895 && id != 900 && id != 1192 && id != 9471) {
             continue;
         }
+        selectedStates.push_back(registryStates[index]);
+        auto state = allItemStateValues.arrayValue[index];
         if (state.get("version") == nullptr) {
             state.objectValue["version"] = Value::string("none");
         }
         if (state.get("nbt") == nullptr) {
             state.objectValue["nbt"] = emptyPacketNbtValue();
         }
-        selectedItemStates.push_back(std::move(state));
+        selectedStateValues.push_back(std::move(state));
     }
-    const auto expectedRegistryCount = selectedItemStates.size();
-    if (expectedRegistryCount != 5) {
-        throw std::runtime_error("realistic item registry fixture is incomplete");
+    if (selectedStates.size() != 5) {
+        throw std::runtime_error("item registry control entries are incomplete");
     }
-    auto itemStates = Value::array(std::move(selectedItemStates));
-    const auto registry = encodedPacket(
+    const auto schemaReferenceRegistry = encodedPacket(
         version,
         "item_registry",
-        Value::object({{"itemstates", std::move(itemStates)}})
+        Value::object({
+            {"itemstates", Value::array(std::move(selectedStateValues))}
+        })
     );
+    if (itemRegistryPacket(version, selectedStates).fullPacket !=
+        schemaReferenceRegistry.fullPacket) {
+        throw std::runtime_error("full item registry fixture disagrees with schema encoder");
+    }
+    auto registry = itemRegistryPacket(version, registryStates);
+    if (capturedRegistry.has_value()) registry = *capturedRegistry;
+    const auto registryDecodeStarted = std::chrono::steady_clock::now();
+    const auto registryFields = bedrock::ProtoDefPacketDecoder(version)
+        .decodePacketStrict("item_registry", registry.payload);
+    const auto registryDecodeElapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - registryDecodeStarted
+        );
     const auto creativeContent = encodedPacket(
         version,
         "creative_content",
@@ -902,7 +1197,6 @@ bool checkMapFloodAndItemOrdering() {
             )
         ));
     }
-
     ErrorLog errors;
     std::mutex connectionMutex;
     bedrock::BedrockServerConnection upstreamConnection;
@@ -963,6 +1257,8 @@ bool checkMapFloodAndItemOrdering() {
     std::atomic<int> receivedMaps {0};
     std::atomic<int> slots {0};
     std::atomic<int> itemBearingPackets {0};
+    std::atomic<int64_t> registrySentAtNs {0};
+    std::atomic<int64_t> registryDeliveryMs {-1};
     std::atomic<bool> bytesMismatch {false};
     std::atomic<bool> missingRuntimeId {false};
     std::atomic<bool> downstreamDecodeFailed {false};
@@ -994,6 +1290,14 @@ bool checkMapFloodAndItemOrdering() {
             return;
         }
         if (event.packet.name == "item_registry") {
+            const auto sentAt = registrySentAtNs.load();
+            if (sentAt != 0) {
+                const auto receivedAt =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()
+                    ).count();
+                registryDeliveryMs = (receivedAt - sentAt) / 1'000'000;
+            }
             ++registries;
             if (event.packet.fullPacket != registry.fullPacket) {
                 bytesMismatch = true;
@@ -1074,6 +1378,10 @@ bool checkMapFloodAndItemOrdering() {
     });
 
     bool ok = true;
+    ok &= check(
+        registryDecodeElapsed < 2s,
+        "full 1.21.100 item_registry strict decode exceeded two seconds"
+    );
     const bool connected = downstream.connect();
     const bool ready = connected && waitFor([&]() {
         return joins.load() == 1 && hasUpstreamConnection &&
@@ -1104,11 +1412,29 @@ bool checkMapFloodAndItemOrdering() {
     });
     ok &= check(startGameReady, "start_game was not delivered before item_registry");
 
-    if (startGameReady) upstream.sendPacket(target, registry);
+    if (startGameReady) {
+        registrySentAtNs =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()
+            ).count();
+        upstream.sendPacket(target, registry);
+    }
     const bool paletteReady = ready && waitFor([&]() {
         return registries.load() == 1;
-    });
+    }, 60s);
     ok &= check(paletteReady, "item_registry was not delivered before items");
+    if (paletteReady) {
+        ok &= check(
+            registryDeliveryMs.load() >= 0 && registryDeliveryMs.load() < 6'000,
+            "full 1.21.100 item_registry relay delivery exceeded six seconds"
+        );
+    }
+    std::cerr << "[item-registry-regression] entries=" << expectedRegistryCount
+              << " bytes=" << registry.fullPacket.size()
+              << " fields=" << registryFields.size()
+              << " strict_decode_ms=" << registryDecodeElapsed.count()
+              << " relay_delivery_ms=" << registryDeliveryMs.load()
+              << "\n";
 
     if (paletteReady) {
         upstream.queuePacket(target, creativeContent);
@@ -1149,10 +1475,11 @@ bool checkMapFloodAndItemOrdering() {
             downstreamRegistry.size() == expectedRegistryCount,
             "downstream item runtime-ID table is incomplete"
         );
-        for (const auto id : {59ll, 895ll, 900ll, 1192ll, 9471ll}) {
+        for (const auto& [name, id] : expectedItemIds) {
             ok &= check(
                 downstreamRegistry.find(id) != downstreamRegistry.end(),
-                "downstream item runtime-ID table is missing " + std::to_string(id)
+                "downstream item runtime-ID table is missing " + name + "=" +
+                    std::to_string(id)
             );
         }
     }
@@ -1176,15 +1503,20 @@ bool checkMapFloodAndItemOrdering() {
             text.find("item_registry count=" +
                 std::to_string(expectedRegistryCount)) !=
                 std::string::npos &&
-            text.find("name=minecraft:firework_rocket present=true runtime_id=1192") !=
+            text.find("name=minecraft:firework_rocket present=true runtime_id=" +
+                std::to_string(itemId("minecraft:firework_rocket"))) !=
                 std::string::npos &&
-            text.find("name=minecraft:diamond_sword present=true runtime_id=895") !=
+            text.find("name=minecraft:diamond_sword present=true runtime_id=" +
+                std::to_string(itemId("minecraft:diamond_sword"))) !=
                 std::string::npos &&
-            text.find("name=minecraft:netherite_sword present=true runtime_id=900") !=
+            text.find("name=minecraft:netherite_sword present=true runtime_id=" +
+                std::to_string(itemId("minecraft:netherite_sword"))) !=
                 std::string::npos &&
-            text.find("name=minecraft:sand present=true runtime_id=59") !=
+            text.find("name=minecraft:sand present=true runtime_id=" +
+                std::to_string(itemId("minecraft:sand"))) !=
                 std::string::npos &&
-            text.find("name=minecraft:shulker_box present=true runtime_id=9471") !=
+            text.find("name=minecraft:shulker_box present=true runtime_id=" +
+                std::to_string(itemId("minecraft:shulker_box"))) !=
                 std::string::npos &&
             text.find("registry_present=false") == std::string::npos,
             "item/resource diagnostics did not prove palette consistency"
@@ -1199,33 +1531,145 @@ bool checkMapFloodAndItemOrdering() {
 }
 
 bool checkResourcePackServerboundOrdering() {
+    using Value = bedrock::ProtoDefValue;
     const std::string version = "1.21.100";
+    const std::string packId = "11111111-2222-3333-4444-555555555555";
+    const std::string packVersion = "1.0.0";
+    const std::string packReference = packId + "_" + packVersion;
+    const std::string secretContentKey = "do-not-log-content-key";
+    const std::string cdnUrl =
+        "https://cdn.example.invalid/pack.mcpack?sig=relay-secret-token";
+
+    const auto zeroPacksInfo = encodedPacket(
+        version,
+        "resource_packs_info",
+        Value::object({
+            {"must_accept", Value::boolean(false)},
+            {"has_addons", Value::boolean(false)},
+            {"has_scripts", Value::boolean(false)},
+            {"disable_vibrant_visuals", Value::boolean(false)},
+            {"world_template", Value::object({
+                {"uuid", Value::string("00000000-0000-0000-0000-000000000000")},
+                {"version", Value::string("")}
+            })},
+            {"texture_packs", Value::array({})}
+        })
+    );
+    const auto cdnPacksInfo = encodedPacket(
+        version,
+        "resource_packs_info",
+        Value::object({
+            {"must_accept", Value::boolean(true)},
+            {"has_addons", Value::boolean(true)},
+            {"has_scripts", Value::boolean(false)},
+            {"disable_vibrant_visuals", Value::boolean(false)},
+            {"world_template", Value::object({
+                {"uuid", Value::string("00000000-0000-0000-0000-000000000000")},
+                {"version", Value::string("")}
+            })},
+            {"texture_packs", Value::array({
+                Value::object({
+                    {"uuid", Value::string(packId)},
+                    {"version", Value::string(packVersion)},
+                    {"size", Value::uinteger(6)},
+                    {"content_key", Value::string(secretContentKey)},
+                    {"sub_pack_name", Value::string("")},
+                    {"content_identity", Value::string(packId)},
+                    {"has_scripts", Value::boolean(false)},
+                    {"addon_pack", Value::boolean(false)},
+                    {"rtx_enabled", Value::boolean(false)},
+                    {"cdn_url", Value::string(cdnUrl)}
+                })
+            })}
+        })
+    );
+    const auto dataInfo = encodedPacket(
+        version,
+        "resource_pack_data_info",
+        Value::object({
+            {"pack_id", Value::string(packId)},
+            {"max_chunk_size", Value::uinteger(4)},
+            {"chunk_count", Value::uinteger(2)},
+            {"size", Value::uinteger(6)},
+            {"hash", Value::bytes({0x10, 0x20, 0x30, 0x40})},
+            {"is_premium", Value::boolean(false)},
+            {"pack_type", Value::string("cached")}
+        })
+    );
+    const auto chunkData = encodedPacket(
+        version,
+        "resource_pack_chunk_data",
+        Value::object({
+            {"pack_id", Value::string(packId)},
+            {"chunk_index", Value::uinteger(0)},
+            {"progress", Value::uinteger(4)},
+            {"payload", Value::bytes({0xde, 0xad, 0xbe, 0xef})}
+        })
+    );
+    const auto packStack = encodedPacket(
+        version,
+        "resource_pack_stack",
+        Value::object({
+            {"must_accept", Value::boolean(true)},
+            {"behavior_packs", Value::array({})},
+            {"resource_packs", Value::array({
+                Value::object({
+                    {"uuid", Value::string(packId)},
+                    {"version", Value::string(packVersion)},
+                    {"name", Value::string("")}
+                })
+            })},
+            {"game_version", Value::string(version)},
+            {"experiments", Value::array({})},
+            {"experiments_previously_used", Value::boolean(false)},
+            {"has_editor_packs", Value::boolean(false)}
+        })
+    );
+    const std::vector<bedrock::VersionedGamePacket> expectedClientbound {
+        zeroPacksInfo,
+        cdnPacksInfo,
+        dataInfo,
+        chunkData,
+        packStack
+    };
+
+    const auto haveAllPacks = encodedPacket(
+        version,
+        "resource_pack_client_response",
+        Value::object({
+            {"response_status", Value::string("have_all_packs")},
+            {"resourcepackids", Value::array({Value::string(packReference)})}
+        })
+    );
     const auto chunkRequest = encodedPacket(
         version,
         "resource_pack_chunk_request",
-        bedrock::ProtoDefValue::object({
-            {"pack_id", bedrock::ProtoDefValue::string(
-                "11111111-2222-3333-4444-555555555555"
-            )},
-            {"chunk_index", bedrock::ProtoDefValue::uinteger(0)}
+        Value::object({
+            {"pack_id", Value::string(packId)},
+            {"chunk_index", Value::uinteger(0)}
         })
     );
     const auto completed = encodedPacket(
         version,
         "resource_pack_client_response",
-        bedrock::ProtoDefValue::object({
-            {"response_status", bedrock::ProtoDefValue::uinteger(4)},
-            {"resourcepackids", bedrock::ProtoDefValue::array({
-                bedrock::ProtoDefValue::string(
-                    "11111111-2222-3333-4444-555555555555_1.0.0"
-                )
-            })}
+        Value::object({
+            {"response_status", Value::string("completed")},
+            {"resourcepackids", Value::array({Value::string(packReference)})}
         })
     );
+    const std::vector<bedrock::VersionedGamePacket> expectedServerbound {
+        haveAllPacks,
+        chunkRequest,
+        completed
+    };
 
     ErrorLog errors;
-    std::mutex receivedMutex;
-    std::vector<bedrock::VersionedGamePacket> received;
+    std::mutex connectionMutex;
+    bedrock::BedrockServerConnection upstreamConnection;
+    std::atomic<bool> hasUpstreamConnection {false};
+    std::atomic<bool> captureServerbound {false};
+    std::mutex serverboundMutex;
+    std::vector<bedrock::VersionedGamePacket> receivedServerbound;
     bedrock::BedrockServer upstream({
         .host = "127.0.0.1",
         .port = 0,
@@ -1237,22 +1681,35 @@ bool checkResourcePackServerboundOrdering() {
         // chunk request must not be overtaken while this batch is pending.
         .batchingInterval = 100
     });
+    upstream.onConnect([&](const bedrock::BedrockServerConnection& connection) {
+        std::lock_guard<std::mutex> lock(connectionMutex);
+        upstreamConnection = connection;
+        hasUpstreamConnection = true;
+    });
     upstream.onAny([&](const bedrock::BedrockServerPacketEvent& event) {
-        if (event.packet.name != "resource_pack_chunk_request" &&
-            event.packet.name != "resource_pack_client_response") {
+        if (!captureServerbound.load() ||
+            (event.packet.name != "resource_pack_chunk_request" &&
+             event.packet.name != "resource_pack_client_response")) {
             return;
         }
-        std::lock_guard<std::mutex> lock(receivedMutex);
-        received.push_back(event.packet);
+        std::lock_guard<std::mutex> lock(serverboundMutex);
+        receivedServerbound.push_back(event.packet);
     });
     upstream.listen();
 
     auto options = relayOptions(upstream.boundPort(), true);
     options.batchingInterval = 100;
+    options.itemResourceDiagnostics = true;
     bedrock::Relay relay(std::move(options));
     std::atomic<int> joins {0};
+    std::mutex diagnosticsMutex;
+    std::vector<std::string> diagnostics;
     relay.onJoin([&](bedrock::RelayPlayer&, bedrock::BedrockNetworkClient&) {
         ++joins;
+    });
+    relay.onDiagnostic([&](const std::string& message) {
+        std::lock_guard<std::mutex> lock(diagnosticsMutex);
+        diagnostics.push_back(message);
     });
     relay.onError([&](const std::string& message) {
         errors.add("relay", message);
@@ -1263,6 +1720,20 @@ bool checkResourcePackServerboundOrdering() {
     clientOptions.batchingIntervalMs = 100;
     clientOptions.autoResourcePackResponses = false;
     auto downstream = bedrock::createNetworkClient(std::move(clientOptions));
+    std::atomic<bool> captureClientbound {false};
+    std::mutex clientboundMutex;
+    std::vector<bedrock::VersionedGamePacket> receivedClientbound;
+    downstream.onAny([&](const bedrock::BedrockNetworkClientPacketEvent& event) {
+        if (!captureClientbound.load() ||
+            (event.packet.name != "resource_packs_info" &&
+             event.packet.name != "resource_pack_data_info" &&
+             event.packet.name != "resource_pack_chunk_data" &&
+             event.packet.name != "resource_pack_stack")) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(clientboundMutex);
+        receivedClientbound.push_back(event.packet);
+    });
     downstream.onError([&](const std::string& message) {
         errors.add("downstream", message);
     });
@@ -1270,32 +1741,82 @@ bool checkResourcePackServerboundOrdering() {
     bool ok = true;
     const bool connected = downstream.connect();
     const bool ready = connected && waitFor([&]() {
-        return joins.load() == 1 && relay.live().upstreamReady();
+        return joins.load() == 1 && relay.live().upstreamReady() &&
+            hasUpstreamConnection.load();
     });
     ok &= check(connected, "resource-pack ordering downstream failed to connect");
     ok &= check(ready, "resource-pack ordering relay did not become ready");
 
+    bedrock::BedrockServerConnection target;
+    {
+        std::lock_guard<std::mutex> lock(connectionMutex);
+        target = upstreamConnection;
+    }
     if (ready) {
-        downstream.sendBuffer(chunkRequest.fullPacket);
-        downstream.sendBuffer(completed.fullPacket);
+        captureClientbound = true;
+        upstream.queuePackets(target, expectedClientbound);
+        upstream.sendQueued(target);
+    }
+    const bool clientboundDelivered = ready && waitFor([&]() {
+        std::lock_guard<std::mutex> lock(clientboundMutex);
+        return receivedClientbound.size() == expectedClientbound.size();
+    });
+    ok &= check(
+        clientboundDelivered,
+        "resource-pack clientbound variants were not delivered"
+    );
+    if (clientboundDelivered) {
+        std::lock_guard<std::mutex> lock(clientboundMutex);
+        std::string mismatch;
+        ok &= check(
+            packetSequenceEquals(receivedClientbound, expectedClientbound, mismatch),
+            "Relay changed resource-pack clientbound bytes or order: " + mismatch
+        );
+    }
+
+    if (ready) {
+        captureServerbound = true;
+        for (const auto& packet : expectedServerbound) {
+            downstream.sendBuffer(packet.fullPacket);
+        }
         downstream.sendQueued();
     }
-    const bool delivered = ready && waitFor([&]() {
-        std::lock_guard<std::mutex> lock(receivedMutex);
-        return received.size() == 2;
+    const bool serverboundDelivered = ready && waitFor([&]() {
+        std::lock_guard<std::mutex> lock(serverboundMutex);
+        return receivedServerbound.size() == expectedServerbound.size();
     });
-    ok &= check(delivered, "resource-pack control packets were not delivered");
-    if (delivered) {
-        std::lock_guard<std::mutex> lock(receivedMutex);
+    ok &= check(
+        serverboundDelivered,
+        "resource-pack serverbound variants were not delivered"
+    );
+    if (serverboundDelivered) {
+        std::lock_guard<std::mutex> lock(serverboundMutex);
+        std::string mismatch;
         ok &= check(
-            received[0].name == "resource_pack_chunk_request" &&
-                received[1].name == "resource_pack_client_response",
-            "resource_pack_client_response overtook resource_pack_chunk_request"
+            packetSequenceEquals(receivedServerbound, expectedServerbound, mismatch),
+            "Relay changed resource-pack serverbound bytes or order: " + mismatch
+        );
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(diagnosticsMutex);
+        std::ostringstream joined;
+        for (const auto& line : diagnostics) joined << line << '\n';
+        const auto text = joined.str();
+        ok &= check(
+            text.find("resource_packs_info count=0") != std::string::npos &&
+                text.find("resource_packs_info count=1") != std::string::npos &&
+                text.find("uuid=" + packId) != std::string::npos &&
+                text.find("version=" + packVersion) != std::string::npos &&
+                text.find("has_cdn_url=true") != std::string::npos &&
+                text.find("have_all_packs") != std::string::npos &&
+                text.find("completed") != std::string::npos,
+            "resource-pack diagnostics omitted negotiation metadata"
         );
         ok &= check(
-            received[0].fullPacket == chunkRequest.fullPacket &&
-                received[1].fullPacket == completed.fullPacket,
-            "Relay changed resource-pack serverbound packet bytes"
+            text.find(secretContentKey) == std::string::npos &&
+                text.find("relay-secret-token") == std::string::npos,
+            "resource-pack diagnostics leaked content_key or CDN token"
         );
     }
     ok &= check(errors.empty(), "resource-pack ordering error: " + errors.text());
@@ -1569,7 +2090,9 @@ bool checkDownstreamCloseLifecycle() {
 } // namespace
 
 int main() {
-    bool ok = checkMixedAuthenticationHandshake();
+    bool ok = checkCapturedItemRegistry();
+    ok = checkItemRegistryVersionBoundary() && ok;
+    ok = checkMixedAuthenticationHandshake() && ok;
     ok = checkFullMapForwarding() && ok;
     ok = checkMapFloodAndItemOrdering() && ok;
     ok = checkResourcePackServerboundOrdering() && ok;

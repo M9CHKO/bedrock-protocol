@@ -404,15 +404,15 @@ ProtoDefValue readProtoDefNbt(
     ProtoDefReader& reader,
     BedrockNbtEncoding encoding
 ) {
-    auto input = reader.peekRemainingBytes();
-    if (input.empty()) {
+    if (reader.remaining() == 0) {
         throw BedrockNbtError("not enough bytes for NBT root tag");
     }
 
-    BinaryStream stream(std::move(input));
+    const auto start = reader.offset();
+    BinaryStream stream = BinaryStream::view(reader.data(), start);
     NbtDocument document;
 
-    if (stream.buffer().front() == static_cast<uint8_t>(NbtTagType::End)) {
+    if (reader.data()[start] == static_cast<uint8_t>(NbtTagType::End)) {
         stream.readU8();
         if (encoding == BedrockNbtEncoding::LittleVarInt) {
             document.name = stream.readString();
@@ -422,7 +422,7 @@ ProtoDefValue readProtoDefNbt(
         document = BedrockNbtCodec::read(stream, encoding);
     }
 
-    reader.skip(stream.offset());
+    reader.skip(stream.offset() - start);
     return nbtDocumentToProtoDefValue(document);
 }
 
