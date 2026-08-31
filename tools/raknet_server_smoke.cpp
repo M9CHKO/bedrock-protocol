@@ -1021,12 +1021,91 @@ bool checkEncryptedPlayerErrorBranches() {
 
         if (duplicateEvents != 1 ||
             duplicateDetail !=
-                "duplicate encrypted batch ignored receive_counter=1" ||
+                "duplicate encrypted batch ignored original_receive_counter=0 "
+                "receive_counter=1 replay_distance=1" ||
             bedrock::BedrockServerTestAccess::counters(server, connection) !=
                 std::pair<uint64_t, uint64_t>{1, 1} ||
             bedrock::BedrockServerTestAccess::scheduledCloses(server) != 0) {
             std::cerr << "[SMOKE] encrypted duplicate was not ignored before "
                          "advancing cipher state\n";
+            return false;
+        }
+    }
+
+    {
+        bedrock::BedrockServer server({.version = "1.20.61", .offline = true});
+        const auto connection = bedrock::BedrockServerTestAccess::addEncryptedPlayer(
+            server, key, iv, 19206, 17
+        );
+        int duplicateEvents = 0;
+        std::string duplicateDetail;
+        server.onTransport([&](
+            const bedrock::BedrockServerTransportEvent& event
+        ) {
+            if (event.kind ==
+                    bedrock::BedrockServerTransportEventKind::Receive &&
+                event.message.starts_with("duplicate encrypted batch ignored")) {
+                ++duplicateEvents;
+                duplicateDetail = event.message;
+            }
+        });
+
+        const auto codec = bedrock::VersionedMcpeCodec::forVersion("1.20.61");
+        const auto tick = codec.packetCodec().makePacketByName(
+            "tick_sync",
+            std::vector<uint8_t>(16, 0)
+        );
+        const auto compressionPacket = codec.encodeEncryptedCompressionPacket(
+            {tick},
+            7
+        );
+        auto cipher = bedrock::BedrockEncryption::createCipherStream(
+            bedrock::protocolVersionFor("1.20.61"),
+            key,
+            iv,
+            bedrock::BedrockCipherMode::Encrypt
+        );
+
+        constexpr uint64_t acceptedBatchCount = 128;
+        std::vector<uint8_t> firstWire;
+        for (uint64_t counter = 0;
+             counter < acceptedBatchCount;
+             ++counter) {
+            const auto plaintext = bedrock::BedrockEncryption::makeAesPlaintext(
+                compressionPacket,
+                counter,
+                key
+            );
+            auto encrypted = cipher->process(plaintext);
+            encrypted.insert(encrypted.begin(), 0xfe);
+            if (counter == 0) {
+                firstWire = encrypted;
+            }
+            bedrock::BedrockServerTestAccess::handle(
+                server,
+                connection,
+                encrypted
+            );
+        }
+
+        // A one-entry/32-entry replay cache passes the adjacent duplicate
+        // test above but fails this live failure mode after normal movement
+        // traffic advances the continuous cipher far enough.
+        bedrock::BedrockServerTestAccess::handle(
+            server,
+            connection,
+            firstWire
+        );
+
+        if (duplicateEvents != 1 ||
+            duplicateDetail !=
+                "duplicate encrypted batch ignored original_receive_counter=0 "
+                "receive_counter=128 replay_distance=128" ||
+            bedrock::BedrockServerTestAccess::counters(server, connection) !=
+                std::pair<uint64_t, uint64_t>{0, acceptedBatchCount} ||
+            bedrock::BedrockServerTestAccess::scheduledCloses(server) != 0) {
+            std::cerr << "[SMOKE] delayed encrypted replay escaped the "
+                         "transport retry history\n";
             return false;
         }
     }
@@ -1887,6 +1966,139 @@ bool checkReliableSendBackpressure() {
 
     close(sock);
     server.close();
+    return ok;
+}
+
+bool checkReconnectSplitSequenceResynchronization() {
+    bedrock::RakNetServer server({
+        .host = "127.0.0.1",
+        .port = 0,
+        .maxPlayers = 1,
+        .protocolVersion = RAKNET_PROTOCOL
+    });
+    std::atomic<bool> opened {false};
+    std::atomic<bool> sawPrelude {false};
+    std::atomic<bool> sawLargePayload {false};
+    std::atomic<bool> acceptedSecondDiscontinuity {false};
+    const std::vector<uint8_t> prelude {0xfe, 0x01, 0x02, 0x03};
+    const std::vector<uint8_t> rejectedPayload(600, 0xfe);
+    std::vector<uint8_t> largePayload(32'000);
+    largePayload.front() = 0xfe;
+    uint32_t random = 0x6d2b79f5u;
+    for (std::size_t index = 1; index < largePayload.size(); ++index) {
+        random ^= random << 13u;
+        random ^= random >> 17u;
+        random ^= random << 5u;
+        largePayload[index] = static_cast<uint8_t>(random & 0xffu);
+    }
+
+    server.onOpenConnection([&](const bedrock::RakNetServerPeer&) {
+        opened = true;
+    });
+    server.onEncapsulated([&](
+        const bedrock::RakNetServerPeer&,
+        const std::vector<uint8_t>& payload
+    ) {
+        if (payload == prelude) sawPrelude = true;
+        if (payload == largePayload) sawLargePayload = true;
+        if (payload == rejectedPayload) acceptedSecondDiscontinuity = true;
+    });
+    server.listen();
+
+    sockaddr_in target {};
+    target.sin_family = AF_INET;
+    target.sin_port = htons(server.boundPort());
+    inet_pton(AF_INET, "127.0.0.1", &target.sin_addr);
+    const int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0 || !establishConnectedSession(
+            sock,
+            target,
+            server.boundPort()
+        )) {
+        if (sock >= 0) close(sock);
+        server.close();
+        std::cerr << "[SMOKE] reconnect-sequence peer setup failed\n";
+        return false;
+    }
+    for (int attempt = 0; attempt < 100 && !opened.load(); ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    if (!sendPacket(
+            sock,
+            target,
+            buildReliableDatagram(prelude, 2, 2, 2)
+        )) {
+        close(sock);
+        server.close();
+        return false;
+    }
+    for (int attempt = 0; attempt < 100 && !sawPrelude.load(); ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    constexpr std::size_t partBytes = 1'200;
+    const uint32_t splitCount = static_cast<uint32_t>(
+        (largePayload.size() + partBytes - 1) / partBytes
+    );
+    constexpr uint32_t firstDatagramSequence = 60'003;
+    for (uint32_t splitIndex = 0; splitIndex < splitCount; ++splitIndex) {
+        const auto beginOffset = static_cast<std::size_t>(splitIndex) *
+            partBytes;
+        const auto endOffset = std::min(
+            largePayload.size(),
+            beginOffset + partBytes
+        );
+        const std::vector<uint8_t> part(
+            largePayload.begin() + static_cast<std::ptrdiff_t>(beginOffset),
+            largePayload.begin() + static_cast<std::ptrdiff_t>(endOffset)
+        );
+        auto datagram = buildSplitReliableDatagram(
+            part,
+            firstDatagramSequence + splitIndex,
+            3 + splitIndex,
+            3,
+            splitCount,
+            29,
+            splitIndex
+        );
+        // The real Login burst marks that more datagrams are pending.
+        datagram.front() |= 0x08u;
+        if (!sendPacket(sock, target, datagram)) {
+            close(sock);
+            server.close();
+            return false;
+        }
+    }
+
+    for (int attempt = 0; attempt < 300 && !sawLargePayload.load(); ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    if (sawLargePayload.load()) {
+        auto secondJump = buildReliableDatagram(
+            rejectedPayload,
+            firstDatagramSequence + splitCount + 60'000,
+            3 + splitCount,
+            4
+        );
+        secondJump.front() |= 0x08u;
+        if (!sendPacket(sock, target, secondJump)) {
+            close(sock);
+            server.close();
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    const bool ok = opened.load() && sawPrelude.load() &&
+        sawLargePayload.load() && !acceptedSecondDiscontinuity.load();
+    close(sock);
+    server.close();
+    if (!ok) {
+        std::cerr << "[SMOKE] large split payload stayed blocked after an "
+                     "early reconnect sequence discontinuity, or a second "
+                     "discontinuity was incorrectly accepted\n";
+    }
     return ok;
 }
 
@@ -3578,6 +3790,9 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (!checkReliableSendBackpressure()) {
+        return 1;
+    }
+    if (!checkReconnectSplitSequenceResynchronization()) {
         return 1;
     }
     if (!checkProtocol827NetworkSettingsDelivery()) {

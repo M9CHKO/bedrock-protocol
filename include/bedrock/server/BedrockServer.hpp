@@ -30,6 +30,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <filesystem>
 #include <functional>
 #include <initializer_list>
@@ -1841,6 +1842,12 @@ private:
     };
 
     struct SessionState {
+        struct RecentEncryptedBatch {
+            uint64_t fingerprint = 0;
+            uint64_t receiveCounter = 0;
+            std::vector<uint8_t> bytes;
+        };
+
         mutable std::mutex mutex;
         // Node runs queue admission, _tick, and write on one event loop.
         // Serialize those boundaries per Player while allowing sendQueued()
@@ -1865,7 +1872,7 @@ private:
         uint64_t receiveCounter = 0;
         bool inboundEncryptionFailed = false;
         std::size_t recentEncryptedBatchBytes = 0;
-        std::vector<std::vector<uint8_t>> recentEncryptedBatches;
+        std::deque<RecentEncryptedBatch> recentEncryptedBatches;
         ProtoDefVariableStorePtr protoDefVariables = makeProtoDefVariableStore();
         std::vector<QueuedPacket> queuedPackets;
     };
@@ -2555,6 +2562,7 @@ private:
         bool compressionReady = false;
         bool duplicateEncryptedBatch = false;
         uint64_t encryptedReceiveCounter = 0;
+        uint64_t duplicateOriginalReceiveCounter = 0;
         std::optional<BedrockChecksumVerification> verification;
         {
             std::lock_guard<std::mutex> lock(session->mutex);
@@ -2569,14 +2577,22 @@ private:
                 }
 
                 std::vector<uint8_t> encryptedOnly(payload.begin() + 1, payload.end());
-                duplicateEncryptedBatch = std::any_of(
+                const auto encryptedFingerprint = diagnosticHash(encryptedOnly);
+                const auto duplicate = std::find_if(
                     session->recentEncryptedBatches.begin(),
                     session->recentEncryptedBatches.end(),
                     [&](const auto& recent) {
-                        return recent == encryptedOnly;
+                        return recent.fingerprint == encryptedFingerprint &&
+                            recent.bytes == encryptedOnly;
                     }
                 );
+                duplicateEncryptedBatch =
+                    duplicate != session->recentEncryptedBatches.end();
                 encryptedReceiveCounter = session->receiveCounter;
+                if (duplicateEncryptedBatch) {
+                    duplicateOriginalReceiveCounter =
+                        duplicate->receiveCounter;
+                }
                 if (!duplicateEncryptedBatch) {
                     verification = BedrockEncryption::decryptAndVerify(
                         *session->decryptStream,
@@ -2585,8 +2601,17 @@ private:
                         session->encryptionKeys.secretKeyBytes
                     );
                     if (verification && verification->matches()) {
-                        constexpr std::size_t maxRecentBatchCount = 32;
-                        constexpr std::size_t maxRecentBatchBytes = 1024 * 1024;
+                        // RakNet can surface a previously accepted encrypted
+                        // application batch well after newer ordered traffic
+                        // when a peer is congested by large split packets.
+                        // Keep enough exact ciphertext history to cover the
+                        // transport retry horizon.  Comparing the fingerprint
+                        // first keeps ordinary movement traffic cheap while
+                        // the byte comparison prevents hash collisions from
+                        // being treated as replays.
+                        constexpr std::size_t maxRecentBatchCount = 4096;
+                        constexpr std::size_t maxRecentBatchBytes =
+                            8 * 1024 * 1024;
                         if (encryptedOnly.size() <= maxRecentBatchBytes) {
                             while (!session->recentEncryptedBatches.empty() &&
                                    (session->recentEncryptedBatches.size() >=
@@ -2595,15 +2620,18 @@ private:
                                             encryptedOnly.size() >
                                         maxRecentBatchBytes)) {
                                 session->recentEncryptedBatchBytes -=
-                                    session->recentEncryptedBatches.front().size();
-                                session->recentEncryptedBatches.erase(
-                                    session->recentEncryptedBatches.begin()
-                                );
+                                    session->recentEncryptedBatches.front()
+                                        .bytes.size();
+                                session->recentEncryptedBatches.pop_front();
                             }
                             session->recentEncryptedBatchBytes +=
                                 encryptedOnly.size();
                             session->recentEncryptedBatches.push_back(
-                                std::move(encryptedOnly)
+                                {
+                                    encryptedFingerprint,
+                                    encryptedReceiveCounter,
+                                    std::move(encryptedOnly)
+                                }
                             );
                         }
                     } else if (verification) {
@@ -2625,8 +2653,15 @@ private:
                     payload.empty() ? 0 : payload.front(),
                     0,
                     {},
-                    "duplicate encrypted batch ignored receive_counter=" +
-                        std::to_string(encryptedReceiveCounter)
+                    "duplicate encrypted batch ignored original_receive_counter=" +
+                        std::to_string(duplicateOriginalReceiveCounter) +
+                        " receive_counter=" +
+                        std::to_string(encryptedReceiveCounter) +
+                        " replay_distance=" +
+                        std::to_string(
+                            encryptedReceiveCounter -
+                                duplicateOriginalReceiveCounter
+                        )
                 );
                 return;
             }

@@ -1,5 +1,6 @@
 package com.m9chko.bedrockrelay;
 
+import android.animation.ValueAnimator;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.graphics.Color;
@@ -10,9 +11,10 @@ import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.ViewConfiguration;
 import android.view.WindowManager;
+import android.view.animation.DecelerateInterpolator;
 import android.widget.Button;
-import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.SeekBar;
 import android.widget.Switch;
@@ -28,8 +30,11 @@ final class RelayOverlayController {
     private final WindowManager windowManager;
 
     private WindowManager.LayoutParams windowParams;
-    private FrameLayout windowRoot;
-    private boolean collapsed;
+    private LinearLayout windowRoot;
+    private TextView drawerTab;
+    private ValueAnimator drawerAnimator;
+    private int drawerPanelWidth;
+    private boolean drawerOpen;
     private boolean missingPermissionLogged;
 
     RelayOverlayController(
@@ -61,23 +66,45 @@ final class RelayOverlayController {
         }
 
         missingPermissionLogged = false;
-        collapsed = false;
-        windowRoot = new FrameLayout(context);
+        drawerPanelWidth = expandedPanelWidth();
+        drawerOpen = false;
+        windowRoot = new LinearLayout(context);
+        windowRoot.setOrientation(LinearLayout.HORIZONTAL);
+        windowRoot.setGravity(Gravity.TOP);
+        windowRoot.setClipChildren(false);
+        windowRoot.addView(
+            buildPanel(),
+            new LinearLayout.LayoutParams(
+                drawerPanelWidth,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        );
+        drawerTab = buildDrawerTab();
+        windowRoot.addView(
+            drawerTab,
+            new LinearLayout.LayoutParams(dp(52), dp(68))
+        );
         windowParams = new WindowManager.LayoutParams(
-            expandedWidth(),
+            drawerPanelWidth + dp(52),
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
                 WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL |
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN |
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
         );
         windowParams.gravity = Gravity.TOP | Gravity.START;
-        windowParams.x = dp(12);
+        windowParams.x = -drawerPanelWidth;
         windowParams.y = dp(72);
-        render();
         try {
             windowManager.addView(windowRoot, windowParams);
+            final LinearLayout addedRoot = windowRoot;
+            addedRoot.post(() -> {
+                if (windowRoot == addedRoot) {
+                    animateDrawer(true);
+                }
+            });
             DiagnosticsLog.append(
                 context,
                 "INFO",
@@ -97,8 +124,13 @@ final class RelayOverlayController {
     }
 
     void hide() {
-        FrameLayout root = windowRoot;
+        LinearLayout root = windowRoot;
+        if (drawerAnimator != null) {
+            drawerAnimator.cancel();
+            drawerAnimator = null;
+        }
         windowRoot = null;
+        drawerTab = null;
         windowParams = null;
         if (root == null) return;
         try {
@@ -119,41 +151,18 @@ final class RelayOverlayController {
         }
     }
 
-    private void render() {
-        if (windowRoot == null || windowParams == null) return;
-        windowRoot.removeAllViews();
-        if (collapsed) {
-            windowParams.width = dp(74);
-            windowParams.height = dp(50);
-            TextView bubble = text("CPE", 15, true);
-            bubble.setGravity(Gravity.CENTER);
-            bubble.setTextColor(Color.WHITE);
-            bubble.setBackground(panelBackground(dp(16)));
-            bubble.setElevation(dp(8));
-            attachDragHandle(bubble, () -> {
-                collapsed = false;
-                render();
-            });
-            windowRoot.addView(bubble, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT
-            ));
-        } else {
-            windowParams.width = expandedWidth();
-            windowParams.height = WindowManager.LayoutParams.WRAP_CONTENT;
-            windowRoot.addView(
-                buildPanel(),
-                new FrameLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT
-                )
-            );
-        }
-        try {
-            windowManager.updateViewLayout(windowRoot, windowParams);
-        } catch (Throwable ignored) {
-            // The first render happens before addView().
-        }
+    private TextView buildDrawerTab() {
+        TextView tab = text("CPE\n›", 13, true);
+        tab.setGravity(Gravity.CENTER);
+        tab.setTextColor(Color.WHITE);
+        tab.setBackground(tabBackground());
+        tab.setElevation(dp(12));
+        tab.setContentDescription(
+            "Открыть меню CPE Relay; удерживайте и двигайте по вертикали"
+        );
+        tab.setOnClickListener(view -> animateDrawer(!drawerOpen));
+        attachDrawerTabDrag(tab);
+        return tab;
     }
 
     private View buildPanel() {
@@ -163,29 +172,10 @@ final class RelayOverlayController {
         panel.setBackground(panelBackground(dp(18)));
         panel.setElevation(dp(10));
 
-        LinearLayout titleRow = new LinearLayout(context);
-        titleRow.setOrientation(LinearLayout.HORIZONTAL);
-        titleRow.setGravity(Gravity.CENTER_VERTICAL);
         TextView title = text("CPE Relay  •  подключено", 16, true);
         title.setTextColor(Color.WHITE);
-        title.setPadding(dp(2), dp(6), dp(4), dp(8));
-        attachDragHandle(title, null);
-        titleRow.addView(title, new LinearLayout.LayoutParams(
-            0,
-            ViewGroup.LayoutParams.WRAP_CONTENT,
-            1f
-        ));
-        Button collapse = smallButton("—");
-        collapse.setContentDescription("Свернуть меню CPE Relay");
-        collapse.setOnClickListener(view -> {
-            collapsed = true;
-            render();
-        });
-        titleRow.addView(collapse, new LinearLayout.LayoutParams(
-            dp(48),
-            dp(42)
-        ));
-        panel.addView(titleRow);
+        title.setPadding(dp(2), dp(6), dp(4), dp(10));
+        panel.addView(title);
 
         Switch detailedLogs = new Switch(context);
         detailedLogs.setText("Подробные логи");
@@ -322,12 +312,58 @@ final class RelayOverlayController {
         settingsChanged.run();
     }
 
-    private void attachDragHandle(View handle, Runnable tapAction) {
-        if (tapAction != null) {
-            handle.setOnClickListener(view -> tapAction.run());
+    private void animateDrawer(boolean open) {
+        if (windowRoot == null || windowParams == null) return;
+        if (drawerAnimator != null) {
+            drawerAnimator.cancel();
         }
+
+        drawerOpen = open;
+        updateDrawerTab();
+        final int startX = windowParams.x;
+        final int startY = windowParams.y;
+        final int targetX = open ? 0 : -drawerPanelWidth;
+        final int targetY = open
+            ? Math.min(startY, maximumDrawerY(true))
+            : startY;
+        if (startX == targetX && startY == targetY) return;
+
+        drawerAnimator = ValueAnimator.ofFloat(0f, 1f);
+        drawerAnimator.setDuration(240L);
+        drawerAnimator.setInterpolator(new DecelerateInterpolator());
+        drawerAnimator.addUpdateListener(animation -> {
+            if (windowRoot == null || windowParams == null) return;
+            float progress = (float) animation.getAnimatedValue();
+            windowParams.x = Math.round(
+                startX + (targetX - startX) * progress
+            );
+            windowParams.y = Math.round(
+                startY + (targetY - startY) * progress
+            );
+            updateWindowLayout();
+        });
+        drawerAnimator.start();
+    }
+
+    private void updateDrawerTab() {
+        if (drawerTab == null) return;
+        if (drawerOpen) {
+            drawerTab.setText("‹\nCPE");
+            drawerTab.setContentDescription(
+                "Скрыть меню CPE Relay; удерживайте и двигайте по вертикали"
+            );
+        } else {
+            drawerTab.setText("CPE\n›");
+            drawerTab.setContentDescription(
+                "Открыть меню CPE Relay; удерживайте и двигайте по вертикали"
+            );
+        }
+    }
+
+    private void attachDrawerTabDrag(View handle) {
+        final int touchSlop = ViewConfiguration.get(context)
+            .getScaledTouchSlop();
         handle.setOnTouchListener(new View.OnTouchListener() {
-            private int originalX;
             private int originalY;
             private float downX;
             private float downY;
@@ -337,7 +373,10 @@ final class RelayOverlayController {
                 if (windowParams == null || windowRoot == null) return false;
                 switch (event.getActionMasked()) {
                     case MotionEvent.ACTION_DOWN:
-                        originalX = windowParams.x;
+                        if (drawerAnimator != null) {
+                            drawerAnimator.cancel();
+                            drawerAnimator = null;
+                        }
                         originalY = windowParams.y;
                         downX = event.getRawX();
                         downY = event.getRawY();
@@ -346,14 +385,16 @@ final class RelayOverlayController {
                     case MotionEvent.ACTION_MOVE:
                         int deltaX = Math.round(event.getRawX() - downX);
                         int deltaY = Math.round(event.getRawY() - downY);
-                        moved |= Math.abs(deltaX) > dp(4) ||
-                            Math.abs(deltaY) > dp(4);
-                        windowParams.x = Math.max(0, originalX + deltaX);
-                        windowParams.y = Math.max(0, originalY + deltaY);
-                        try {
-                            windowManager.updateViewLayout(windowRoot, windowParams);
-                        } catch (Throwable ignored) {
-                        }
+                        moved |= Math.abs(deltaX) > touchSlop ||
+                            Math.abs(deltaY) > touchSlop;
+                        windowParams.y = Math.max(
+                            0,
+                            Math.min(
+                                maximumDrawerY(drawerOpen),
+                                originalY + deltaY
+                            )
+                        );
+                        updateWindowLayout();
                         return true;
                     case MotionEvent.ACTION_UP:
                         if (!moved) view.performClick();
@@ -367,11 +408,46 @@ final class RelayOverlayController {
         });
     }
 
+    private int maximumDrawerY(boolean open) {
+        int visibleHeight = dp(68);
+        if (open && windowRoot != null && windowRoot.getHeight() > 0) {
+            visibleHeight = windowRoot.getHeight();
+        }
+        return Math.max(
+            0,
+            context.getResources().getDisplayMetrics().heightPixels -
+                visibleHeight
+        );
+    }
+
+    private void updateWindowLayout() {
+        if (windowRoot == null || windowParams == null) return;
+        try {
+            windowManager.updateViewLayout(windowRoot, windowParams);
+        } catch (Throwable ignored) {
+            // The service may remove the overlay while an animation frame is
+            // already queued on the main thread.
+        }
+    }
+
     private GradientDrawable panelBackground(float radius) {
         GradientDrawable background = new GradientDrawable();
         background.setColor(0xeb151a22);
         background.setCornerRadius(radius);
         background.setStroke(dp(1), 0xff5f789d);
+        return background;
+    }
+
+    private GradientDrawable tabBackground() {
+        GradientDrawable background = new GradientDrawable();
+        background.setColor(0xf21b2330);
+        background.setCornerRadii(new float[] {
+            0, 0,
+            dp(16), dp(16),
+            dp(16), dp(16),
+            0, 0
+        });
+        background.setStroke(dp(1), 0xff7f9bc4);
         return background;
     }
 
@@ -410,10 +486,10 @@ final class RelayOverlayController {
         return params;
     }
 
-    private int expandedWidth() {
+    private int expandedPanelWidth() {
         return Math.min(
             dp(320),
-            context.getResources().getDisplayMetrics().widthPixels - dp(24)
+            context.getResources().getDisplayMetrics().widthPixels - dp(60)
         );
     }
 
