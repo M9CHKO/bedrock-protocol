@@ -443,10 +443,7 @@ void skipProtoDefNbt(
             (void) stream.readString();
         }
     } else {
-        // BedrockNbtCodec still performs the complete recursive parse and all
-        // bounds checks. Avoid only the additional NbtValue -> ProtoDefValue
-        // conversion required by structured packet consumers.
-        (void) BedrockNbtCodec::read(stream, encoding);
+        BedrockNbtCodec::skip(stream, encoding);
     }
 
     reader.skip(stream.offset() - start);

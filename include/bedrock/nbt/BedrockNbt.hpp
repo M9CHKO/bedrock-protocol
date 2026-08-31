@@ -115,6 +115,15 @@ public:
         const BedrockNbtLimits& limits = {}
     );
 
+    // Strictly validate and consume one named NBT document without building
+    // an NbtDocument/NbtValue tree. Transparent packet relays use this for
+    // component-rich item registries where only the packet boundary matters.
+    static void skip(
+        BinaryStream& stream,
+        BedrockNbtEncoding encoding,
+        const BedrockNbtLimits& limits = {}
+    );
+
     // Unnamed NBT is used by several Bedrock packet fields. It starts with the
     // tag type and omits the root-name string.
     static NbtValue readUnnamed(
@@ -126,6 +135,12 @@ public:
     static void writeUnnamed(
         BinaryStream& stream,
         const NbtValue& value,
+        BedrockNbtEncoding encoding,
+        const BedrockNbtLimits& limits = {}
+    );
+
+    static void skipUnnamed(
+        BinaryStream& stream,
         BedrockNbtEncoding encoding,
         const BedrockNbtLimits& limits = {}
     );

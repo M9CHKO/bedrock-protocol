@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace bedrock {
@@ -155,6 +156,30 @@ public:
 
     std::string string() {
         return cursor_.string();
+    }
+
+    // Borrow a packet string while advancing the cursor. Compact validators
+    // use this when they only need to compare a name and must not allocate a
+    // std::string for every item_registry entry.
+    std::string_view stringView() {
+        const auto length = varuint32();
+        if (length > remaining()) {
+            throw std::runtime_error(
+                "not enough bytes for string bytes at offset " +
+                std::to_string(offset()) +
+                " remaining=" + std::to_string(remaining()) +
+                " need=" + std::to_string(length)
+            );
+        }
+        const auto start = offset();
+        skip(length);
+        if (length == 0) {
+            return {};
+        }
+        return std::string_view(
+            reinterpret_cast<const char*>(data().data() + start),
+            length
+        );
     }
 
     void skip(std::size_t n) {

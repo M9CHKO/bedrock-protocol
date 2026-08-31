@@ -23,9 +23,25 @@
 #include <utility>
 #include <vector>
 
+#if defined(BEDROCK_ANDROID_RELEASE_BUILD) && !defined(__OPTIMIZE__)
+#error "The distributable Android relay must compile native code with optimization"
+#endif
+
 namespace {
 
 constexpr char LogTag[] = "CpeRelayNative";
+
+#if defined(BEDROCK_ANDROID_RELEASE_BUILD)
+constexpr std::string_view NativeBuildType = "release";
+#else
+constexpr std::string_view NativeBuildType = "debug";
+#endif
+
+#if defined(__OPTIMIZE__)
+constexpr bool NativeCompilerOptimized = true;
+#else
+constexpr bool NativeCompilerOptimized = false;
+#endif
 
 JavaVM* javaVm = nullptr;
 jclass nativeBridgeClass = nullptr;
@@ -548,7 +564,10 @@ public:
             "local=0.0.0.0:19132 destination=" + destinationHost + ":" +
                 std::to_string(destinationPort) +
                 " version=" + version +
-                " forceSingle=true replaceExisting=true",
+                " forceSingle=true replaceExisting=true" +
+                " nativeBuild=" + std::string(NativeBuildType) +
+                " compilerOptimized=" +
+                (NativeCompilerOptimized ? "true" : "false"),
             "INFO",
             "lifecycle"
         );

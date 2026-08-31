@@ -44,6 +44,12 @@ target_compile_options(
         -Wno-deprecated-declarations
 )
 
+target_compile_definitions(
+    bedrock_relay_android
+    PRIVATE
+        $<$<CONFIG:Release,RelWithDebInfo,MinSizeRel>:BEDROCK_ANDROID_RELEASE_BUILD=1>
+)
+
 # Android 15+ devices may use a 16 KiB page size. NDK r27 applies compatible
 # segment alignment to this JNI library; the flag keeps it explicit for local
 # command-line builds as well.

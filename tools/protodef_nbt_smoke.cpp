@@ -166,6 +166,20 @@ bool checkRichPrimitiveVectors() {
         {"lnbt", lnbtGolden}
     }) {
         try {
+            bedrock::PacketFieldCursor skipCursor(bytes);
+            bedrock::ProtoDefReader skipReader(skipCursor);
+            bedrock::skipProtoDefNbt(
+                skipReader,
+                type == "nbt"
+                    ? bedrock::BedrockNbtEncoding::LittleVarInt
+                    : bedrock::BedrockNbtEncoding::LittleEndian
+            );
+            if (skipReader.remaining() != 0) {
+                std::cerr << "[FAIL] " << type
+                          << " strict skip left trailing bytes\n";
+                ok = false;
+            }
+
             const auto fields = decodePrimitive(type, bytes);
             const auto* decoded = field(fields, "value");
             if (!decoded || !decoded->structuredValue.has_value()) {

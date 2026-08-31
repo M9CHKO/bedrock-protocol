@@ -256,7 +256,7 @@ private:
 
             for (uint32_t index = 0; index < count; ++index) {
                 try {
-                    auto name = reader.string();
+                    const auto name = reader.stringView();
                     const auto runtimeId = static_cast<int16_t>(reader.u16le());
                     (void) reader.boolean();
                     (void) reader.zigzag32();
@@ -266,7 +266,10 @@ private:
                     );
 
                     if (itemPalette) {
-                        itemPalette->emplace_back(runtimeId, name);
+                        itemPalette->emplace_back(
+                            runtimeId,
+                            std::string(name)
+                        );
                     }
                     if (!shieldRuntimeId && name == "minecraft:shield") {
                         shieldRuntimeId = std::to_string(runtimeId);

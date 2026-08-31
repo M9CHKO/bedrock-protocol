@@ -1,5 +1,6 @@
 #include <bedrock/nbt/BedrockNbt.hpp>
 
+#include <algorithm>
 #include <bit>
 #include <cmath>
 #include <limits>
@@ -126,12 +127,54 @@ std::string readString(ReadContext& context, bool tagName) {
         throw BedrockNbtError("NBT string length exceeds remaining input");
     }
 
-    const auto bytes = context.stream.readBytes(length);
-    std::string value(bytes.begin(), bytes.end());
+    if (length == 0) {
+        return {};
+    }
+
+    const auto offset = context.stream.offset();
+    const auto& bytes = static_cast<const BinaryStream&>(
+        context.stream
+    ).buffer();
+    std::string value(
+        reinterpret_cast<const char*>(bytes.data() + offset),
+        length
+    );
+    context.stream.seek(offset + length);
     if (tagName && value.find('\0') != std::string::npos) {
         throw BedrockNbtError("NBT tag name contains an embedded null byte");
     }
     return value;
+}
+
+void skipString(ReadContext& context, bool tagName) {
+    std::size_t length = 0;
+    if (context.encoding == BedrockNbtEncoding::LittleVarInt) {
+        length = context.stream.readVarUInt();
+    } else {
+        length = context.stream.readU16LE();
+    }
+
+    if (length > context.limits.maxStringBytes) {
+        throw BedrockNbtError("NBT string length exceeds configured limit");
+    }
+    if (length > context.stream.remaining()) {
+        throw BedrockNbtError("NBT string length exceeds remaining input");
+    }
+
+    const auto offset = context.stream.offset();
+    if (tagName && length != 0) {
+        const auto& bytes = static_cast<const BinaryStream&>(
+            context.stream
+        ).buffer();
+        const auto begin = bytes.begin() + static_cast<std::ptrdiff_t>(offset);
+        const auto end = begin + static_cast<std::ptrdiff_t>(length);
+        if (std::find(begin, end, uint8_t {0}) != end) {
+            throw BedrockNbtError(
+                "NBT tag name contains an embedded null byte"
+            );
+        }
+    }
+    context.stream.seek(offset + length);
 }
 
 void writeString(WriteContext& context, std::string_view value, bool tagName) {
@@ -245,6 +288,109 @@ NbtValue readPayload(ReadContext& context, NbtTagType type, std::size_t depth) {
                 out.longArrayValue.push_back(context.stream.readI64LE());
             }
             return out;
+        }
+    }
+
+    throw BedrockNbtError("unreachable NBT tag type");
+}
+
+void skipPayload(ReadContext& context, NbtTagType type, std::size_t depth) {
+    checkDepth(depth, context.limits);
+    accountValue(context.totalValues, context.limits);
+
+    switch (type) {
+        case NbtTagType::End:
+            return;
+        case NbtTagType::Byte:
+            (void) context.stream.readI8();
+            return;
+        case NbtTagType::Short:
+            (void) context.stream.readI16LE();
+            return;
+        case NbtTagType::Int:
+            (void) readInt32(context);
+            return;
+        case NbtTagType::Long:
+            (void) readInt64(context);
+            return;
+        case NbtTagType::Float:
+            (void) context.stream.readU32LE();
+            return;
+        case NbtTagType::Double:
+            (void) context.stream.readU64LE();
+            return;
+        case NbtTagType::ByteArray: {
+            const auto length = checkedCollectionLength(
+                readInt32(context),
+                context.limits
+            );
+            if (length > context.stream.remaining()) {
+                throw BedrockNbtError(
+                    "NBT byte array exceeds remaining input"
+                );
+            }
+            context.stream.seek(context.stream.offset() + length);
+            return;
+        }
+        case NbtTagType::String:
+            skipString(context, false);
+            return;
+        case NbtTagType::List: {
+            const auto elementType = checkedTagType(context.stream.readU8());
+            const auto length = checkedCollectionLength(
+                readInt32(context),
+                context.limits
+            );
+            if (elementType == NbtTagType::End && length != 0) {
+                throw BedrockNbtError(
+                    "non-empty NBT list cannot use TAG_End elements"
+                );
+            }
+            for (std::size_t index = 0; index < length; ++index) {
+                skipPayload(context, elementType, depth + 1);
+            }
+            return;
+        }
+        case NbtTagType::Compound:
+            while (true) {
+                const auto childType = checkedTagType(
+                    context.stream.readU8()
+                );
+                if (childType == NbtTagType::End) {
+                    return;
+                }
+                skipString(context, true);
+                skipPayload(context, childType, depth + 1);
+            }
+        case NbtTagType::IntArray: {
+            const auto length = checkedCollectionLength(
+                readInt32(context),
+                context.limits
+            );
+            if (length > context.stream.remaining() / sizeof(int32_t)) {
+                throw BedrockNbtError(
+                    "NBT int array exceeds remaining input"
+                );
+            }
+            context.stream.seek(
+                context.stream.offset() + length * sizeof(int32_t)
+            );
+            return;
+        }
+        case NbtTagType::LongArray: {
+            const auto length = checkedCollectionLength(
+                readInt32(context),
+                context.limits
+            );
+            if (length > context.stream.remaining() / sizeof(int64_t)) {
+                throw BedrockNbtError(
+                    "NBT long array exceeds remaining input"
+                );
+            }
+            context.stream.seek(
+                context.stream.offset() + length * sizeof(int64_t)
+            );
+            return;
         }
     }
 
@@ -530,6 +676,20 @@ void BedrockNbtCodec::write(
     writePayload(context, document.root, 0);
 }
 
+void BedrockNbtCodec::skip(
+    BinaryStream& stream,
+    BedrockNbtEncoding encoding,
+    const BedrockNbtLimits& limits
+) {
+    ReadContext context {stream, encoding, limits};
+    const auto type = checkedTagType(stream.readU8());
+    if (type == NbtTagType::End) {
+        return;
+    }
+    skipString(context, true);
+    skipPayload(context, type, 0);
+}
+
 NbtValue BedrockNbtCodec::readUnnamed(
     BinaryStream& stream,
     BedrockNbtEncoding encoding,
@@ -549,6 +709,16 @@ void BedrockNbtCodec::writeUnnamed(
     WriteContext context {stream, encoding, limits};
     stream.writeU8(static_cast<uint8_t>(value.type));
     writePayload(context, value, 0);
+}
+
+void BedrockNbtCodec::skipUnnamed(
+    BinaryStream& stream,
+    BedrockNbtEncoding encoding,
+    const BedrockNbtLimits& limits
+) {
+    ReadContext context {stream, encoding, limits};
+    const auto type = checkedTagType(stream.readU8());
+    skipPayload(context, type, 0);
 }
 
 } // namespace bedrock

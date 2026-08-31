@@ -8,17 +8,23 @@ UDP-порту `19132` и подключает его к серверу, кот�
 
 ## Готовый APK
 
-- [CPE Relay 1.0.2 (arm64-v8a, debug-signed)](apk/CPE-Relay-v1.0.2-arm64-v8a-debug.apk)
-- [SHA-256](apk/CPE-Relay-v1.0.2-arm64-v8a-debug.apk.sha256)
+- [CPE Relay 1.0.3 (arm64-v8a, optimized Release, debug-signed)](apk/CPE-Relay-v1.0.3-arm64-v8a-release-debug-signed.apk)
+- [SHA-256](apk/CPE-Relay-v1.0.3-arm64-v8a-release-debug-signed.apk.sha256)
 
-Версия 1.0.2 устраняет блокировку сетевого потока на большом
-`item_registry` 1.21.100 и последующий пакетный всплеск при загрузке мира.
-Успешные массовые equipment-события в подробном журнале семплируются, а
-ошибки и итоговый счётчик пакетов сохраняются полностью.
+Версия 1.0.3 устраняет оставшуюся Android-only блокировку сетевого потока:
+строгая проверка component-rich `item_registry` теперь обходит NBT без
+создания полного дерева объектов и без копирования каждого имени item.
+Распространяемая APK компилирует C++ как `RelWithDebInfo` с `-O2` и
+compile-time guard от случайной сборки без оптимизации. Это не меняет байты,
+порядок или strict validation пакетов. Успешные массовые equipment-события в
+подробном журнале семплируются, а ошибки и итоговый счётчик сохраняются
+полностью. В `relay_start` видны `nativeBuild=release` и
+`compilerOptimized=true`.
 
 Минимальная версия — Android 8.0 (API 26). APK содержит только
 `arm64-v8a`, то есть предназначен для обычных современных ARM64-телефонов.
-Это устанавливаемая тестовая сборка, подписанная Android debug certificate.
+Это оптимизированная устанавливаемая сборка, подписанная тем же Android debug
+certificate, что и предыдущие APK, поэтому она обновляется поверх них.
 
 ## Использование
 
@@ -74,16 +80,16 @@ Xbox HTTPS-запросов и готовности upstream, поэтому д�
 
 ```text
 cd android/relay-app
-./gradlew :app:assembleDebug
+./gradlew :app:assembleRelease :app:lintRelease
 ```
 
 На Windows используется `gradlew.bat`. Итоговый файл создаётся по адресу
-`app/build/outputs/apk/debug/app-debug.apk`.
+`app/build/outputs/apk/release/app-release.apk`.
 
 Установка через ADB:
 
 ```text
-adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb install -r app/build/outputs/apk/release/app-release.apk
 ```
 
 Gradle/Prefab поставляет OpenSSL для Android, а NDK — zlib и системные UDP

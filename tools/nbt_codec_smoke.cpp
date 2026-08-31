@@ -88,14 +88,25 @@ void checkGolden(
         throw std::runtime_error(std::string(label) + " decode mismatch");
     }
 
+    auto skipped = bedrock::BinaryStream::view(expected);
+    bedrock::BedrockNbtCodec::skip(skipped, encoding);
+    if (!skipped.eof()) {
+        throw std::runtime_error(
+            std::string(label) + " strict skip boundary mismatch"
+        );
+    }
+
     bedrock::BinaryStream sequential;
     bedrock::BedrockNbtCodec::write(sequential, document, encoding);
     bedrock::BedrockNbtCodec::write(sequential, document, encoding);
     bedrock::BinaryStream sequentialInput(sequential.buffer());
-    if (!(bedrock::BedrockNbtCodec::read(sequentialInput, encoding) == document) ||
+    bedrock::BedrockNbtCodec::skip(sequentialInput, encoding);
+    if (sequentialInput.offset() != expected.size() ||
         !(bedrock::BedrockNbtCodec::read(sequentialInput, encoding) == document) ||
         !sequentialInput.eof()) {
-        throw std::runtime_error(std::string(label) + " sequential decode mismatch");
+        throw std::runtime_error(
+            std::string(label) + " sequential skip/decode mismatch"
+        );
     }
 }
 
@@ -147,6 +158,17 @@ int main() {
             throw std::runtime_error("unnamed NBT roundtrip mismatch");
         }
 
+        auto unnamedSkipped = bedrock::BinaryStream::view(
+            unnamedBytes.buffer()
+        );
+        bedrock::BedrockNbtCodec::skipUnnamed(
+            unnamedSkipped,
+            bedrock::BedrockNbtEncoding::LittleVarInt
+        );
+        if (!unnamedSkipped.eof()) {
+            throw std::runtime_error("unnamed NBT skip mismatch");
+        }
+
         expectThrows([] {
             bedrock::BinaryStream input(std::vector<uint8_t>{13});
             (void) bedrock::BedrockNbtCodec::read(
@@ -154,6 +176,14 @@ int main() {
                 bedrock::BedrockNbtEncoding::LittleEndian
             );
         }, "unknown tag");
+
+        expectThrows([] {
+            bedrock::BinaryStream input(std::vector<uint8_t>{13});
+            bedrock::BedrockNbtCodec::skip(
+                input,
+                bedrock::BedrockNbtEncoding::LittleEndian
+            );
+        }, "unknown tag skip");
 
         expectThrows([] {
             bedrock::BinaryStream input(std::vector<uint8_t>{7, 0, 1});
@@ -164,12 +194,65 @@ int main() {
         }, "negative byte array length");
 
         expectThrows([] {
+            bedrock::BinaryStream input(std::vector<uint8_t>{7, 0, 1});
+            bedrock::BedrockNbtCodec::skip(
+                input,
+                bedrock::BedrockNbtEncoding::LittleVarInt
+            );
+        }, "negative byte array length skip");
+
+        expectThrows([] {
             bedrock::BinaryStream input(std::vector<uint8_t>{8, 0, 5, 'a'});
             (void) bedrock::BedrockNbtCodec::read(
                 input,
                 bedrock::BedrockNbtEncoding::LittleVarInt
             );
         }, "truncated string");
+
+        expectThrows([] {
+            bedrock::BinaryStream input(std::vector<uint8_t>{8, 0, 5, 'a'});
+            bedrock::BedrockNbtCodec::skip(
+                input,
+                bedrock::BedrockNbtEncoding::LittleVarInt
+            );
+        }, "truncated string skip");
+
+        expectThrows([] {
+            // Named TAG_Byte with a one-byte root name containing NUL.
+            bedrock::BinaryStream input(
+                std::vector<uint8_t>{1, 1, 0, 42}
+            );
+            bedrock::BedrockNbtCodec::skip(
+                input,
+                bedrock::BedrockNbtEncoding::LittleVarInt
+            );
+        }, "embedded-null tag name skip");
+
+        expectThrows([] {
+            // Unnamed TAG_List<TAG_End> with one element. Zigzag(1) is 2.
+            bedrock::BinaryStream input(std::vector<uint8_t>{9, 0, 2});
+            bedrock::BedrockNbtCodec::skipUnnamed(
+                input,
+                bedrock::BedrockNbtEncoding::LittleVarInt
+            );
+        }, "non-empty end list skip");
+
+        expectThrows([] {
+            bedrock::BinaryStream encoded;
+            bedrock::BedrockNbtCodec::write(
+                encoded,
+                makeDocument(),
+                bedrock::BedrockNbtEncoding::LittleVarInt
+            );
+            bedrock::BinaryStream input(encoded.buffer());
+            bedrock::BedrockNbtLimits limits;
+            limits.maxTotalValues = 1;
+            bedrock::BedrockNbtCodec::skip(
+                input,
+                bedrock::BedrockNbtEncoding::LittleVarInt,
+                limits
+            );
+        }, "skip total-value limit");
 
         expectThrows([] {
             bedrock::NbtValue invalid = bedrock::NbtValue::list(
