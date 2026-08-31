@@ -3025,13 +3025,22 @@ bool checkServerAdvertisementSurface() {
     const auto cachedPong = bedrock::RakNetPinger::ping(
         "127.0.0.1", cached.boundPort(), 500
     );
+    const auto expectedCachedWire = cached.getAdvertisement().toBuffer();
+    const std::string expectedCachedPayload(
+        expectedCachedWire.begin(),
+        expectedCachedWire.end()
+    );
     const bool cachedWireOk = cachedPong.ok &&
+        cachedPong.rawMotd == expectedCachedPayload &&
         cachedPong.motd == "Aliased MOTD" && cachedPong.onlinePlayers == 0 &&
         cachedPong.maxPlayers == 0 &&
         cachedPong.serverId == cachedServerId.toString();
     cached.close();
     if (!cachedWireOk) {
-        std::cerr << "[SMOKE] object advertisement wire mismatch\n";
+        std::cerr
+            << "[SMOKE] object advertisement wire mismatch: expected "
+            << expectedCachedWire.size() << " byte Node-compatible payload, got "
+            << cachedPong.rawMotd.size() << " bytes\n";
         return false;
     }
 
@@ -3081,7 +3090,13 @@ bool checkServerAdvertisementSurface() {
     const auto pong = bedrock::RakNetPinger::ping(
         "127.0.0.1", callbackServer.boundPort(), 500
     );
+    const auto expectedCallbackWire = custom.toBuffer();
+    const std::string expectedCallbackPayload(
+        expectedCallbackWire.begin(),
+        expectedCallbackWire.end()
+    );
     const bool ok = callbackCalls.load() > callsBeforeTimer && pong.ok &&
+        pong.rawMotd == expectedCallbackPayload &&
         pong.motd == "Callback MOTD" && pong.onlinePlayers == 17 &&
         pong.maxPlayers == 23 && pong.serverId == "callback-server-id" &&
         custom.playersOnline == 17;

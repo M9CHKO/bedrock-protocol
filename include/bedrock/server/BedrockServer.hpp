@@ -683,7 +683,7 @@ public:
     explicit BedrockServer(BedrockServerOptions options = {})
         : options_(normalizeOptions(std::move(options))),
           advertisement_(makeAdvertisement(options_)),
-          raknet_(makeRakNetOptions(options_, advertisement_.toString())),
+          raknet_(makeRakNetOptions(options_, encodeAdvertisement(advertisement_))),
           mcpeCodec_(VersionedMcpeCodec::forVersion(options_.version)) {}
 
     ~BedrockServer() {
@@ -768,9 +768,9 @@ public:
         closing_ = false;
         // RakServer's constructor asks Server#getAdvertisement for the initial
         // offline response before the backend starts listening.
-        raknet_.setAdvertisement(getAdvertisement().toString());
+        raknet_.setAdvertisement(encodeAdvertisement(getAdvertisement()));
         raknet_.setAdvertisementProvider([this]() {
-            return getAdvertisement().toString();
+            return encodeAdvertisement(getAdvertisement());
         });
         raknet_.onOpenConnection([this](const RakNetServerPeer& peer) {
             if (closing_.load()) {
@@ -1448,6 +1448,17 @@ private:
         raknet.protocolVersion = protocolVersionForMinecraft(options.version) >= 554 ? 11 : 10;
         raknet.advertisement = std::move(advertisement);
         return raknet;
+    }
+
+    static std::string encodeAdvertisement(
+        const ServerAdvertisement& advertisement
+    ) {
+        // raknet-native forwards this buffer verbatim after the Pong magic.
+        // Bedrock requires the same UInt16BE-prefixed payload produced by
+        // JavaScript ServerAdvertisement#toBuffer().  The former custom
+        // transport added this prefix while building the Pong itself.
+        const auto wire = advertisement.toBuffer();
+        return std::string(wire.begin(), wire.end());
     }
 
     static int protocolVersionForMinecraft(const std::string& version) {
