@@ -2865,6 +2865,9 @@ struct RelayOptions {
     bool itemResourceDiagnostics = false;
     bool enableChunkCaching = false;
     bool forceSingle = false;
+    // With forceSingle, let a new downstream replace a stale existing
+    // session instead of rejecting the new transport.
+    bool replaceExisting = false;
     // Match RelayPlayer.readUpstream: malformed backend packets are always
     // dropped, and normally disconnect that downstream unless this is true.
     bool omitParseErrors = false;
@@ -4346,6 +4349,7 @@ private:
         out.logging = options.logging;
         out.itemResourceDiagnostics = options.itemResourceDiagnostics;
         out.forceSingle = options.forceSingle;
+        out.replaceExisting = options.replaceExisting;
         out.useDownstreamDisplayNameForUpstreamUsername = options.offline;
         return out;
     }

@@ -51,6 +51,11 @@ struct BedrockLiveRelayOptions {
     // Relay#forceSingle rejects a second transport while any accepted
     // downstream Player session is still present.
     bool forceSingle = false;
+    // Opt-in latest-connection-wins policy for single-player frontends. A
+    // newly accepted transport synchronously tears down the previous relay
+    // session and its upstream before its connect callback runs. This is
+    // useful on mobile where an old UDP transport can outlive the game UI.
+    bool replaceExisting = false;
     // relay.js chooses username from the relay-level offline flag, separately
     // from destination.offline ?? relay.offline used for upstream auth mode.
     bool useDownstreamDisplayNameForUpstreamUsername = false;

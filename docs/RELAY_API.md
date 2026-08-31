@@ -146,6 +146,13 @@ Set `RelayOptions::forceSingle = true` to reject a second transport while one
 accepted player is active. A rejected transport does not emit the relay
 `connect` callback and never creates an upstream client.
 
+Mobile single-player frontends can additionally set
+`RelayOptions::replaceExisting = true`. With `forceSingle` enabled, the newest
+accepted transport first sends a Bedrock `disconnect` to the previous
+upstream, closes the stale downstream, and then emits its own `connect` event.
+Configure `maxPlayers >= 2` so RakNet has one short-lived overlap slot in which
+the replacement callback can run.
+
 The low-level runtime has matching `sessionCount()`, `upstreamCount()`,
 `upstream(connection)`, and owning `upstreamShared(connection)` accessors.
 

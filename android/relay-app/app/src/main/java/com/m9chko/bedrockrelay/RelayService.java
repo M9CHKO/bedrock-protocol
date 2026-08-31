@@ -27,6 +27,7 @@ public final class RelayService extends Service {
     public static final String PREFERENCES = "relay";
     public static final String KEY_HOST = "destination_host";
     public static final String KEY_PORT = "destination_port";
+    public static final String KEY_VERSION = "minecraft_version";
     public static final String KEY_LAST_ERROR = "last_error";
     public static final String KEY_AUTH_CODE = "auth_code";
     public static final String KEY_AUTH_URI = "auth_uri";
@@ -37,6 +38,7 @@ public final class RelayService extends Service {
         "com.m9chko.bedrockrelay.action.STOP";
     public static final String EXTRA_HOST = "host";
     public static final String EXTRA_PORT = "port";
+    public static final String EXTRA_VERSION = "version";
 
     private static final String CHANNEL_ID = "bedrock_relay";
     private static final int NOTIFICATION_ID = 19132;
@@ -51,31 +53,62 @@ public final class RelayService extends Service {
     private PowerManager.WakeLock wakeLock;
     private volatile boolean serviceStopping;
     private volatile String notificationStatus = "Запуск UDP relay…";
+    private volatile String lastSnapshotFingerprint = "";
+    private volatile long lastPollingErrorAt;
 
     @Override
     public void onCreate() {
         super.onCreate();
         preferences = getSharedPreferences(PREFERENCES, MODE_PRIVATE);
         createNotificationChannel();
+        DiagnosticsLog.append(
+            this,
+            "INFO",
+            "service",
+            "Foreground service created; app=" + BuildConfig.VERSION_NAME +
+                " sdk=" + Build.VERSION.SDK_INT +
+                " abi=" + Build.SUPPORTED_ABIS[0]
+        );
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         String action = intent == null ? null : intent.getAction();
         if (ACTION_STOP.equals(action)) {
+            DiagnosticsLog.append(this, "INFO", "service", "Stop action received");
             stopRelayAndSelf();
             return START_NOT_STICKY;
         }
         if (!ACTION_START.equals(action)) {
+            DiagnosticsLog.append(
+                this,
+                "WARN",
+                "service",
+                "Ignored service start without ACTION_START"
+            );
             return START_NOT_STICKY;
         }
 
         String host = intent.getStringExtra(EXTRA_HOST);
         int port = intent.getIntExtra(EXTRA_PORT, 19132);
+        String version = intent.getStringExtra(EXTRA_VERSION);
         if (host == null || host.trim().isEmpty()) {
             host = preferences.getString(KEY_HOST, "cpe.ign.gg");
         }
         host = host.trim();
+        if (version == null || version.trim().isEmpty()) {
+            version = preferences.getString(KEY_VERSION, "1.21.100");
+        }
+        version = version.trim();
+
+        DiagnosticsLog.append(
+            this,
+            "INFO",
+            "service",
+            "Start requested: local=0.0.0.0:19132 destination=" +
+                host + ":" + port
+                + " version=" + version
+        );
 
         promoteToForeground(buildNotification());
         acquireWakeLock();
@@ -83,9 +116,11 @@ public final class RelayService extends Service {
         serviceStopping = false;
         final String destinationHost = host;
         final int destinationPort = port;
+        final String minecraftVersion = version;
         commandExecutor.execute(() -> startNativeRelay(
             destinationHost,
-            destinationPort
+            destinationPort,
+            minecraftVersion
         ));
         return START_NOT_STICKY;
     }
@@ -93,9 +128,16 @@ public final class RelayService extends Service {
     @Override
     public void onDestroy() {
         serviceStopping = true;
+        DiagnosticsLog.append(this, "INFO", "service", "Service destroying");
         try {
             NativeBridge.stopRelay();
-        } catch (Throwable ignored) {
+        } catch (Throwable error) {
+            DiagnosticsLog.appendError(
+                this,
+                "native",
+                "Native stop failed during service destruction",
+                error
+            );
         }
         releaseWakeLock();
         pollExecutor.shutdownNow();
@@ -108,10 +150,18 @@ public final class RelayService extends Service {
         return null;
     }
 
-    private void startNativeRelay(String host, int port) {
+    private void startNativeRelay(String host, int port, String version) {
+        DiagnosticsLog.append(
+            this,
+            "INFO",
+            "native",
+            "Starting embedded relay for " + host + ":" + port +
+                " version=" + version
+        );
         preferences.edit()
             .putString(KEY_HOST, host)
             .putInt(KEY_PORT, port)
+            .putString(KEY_VERSION, version)
             .remove(KEY_LAST_ERROR)
             .remove(KEY_AUTH_CODE)
             .remove(KEY_AUTH_URI)
@@ -126,18 +176,27 @@ public final class RelayService extends Service {
             JSONObject result = new JSONObject(NativeBridge.startRelay(
                 host,
                 port,
+                version,
                 cache.getAbsolutePath()
             ));
             if (!result.optBoolean("ok", false)) {
                 reportError(result.optString("error", "Не удалось запустить relay"));
                 return;
             }
+            DiagnosticsLog.append(
+                this,
+                "INFO",
+                "native",
+                "Embedded relay started; boundPort=" +
+                    result.optInt("boundPort", 0) +
+                    " listening=" + result.optBoolean("listening", false)
+            );
             notificationStatus = "Relay готов: 127.0.0.1:19132";
             refreshNotification();
         } catch (Throwable error) {
             reportError(error.getMessage() == null
                 ? error.getClass().getSimpleName()
-                : error.getMessage());
+                : error.getMessage(), error);
         }
     }
 
@@ -158,8 +217,16 @@ public final class RelayService extends Service {
                     new JSONObject(NativeBridge.snapshot())
                 );
             } catch (Throwable error) {
-                // A startup error is reported by startNativeRelay. Polling
-                // continues so a subsequent start can reuse this service.
+                long now = System.currentTimeMillis();
+                if (now - lastPollingErrorAt >= 10_000) {
+                    lastPollingErrorAt = now;
+                    DiagnosticsLog.appendError(
+                        this,
+                        "poll",
+                        "Native event/snapshot polling failed; polling continues",
+                        error
+                    );
+                }
             }
         }, 0, 500, TimeUnit.MILLISECONDS);
     }
@@ -179,6 +246,12 @@ public final class RelayService extends Service {
             notificationStatus = code.isEmpty()
                 ? "Требуется вход Xbox"
                 : "Код Xbox: " + code;
+            DiagnosticsLog.append(
+                this,
+                "INFO",
+                "auth",
+                "Xbox device authorization requested; user code omitted from log"
+            );
             refreshNotification();
             return;
         }
@@ -186,6 +259,19 @@ public final class RelayService extends Service {
             reportError(event.optString("message", "Неизвестная ошибка relay"));
             return;
         }
+
+        String message = event.optString("message", "");
+        String level = event.optString(
+            "level",
+            "ping_warning".equals(type) ? "WARN" : "INFO"
+        );
+        String component = event.optString("component", "native");
+        DiagnosticsLog.append(
+            this,
+            level,
+            component,
+            "event=" + type + (message.isEmpty() ? "" : " " + message)
+        );
         if ("upstream_ready".equals(type)) {
             preferences.edit()
                 .remove(KEY_AUTH_CODE)
@@ -199,6 +285,21 @@ public final class RelayService extends Service {
     private void updateStatusFromSnapshot(JSONObject state) {
         if (!state.optBoolean("running", false)) {
             return;
+        }
+        String fingerprint =
+            "running=" + state.optBoolean("running", false) +
+            " listening=" + state.optBoolean("listening", false) +
+            " version=" + state.optString("version", "") +
+            " ping=" + state.optBoolean("pingOk", false) +
+            " downstream=" + state.optInt("downstreamConnections", 0) +
+            " downstreamJoined=" + state.optInt("downstreamJoinedCount", 0) +
+            " destinationPing=" + state.optBoolean("destinationPingOk", false) +
+            " destinationVersion=" + state.optString("destinationGameVersion", "") +
+            " upstreamStarted=" + state.optInt("upstreamStartedCount", 0) +
+            " upstreamReady=" + state.optInt("upstreamReadyCount", 0);
+        if (!fingerprint.equals(lastSnapshotFingerprint)) {
+            lastSnapshotFingerprint = fingerprint;
+            DiagnosticsLog.append(this, "DEBUG", "snapshot", fingerprint);
         }
         String authCode = preferences.getString(KEY_AUTH_CODE, "");
         if (!authCode.isEmpty()) {
@@ -219,27 +320,49 @@ public final class RelayService extends Service {
             return;
         }
         serviceStopping = true;
+        DiagnosticsLog.append(
+            this,
+            "INFO",
+            "service",
+            "Stopping relay by user request"
+        );
         notificationStatus = "Остановка relay…";
         refreshNotification();
         commandExecutor.execute(() -> {
             try {
                 NativeBridge.stopRelay();
-            } catch (Throwable ignored) {
+            } catch (Throwable error) {
+                DiagnosticsLog.appendError(
+                    this,
+                    "native",
+                    "Native stop failed",
+                    error
+                );
             }
             preferences.edit()
                 .remove(KEY_AUTH_CODE)
                 .remove(KEY_AUTH_URI)
                 .apply();
             releaseWakeLock();
+            DiagnosticsLog.append(this, "INFO", "service", "Relay stopped");
             stopForeground(STOP_FOREGROUND_REMOVE);
             stopSelf();
         });
     }
 
     private void reportError(String message) {
+        reportError(message, null);
+    }
+
+    private void reportError(String message, Throwable error) {
         String safe = message == null || message.isEmpty()
             ? "Неизвестная ошибка"
             : message;
+        if (error == null) {
+            DiagnosticsLog.append(this, "ERROR", "relay", safe);
+        } else {
+            DiagnosticsLog.appendError(this, "relay", safe, error);
+        }
         preferences.edit().putString(KEY_LAST_ERROR, safe).apply();
         notificationStatus = "Ошибка relay: " + safe;
         refreshNotification();
@@ -278,8 +401,11 @@ public final class RelayService extends Service {
         Notification.Builder builder = Build.VERSION.SDK_INT >= 26
             ? new Notification.Builder(this, CHANNEL_ID)
             : new Notification.Builder(this);
+        String version = preferences == null
+            ? "1.21.100"
+            : preferences.getString(KEY_VERSION, "1.21.100");
         builder.setSmallIcon(R.drawable.ic_relay)
-            .setContentTitle("CPE Relay 1.21.100")
+            .setContentTitle("CPE Relay " + version)
             .setContentText(notificationStatus)
             .setStyle(new Notification.BigTextStyle().bigText(notificationStatus))
             .setContentIntent(contentIntent)
@@ -343,11 +469,13 @@ public final class RelayService extends Service {
         );
         wakeLock.setReferenceCounted(false);
         wakeLock.acquire();
+        DiagnosticsLog.append(this, "DEBUG", "power", "Partial wake lock acquired");
     }
 
     private void releaseWakeLock() {
         if (wakeLock != null && wakeLock.isHeld()) {
             wakeLock.release();
+            DiagnosticsLog.append(this, "DEBUG", "power", "Partial wake lock released");
         }
         wakeLock = null;
     }

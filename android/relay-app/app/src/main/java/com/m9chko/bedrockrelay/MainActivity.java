@@ -14,18 +14,24 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.provider.Settings;
 import android.text.InputType;
 import android.view.Gravity;
 import android.view.View;
 import android.widget.Button;
+import android.widget.ArrayAdapter;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
+import android.widget.Spinner;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
+
+import java.util.ArrayList;
 
 public final class MainActivity extends Activity {
     private static final int NOTIFICATION_PERMISSION_REQUEST = 100;
@@ -42,16 +48,21 @@ public final class MainActivity extends Activity {
     private SharedPreferences preferences;
     private EditText hostInput;
     private EditText portInput;
+    private Spinner versionInput;
     private TextView statusText;
     private TextView detailText;
     private TextView authText;
     private Button authButton;
     private boolean launchMinecraftWhenReady;
+    private TextView logText;
+    private boolean logVisible;
+    private long nextLogRefreshAt;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         preferences = getSharedPreferences(RelayService.PREFERENCES, MODE_PRIVATE);
+        DiagnosticsLog.append(this, "INFO", "ui", "Main screen opened");
         setContentView(buildContent());
     }
 
@@ -77,7 +88,7 @@ public final class MainActivity extends Activity {
         TextView title = text("CPE Relay", 30, true);
         root.addView(title);
         TextView subtitle = text(
-            "Автономный Bedrock 1.21.100 relay без Termux",
+            "Автономный Minecraft Bedrock relay без Termux",
             15,
             false
         );
@@ -99,6 +110,20 @@ public final class MainActivity extends Activity {
             preferences.getInt(RelayService.KEY_PORT, 19132)
         ));
         root.addView(portInput, margins(-1, -2, 0, 2, 0, 18));
+
+        root.addView(text("Версия Minecraft Bedrock", 14, true));
+        versionInput = new Spinner(this);
+        configureVersions();
+        root.addView(versionInput, margins(-1, dp(52), 0, 2, 0, 18));
+
+        TextView versionHint = text(
+            "Выбери точную версию клиента и сервера. Relay не переводит " +
+                "пакеты между разными версиями.",
+            12,
+            false
+        );
+        versionHint.setAlpha(0.65f);
+        root.addView(versionHint, margins(-1, -2, 0, -10, 0, 16));
 
         TextView localAddress = text(
             "Minecraft подключается к 127.0.0.1:19132",
@@ -161,6 +186,51 @@ public final class MainActivity extends Activity {
         hint.setAlpha(0.7f);
         root.addView(hint);
 
+        Button showLog = new Button(this);
+        showLog.setText("Показать подробный журнал");
+        showLog.setAllCaps(false);
+        showLog.setOnClickListener(view -> {
+            logVisible = !logVisible;
+            logText.setVisibility(logVisible ? View.VISIBLE : View.GONE);
+            showLog.setText(logVisible
+                ? "Скрыть подробный журнал"
+                : "Показать подробный журнал");
+            if (logVisible) refreshLogNow();
+        });
+        root.addView(showLog, margins(-1, dp(50), 0, 18, 0, 8));
+
+        Button copyLog = new Button(this);
+        copyLog.setText("Копировать журнал");
+        copyLog.setAllCaps(false);
+        copyLog.setOnClickListener(view -> copyLog());
+        root.addView(copyLog, margins(-1, dp(48), 0, 0, 0, 8));
+
+        Button clearLog = new Button(this);
+        clearLog.setText("Очистить журнал");
+        clearLog.setAllCaps(false);
+        clearLog.setOnClickListener(view -> {
+            DiagnosticsLog.clear(this);
+            DiagnosticsLog.append(this, "INFO", "ui", "Diagnostics log cleared");
+            refreshLogNow();
+            toast("Журнал очищен");
+        });
+        root.addView(clearLog, margins(-1, dp(48), 0, 0, 0, 8));
+
+        TextView logPath = text(
+            "Файл журнала: " + DiagnosticsLog.path(this),
+            11,
+            false
+        );
+        logPath.setAlpha(0.6f);
+        logPath.setTextIsSelectable(true);
+        root.addView(logPath, margins(-1, -2, 0, 0, 0, 6));
+
+        logText = text("", 11, false);
+        logText.setTypeface(Typeface.MONOSPACE);
+        logText.setTextIsSelectable(true);
+        logText.setVisibility(View.GONE);
+        root.addView(logText, margins(-1, -2, 0, 0, 0, 18));
+
         ScrollView scroll = new ScrollView(this);
         scroll.addView(root);
         return scroll;
@@ -180,18 +250,32 @@ public final class MainActivity extends Activity {
             toast("Проверь адрес сервера и порт");
             return;
         }
+        Object selectedVersion = versionInput.getSelectedItem();
+        String version = selectedVersion == null
+            ? "1.21.100"
+            : selectedVersion.toString();
 
         preferences.edit()
             .putString(RelayService.KEY_HOST, host)
             .putInt(RelayService.KEY_PORT, port)
+            .putString(RelayService.KEY_VERSION, version)
             .remove(RelayService.KEY_LAST_ERROR)
             .apply();
+        DiagnosticsLog.append(
+            this,
+            "INFO",
+            "ui",
+            "Start button: destination=" + host + ":" + port +
+                " version=" + version +
+                " launchMinecraft=" + launchMinecraft
+        );
         requestNotificationPermissionIfNeeded();
 
         Intent intent = new Intent(this, RelayService.class)
             .setAction(RelayService.ACTION_START)
             .putExtra(RelayService.EXTRA_HOST, host)
-            .putExtra(RelayService.EXTRA_PORT, port);
+            .putExtra(RelayService.EXTRA_PORT, port)
+            .putExtra(RelayService.EXTRA_VERSION, version);
         if (Build.VERSION.SDK_INT >= 26) {
             startForegroundService(intent);
         } else {
@@ -203,6 +287,7 @@ public final class MainActivity extends Activity {
 
     private void stopRelay() {
         launchMinecraftWhenReady = false;
+        DiagnosticsLog.append(this, "INFO", "ui", "Stop button pressed");
         startService(new Intent(this, RelayService.class)
             .setAction(RelayService.ACTION_STOP));
     }
@@ -213,6 +298,14 @@ public final class MainActivity extends Activity {
             boolean running = state.optBoolean("running", false);
             boolean listening = state.optBoolean("listening", false);
             boolean pingOk = state.optBoolean("pingOk", false);
+            boolean destinationPingDone = state.optBoolean(
+                "destinationPingDone",
+                false
+            );
+            boolean destinationPingOk = state.optBoolean(
+                "destinationPingOk",
+                false
+            );
             int downstream = state.optInt("downstreamConnections", 0);
             boolean upstreamReady = state.optBoolean("upstreamReady", false);
 
@@ -230,10 +323,30 @@ public final class MainActivity extends Activity {
 
             String host = preferences.getString(RelayService.KEY_HOST, "cpe.ign.gg");
             int port = preferences.getInt(RelayService.KEY_PORT, 19132);
+            String version = preferences.getString(
+                RelayService.KEY_VERSION,
+                "1.21.100"
+            );
             String error = preferences.getString(RelayService.KEY_LAST_ERROR, "");
-            String details = "127.0.0.1:19132 → " + host + ":" + port;
+            String details = "Версия " + version + "\n127.0.0.1:19132 → " +
+                host + ":" + port;
             if (listening) {
                 details += pingOk ? "\nRakNet pong: OK" : "\nUDP listener активен";
+            }
+            if (destinationPingDone && destinationPingOk) {
+                String serverVersion = state.optString(
+                    "destinationGameVersion",
+                    ""
+                );
+                details += "\nСервер отвечает: " + serverVersion +
+                    " (protocol " +
+                    state.optInt("destinationProtocolVersion", -1) +
+                    ", " + state.optLong("destinationLatencyMs", 0) + " ms)";
+                if (!serverVersion.isEmpty() && !serverVersion.equals(version)) {
+                    details += "\n⚠ Выбранная версия не совпадает с сервером";
+                }
+            } else if (destinationPingDone) {
+                details += "\n⚠ Сервер не ответил на RakNet ping";
             }
             if (!error.isEmpty()) {
                 details += "\nОшибка: " + error;
@@ -246,6 +359,16 @@ public final class MainActivity extends Activity {
             }
         } catch (Throwable error) {
             detailText.setText("Native relay недоступен: " + error.getMessage());
+            DiagnosticsLog.appendError(
+                this,
+                "ui",
+                "Failed to refresh native relay state",
+                error
+            );
+        }
+
+        if (logVisible && SystemClock.elapsedRealtime() >= nextLogRefreshAt) {
+            refreshLogNow();
         }
 
         String code = preferences.getString(RelayService.KEY_AUTH_CODE, "");
@@ -288,11 +411,97 @@ public final class MainActivity extends Activity {
             }
         }
         if (launch == null || launch.resolveActivity(getPackageManager()) == null) {
+            DiagnosticsLog.append(this, "ERROR", "minecraft", "Minecraft package not found");
             toast("Minecraft не найден на устройстве");
             return;
         }
         launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        DiagnosticsLog.append(this, "INFO", "minecraft", "Launching Minecraft");
         startActivity(launch);
+    }
+
+    private void refreshLogNow() {
+        if (logText == null) return;
+        logText.setText(DiagnosticsLog.readTail(this, 128 * 1024));
+        nextLogRefreshAt = SystemClock.elapsedRealtime() + 2_000;
+    }
+
+    private void copyLog() {
+        String value = DiagnosticsLog.readAll(this);
+        ClipboardManager clipboard = (ClipboardManager)
+            getSystemService(Context.CLIPBOARD_SERVICE);
+        clipboard.setPrimaryClip(ClipData.newPlainText(
+            "CPE Relay diagnostics",
+            value
+        ));
+        DiagnosticsLog.append(
+            this,
+            "INFO",
+            "ui",
+            "Diagnostics log copied; characters=" + value.length()
+        );
+        toast("Подробный журнал скопирован");
+    }
+
+    private void configureVersions() {
+        ArrayList<String> versions = new ArrayList<>();
+        String saved = preferences.getString(
+            RelayService.KEY_VERSION,
+            "1.21.100"
+        );
+        try {
+            JSONArray values = new JSONArray(NativeBridge.supportedVersions());
+            for (int index = 0; index < values.length(); ++index) {
+                String version = values.optString(index, "");
+                if (!version.isEmpty()) versions.add(version);
+            }
+            versions.sort((left, right) -> compareVersions(right, left));
+        } catch (Throwable error) {
+            DiagnosticsLog.appendError(
+                this,
+                "ui",
+                "Failed to load supported protocol versions",
+                error
+            );
+        }
+        if (versions.isEmpty()) versions.add(saved);
+        if (!versions.contains(saved)) versions.add(0, saved);
+
+        ArrayAdapter<String> adapter = new ArrayAdapter<>(
+            this,
+            android.R.layout.simple_spinner_item,
+            versions
+        );
+        adapter.setDropDownViewResource(
+            android.R.layout.simple_spinner_dropdown_item
+        );
+        versionInput.setAdapter(adapter);
+        versionInput.setSelection(Math.max(0, versions.indexOf(saved)));
+    }
+
+    private static int compareVersions(String left, String right) {
+        String[] a = left.split("\\.");
+        String[] b = right.split("\\.");
+        int count = Math.max(a.length, b.length);
+        for (int index = 0; index < count; ++index) {
+            int av = index < a.length ? numberPrefix(a[index]) : 0;
+            int bv = index < b.length ? numberPrefix(b[index]) : 0;
+            if (av != bv) return Integer.compare(av, bv);
+        }
+        return left.compareTo(right);
+    }
+
+    private static int numberPrefix(String value) {
+        int end = 0;
+        while (end < value.length() && Character.isDigit(value.charAt(end))) {
+            ++end;
+        }
+        if (end == 0) return 0;
+        try {
+            return Integer.parseInt(value.substring(0, end));
+        } catch (NumberFormatException ignored) {
+            return 0;
+        }
     }
 
     private void requestNotificationPermissionIfNeeded() {

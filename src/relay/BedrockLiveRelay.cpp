@@ -653,13 +653,25 @@ ServerListenResult BedrockLiveRelay::listen() {
     server_->onConnect([this](const BedrockServerConnection& connection) {
         const auto id = sessionId(connection);
         std::shared_ptr<Session> session;
+        std::vector<std::shared_ptr<Session>> replacedSessions;
         bool rejected = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (options_.forceSingle && !sessions_.empty()) {
-                rejectedConnections_.insert(id);
-                rejected = true;
-            } else {
+                if (options_.replaceExisting) {
+                    replacedSessions.reserve(sessions_.size());
+                    for (const auto& [existingId, existingSession] : sessions_) {
+                        (void) existingId;
+                        replacedSessions.push_back(existingSession);
+                    }
+                    sessions_.clear();
+                    primarySessionId_.clear();
+                } else {
+                    rejectedConnections_.insert(id);
+                    rejected = true;
+                }
+            }
+            if (!rejected) {
                 session = std::make_shared<Session>();
                 session->id = id;
                 session->downstream = connection;
@@ -676,6 +688,22 @@ ServerListenResult BedrockLiveRelay::listen() {
             server_->closeConnection(connection);
             emitStatus();
             return;
+        }
+
+        for (const auto& replaced : replacedSessions) {
+            const std::string reason =
+                "replaced by a new downstream connection";
+            (void) resetRelaySession(replaced, reason, false);
+            server_->closeConnection(replaced->downstream);
+            for (auto& handler : disconnectHandlers_) {
+                handler(replaced->downstream);
+            }
+            if (options_.logging) {
+                relayLogLine(
+                    "[relay] replaced stale session " + replaced->id +
+                    " with " + id
+                );
+            }
         }
 
         // RelayPlayer installs its own one-shot join listener in the
@@ -1343,7 +1371,24 @@ bool BedrockLiveRelay::resetRelaySession(
         );
     }
 
-    if (upstream) upstream->close(reason);
+    // A downstream departure is a Bedrock session departure, not merely a
+    // local transport teardown. Notify the backend before RakNet shutdown so
+    // account/session state is released immediately and a prompt reconnect
+    // cannot be held behind the previous login. BedrockNetworkClient::close()
+    // intentionally sends no game packet; disconnect() sends the protocol
+    // packet synchronously and then performs the same bounded RakNet close.
+    if (upstream) {
+        try {
+            upstream->disconnect(reason, true);
+        } catch (const std::exception& error) {
+            // Teardown must still complete if a version-specific disconnect
+            // encoder fails before RakNet shutdown.
+            emitError(
+                "[upstream disconnect] " + std::string(error.what())
+            );
+            upstream->close(reason);
+        }
+    }
     if (upstreamThread.joinable()) {
         if (upstreamThread.get_id() == std::this_thread::get_id()) {
             upstreamThread.detach();

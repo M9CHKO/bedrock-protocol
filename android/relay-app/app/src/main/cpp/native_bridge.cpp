@@ -11,9 +11,12 @@
 #include <cstdint>
 #include <deque>
 #include <filesystem>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <regex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -77,16 +80,86 @@ std::string redactJsonValue(std::string text, std::string_view key) {
 std::string safeMessage(std::string message) {
     for (const std::string_view key : {
             "access_token", "refresh_token", "identityToken",
-            "Token", "token", "content_key"
+            "Token", "token", "content_key", "client_secret",
+            "password", "device_code", "user_code", "Authorization",
+            "Cookie"
         }) {
         message = redactJsonValue(std::move(message), key);
     }
+    static const std::regex assignedSecret(
+        R"(((access_token|refresh_token|identitytoken|token|content_key|client_secret|password|device_code|user_code|authorization|cookie)\s*[:=]\s*)("[^"]*"|[^&\s,;]+))",
+        std::regex::icase
+    );
+    static const std::regex queryValue(
+        R"(([?&][^=&#\s]+)=([^&\s#]+))",
+        std::regex::icase
+    );
+    static const std::regex bearer(
+        R"(\bBearer\s+[A-Za-z0-9._~+/=-]+)",
+        std::regex::icase
+    );
+    static const std::regex xbl(
+        R"(XBL3\.0\s+x=[^\s"']+)",
+        std::regex::icase
+    );
+    static const std::regex jwt(
+        R"(\beyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}\b)"
+    );
+    message = std::regex_replace(message, assignedSecret, "$1<redacted>");
+    message = std::regex_replace(message, queryValue, "$1=<redacted>");
+    message = std::regex_replace(message, bearer, "Bearer <redacted>");
+    message = std::regex_replace(message, xbl, "XBL3.0 x=<redacted>");
+    message = std::regex_replace(message, jwt, "<redacted-jwt>");
     constexpr std::size_t MaxUiErrorLength = 1200;
     if (message.size() > MaxUiErrorLength) {
         message.resize(MaxUiErrorLength);
         message += "…";
     }
     return message;
+}
+
+int64_t unixMilliseconds() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()
+    ).count();
+}
+
+uint64_t packetHash(const std::vector<uint8_t>& bytes) {
+    uint64_t hash = 1469598103934665603ull;
+    for (const auto byte : bytes) {
+        hash ^= byte;
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+bool isItemInteractionBreadcrumb(std::string_view name) {
+    return name == "inventory_transaction" ||
+        name == "item_stack_request" ||
+        name == "item_stack_response" ||
+        name == "inventory_content" ||
+        name == "inventory_slot" ||
+        name == "mob_equipment" ||
+        name == "mob_armor_equipment" ||
+        name == "add_item_entity" ||
+        name == "interact" ||
+        name == "animate" ||
+        name == "player_action" ||
+        name == "container_open" ||
+        name == "container_close";
+}
+
+std::string packetBreadcrumb(
+    std::string_view direction,
+    const bedrock::VersionedGamePacket& packet
+) {
+    std::ostringstream detail;
+    detail << "direction=" << direction
+           << " packet=" << packet.name
+           << " fullBytes=" << packet.fullPacket.size()
+           << " payloadBytes=" << packet.payload.size()
+           << " hash=0x" << std::hex << packetHash(packet.fullPacket);
+    return detail.str();
 }
 
 class AttachedEnvironment {
@@ -297,26 +370,60 @@ struct RelayState {
     bool listening = false;
     bool pingDone = false;
     bool pingOk = false;
+    bool destinationPingDone = false;
+    bool destinationPingOk = false;
     bool upstreamReady = false;
     uint16_t boundPort = 0;
     std::size_t downstreamConnections = 0;
+    std::size_t downstreamJoinedCount = 0;
     std::size_t upstreamStartedCount = 0;
     std::size_t upstreamReadyCount = 0;
     std::string destinationHost;
     uint16_t destinationPort = 19132;
+    std::string version = "1.21.100";
+    std::string destinationGameVersion;
+    int destinationProtocolVersion = -1;
+    int64_t destinationLatencyMs = 0;
+    int64_t relayStartedAt = 0;
+    int64_t downstreamConnectedAt = 0;
     std::string lastError;
     std::deque<bedrock::JsRuntimeValue> events;
+    uint64_t droppedEvents = 0;
 
     void push(bedrock::JsRuntimeValue event) {
         std::lock_guard lock(mutex);
-        constexpr std::size_t MaximumEvents = 256;
-        if (events.size() == MaximumEvents) events.pop_front();
+        if (event.isObject()) {
+            const auto now = unixMilliseconds();
+            event.set("timestampMs", bedrock::JsRuntimeValue::number(
+                static_cast<double>(now)
+            ));
+            if (!event.get("level")) {
+                event.set("level", bedrock::JsRuntimeValue::string("INFO"));
+            }
+            if (!event.get("component")) {
+                event.set("component", bedrock::JsRuntimeValue::string("native"));
+            }
+        }
+        constexpr std::size_t MaximumEvents = 1024;
+        if (events.size() == MaximumEvents) {
+            events.pop_front();
+            ++droppedEvents;
+        }
         events.push_back(std::move(event));
     }
 
-    void push(std::string type, std::string message) {
+    void push(
+        std::string type,
+        std::string message,
+        std::string level = "INFO",
+        std::string component = "relay"
+    ) {
         push(bedrock::JsRuntimeValue::object({
             {"type", bedrock::JsRuntimeValue::string(std::move(type))},
+            {"level", bedrock::JsRuntimeValue::string(std::move(level))},
+            {"component", bedrock::JsRuntimeValue::string(
+                std::move(component)
+            )},
             {"message", bedrock::JsRuntimeValue::string(
                 safeMessage(std::move(message))
             )}
@@ -334,12 +441,21 @@ bedrock::JsRuntimeValue snapshotValue(
         {"listening", bedrock::JsRuntimeValue::boolean(state->listening)},
         {"pingDone", bedrock::JsRuntimeValue::boolean(state->pingDone)},
         {"pingOk", bedrock::JsRuntimeValue::boolean(state->pingOk)},
+        {"destinationPingDone", bedrock::JsRuntimeValue::boolean(
+            state->destinationPingDone
+        )},
+        {"destinationPingOk", bedrock::JsRuntimeValue::boolean(
+            state->destinationPingOk
+        )},
         {"upstreamReady", bedrock::JsRuntimeValue::boolean(
             state->upstreamReady
         )},
         {"boundPort", bedrock::JsRuntimeValue::number(state->boundPort)},
         {"downstreamConnections", bedrock::JsRuntimeValue::number(
             static_cast<double>(state->downstreamConnections)
+        )},
+        {"downstreamJoinedCount", bedrock::JsRuntimeValue::number(
+            static_cast<double>(state->downstreamJoinedCount)
         )},
         {"upstreamStartedCount", bedrock::JsRuntimeValue::number(
             static_cast<double>(state->upstreamStartedCount)
@@ -352,6 +468,16 @@ bedrock::JsRuntimeValue snapshotValue(
         )},
         {"destinationPort", bedrock::JsRuntimeValue::number(
             state->destinationPort
+        )},
+        {"version", bedrock::JsRuntimeValue::string(state->version)},
+        {"destinationGameVersion", bedrock::JsRuntimeValue::string(
+            state->destinationGameVersion
+        )},
+        {"destinationProtocolVersion", bedrock::JsRuntimeValue::number(
+            state->destinationProtocolVersion
+        )},
+        {"destinationLatencyMs", bedrock::JsRuntimeValue::number(
+            static_cast<double>(state->destinationLatencyMs)
         )},
         {"error", bedrock::JsRuntimeValue::string(state->lastError)}
     });
@@ -371,16 +497,20 @@ public:
     void start(
         const std::string& destinationHost,
         uint16_t destinationPort,
+        const std::string& version,
         const std::filesystem::path& cacheDirectory
     ) {
         bedrock::RelayOptions options;
-        options.version = "1.21.100";
+        options.version = version;
         options.host = "0.0.0.0";
         options.port = 19132;
         options.motd = "CPE Relay Android";
-        options.maxPlayers = 1;
+        // Keep one overlap slot so a new Minecraft transport can replace a
+        // stale Android UDP session before its timeout expires.
+        options.maxPlayers = 2;
         options.offline = true;
         options.forceSingle = true;
+        options.replaceExisting = true;
         options.logging = false;
         options.enableChunkCaching = false;
         options.destination.host = destinationHost;
@@ -408,40 +538,185 @@ public:
             }));
         };
 
+        state_->push(
+            "relay_start",
+            "local=0.0.0.0:19132 destination=" + destinationHost + ":" +
+                std::to_string(destinationPort) +
+                " version=" + version +
+                " forceSingle=true replaceExisting=true",
+            "INFO",
+            "lifecycle"
+        );
+
         auto relay = std::make_unique<bedrock::Relay>(std::move(options));
         relay->onConnect([state](bedrock::RelayPlayer& player) {
-            state->push("connect", player.sessionId());
+            int64_t relayElapsed = 0;
+            {
+                std::lock_guard lock(state->mutex);
+                state->downstreamConnectedAt = unixMilliseconds();
+                relayElapsed = state->relayStartedAt == 0
+                    ? 0
+                    : state->downstreamConnectedAt - state->relayStartedAt;
+            }
+            state->push(
+                "connect",
+                "downstream_session=" + player.sessionId() +
+                    " elapsedSinceRelayStartMs=" +
+                    std::to_string(relayElapsed),
+                "INFO",
+                "downstream"
+            );
         });
         relay->onJoin([state](
             bedrock::RelayPlayer&,
             bedrock::BedrockNetworkClient&
         ) {
-            state->push("upstream_ready", "Destination session is ready");
+            int64_t elapsed = 0;
+            {
+                std::lock_guard lock(state->mutex);
+                elapsed = state->downstreamConnectedAt == 0
+                    ? 0
+                    : unixMilliseconds() - state->downstreamConnectedAt;
+            }
+            state->push(
+                "upstream_ready",
+                "Destination Bedrock session is ready; "
+                    "elapsedSinceDownstreamConnectMs=" +
+                    std::to_string(elapsed),
+                "INFO",
+                "upstream"
+            );
         });
         relay->onDisconnect([state](bedrock::RelayPlayer& player) {
-            state->push("disconnect", player.sessionId());
+            state->push(
+                "disconnect",
+                "downstream_session=" + player.sessionId() +
+                    "; matching upstream was notified and closed",
+                "INFO",
+                "lifecycle"
+            );
         });
         relay->onError([state](const std::string& message) {
             {
                 std::lock_guard lock(state->mutex);
                 state->lastError = safeMessage(message);
             }
-            state->push("error", message);
+            state->push("error", message, "ERROR", "relay");
+        });
+        relay->onParseError([state](const bedrock::RelayParseError& error) {
+            state->push(
+                "parse_error",
+                "direction=" + std::string(
+                    error.direction == bedrock::BedrockRelayDirection::Clientbound
+                        ? "clientbound"
+                        : "serverbound"
+                ) + " session=" + error.sessionId +
+                    " packet=" + error.packetName +
+                    " policy=" + bedrock::relayParseErrorPolicyName(error.policy) +
+                    " error=" + error.message,
+                "ERROR",
+                "packet"
+            );
+        });
+        relay->live().onServerbound([state](bedrock::BedrockRelayPacketEvent& event) {
+            if (!isItemInteractionBreadcrumb(event.packet.name)) return;
+            state->push(
+                "packet",
+                packetBreadcrumb("serverbound", event.packet),
+                "DEBUG",
+                "packet"
+            );
+        });
+        relay->live().onClientbound([state](bedrock::BedrockRelayPacketEvent& event) {
+            if (isItemInteractionBreadcrumb(event.packet.name)) {
+                state->push(
+                    "packet",
+                    packetBreadcrumb("clientbound", event.packet),
+                    "DEBUG",
+                    "packet"
+                );
+            }
+            if (event.packet.name == "start_game" ||
+                event.packet.name == "item_registry" ||
+                event.packet.name == "play_status") {
+                state->push(
+                    "join_stage",
+                    packetBreadcrumb("clientbound", event.packet),
+                    "DEBUG",
+                    "join"
+                );
+            }
         });
         relay->onStatus([state](const bedrock::BedrockLiveRelayStatus& status) {
             bool becameReady = false;
+            bool changed = false;
+            bool downstreamJoined = false;
+            bool upstreamStarted = false;
+            int64_t elapsed = 0;
             {
                 std::lock_guard lock(state->mutex);
                 becameReady = status.upstreamReady && !state->upstreamReady;
+                downstreamJoined = status.downstreamJoinedCount != 0 &&
+                    state->downstreamJoinedCount == 0;
+                upstreamStarted = status.upstreamStartedCount != 0 &&
+                    state->upstreamStartedCount == 0;
+                elapsed = state->downstreamConnectedAt == 0
+                    ? 0
+                    : unixMilliseconds() - state->downstreamConnectedAt;
+                changed = state->listening != status.listening ||
+                    state->boundPort != status.boundPort ||
+                    state->downstreamConnections != status.downstreamConnections ||
+                    state->downstreamJoinedCount != status.downstreamJoinedCount ||
+                    state->upstreamStartedCount != status.upstreamStartedCount ||
+                    state->upstreamReadyCount != status.upstreamReadyCount;
                 state->listening = status.listening;
                 state->boundPort = status.boundPort;
                 state->downstreamConnections = status.downstreamConnections;
+                state->downstreamJoinedCount = status.downstreamJoinedCount;
                 state->upstreamStartedCount = status.upstreamStartedCount;
                 state->upstreamReadyCount = status.upstreamReadyCount;
                 state->upstreamReady = status.upstreamReady;
             }
+            if (changed) {
+                std::ostringstream detail;
+                detail << "listening=" << (status.listening ? "true" : "false")
+                       << " boundPort=" << status.boundPort
+                       << " downstream=" << status.downstreamConnections
+                       << " downstreamJoined=" << status.downstreamJoinedCount
+                       << " upstreamStarted=" << status.upstreamStartedCount
+                       << " upstreamReady=" << status.upstreamReadyCount;
+                state->push(
+                    "status",
+                    detail.str(),
+                    "DEBUG",
+                    "lifecycle"
+                );
+            }
+            if (downstreamJoined) {
+                state->push(
+                    "join_stage",
+                    "downstream handshake complete; elapsedMs=" +
+                        std::to_string(elapsed),
+                    "INFO",
+                    "join"
+                );
+            }
+            if (upstreamStarted) {
+                state->push(
+                    "join_stage",
+                    "upstream authentication/connection started; elapsedMs=" +
+                        std::to_string(elapsed),
+                    "INFO",
+                    "join"
+                );
+            }
             if (becameReady) {
-                state->push("upstream_ready", "Destination session is ready");
+                state->push(
+                    "upstream_ready",
+                    "Destination Bedrock session became ready",
+                    "INFO",
+                    "upstream"
+                );
             }
         });
 
@@ -454,7 +729,9 @@ public:
         }
         state_->push(
             "listening",
-            listener.host + ":" + std::to_string(listener.port)
+            listener.host + ":" + std::to_string(listener.port),
+            "INFO",
+            "listener"
         );
 
         {
@@ -462,11 +739,25 @@ public:
             relay_ = std::move(relay);
         }
 
-        const auto pong = bedrock::RakNetPinger::ping(
-            "127.0.0.1",
-            listener.port,
-            1200
+        auto localPing = std::async(std::launch::async, [port = listener.port]() {
+            return bedrock::RakNetPinger::ping("127.0.0.1", port, 1200);
+        });
+        auto destinationPing = std::async(
+            std::launch::async,
+            [destinationHost, destinationPort]() {
+                const auto started = std::chrono::steady_clock::now();
+                auto pong = bedrock::RakNetPinger::ping(
+                    destinationHost,
+                    destinationPort,
+                    1500
+                );
+                const auto elapsed = std::chrono::duration_cast<
+                    std::chrono::milliseconds
+                >(std::chrono::steady_clock::now() - started).count();
+                return std::make_pair(std::move(pong), elapsed);
+            }
         );
+        const auto pong = localPing.get();
         {
             std::lock_guard lock(state_->mutex);
             state_->pingDone = true;
@@ -474,8 +765,49 @@ public:
         }
         state_->push(
             pong.ok ? "ping_ok" : "ping_warning",
-            pong.ok ? "Local RakNet pong verified" : safeMessage(pong.error)
+            pong.ok ? "Local RakNet pong verified on 127.0.0.1:" +
+                std::to_string(listener.port) : safeMessage(pong.error),
+            pong.ok ? "INFO" : "WARN",
+            "listener"
         );
+
+        auto destinationResult = destinationPing.get();
+        const auto& upstreamPong = destinationResult.first;
+        const auto destinationLatencyMs = destinationResult.second;
+        {
+            std::lock_guard lock(state_->mutex);
+            state_->destinationPingDone = true;
+            state_->destinationPingOk = upstreamPong.ok;
+            state_->destinationGameVersion = upstreamPong.gameVersion;
+            state_->destinationProtocolVersion = upstreamPong.protocolVersion;
+            state_->destinationLatencyMs = destinationLatencyMs;
+        }
+        if (upstreamPong.ok) {
+            const bool versionMismatch = !upstreamPong.gameVersion.empty() &&
+                upstreamPong.gameVersion != version;
+            state_->push(
+                versionMismatch ? "destination_version_warning" : "destination_ping_ok",
+                "destination=" + destinationHost + ":" +
+                    std::to_string(destinationPort) +
+                    " gameVersion=" + upstreamPong.gameVersion +
+                    " protocol=" + std::to_string(upstreamPong.protocolVersion) +
+                    " latencyMs=" + std::to_string(destinationLatencyMs) +
+                    (versionMismatch
+                        ? " selectedVersion=" + version + " mismatch=true"
+                        : " mismatch=false"),
+                versionMismatch ? "WARN" : "INFO",
+                "destination"
+            );
+        } else {
+            state_->push(
+                "destination_ping_warning",
+                "destination=" + destinationHost + ":" +
+                    std::to_string(destinationPort) + " error=" +
+                    safeMessage(upstreamPong.error),
+                "WARN",
+                "destination"
+            );
+        }
     }
 
     void stop() {
@@ -488,7 +820,20 @@ public:
         if (relay) {
             try {
                 relay->close("Android relay stopped");
+            } catch (const std::exception& error) {
+                state_->push(
+                    "error",
+                    "Relay close failed: " + std::string(error.what()),
+                    "ERROR",
+                    "lifecycle"
+                );
             } catch (...) {
+                state_->push(
+                    "error",
+                    "Relay close failed with an unknown native exception",
+                    "ERROR",
+                    "lifecycle"
+                );
             }
         }
         {
@@ -496,11 +841,15 @@ public:
             state_->running = false;
             state_->listening = false;
             state_->upstreamReady = false;
+            state_->destinationPingDone = false;
+            state_->destinationPingOk = false;
+            state_->destinationLatencyMs = 0;
             state_->downstreamConnections = 0;
+            state_->downstreamJoinedCount = 0;
             state_->upstreamStartedCount = 0;
             state_->upstreamReadyCount = 0;
         }
-        state_->push("stopped", "Relay stopped");
+        state_->push("stopped", "Relay stopped", "INFO", "lifecycle");
     }
 
 private:
@@ -563,6 +912,7 @@ Java_com_m9chko_bedrockrelay_NativeBridge_startRelay(
     jclass bridgeClass,
     jstring destinationHostValue,
     jint destinationPortValue,
+    jstring versionValue,
     jstring cacheDirectoryValue
 ) {
     auto state = std::make_shared<RelayState>();
@@ -576,6 +926,7 @@ Java_com_m9chko_bedrockrelay_NativeBridge_startRelay(
             environment,
             cacheDirectoryValue
         );
+        const auto version = fromJavaString(environment, versionValue);
         if (destinationHost.empty()) {
             throw std::runtime_error("Destination host is empty");
         }
@@ -585,9 +936,16 @@ Java_com_m9chko_bedrockrelay_NativeBridge_startRelay(
         if (cacheDirectory.empty()) {
             throw std::runtime_error("Authentication cache path is empty");
         }
+        if (version.empty() || !bedrock::supportsVersion(version)) {
+            throw std::runtime_error(
+                "Unsupported Minecraft Bedrock version: " + version
+            );
+        }
 
         state->destinationHost = destinationHost;
         state->destinationPort = static_cast<uint16_t>(destinationPortValue);
+        state->version = version;
+        state->relayStartedAt = unixMilliseconds();
         state->running = true;
 
         std::shared_ptr<RelayController> previous;
@@ -602,6 +960,7 @@ Java_com_m9chko_bedrockrelay_NativeBridge_startRelay(
         next->start(
             destinationHost,
             static_cast<uint16_t>(destinationPortValue),
+            version,
             std::filesystem::path(cacheDirectory)
         );
         {
@@ -620,12 +979,29 @@ Java_com_m9chko_bedrockrelay_NativeBridge_startRelay(
             state->listening = false;
             state->lastError = message;
         }
-        state->push("error", message);
+        state->push("error", message, "ERROR", "native");
         auto result = snapshotValue(state, false);
         result.set("error", bedrock::JsRuntimeValue::string(message));
         __android_log_print(ANDROID_LOG_ERROR, LogTag, "%s", message.c_str());
         return toJavaString(environment, jsonString(result));
     }
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_m9chko_bedrockrelay_NativeBridge_supportedVersions(
+    JNIEnv* environment,
+    jclass
+) {
+    std::vector<bedrock::JsRuntimeValue> versions;
+    for (auto& version : bedrock::versions()) {
+        versions.push_back(bedrock::JsRuntimeValue::string(
+            std::move(version)
+        ));
+    }
+    return toJavaString(
+        environment,
+        jsonString(bedrock::JsRuntimeValue::array(std::move(versions)))
+    );
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -667,7 +1043,23 @@ Java_com_m9chko_bedrockrelay_NativeBridge_pollEvents(
     std::vector<bedrock::JsRuntimeValue> events;
     {
         std::lock_guard lock(state->mutex);
-        events.reserve(state->events.size());
+        events.reserve(state->events.size() + (state->droppedEvents == 0 ? 0 : 1));
+        if (state->droppedEvents != 0) {
+            events.push_back(bedrock::JsRuntimeValue::object({
+                {"type", bedrock::JsRuntimeValue::string("log_overflow")},
+                {"level", bedrock::JsRuntimeValue::string("WARN")},
+                {"component", bedrock::JsRuntimeValue::string("diagnostics")},
+                {"timestampMs", bedrock::JsRuntimeValue::number(
+                    static_cast<double>(unixMilliseconds())
+                )},
+                {"message", bedrock::JsRuntimeValue::string(
+                    "Native diagnostic queue dropped " +
+                    std::to_string(state->droppedEvents) +
+                    " oldest events"
+                )}
+            }));
+            state->droppedEvents = 0;
+        }
         while (!state->events.empty()) {
             events.push_back(std::move(state->events.front()));
             state->events.pop_front();

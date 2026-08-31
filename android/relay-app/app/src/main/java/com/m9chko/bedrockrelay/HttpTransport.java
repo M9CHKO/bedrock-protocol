@@ -29,6 +29,17 @@ final class HttpTransport {
         if (!"https".equalsIgnoreCase(uri.getScheme())) {
             throw new SecurityException("Authentication transport requires HTTPS");
         }
+        String method = request.optString("method", "POST")
+            .toUpperCase(Locale.ROOT);
+        String endpoint = uri.getHost() +
+            (uri.getPath() == null ? "" : uri.getPath());
+        long startedAt = System.currentTimeMillis();
+        DiagnosticsLog.append(
+            RelayApplication.context(),
+            "DEBUG",
+            "http",
+            method + " https://" + endpoint + " started; body/headers omitted"
+        );
 
         HttpURLConnection connection = (HttpURLConnection)
             new URL(urlText).openConnection();
@@ -36,9 +47,7 @@ final class HttpTransport {
         connection.setReadTimeout(READ_TIMEOUT_MS);
         connection.setUseCaches(false);
         connection.setInstanceFollowRedirects(true);
-        connection.setRequestMethod(
-            request.optString("method", "POST").toUpperCase(Locale.ROOT)
-        );
+        connection.setRequestMethod(method);
 
         JSONArray headers = request.optJSONArray("headers");
         if (headers != null) {
@@ -65,6 +74,14 @@ final class HttpTransport {
         }
 
         int status = connection.getResponseCode();
+        DiagnosticsLog.append(
+            RelayApplication.context(),
+            status >= 400 ? "WARN" : "DEBUG",
+            "http",
+            method + " https://" + endpoint + " status=" + status +
+                " elapsedMs=" + (System.currentTimeMillis() - startedAt) +
+                "; response body omitted"
+        );
         InputStream input = status >= 400
             ? connection.getErrorStream()
             : connection.getInputStream();

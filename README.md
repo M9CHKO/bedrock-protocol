@@ -97,7 +97,9 @@ int main() {
   with one isolated upstream
   C++ client, queues, packet-variable store, and lifecycle per accepted
   downstream Bedrock player. Multiple clients are supported concurrently;
-  `forceSingle` restores the single-client rejection mode, and each destination
+  `forceSingle` restores the single-client rejection mode, optional
+  `replaceExisting` gives mobile frontends latest-connection-wins teardown,
+  and each destination
   can be a real Bedrock server or Bedrock Realm. Relay login preserves custom
   skin/client metadata per session, phase-isolated downstream/upstream
   negotiation, and high-level `logging`, `enableChunkCaching`, explicit

@@ -11,8 +11,11 @@ public final class NativeBridge {
     public static native String startRelay(
         String destinationHost,
         int destinationPort,
+        String version,
         String authCacheDirectory
     );
+
+    public static native String supportedVersions();
 
     public static native void stopRelay();
 
@@ -23,6 +26,16 @@ public final class NativeBridge {
     // Called by AndroidXboxTokenHttpClient from a native authentication
     // worker. No request or response body is logged on either side.
     public static String httpFetch(String requestJson) throws Exception {
-        return HttpTransport.fetch(requestJson);
+        try {
+            return HttpTransport.fetch(requestJson);
+        } catch (Exception error) {
+            DiagnosticsLog.appendError(
+                RelayApplication.context(),
+                "http",
+                "Android authentication HTTPS request failed; request omitted",
+                error
+            );
+            throw error;
+        }
     }
 }

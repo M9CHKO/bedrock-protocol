@@ -93,7 +93,8 @@ bool check(bool condition, const std::string& message) {
 
 bedrock::RelayOptions relayOptions(
     uint16_t upstreamPort,
-    bool forceSingle
+    bool forceSingle,
+    bool replaceExisting = false
 ) {
     bedrock::RelayOptions options;
     options.version = "1.21.100";
@@ -107,6 +108,7 @@ bedrock::RelayOptions relayOptions(
     options.maxPlayers = 4;
     options.batchingInterval = 5;
     options.forceSingle = forceSingle;
+    options.replaceExisting = replaceExisting;
     options.destination.host = "127.0.0.1";
     options.destination.port = upstreamPort;
     options.destination.offline = true;
@@ -144,6 +146,7 @@ bool checkMultiClientRouting() {
     std::string upstreamRouteB;
     std::string upstreamRouteB2;
     std::atomic<int> upstreamRequests {0};
+    std::atomic<int> upstreamDisconnectPackets {0};
 
     bedrock::BedrockServer upstreamServer({
         .host = "127.0.0.1",
@@ -187,6 +190,9 @@ bool checkMultiClientRouting() {
         } catch (const std::exception& error) {
             errors.add("upstream tick handler", error.what());
         }
+    });
+    upstreamServer.on("disconnect", [&](const bedrock::BedrockServerPacketEvent&) {
+        ++upstreamDisconnectPackets;
     });
     upstreamServer.listen();
 
@@ -427,6 +433,10 @@ bool checkMultiClientRouting() {
               << " disconnect-callbacks=" << disconnectCalls.load();
         ok &= check(false, state.str());
     }
+    ok &= check(
+        waitFor([&]() { return upstreamDisconnectPackets.load() == 1; }, 2s),
+        "downstream teardown did not send an upstream Bedrock disconnect packet"
+    );
 
     if (!downstreamSessionA.empty() && !downstreamSessionB.empty()) {
         ok &= check(relay.player(connectionA) == nullptr,
@@ -467,9 +477,15 @@ bool checkMultiClientRouting() {
                 "aggregate relay status did not expose two connections");
 
     clientB.close("multi-client smoke complete");
-    (void) waitFor([&]() {
-        return relay.playerCount() == 0 && relay.live().sessionCount() == 0;
+    const bool finalTeardown = waitFor([&]() {
+        return relay.playerCount() == 0 &&
+            relay.live().sessionCount() == 0 &&
+            upstreamDisconnectPackets.load() == 2;
     }, 2s);
+    ok &= check(
+        finalTeardown,
+        "final downstream teardown did not notify the upstream Bedrock session"
+    );
     relay.close("multi-client smoke complete");
     upstreamServer.close("multi-client smoke complete");
 
@@ -604,10 +620,123 @@ bool checkForceSingle() {
     return ok;
 }
 
+bool checkReplaceExisting() {
+    const std::string version = "1.21.100";
+    ErrorLog errors;
+    std::atomic<int> upstreamDisconnectPackets {0};
+
+    bedrock::BedrockServer upstreamServer({
+        .host = "127.0.0.1",
+        .port = 0,
+        .version = version,
+        .motd = {{"motd", "Relay replace-existing Upstream"}},
+        .maxPlayers = 4,
+        .offline = true,
+        .batchingInterval = 5
+    });
+    upstreamServer.onConnect([&](const bedrock::BedrockServerConnection& connection) {
+        connection.onError([&](const std::string& message) {
+            errors.add("replace-existing upstream player", message);
+        });
+    });
+    upstreamServer.on("disconnect", [&](const bedrock::BedrockServerPacketEvent&) {
+        ++upstreamDisconnectPackets;
+    });
+    upstreamServer.listen();
+
+    bedrock::Relay relay(relayOptions(
+        upstreamServer.boundPort(),
+        true,
+        true
+    ));
+    std::atomic<int> connectCalls {0};
+    std::atomic<int> disconnectCalls {0};
+    std::atomic<std::size_t> statusConnections {0};
+    std::atomic<std::size_t> statusReady {0};
+    relay.onConnect([&](bedrock::RelayPlayer&) { ++connectCalls; });
+    relay.onDisconnect([&](bedrock::RelayPlayer&) { ++disconnectCalls; });
+    relay.onStatus([&](const bedrock::BedrockLiveRelayStatus& status) {
+        statusConnections = status.downstreamConnections;
+        statusReady = status.upstreamReadyCount;
+    });
+    relay.onError([&](const std::string& message) {
+        errors.add("replace-existing relay", message);
+    });
+    relay.listen();
+
+    auto first = bedrock::createNetworkClient(
+        clientOptions(relay.live().boundPort(), "RelayReplaceA")
+    );
+    auto second = bedrock::createNetworkClient(
+        clientOptions(relay.live().boundPort(), "RelayReplaceB")
+    );
+    std::atomic<bool> firstClosed {false};
+    first.onClose([&]() { firstClosed = true; });
+    // The replaced transport may surface a connection-loss error depending
+    // on native RakNet callback timing; replacement itself is the assertion.
+    first.onError([](const std::string&) {});
+    second.onError([&](const std::string& message) {
+        errors.add("replace-existing second downstream", message);
+    });
+
+    bool ok = true;
+    const bool connectedFirst = first.connect();
+    const bool firstReady = connectedFirst && waitFor([&]() {
+        return relay.live().sessionCount() == 1 &&
+            relay.live().upstreamCount() == 1 &&
+            upstreamServer.clientCount() == 1 &&
+            statusReady.load() == 1;
+    });
+    const bool connectedSecond = firstReady && second.connect();
+    const bool replacementReady = connectedSecond && waitFor([&]() {
+        return relay.live().sessionCount() == 1 &&
+            relay.live().upstreamCount() == 1 &&
+            relay.live().server().clientCount() == 1 &&
+            upstreamServer.clientCount() == 1 &&
+            statusConnections.load() == 1 &&
+            statusReady.load() == 1 &&
+            connectCalls.load() == 2 &&
+            disconnectCalls.load() == 1 &&
+            upstreamDisconnectPackets.load() == 1 &&
+            (firstClosed.load() ||
+             first.status() == bedrock::BedrockNetworkClientStatus::Disconnected);
+    });
+
+    ok &= check(connectedFirst, "replace-existing first downstream connect failed");
+    ok &= check(firstReady, "replace-existing first session did not become ready");
+    ok &= check(connectedSecond, "replace-existing second downstream connect failed");
+    ok &= check(
+        replacementReady,
+        "new downstream did not atomically replace and release the old session"
+    );
+    ok &= check(
+        relay.live().options().replaceExisting,
+        "replaceExisting was not propagated to the live relay"
+    );
+
+    second.close("replace-existing smoke complete");
+    const bool finalTeardown = waitFor([&]() {
+        return relay.live().sessionCount() == 0 &&
+            upstreamServer.clientCount() == 0 &&
+            upstreamDisconnectPackets.load() == 2;
+    });
+    ok &= check(finalTeardown, "replacement session did not tear down cleanly");
+
+    first.close("replace-existing smoke complete");
+    relay.close("replace-existing smoke complete");
+    upstreamServer.close("replace-existing smoke complete");
+    ok &= check(errors.empty(), "unexpected replace-existing error: " + errors.text());
+    if (ok) {
+        std::cout << "[LIVE-RELAY-MULTI-SMOKE] replaceExisting ok\n";
+    }
+    return ok;
+}
+
 } // namespace
 
 int main() {
     bool ok = checkMultiClientRouting();
     ok = checkForceSingle() && ok;
+    ok = checkReplaceExisting() && ok;
     return ok ? 0 : 1;
 }
