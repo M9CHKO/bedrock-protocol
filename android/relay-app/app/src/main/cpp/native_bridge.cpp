@@ -180,6 +180,10 @@ bool isClientboundEquipmentFlood(std::string_view name) {
     return name == "mob_equipment" || name == "mob_armor_equipment";
 }
 
+bool shouldRecordEquipmentSample(uint64_t sampleIndex) {
+    return sampleIndex <= 8 || sampleIndex % 128 == 0;
+}
+
 bool isFlightPacket(std::string_view name) {
     return isItemInteractionBreadcrumb(name) ||
         name == "start_game" ||
@@ -507,6 +511,8 @@ struct RelayState {
     uint64_t flightSequence = 0;
     uint64_t lastFlushedFlightSequence = 0;
     std::atomic<uint64_t> clientboundEquipmentPackets {0};
+    std::atomic<uint64_t> clientboundEquipmentTransportPackets {0};
+    std::atomic<uint64_t> clientboundEquipmentForwardedPackets {0};
 
     void push(bedrock::JsRuntimeValue event) {
         std::lock_guard lock(mutex);
@@ -567,7 +573,15 @@ struct RelayState {
                 flightSequence == lastFlushedFlightSequence) {
                 return;
             }
-            snapshot.assign(flight.begin(), flight.end());
+            auto firstUnflushed = flight.begin();
+            while (firstUnflushed != flight.end() &&
+                   firstUnflushed->sequence <= lastFlushedFlightSequence) {
+                ++firstUnflushed;
+            }
+            if (firstUnflushed == flight.end()) {
+                return;
+            }
+            snapshot.assign(firstUnflushed, flight.end());
             firstSequence = snapshot.front().sequence;
             lastSequence = snapshot.back().sequence;
             lastFlushedFlightSequence = flightSequence;
@@ -752,6 +766,7 @@ public:
                 state->resetFlight();
             }
             bool record = true;
+            uint64_t sampleIndex = 0;
             if (event.kind ==
                 bedrock::BedrockServerTransportEventKind::Receive) {
                 std::lock_guard lock(state->mutex);
@@ -759,6 +774,14 @@ public:
                 // become high-volume duplicates once decoded packet events
                 // are available.
                 record = state->downstreamJoinedCount == 0;
+            } else if (
+                event.kind ==
+                    bedrock::BedrockServerTransportEventKind::SendPacket &&
+                isClientboundEquipmentFlood(event.packetName)
+            ) {
+                sampleIndex =
+                    state->clientboundEquipmentTransportPackets.fetch_add(1) + 1;
+                record = shouldRecordEquipmentSample(sampleIndex);
             } else if ((event.kind ==
                             bedrock::BedrockServerTransportEventKind::DecodedPacket ||
                         event.kind ==
@@ -775,6 +798,10 @@ public:
             std::string breadcrumb;
             if (record || publishLoginStage || publishError) {
                 breadcrumb = transportBreadcrumb(event);
+                if (sampleIndex != 0) {
+                    breadcrumb += " sample_index=" +
+                        std::to_string(sampleIndex);
+                }
             }
             if (record) {
                 state->recordFlight("transport", breadcrumb);
@@ -817,6 +844,8 @@ public:
 
         relay->onConnect([this, state](bedrock::RelayPlayer& player) {
             state->clientboundEquipmentPackets = 0;
+            state->clientboundEquipmentTransportPackets = 0;
+            state->clientboundEquipmentForwardedPackets = 0;
             int64_t relayElapsed = 0;
             {
                 std::lock_guard lock(state->mutex);
@@ -910,23 +939,25 @@ public:
             );
         });
         relay->live().onClientbound([state](bedrock::BedrockRelayPacketEvent& event) {
-            if (isFlightPacket(event.packet.name)) {
+            uint64_t sampleIndex = 0;
+            bool sampled = true;
+            if (isClientboundEquipmentFlood(event.packet.name)) {
+                sampleIndex =
+                    state->clientboundEquipmentPackets.fetch_add(1) + 1;
+                sampled = shouldRecordEquipmentSample(sampleIndex);
+            }
+            if (sampled && isFlightPacket(event.packet.name)) {
                 state->recordFlight(
                     "relay_seen",
                     packetBreadcrumb("clientbound", event.packet)
                 );
             }
             if (isItemInteractionBreadcrumb(event.packet.name)) {
-                uint64_t sampleIndex = 0;
-                if (isClientboundEquipmentFlood(event.packet.name)) {
-                    sampleIndex =
-                        state->clientboundEquipmentPackets.fetch_add(1) + 1;
-                    // A populated server can emit hundreds of equipment
-                    // updates immediately after the registry. Keep enough
-                    // samples for diagnosis without doing hundreds of JNI,
-                    // JSON and file writes in one Android scheduler slice.
-                    if (sampleIndex > 8 && sampleIndex % 128 != 0) return;
-                }
+                // A populated server can emit hundreds of equipment updates
+                // immediately after the registry. Keep enough samples for
+                // diagnosis without flooding either the live log or the
+                // post-error flight recorder.
+                if (!sampled) return;
                 auto breadcrumb = packetBreadcrumb(
                     "clientbound",
                     event.packet
@@ -956,16 +987,30 @@ public:
         relay->live().onForwarded([state](
             const bedrock::BedrockRelayPacketEvent& event
         ) {
-            if (isFlightPacket(event.packet.name)) {
+            bool record = isFlightPacket(event.packet.name);
+            uint64_t sampleIndex = 0;
+            if (event.direction ==
+                    bedrock::BedrockRelayDirection::Clientbound &&
+                isClientboundEquipmentFlood(event.packet.name)) {
+                sampleIndex =
+                    state->clientboundEquipmentForwardedPackets.fetch_add(1) + 1;
+                record = record && shouldRecordEquipmentSample(sampleIndex);
+            }
+            if (record) {
+                auto breadcrumb = packetBreadcrumb(
+                    event.direction ==
+                            bedrock::BedrockRelayDirection::Clientbound
+                        ? "clientbound"
+                        : "serverbound",
+                    event.packet
+                );
+                if (sampleIndex != 0) {
+                    breadcrumb += " sample_index=" +
+                        std::to_string(sampleIndex);
+                }
                 state->recordFlight(
                     "relay_forwarded",
-                    packetBreadcrumb(
-                        event.direction ==
-                                bedrock::BedrockRelayDirection::Clientbound
-                            ? "clientbound"
-                            : "serverbound",
-                        event.packet
-                    )
+                    std::move(breadcrumb)
                 );
             }
         });

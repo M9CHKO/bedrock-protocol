@@ -2414,7 +2414,7 @@ private:
         if (versioned.has_value()) {
             return versioned;
         }
-        return generatedProtocolTypeJson(typeName);
+        return generatedProtocolTypeJson(options_.version, typeName);
     }
 
     void validatePlayerPacket(

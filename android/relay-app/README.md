@@ -8,8 +8,17 @@ UDP-порту `19132` и подключает его к серверу, кот�
 
 ## Готовый APK
 
-- [CPE Relay 1.0.5 (arm64-v8a, optimized Release, debug-signed)](apk/CPE-Relay-v1.0.5-arm64-v8a-release-debug-signed.apk)
-- [SHA-256](apk/CPE-Relay-v1.0.5-arm64-v8a-release-debug-signed.apk.sha256)
+- [CPE Relay 1.0.6 (arm64-v8a, optimized Release, debug-signed)](apk/CPE-Relay-v1.0.6-arm64-v8a-release-debug-signed.apk)
+- [SHA-256](apk/CPE-Relay-v1.0.6-arm64-v8a-release-debug-signed.apk.sha256)
+
+Версия 1.0.6 исправляет разрыв при смене слота хотбара. Если внешний TSV-
+каталог протокола недоступен внутри APK, relay теперь выбирает встроенную схему
+строго для указанной версии (`1.21.100`), а не схему самой новой встроенной
+версии. Поэтому корректный короткий `mob_equipment` с пустым предметом больше
+не ошибочно разбирается как новый `ItemV4` и не закрывает локальную сессию.
+Flight-recorder семплирует массовые успешные equipment-пакеты на всех стадиях
+и при повторной причине выгружает только новые записи, сохраняя ошибки без
+семплирования и не переполняя очередь подробного журнала.
 
 Версия 1.0.5 исправляет доказанный разрыв локального login сразу после
 `request_network_settings`: первый `network_settings` теперь адресуется

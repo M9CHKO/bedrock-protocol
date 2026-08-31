@@ -14,6 +14,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace bedrock {
 
@@ -51,6 +52,20 @@ struct BedrockServerTestAccess {
         const VersionedGamePacket& packet
     ) {
         return server.handleBuiltInPacket(connection, packet);
+    }
+
+    static void useMissingProtocolTypeIndex(BedrockServer& server) {
+        server.playerProtocolTypes_ = ProtocolTypeTsvIndex(
+            "data/does-not-exist/protocol-types"
+        );
+    }
+
+    static void validatePlayerPacket(
+        const BedrockServer& server,
+        const BedrockServerConnection& connection,
+        const VersionedGamePacket& packet
+    ) {
+        server.validatePlayerPacket(connection, packet);
     }
 };
 
@@ -402,6 +417,58 @@ bool checkModernNetworkSettingsGate() {
     return ok;
 }
 
+bool checkEmbeddedVersionedSchemaFallback() {
+    const std::string version = "1.21.100";
+    bedrock::BedrockServer server({
+        .version = version,
+        .offline = true
+    });
+    bedrock::BedrockServerTestAccess::useMissingProtocolTypeIndex(server);
+    const auto connection = bedrock::BedrockServerTestAccess::addPlainPlayer(
+        server,
+        19323,
+        0x1020304050607083ull
+    );
+
+    // A high runtime ID makes the canonical old-format empty-item
+    // mob_equipment packet exactly 14 bytes including its packet header,
+    // matching the Android hotbar-switch capture. Item.network_id == 0 must
+    // select the 1.21.100 void branch before the three trailing slot fields.
+    std::vector<uint8_t> fullPacket {0x1f};
+    fullPacket.insert(fullPacket.end(), 8, 0x80);
+    fullPacket.insert(fullPacket.end(), {0x01, 0x00, 0x04, 0x04, 0x00});
+    const auto packet = bedrock::VersionedPacketCodec::forVersion(version)
+        .decodeFullPacket(fullPacket);
+
+    bool validated = true;
+    std::string validationError;
+    try {
+        bedrock::BedrockServerTestAccess::validatePlayerPacket(
+            server,
+            connection,
+            packet
+        );
+    } catch (const std::exception& error) {
+        validated = false;
+        validationError = error.what();
+    }
+
+    bool ok = true;
+    ok &= check(fullPacket.size() == 14, "empty mob_equipment fixture size changed");
+    ok &= check(packet.name == "mob_equipment", "fixture packet name mismatch");
+    ok &= check(
+        validated,
+        "embedded 1.21.100 schema fallback rejected empty mob_equipment: " +
+            validationError
+    );
+
+    server.close();
+    if (ok) {
+        std::cout << "[SERVER-PROTOCOL-VERSION-SMOKE] embedded versioned schema fallback ok\n";
+    }
+    return ok;
+}
+
 } // namespace
 
 int main() {
@@ -409,5 +476,6 @@ int main() {
     ok = checkLegacyLoginGate() && ok;
     ok = checkLoggingInExceptionBoundary() && ok;
     ok = checkModernNetworkSettingsGate() && ok;
+    ok = checkEmbeddedVersionedSchemaFallback() && ok;
     return ok ? 0 : 1;
 }
