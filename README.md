@@ -2,6 +2,9 @@
 
 Minecraft Bedrock Protocol Client Library for C++20
 
+Standalone Android 8+ relay app (no Termux), including a directly
+installable arm64 APK: [Android relay app](android/relay-app/README.md).
+
 ## Supported Versions
 
 The bundled protocol data currently includes these Bedrock versions:

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">CPE Relay</string>
+    <string name="notification_channel_name">Bedrock relay</string>
+    <string name="notification_channel_description">Keeps the local Bedrock relay active while Minecraft is open</string>
+</resources>

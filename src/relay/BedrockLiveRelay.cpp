@@ -1264,7 +1264,8 @@ void BedrockLiveRelay::resolveUpstreamRealm(
         .forceRefresh = upstreamOptions.forceRefresh,
         .msalConfig = upstreamOptions.msalConfig,
         .password = upstreamOptions.password,
-        .onMsaCode = upstreamOptions.onMsaCode
+        .onMsaCode = upstreamOptions.onMsaCode,
+        .httpClientFactory = upstreamOptions.httpClientFactory
     };
     validateNativeBedrockAuthflowOptions(authOptions);
     upstreamOptions.profilesFolder = authOptions.profilesFolder;

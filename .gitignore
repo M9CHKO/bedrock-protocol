@@ -39,6 +39,11 @@ _*.log
 *.o
 *.pdb
 *.ilk
+android/relay-app/.gradle/
+android/relay-app/.idea/
+android/relay-app/local.properties
+android/relay-app/app/.cxx/
+android/relay-app/*.iml
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake

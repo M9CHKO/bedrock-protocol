@@ -252,18 +252,37 @@ NativeBedrockAuthflowRuntime createNativeBedrockAuthflow(
         ? "msal"
         : authFlow.flow;
     initializeCache(firstCache);
+    auto managerQueue = JsMicrotaskQueue::create();
+    XboxTokenHttpClientPtr managerHttpClient;
+    if (options.httpClientFactory) {
+        managerHttpClient = options.httpClientFactory(managerQueue);
+        if (!managerHttpClient) {
+            throw std::runtime_error(
+                "httpClientFactory returned a null Xbox HTTP client"
+            );
+        }
+    }
     auto authRuntime = XboxLiveAuth::initializePrismarineAuthFlowRuntime(
         authFlow,
         options.msalConfig,
-        caches[firstCache]
+        caches[firstCache],
+        {},
+        managerQueue,
+        {},
+        LiveTokenManagerDependencies {
+            .httpClient = managerHttpClient,
+            .microtaskQueue = managerQueue
+        }
     );
-    auto managerQueue = authRuntime.live
+    managerQueue = authRuntime.live
         ? authRuntime.live->microtaskQueue()
         : authRuntime.msa
             ? authRuntime.msa->microtaskQueue()
-            : JsMicrotaskQueue::create();
-    auto managerHttpClient =
-        std::make_shared<CurlXboxTokenHttpClient>(managerQueue);
+            : managerQueue;
+    if (!managerHttpClient) {
+        managerHttpClient =
+            std::make_shared<CurlXboxTokenHttpClient>(managerQueue);
+    }
     auto xboxProofKey = XboxProofKey::generate();
 
     initializeCache("xbl");

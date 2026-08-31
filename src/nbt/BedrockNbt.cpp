@@ -343,6 +343,13 @@ void writePayload(WriteContext& context, const NbtValue& value, std::size_t dept
 
 } // namespace
 
+NbtValue::NbtValue() = default;
+NbtValue::~NbtValue() = default;
+NbtValue::NbtValue(const NbtValue& other) = default;
+NbtValue::NbtValue(NbtValue&& other) noexcept = default;
+NbtValue& NbtValue::operator=(const NbtValue& other) = default;
+NbtValue& NbtValue::operator=(NbtValue&& other) noexcept = default;
+
 NbtValue NbtValue::end() {
     return {};
 }
@@ -409,6 +416,10 @@ NbtValue NbtValue::list(NbtTagType elementType, std::vector<NbtValue> value) {
     out.listElementType = elementType;
     out.listValue = std::move(value);
     return out;
+}
+
+NbtValue NbtValue::compound() {
+    return compound({});
 }
 
 NbtValue NbtValue::compound(std::vector<NbtNamedValue> value) {

@@ -26,6 +26,7 @@ struct NativeBedrockAuthflowOptions {
     MsalConfigPtr msalConfig;
     std::string password;
     std::function<void(const XboxDeviceCodeInfo&)> onMsaCode;
+    XboxTokenHttpClientFactory httpClientFactory;
 };
 
 // Keep the complete manager graph available to BedrockNetworkClient's

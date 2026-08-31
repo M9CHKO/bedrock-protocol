@@ -217,6 +217,9 @@ struct BedrockNetworkClientOptions {
     std::string xboxClientId;
     std::filesystem::path authCacheRoot;
     std::function<void(const XboxDeviceCodeInfo&)> onMsaCode;
+    // Replaces the process-spawned curl transport while preserving all token
+    // parsing, polling, signing, and cache behavior in the library.
+    XboxTokenHttpClientFactory httpClientFactory;
 
     int mtu = 1400;
     int connectTimeoutMs = 9000;

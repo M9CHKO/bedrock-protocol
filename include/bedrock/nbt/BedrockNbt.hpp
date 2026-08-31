@@ -30,6 +30,13 @@ enum class NbtTagType : uint8_t {
 struct NbtNamedValue;
 
 struct NbtValue {
+    NbtValue();
+    ~NbtValue();
+    NbtValue(const NbtValue& other);
+    NbtValue(NbtValue&& other) noexcept;
+    NbtValue& operator=(const NbtValue& other);
+    NbtValue& operator=(NbtValue&& other) noexcept;
+
     NbtTagType type = NbtTagType::End;
     int64_t integerValue = 0;
     double floatingValue = 0.0;
@@ -51,7 +58,8 @@ struct NbtValue {
     static NbtValue byteArray(std::vector<uint8_t> value);
     static NbtValue string(std::string value);
     static NbtValue list(NbtTagType elementType, std::vector<NbtValue> value = {});
-    static NbtValue compound(std::vector<NbtNamedValue> value = {});
+    static NbtValue compound();
+    static NbtValue compound(std::vector<NbtNamedValue> value);
     static NbtValue intArray(std::vector<int32_t> value);
     static NbtValue longArray(std::vector<int64_t> value);
 

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.CpeRelay" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">#4CAF50</item>
+        <item name="android:navigationBarColor">#101510</item>
+        <item name="android:statusBarColor">#1B5E20</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

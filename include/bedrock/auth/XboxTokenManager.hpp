@@ -54,6 +54,13 @@ public:
 
 using XboxTokenHttpClientPtr = std::shared_ptr<IXboxTokenHttpClient>;
 
+// Platform integrations (notably Android, where spawning a curl process is
+// unavailable) can create a transport bound to the exact Promise queue used
+// by the native Authflow. Returning null is treated as a configuration error.
+using XboxTokenHttpClientFactory = std::function<XboxTokenHttpClientPtr(
+    std::shared_ptr<JsMicrotaskQueue> microtaskQueue
+)>;
+
 // Default byte transport. Protocol and JSON/error handling intentionally stay
 // in XboxTokenManager; this adapter only performs the HTTP exchange.
 class CurlXboxTokenHttpClient final : public IXboxTokenHttpClient {

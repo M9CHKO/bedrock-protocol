@@ -13,8 +13,28 @@ option(BEDROCK_PROTOCOL_CPP_BUILD_BOT "Build local bot that links bedrock_protoc
 option(BEDROCK_PROTOCOL_CPP_BUILD_EXAMPLES "Build example bots" ON)
 option(BEDROCK_PROTOCOL_CPP_INSTALL "Enable install rules" ON)
 
-find_package(ZLIB REQUIRED)
-find_package(OpenSSL REQUIRED)
+if(ANDROID)
+    # Android's NDK exposes zlib as a platform library. OpenSSL is supplied by
+    # the consuming Gradle/Prefab project because it is not an NDK API.
+    find_library(BEDROCK_ANDROID_ZLIB_LIBRARY z REQUIRED)
+    add_library(bedrock_android_zlib INTERFACE)
+    target_link_libraries(
+        bedrock_android_zlib
+        INTERFACE ${BEDROCK_ANDROID_ZLIB_LIBRARY}
+    )
+    add_library(ZLIB::ZLIB ALIAS bedrock_android_zlib)
+
+    find_package(openssl REQUIRED CONFIG)
+    if(NOT TARGET openssl::crypto)
+        message(FATAL_ERROR "Android OpenSSL Prefab package has no crypto module")
+    endif()
+    add_library(bedrock_android_crypto INTERFACE)
+    target_link_libraries(bedrock_android_crypto INTERFACE openssl::crypto)
+    add_library(OpenSSL::Crypto ALIAS bedrock_android_crypto)
+else()
+    find_package(ZLIB REQUIRED)
+    find_package(OpenSSL REQUIRED)
+endif()
 find_package(Threads REQUIRED)
 
 # bedrock-protocol's JavaScript implementation delegates RakNet reliability,
@@ -125,6 +145,7 @@ add_library(bedrock_core ALIAS bedrock_protocol)
 set_target_properties(bedrock_protocol PROPERTIES
     OUTPUT_NAME bedrock_protocol
     EXPORT_NAME bedrock_protocol
+    POSITION_INDEPENDENT_CODE ON
 )
 
 target_include_directories(bedrock_protocol
@@ -218,6 +239,15 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
 
     add_executable(msal-native-smoke tools/msal_native_smoke.cpp)
     target_link_libraries(msal-native-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+
+    add_executable(
+        native-auth-transport-smoke
+        tools/native_auth_transport_smoke.cpp
+    )
+    target_link_libraries(
+        native-auth-transport-smoke
+        PRIVATE BedrockProtocol::bedrock_protocol
+    )
 
     add_executable(live-token-manager-smoke tools/live_token_manager_smoke.cpp)
     target_link_libraries(live-token-manager-smoke PRIVATE BedrockProtocol::bedrock_protocol)
@@ -364,6 +394,10 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
         add_test(NAME protodef-structured-smoke COMMAND protodef-structured-smoke)
         add_test(NAME subchunk-packet-smoke COMMAND subchunk-packet-smoke)
         add_test(NAME msal-native-smoke COMMAND msal-native-smoke)
+        add_test(
+            NAME native-auth-transport-smoke
+            COMMAND native-auth-transport-smoke
+        )
         add_test(NAME live-token-manager-smoke COMMAND live-token-manager-smoke)
         add_test(NAME bedrock-token-managers-smoke COMMAND bedrock-token-managers-smoke)
         add_test(NAME bedrock-realms-smoke COMMAND bedrock-realms-smoke)

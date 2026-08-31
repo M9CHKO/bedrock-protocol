@@ -560,7 +560,8 @@ bool BedrockNetworkClient::prepareConnectLifecycle(bool deferQueuePump) {
                 .forceRefresh = authOptionsSnapshot.forceRefresh,
                 .msalConfig = authOptionsSnapshot.msalConfig,
                 .password = authOptionsSnapshot.password,
-                .onMsaCode = authOptionsSnapshot.onMsaCode
+                .onMsaCode = authOptionsSnapshot.onMsaCode,
+                .httpClientFactory = authOptionsSnapshot.httpClientFactory
             };
             validateNativeBedrockAuthflowOptions(normalizedAuthOptions);
             authOptionsSnapshot.profilesFolder =
@@ -631,7 +632,8 @@ bool BedrockNetworkClient::prepareConnectLifecycle(bool deferQueuePump) {
                     .forceRefresh = authOptionsSnapshot.forceRefresh,
                     .msalConfig = authOptionsSnapshot.msalConfig,
                     .password = authOptionsSnapshot.password,
-                    .onMsaCode = authOptionsSnapshot.onMsaCode
+                    .onMsaCode = authOptionsSnapshot.onMsaCode,
+                    .httpClientFactory = authOptionsSnapshot.httpClientFactory
                 };
 
                 try {

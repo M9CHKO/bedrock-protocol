@@ -66,6 +66,9 @@
 #include <vector>
 
 #include <netdb.h>
+#if !defined(_WIN32)
+#include <netinet/in.h>
+#endif
 
 namespace bedrock {
 
@@ -2808,6 +2811,7 @@ struct RelayAdvancedOptions {
     MsalConfigPtr msalConfig;
     std::shared_ptr<Authflow> authflow;
     std::string password;
+    XboxTokenHttpClientFactory httpClientFactory;
 };
 
 enum class RelayParseErrorPolicy {
@@ -4326,6 +4330,8 @@ private:
         out.upstream.msalConfig = options.advanced.msalConfig;
         out.upstream.authflow = options.advanced.authflow;
         out.upstream.password = options.advanced.password;
+        out.upstream.httpClientFactory =
+            options.advanced.httpClientFactory;
         out.upstream.profilesFolder = options.profilesFolder;
         out.upstream.raknetBackend = options.raknetBackend;
         out.upstream.useRaknetWorkers = options.useRaknetWorker;

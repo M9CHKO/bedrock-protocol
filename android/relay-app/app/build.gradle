@@ -1,0 +1,66 @@
+plugins {
+    id "com.android.application"
+}
+
+android {
+    namespace "com.m9chko.bedrockrelay"
+    compileSdk 35
+    ndkVersion "27.2.12479018"
+
+    defaultConfig {
+        applicationId "com.m9chko.bedrockrelay"
+        minSdk 26
+        targetSdk 35
+        versionCode 1
+        versionName "1.0.0"
+
+        ndk {
+            abiFilters "arm64-v8a"
+        }
+
+        externalNativeBuild {
+            cmake {
+                cppFlags "-std=c++20 -fexceptions -frtti"
+                arguments "-DANDROID_STL=c++_shared"
+            }
+        }
+    }
+
+    buildTypes {
+        debug {
+            debuggable true
+        }
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    buildFeatures {
+        prefab true
+        buildConfig true
+    }
+
+    externalNativeBuild {
+        cmake {
+            path file("src/main/cpp/CMakeLists.txt")
+            version "3.22.1"
+        }
+    }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging true
+        }
+    }
+}
+
+dependencies {
+    implementation "com.android.ndk.thirdparty:openssl:1.1.1q-beta-1"
+}
