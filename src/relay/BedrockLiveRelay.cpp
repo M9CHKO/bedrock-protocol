@@ -660,6 +660,21 @@ ServerListenResult BedrockLiveRelay::listen() {
         // boundary before public connect handlers can add their Player join
         // listeners, preserving that ordering for queued clientbound packets.
         std::weak_ptr<Session> weakSession = session;
+        connection.onError([this, weakSession, connection](
+            const std::string& message
+        ) {
+            const auto activeSession = weakSession.lock();
+            if (!activeSession || closed_.load()) return;
+            {
+                std::lock_guard<std::mutex> lock(activeSession->mutex);
+                if (!relaySessionAcceptsPackets(*activeSession)) return;
+            }
+            emitError("[downstream] " + message);
+            disconnectDownstream(
+                connection,
+                "Client transport error: " + message
+            );
+        });
         connection.onJoin([this, weakSession]() {
             const auto joinedSession = weakSession.lock();
             if (joinedSession) handleDownstreamJoin(joinedSession);
@@ -784,6 +799,10 @@ void BedrockLiveRelay::onClientbound(PacketHandler handler) {
 
 void BedrockLiveRelay::onServerbound(PacketHandler handler) {
     serverboundHandlers_.push_back(std::move(handler));
+}
+
+void BedrockLiveRelay::onForwarded(ForwardedHandler handler) {
+    forwardedHandlers_.push_back(std::move(handler));
 }
 
 void BedrockLiveRelay::on(const std::string& direction, PacketHandler handler) {
@@ -1105,6 +1124,31 @@ void BedrockLiveRelay::emitDiagnostic(const std::string& message) {
     const auto handlers = diagnosticHandlers_;
     for (auto& handler : handlers) {
         handler(line);
+    }
+}
+
+void BedrockLiveRelay::emitForwarded(
+    const std::shared_ptr<Session>& session,
+    BedrockRelayDirection direction,
+    const VersionedGamePacket& packet
+) noexcept {
+    try {
+        if (forwardedHandlers_.empty()) return;
+        BedrockRelayPacketEvent event;
+        event.direction = direction;
+        event.sessionId = session->id;
+        event.packet = packet;
+        const auto handlers = forwardedHandlers_;
+        for (const auto& handler : handlers) {
+            try {
+                handler(event);
+            } catch (...) {
+                // A diagnostic observer cannot cancel or break forwarding.
+            }
+        }
+    } catch (...) {
+        // Copying diagnostic metadata may allocate. It must never affect the
+        // already completed forwarding operation.
     }
 }
 
@@ -1532,7 +1576,64 @@ void BedrockLiveRelay::startUpstream(const std::shared_ptr<Session>& session) {
             if (!relaySessionAcceptsPackets(*session) ||
                 session->upstream.get() != upstreamIdentity) return;
         }
-        handleUpstreamPacket(session, event.packet);
+        try {
+            handleUpstreamPacket(session, event.packet);
+        } catch (const std::exception& error) {
+            bool requestDisconnect = false;
+            {
+                std::lock_guard<std::mutex> lock(session->mutex);
+                if (relaySessionAcceptsPackets(*session) &&
+                    session->upstream.get() == upstreamIdentity &&
+                    !session->upstreamDisconnectRequested) {
+                    session->upstreamDisconnectRequested = true;
+                    requestDisconnect = true;
+                }
+            }
+            if (requestDisconnect && !closed_.load()) {
+                const auto detail = "[upstream packet " + event.packet.name +
+                    "] " + error.what() + packetFingerprint(event.packet);
+                emitError(detail);
+                try {
+                    disconnectDownstream(
+                        session->downstream,
+                        "Server packet handling error"
+                    );
+                } catch (const std::exception& teardownError) {
+                    emitError(
+                        "[upstream packet teardown] " +
+                        std::string(teardownError.what())
+                    );
+                }
+            }
+        } catch (...) {
+            bool requestDisconnect = false;
+            {
+                std::lock_guard<std::mutex> lock(session->mutex);
+                if (relaySessionAcceptsPackets(*session) &&
+                    session->upstream.get() == upstreamIdentity &&
+                    !session->upstreamDisconnectRequested) {
+                    session->upstreamDisconnectRequested = true;
+                    requestDisconnect = true;
+                }
+            }
+            if (requestDisconnect && !closed_.load()) {
+                emitError(
+                    "[upstream packet " + event.packet.name +
+                    "] unknown native exception" +
+                    packetFingerprint(event.packet)
+                );
+                try {
+                    disconnectDownstream(
+                        session->downstream,
+                        "Server packet handling error"
+                    );
+                } catch (...) {
+                    emitError(
+                        "[upstream packet teardown] unknown native exception"
+                    );
+                }
+            }
+        }
     });
 
     upstream->onJoin([this, weakSession, upstream]() {
@@ -2094,6 +2195,7 @@ void BedrockLiveRelay::forwardClientbound(
     }
     // relay.js routes live upstream packets through Player#queue so packets
     // observed in one batching interval share one downstream MCPE batch.
+    bool queued = false;
     {
         std::lock_guard<std::mutex> lock(session->mutex);
         if (!relaySessionAcceptsPackets(*session) ||
@@ -2103,6 +2205,14 @@ void BedrockLiveRelay::forwardClientbound(
             packet,
             options_.clientboundCompression
         );
+        queued = true;
+    }
+    if (queued) {
+        emitForwarded(
+            session,
+            BedrockRelayDirection::Clientbound,
+            packet
+        );
     }
 
     if (!heldChunks.empty()) {
@@ -2111,14 +2221,27 @@ void BedrockLiveRelay::forwardClientbound(
             out << "* Proxy -> Client batch level_chunk x" << heldChunks.size();
             relayLogLine(out.str());
         }
-        std::lock_guard<std::mutex> lock(session->mutex);
-        if (!relaySessionAcceptsPackets(*session) ||
-            session->downstreamPhase != RelayDownstreamPhase::Game) return;
-        server_->queuePackets(
-            downstream,
-            heldChunks,
-            options_.clientboundCompression
-        );
+        bool chunksQueued = false;
+        {
+            std::lock_guard<std::mutex> lock(session->mutex);
+            if (!relaySessionAcceptsPackets(*session) ||
+                session->downstreamPhase != RelayDownstreamPhase::Game) return;
+            server_->queuePackets(
+                downstream,
+                heldChunks,
+                options_.clientboundCompression
+            );
+            chunksQueued = true;
+        }
+        if (chunksQueued) {
+            for (const auto& held : heldChunks) {
+                emitForwarded(
+                    session,
+                    BedrockRelayDirection::Clientbound,
+                    held
+                );
+            }
+        }
     }
 }
 
@@ -2152,6 +2275,11 @@ void BedrockLiveRelay::forwardServerbound(
     } else {
         upstream->sendBuffer(packet.fullPacket);
     }
+    emitForwarded(
+        session,
+        BedrockRelayDirection::Serverbound,
+        packet
+    );
 }
 
 std::vector<VersionedGamePacket> BedrockLiveRelay::applyHandlers(

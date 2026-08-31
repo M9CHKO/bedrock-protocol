@@ -88,6 +88,8 @@ struct BedrockLiveRelayStatus {
 class BedrockLiveRelay {
 public:
     using PacketHandler = std::function<void(BedrockRelayPacketEvent&)>;
+    using ForwardedHandler =
+        std::function<void(const BedrockRelayPacketEvent&)>;
     using ConnectionHandler = std::function<void(const BedrockServerConnection&)>;
     using ErrorHandler = std::function<void(const std::string&)>;
     using StatusHandler = std::function<void(const BedrockLiveRelayStatus&)>;
@@ -120,6 +122,9 @@ public:
     void onDisconnect(ConnectionHandler handler);
     void onClientbound(PacketHandler handler);
     void onServerbound(PacketHandler handler);
+    // Observes the final immutable packet after relay handlers accepted it
+    // and the destination send/queue operation completed.
+    void onForwarded(ForwardedHandler handler);
     void on(const std::string& direction, PacketHandler handler);
     void onError(ErrorHandler handler);
     void onStatus(StatusHandler handler);
@@ -186,6 +191,7 @@ private:
     std::vector<ConnectionHandler> disconnectHandlers_;
     std::vector<PacketHandler> clientboundHandlers_;
     std::vector<PacketHandler> serverboundHandlers_;
+    std::vector<ForwardedHandler> forwardedHandlers_;
     std::vector<ErrorHandler> errorHandlers_;
     std::vector<StatusHandler> statusHandlers_;
     std::vector<DiagnosticHandler> diagnosticHandlers_;
@@ -202,6 +208,11 @@ private:
     void emitError(const std::string& message);
     void emitStatus();
     void emitDiagnostic(const std::string& message);
+    void emitForwarded(
+        const std::shared_ptr<Session>& session,
+        BedrockRelayDirection direction,
+        const VersionedGamePacket& packet
+    ) noexcept;
     bool emitMsaCode(
         const XboxDeviceCodeInfo& code,
         const BedrockServerConnection& connection

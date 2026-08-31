@@ -1,6 +1,7 @@
 package com.m9chko.bedrockrelay;
 
 import android.app.Notification;
+import android.app.ActivityManager;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
@@ -10,6 +11,7 @@ import android.content.SharedPreferences;
 import android.content.pm.ServiceInfo;
 import android.net.Uri;
 import android.os.Build;
+import android.os.Debug;
 import android.os.IBinder;
 import android.os.PowerManager;
 
@@ -31,6 +33,7 @@ public final class RelayService extends Service {
     public static final String KEY_LAST_ERROR = "last_error";
     public static final String KEY_AUTH_CODE = "auth_code";
     public static final String KEY_AUTH_URI = "auth_uri";
+    public static final String KEY_RELAY_ACTIVE = "relay_active";
 
     public static final String ACTION_START =
         "com.m9chko.bedrockrelay.action.START";
@@ -139,6 +142,7 @@ public final class RelayService extends Service {
                 error
             );
         }
+        preferences.edit().putBoolean(KEY_RELAY_ACTIVE, false).commit();
         releaseWakeLock();
         pollExecutor.shutdownNow();
         commandExecutor.shutdownNow();
@@ -191,6 +195,10 @@ public final class RelayService extends Service {
                     result.optInt("boundPort", 0) +
                     " listening=" + result.optBoolean("listening", false)
             );
+            // A synchronous marker survives a native abort/process kill. The
+            // next Application instance can then distinguish an abrupt relay
+            // death from a normal user stop even on Android 8/9.
+            preferences.edit().putBoolean(KEY_RELAY_ACTIVE, true).commit();
             notificationStatus = "Relay готов: 127.0.0.1:19132";
             refreshNotification();
         } catch (Throwable error) {
@@ -273,6 +281,12 @@ public final class RelayService extends Service {
             "event=" + type + (message.isEmpty() ? "" : " " + message),
             event.optLong("timestampMs", 0)
         );
+        if ("disconnect".equals(type) ||
+            "local_login_timeout".equals(type) ||
+            "transport_error".equals(type) ||
+            "parse_error".equals(type)) {
+            logMemorySnapshot(type);
+        }
         if ("upstream_ready".equals(type)) {
             preferences.edit()
                 .remove(KEY_AUTH_CODE)
@@ -280,6 +294,37 @@ public final class RelayService extends Service {
                 .apply();
             notificationStatus = "Relay подключён к серверу";
             refreshNotification();
+        }
+    }
+
+    private void logMemorySnapshot(String trigger) {
+        try {
+            Runtime runtime = Runtime.getRuntime();
+            long javaUsed = runtime.totalMemory() - runtime.freeMemory();
+            ActivityManager.MemoryInfo system = new ActivityManager.MemoryInfo();
+            ActivityManager manager =
+                (ActivityManager) getSystemService(ACTIVITY_SERVICE);
+            manager.getMemoryInfo(system);
+            DiagnosticsLog.append(
+                this,
+                "DEBUG",
+                "memory",
+                "trigger=" + trigger +
+                    " javaUsedBytes=" + javaUsed +
+                    " javaMaxBytes=" + runtime.maxMemory() +
+                    " nativeAllocatedBytes=" +
+                        Debug.getNativeHeapAllocatedSize() +
+                    " processPssKb=" + Debug.getPss() +
+                    " systemAvailBytes=" + system.availMem +
+                    " systemLowMemory=" + system.lowMemory
+            );
+        } catch (Throwable error) {
+            DiagnosticsLog.appendError(
+                this,
+                "memory",
+                "Failed to capture relay memory snapshot",
+                error
+            );
         }
     }
 
@@ -343,7 +388,8 @@ public final class RelayService extends Service {
             preferences.edit()
                 .remove(KEY_AUTH_CODE)
                 .remove(KEY_AUTH_URI)
-                .apply();
+                .putBoolean(KEY_RELAY_ACTIVE, false)
+                .commit();
             releaseWakeLock();
             DiagnosticsLog.append(this, "INFO", "service", "Relay stopped");
             stopForeground(STOP_FOREGROUND_REMOVE);

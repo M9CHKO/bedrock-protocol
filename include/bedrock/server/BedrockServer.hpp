@@ -655,6 +655,48 @@ struct BedrockServerPacketEvent {
     VersionedGamePacket packet;
 };
 
+// Secret-safe transport diagnostics for embedders.  The event deliberately
+// carries only packet identity, sizes and hashes: encrypted/login payloads,
+// JWTs and resource-pack keys are never exposed to observers.
+enum class BedrockServerTransportEventKind {
+    Open,
+    Receive,
+    DecodedPacket,
+    SendPacket,
+    SendBatch,
+    Error,
+    Close
+};
+
+inline const char* bedrockServerTransportEventKindName(
+    BedrockServerTransportEventKind kind
+) noexcept {
+    switch (kind) {
+        case BedrockServerTransportEventKind::Open: return "open";
+        case BedrockServerTransportEventKind::Receive: return "receive";
+        case BedrockServerTransportEventKind::DecodedPacket:
+            return "decoded_packet";
+        case BedrockServerTransportEventKind::SendPacket:
+            return "send_packet";
+        case BedrockServerTransportEventKind::SendBatch: return "send_batch";
+        case BedrockServerTransportEventKind::Error: return "error";
+        case BedrockServerTransportEventKind::Close: return "close";
+    }
+    return "unknown";
+}
+
+struct BedrockServerTransportEvent {
+    BedrockServerTransportEventKind kind =
+        BedrockServerTransportEventKind::Receive;
+    RakNetServerPeer peer;
+    uint8_t raknetPacketId = 0;
+    uint32_t gamePacketId = 0;
+    std::size_t byteLength = 0;
+    uint64_t byteHash = 0;
+    std::string packetName;
+    std::string message;
+};
+
 struct BedrockServerLoggingInEvent {
     BedrockServerConnection connection;
     VersionedGamePacket packet;
@@ -679,6 +721,8 @@ public:
         const BedrockServerConnection&,
         BedrockServerClientStatus
     )>;
+    using TransportHandler =
+        std::function<void(const BedrockServerTransportEvent&)>;
 
     explicit BedrockServer(BedrockServerOptions options = {})
         : options_(normalizeOptions(std::move(options))),
@@ -751,6 +795,17 @@ public:
         anyPacketHandlers_.push_back(std::move(handler));
     }
 
+    // Unlike onAny(), this observer also sees the built-in login and network
+    // settings packets. It cannot mutate or cancel traffic.
+    void onInbound(PacketHandler handler) {
+        inboundPacketHandlers_.push_back(std::move(handler));
+    }
+
+    void onTransport(TransportHandler handler) {
+        std::lock_guard<std::mutex> lock(transportHandlersMutex_);
+        transportHandlers_.push_back(std::move(handler));
+    }
+
     void on(const std::string& packetName, PacketHandler handler) {
         packetHandlers_[packetName].push_back(std::move(handler));
     }
@@ -771,6 +826,17 @@ public:
         raknet_.setAdvertisement(encodeAdvertisement(getAdvertisement()));
         raknet_.setAdvertisementProvider([this]() {
             return encodeAdvertisement(getAdvertisement());
+        });
+        raknet_.onRawPacket([this](
+            const RakNetServerPeer& peer,
+            const std::vector<uint8_t>& packet
+        ) {
+            emitTransport(
+                BedrockServerTransportEventKind::Receive,
+                peer,
+                packet,
+                packet.empty() ? 0 : packet.front()
+            );
         });
         raknet_.onOpenConnection([this](const RakNetServerPeer& peer) {
             if (closing_.load()) {
@@ -808,14 +874,62 @@ public:
 
             ensureOutboundQueueScheduler();
 
+            emitTransport(
+                BedrockServerTransportEventKind::Open,
+                peer,
+                {},
+                0,
+                0,
+                {},
+                "mtu=" + std::to_string(peer.mtu)
+            );
+
             for (auto& handler : connectHandlers_) {
                 handler(connection);
             }
         });
         raknet_.onEncapsulated([this](const RakNetServerPeer& peer, const std::vector<uint8_t>& payload) {
-            handleEncapsulated(peer, payload);
+            try {
+                handleEncapsulated(peer, payload);
+            } catch (const std::exception& error) {
+                emitTransport(
+                    BedrockServerTransportEventKind::Error,
+                    peer,
+                    payload,
+                    payload.empty() ? 0 : payload.front(),
+                    0,
+                    {},
+                    std::string("downstream batch failure: ") + error.what()
+                );
+                failPeerAfterTransportError(
+                    peer,
+                    "Server error",
+                    "downstream batch failure"
+                );
+            } catch (...) {
+                emitTransport(
+                    BedrockServerTransportEventKind::Error,
+                    peer,
+                    payload,
+                    payload.empty() ? 0 : payload.front(),
+                    0,
+                    {},
+                    "downstream batch failure: unknown native exception"
+                );
+                failPeerAfterTransportError(
+                    peer,
+                    "Server error",
+                    "downstream batch failure"
+                );
+            }
         });
         raknet_.onCloseConnection([this](const RakNetServerPeer& peer) {
+            emitTransport(
+                BedrockServerTransportEventKind::Close,
+                peer,
+                {},
+                0
+            );
             handlePeerClosed(peer);
         });
         raknet_.listen();
@@ -1383,7 +1497,10 @@ private:
     std::vector<PacketHandler> loginHandlers_;
     std::vector<StatusHandler> statusHandlers_;
     std::vector<PacketHandler> anyPacketHandlers_;
+    std::vector<PacketHandler> inboundPacketHandlers_;
     std::unordered_map<std::string, std::vector<PacketHandler>> packetHandlers_;
+    mutable std::mutex transportHandlersMutex_;
+    std::vector<TransportHandler> transportHandlers_;
     mutable std::mutex serverStateMutex_;
     std::unordered_map<std::string, BedrockServerConnection> connections_;
     std::atomic<int> clientCount_ {0};
@@ -1837,7 +1954,26 @@ private:
         }
 
         if (hasWritablePlayer(connection)) {
+            for (const auto& packet : packets) {
+                emitTransport(
+                    BedrockServerTransportEventKind::SendPacket,
+                    connection.peer,
+                    packet.fullPacket,
+                    0xfe,
+                    packet.packetId,
+                    packet.name
+                );
+            }
             raknet_.sendReliable(connection.peer, mcpe);
+            emitTransport(
+                BedrockServerTransportEventKind::SendBatch,
+                connection.peer,
+                mcpe,
+                mcpe.empty() ? 0 : mcpe.front(),
+                0,
+                {},
+                "packets=" + std::to_string(packets.size())
+            );
         }
     }
 
@@ -1897,10 +2033,40 @@ private:
         for (const auto& player : players) {
             try {
                 sendQueued(player);
+            } catch (const std::exception& error) {
+                emitTransport(
+                    BedrockServerTransportEventKind::Error,
+                    player.peer,
+                    {},
+                    0,
+                    0,
+                    {},
+                    std::string("outbound queue failure: ") + error.what()
+                );
+                // The old implementation silently discarded the already
+                // dequeued batch here, leaving the client with an incomplete
+                // inventory/world sequence. Fail the affected connection
+                // explicitly so a clean retry can replace it.
+                failPlayerAfterTransportError(
+                    player,
+                    "Server error",
+                    "outbound queue failure"
+                );
             } catch (...) {
-                // Never let one malformed outbound batch terminate the
-                // process from a std::thread boundary. Serialization errors
-                // still surface synchronously from queue()/sendBuffer().
+                emitTransport(
+                    BedrockServerTransportEventKind::Error,
+                    player.peer,
+                    {},
+                    0,
+                    0,
+                    {},
+                    "outbound queue failure: unknown native exception"
+                );
+                failPlayerAfterTransportError(
+                    player,
+                    "Server error",
+                    "outbound queue failure"
+                );
             }
         }
     }
@@ -1918,6 +2084,122 @@ private:
     }
 
     std::unordered_map<std::string, std::shared_ptr<SessionState>> sessions_;
+
+    static uint64_t diagnosticHash(const std::vector<uint8_t>& bytes) noexcept {
+        uint64_t hash = 1469598103934665603ull;
+        for (const auto byte : bytes) {
+            hash ^= byte;
+            hash *= 1099511628211ull;
+        }
+        return hash;
+    }
+
+    void emitTransport(
+        BedrockServerTransportEventKind kind,
+        const RakNetServerPeer& peer,
+        const std::vector<uint8_t>& bytes,
+        uint8_t raknetPacketId,
+        uint32_t gamePacketId = 0,
+        std::string packetName = {},
+        std::string message = {}
+    ) noexcept {
+        try {
+            std::vector<TransportHandler> handlers;
+            {
+                std::lock_guard<std::mutex> lock(transportHandlersMutex_);
+                handlers = transportHandlers_;
+            }
+            if (handlers.empty()) return;
+
+            BedrockServerTransportEvent event;
+            event.kind = kind;
+            event.peer = peer;
+            event.raknetPacketId = raknetPacketId;
+            event.gamePacketId = gamePacketId;
+            event.byteLength = bytes.size();
+            event.byteHash = diagnosticHash(bytes);
+            event.packetName = std::move(packetName);
+            event.message = std::move(message);
+            for (const auto& handler : handlers) {
+                try {
+                    handler(event);
+                } catch (...) {
+                    // Diagnostic observers must never alter transport behavior.
+                }
+            }
+        } catch (...) {
+            // Allocating/copying the diagnostic snapshot is observational too.
+        }
+    }
+
+    void failPeerAfterTransportError(
+        const RakNetServerPeer& peer,
+        const std::string& reason,
+        const std::string& context
+    ) noexcept {
+        const auto player = playerSnapshot(peer);
+        if (!player.has_value()) return;
+        failPlayerAfterTransportError(player->first, reason, context);
+    }
+
+    void failPlayerAfterTransportError(
+        const BedrockServerConnection& connection,
+        const std::string& reason,
+        const std::string& context
+    ) noexcept {
+        if (!hasActivePlayer(connection)) return;
+        try {
+            disconnect(connection, reason);
+            return;
+        } catch (const std::exception& error) {
+            emitTransport(
+                BedrockServerTransportEventKind::Error,
+                connection.peer,
+                {},
+                0,
+                0,
+                {},
+                context + " disconnect failure: " + error.what()
+            );
+        } catch (...) {
+            emitTransport(
+                BedrockServerTransportEventKind::Error,
+                connection.peer,
+                {},
+                0,
+                0,
+                {},
+                context + " disconnect failure: unknown native exception"
+            );
+        }
+
+        // A broken compressor/cipher cannot be trusted to serialize a final
+        // MCPE disconnect. Close the native peer so no half-session survives
+        // and no exception can cross a worker-thread boundary.
+        try {
+            closePlayer(connection);
+        } catch (const std::exception& error) {
+            emitTransport(
+                BedrockServerTransportEventKind::Error,
+                connection.peer,
+                {},
+                0,
+                0,
+                {},
+                context + " native close failure: " + error.what()
+            );
+        } catch (...) {
+            emitTransport(
+                BedrockServerTransportEventKind::Error,
+                connection.peer,
+                {},
+                0,
+                0,
+                {},
+                context + " native close failure: unknown native exception"
+            );
+        }
+    }
 
     std::shared_ptr<SessionState> sessionSnapshot(
         const BedrockServerConnection& connection
@@ -2155,13 +2437,35 @@ private:
             );
             offset += packetSize;
 
+            std::string packetName;
+            uint32_t packetId = 0;
             try {
                 auto packet = mcpeCodec_.packetCodec().decodeFullPacket(fullPacket);
+                packetName = packet.name;
+                packetId = packet.packetId;
                 validatePlayerPacket(connection, packet);
+                emitTransport(
+                    BedrockServerTransportEventKind::DecodedPacket,
+                    connection.peer,
+                    packet.fullPacket,
+                    0xfe,
+                    packet.packetId,
+                    packet.name
+                );
                 packets.push_back(std::move(packet));
-            } catch (const std::exception&) {
+            } catch (const std::exception& error) {
                 // serverPlayer.readPacket catches only deserializer failures,
                 // sends Server error, and returns to the surrounding batch.
+                emitTransport(
+                    BedrockServerTransportEventKind::Error,
+                    connection.peer,
+                    fullPacket,
+                    0xfe,
+                    packetId,
+                    packetName,
+                    std::string("downstream packet decode failure: ") +
+                        error.what()
+                );
                 disconnect(connection, "Server error");
             }
         }
@@ -2228,6 +2532,15 @@ private:
             }
             if (!verification->matches()) {
                 const auto message = verification->mismatchMessage();
+                emitTransport(
+                    BedrockServerTransportEventKind::Error,
+                    connection.peer,
+                    payload,
+                    payload.empty() ? 0 : payload.front(),
+                    0,
+                    {},
+                    "downstream encryption " + message
+                );
                 emitPlayerError(connection, message);
                 // A listener can synchronously close the player/server. Avoid
                 // recreating sessions_[key] after that external state change.
@@ -2257,6 +2570,33 @@ private:
             BedrockServerPacketEvent event;
             event.connection = connection;
             event.packet = packet;
+
+            const auto inboundHandlers = inboundPacketHandlers_;
+            for (auto& handler : inboundHandlers) {
+                try {
+                    handler(event);
+                } catch (const std::exception& error) {
+                    emitTransport(
+                        BedrockServerTransportEventKind::Error,
+                        connection.peer,
+                        packet.fullPacket,
+                        0xfe,
+                        packet.packetId,
+                        packet.name,
+                        std::string("inbound observer failure: ") + error.what()
+                    );
+                } catch (...) {
+                    emitTransport(
+                        BedrockServerTransportEventKind::Error,
+                        connection.peer,
+                        packet.fullPacket,
+                        0xfe,
+                        packet.packetId,
+                        packet.name,
+                        "inbound observer failure: unknown native exception"
+                    );
+                }
+            }
 
             // serverPlayer.js performs its switch first. Network settings and
             // login return from readPacket and are intentionally invisible to
@@ -2586,7 +2926,24 @@ private:
         mcpe.push_back(0xfe);
         mcpe.insert(mcpe.end(), framed.begin(), framed.end());
         if (hasWritablePlayer(connection)) {
+            emitTransport(
+                BedrockServerTransportEventKind::SendPacket,
+                connection.peer,
+                packet.fullPacket,
+                0xfe,
+                packet.packetId,
+                packet.name
+            );
             raknet_.sendReliable(connection.peer, mcpe);
+            emitTransport(
+                BedrockServerTransportEventKind::SendBatch,
+                connection.peer,
+                mcpe,
+                0xfe,
+                0,
+                {},
+                "packets=1 pre_compression=true"
+            );
         }
     }
 

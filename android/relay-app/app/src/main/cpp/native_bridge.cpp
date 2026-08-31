@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <filesystem>
@@ -158,15 +159,48 @@ bool isItemInteractionBreadcrumb(std::string_view name) {
         name == "mob_equipment" ||
         name == "mob_armor_equipment" ||
         name == "add_item_entity" ||
+        name == "take_item_entity" ||
+        name == "update_equipment" ||
         name == "interact" ||
         name == "animate" ||
         name == "player_action" ||
+        name == "player_hotbar" ||
         name == "container_open" ||
-        name == "container_close";
+        name == "container_close" ||
+        name == "container_set_data" ||
+        name == "container_registry_cleanup" ||
+        name == "set_player_inventory_options" ||
+        name == "crafting_event" ||
+        name == "completed_using_item" ||
+        name == "client_start_item_cooldown" ||
+        name == "gui_data_pick_item";
 }
 
 bool isClientboundEquipmentFlood(std::string_view name) {
     return name == "mob_equipment" || name == "mob_armor_equipment";
+}
+
+bool isFlightPacket(std::string_view name) {
+    return isItemInteractionBreadcrumb(name) ||
+        name == "start_game" ||
+        name == "item_registry" ||
+        name == "creative_content" ||
+        name == "crafting_data" ||
+        name == "trim_data" ||
+        name == "clientbound_map_item_data" ||
+        name == "resource_packs_info" ||
+        name == "resource_pack_data_info" ||
+        name == "resource_pack_chunk_data" ||
+        name == "resource_pack_stack" ||
+        name == "resource_pack_client_response" ||
+        name == "resource_pack_chunk_request" ||
+        name == "network_settings" ||
+        name == "server_to_client_handshake" ||
+        name == "client_to_server_handshake" ||
+        name == "request_network_settings" ||
+        name == "login" ||
+        name == "play_status" ||
+        name == "disconnect";
 }
 
 std::string packetBreadcrumb(
@@ -180,6 +214,38 @@ std::string packetBreadcrumb(
            << " payloadBytes=" << packet.payload.size()
            << " hash=0x" << std::hex << packetHash(packet.fullPacket);
     return detail.str();
+}
+
+std::string transportBreadcrumb(
+    const bedrock::BedrockServerTransportEvent& event
+) {
+    std::ostringstream detail;
+    detail << "kind="
+           << bedrock::bedrockServerTransportEventKindName(event.kind)
+           << " peer=" << event.peer.address << ':' << event.peer.port
+           << " guid=" << event.peer.clientGuid
+           << " raknet_id=" << static_cast<unsigned>(event.raknetPacketId)
+           << " game_id=" << event.gamePacketId
+           << " bytes=" << event.byteLength
+           << " hash=0x" << std::hex << event.byteHash << std::dec;
+    if (!event.packetName.empty()) {
+        detail << " packet=" << event.packetName;
+    }
+    if (!event.message.empty()) {
+        detail << " detail="
+               << (event.kind == bedrock::BedrockServerTransportEventKind::Error
+                       ? safeMessage(event.message)
+                       : event.message);
+    }
+    return detail.str();
+}
+
+bool isLoginStagePacket(std::string_view name) {
+    return name == "request_network_settings" ||
+        name == "login" ||
+        name == "client_to_server_handshake" ||
+        name == "resource_pack_client_response" ||
+        name == "set_local_player_as_initialized";
 }
 
 class AttachedEnvironment {
@@ -385,6 +451,13 @@ private:
 };
 
 struct RelayState {
+    struct FlightRecord {
+        uint64_t sequence = 0;
+        int64_t timestampMs = 0;
+        std::string component;
+        std::string message;
+    };
+
     mutable std::mutex mutex;
     bool running = false;
     bool listening = false;
@@ -409,15 +482,20 @@ struct RelayState {
     std::string lastError;
     std::deque<bedrock::JsRuntimeValue> events;
     uint64_t droppedEvents = 0;
+    std::deque<FlightRecord> flight;
+    uint64_t flightSequence = 0;
+    uint64_t lastFlushedFlightSequence = 0;
     std::atomic<uint64_t> clientboundEquipmentPackets {0};
 
     void push(bedrock::JsRuntimeValue event) {
         std::lock_guard lock(mutex);
         if (event.isObject()) {
-            const auto now = unixMilliseconds();
-            event.set("timestampMs", bedrock::JsRuntimeValue::number(
-                static_cast<double>(now)
-            ));
+            if (!event.get("timestampMs")) {
+                const auto now = unixMilliseconds();
+                event.set("timestampMs", bedrock::JsRuntimeValue::number(
+                    static_cast<double>(now)
+                ));
+            }
             if (!event.get("level")) {
                 event.set("level", bedrock::JsRuntimeValue::string("INFO"));
             }
@@ -431,6 +509,74 @@ struct RelayState {
             ++droppedEvents;
         }
         events.push_back(std::move(event));
+    }
+
+    void resetFlight() {
+        std::lock_guard lock(mutex);
+        flight.clear();
+        lastFlushedFlightSequence = flightSequence;
+    }
+
+    void recordFlight(std::string component, std::string message) {
+        std::lock_guard lock(mutex);
+        constexpr std::size_t MaximumFlightRecords = 768;
+        constexpr std::size_t MaximumFlightMessage = 2048;
+        if (flight.size() == MaximumFlightRecords) {
+            flight.pop_front();
+        }
+        if (message.size() > MaximumFlightMessage) {
+            message.resize(MaximumFlightMessage);
+            message += "…<truncated>";
+        }
+        flight.push_back({
+            ++flightSequence,
+            unixMilliseconds(),
+            std::move(component),
+            std::move(message)
+        });
+    }
+
+    void flushFlight(std::string reason) {
+        std::vector<FlightRecord> snapshot;
+        uint64_t firstSequence = 0;
+        uint64_t lastSequence = 0;
+        {
+            std::lock_guard lock(mutex);
+            if (flight.empty() ||
+                flightSequence == lastFlushedFlightSequence) {
+                return;
+            }
+            snapshot.assign(flight.begin(), flight.end());
+            firstSequence = snapshot.front().sequence;
+            lastSequence = snapshot.back().sequence;
+            lastFlushedFlightSequence = flightSequence;
+        }
+
+        push(
+            "flight_dump",
+            "reason=" + reason + " records=" +
+                std::to_string(snapshot.size()) + " sequence=" +
+                std::to_string(firstSequence) + ".." +
+                std::to_string(lastSequence),
+            "WARN",
+            "flight"
+        );
+        for (auto& record : snapshot) {
+            push(bedrock::JsRuntimeValue::object({
+                {"type", bedrock::JsRuntimeValue::string("flight")},
+                {"level", bedrock::JsRuntimeValue::string("DEBUG")},
+                {"component", bedrock::JsRuntimeValue::string(
+                    "flight." + record.component
+                )},
+                {"timestampMs", bedrock::JsRuntimeValue::number(
+                    static_cast<double>(record.timestampMs)
+                )},
+                {"message", bedrock::JsRuntimeValue::string(
+                    "sequence=" + std::to_string(record.sequence) + " " +
+                    std::move(record.message)
+                )}
+            }));
+        }
     }
 
     void push(
@@ -511,9 +657,13 @@ bedrock::JsRuntimeValue snapshotValue(
 class RelayController {
 public:
     explicit RelayController(std::shared_ptr<RelayState> state)
-        : state_(std::move(state)) {}
+        : state_(std::move(state)),
+          loginWatchdogThread_([this]() { runLoginWatchdog(); }) {}
 
-    ~RelayController() { stop(); }
+    ~RelayController() {
+        stop();
+        stopLoginWatchdog();
+    }
 
     void start(
         const std::string& destinationHost,
@@ -573,7 +723,78 @@ public:
         );
 
         auto relay = std::make_unique<bedrock::Relay>(std::move(options));
-        relay->onConnect([state](bedrock::RelayPlayer& player) {
+
+        relay->live().server().onTransport([this, state](
+            const bedrock::BedrockServerTransportEvent& event
+        ) {
+            if (event.kind == bedrock::BedrockServerTransportEventKind::Open) {
+                state->resetFlight();
+            }
+            bool record = true;
+            if (event.kind ==
+                bedrock::BedrockServerTransportEventKind::Receive) {
+                std::lock_guard lock(state->mutex);
+                // Raw RakNet datagrams are essential before Bedrock login but
+                // become high-volume duplicates once decoded packet events
+                // are available.
+                record = state->downstreamJoinedCount == 0;
+            } else if ((event.kind ==
+                            bedrock::BedrockServerTransportEventKind::DecodedPacket ||
+                        event.kind ==
+                            bedrock::BedrockServerTransportEventKind::SendPacket) &&
+                       !isFlightPacket(event.packetName)) {
+                record = false;
+            }
+            const bool publishLoginStage =
+                event.kind ==
+                    bedrock::BedrockServerTransportEventKind::DecodedPacket &&
+                isLoginStagePacket(event.packetName);
+            const bool publishError = event.kind ==
+                bedrock::BedrockServerTransportEventKind::Error;
+            std::string breadcrumb;
+            if (record || publishLoginStage || publishError) {
+                breadcrumb = transportBreadcrumb(event);
+            }
+            if (record) {
+                state->recordFlight("transport", breadcrumb);
+            }
+
+            if (event.kind ==
+                bedrock::BedrockServerTransportEventKind::DecodedPacket) {
+                noteLoginStage(event.peer, event.packetName);
+                if (publishLoginStage) {
+                    state->push(
+                        "local_login_stage",
+                        breadcrumb,
+                        "DEBUG",
+                        "downstream"
+                    );
+                }
+            } else if (event.kind ==
+                bedrock::BedrockServerTransportEventKind::Error) {
+                state->push(
+                    "transport_error",
+                    breadcrumb,
+                    "ERROR",
+                    "transport"
+                );
+                state->flushFlight("transport_error");
+            }
+        });
+        relay->live().server().onLoggingIn([this, state](
+            const bedrock::BedrockServerLoggingInEvent& event
+        ) {
+            completeLoginWatchdog(event.connection.peer, "login_decoded");
+            state->push(
+                "local_login_stage",
+                "packet=login decoded=true protocol=" +
+                    std::to_string(event.login.protocolVersion),
+                "INFO",
+                "downstream"
+            );
+        });
+
+        relay->onConnect([this, state](bedrock::RelayPlayer& player) {
             state->clientboundEquipmentPackets = 0;
             int64_t relayElapsed = 0;
             {
@@ -591,6 +812,7 @@ public:
                 "INFO",
                 "downstream"
             );
+            armLoginWatchdog(player.connection, player.sessionId());
         });
         relay->onJoin([state](
             bedrock::RelayPlayer&,
@@ -612,7 +834,8 @@ public:
                 "upstream"
             );
         });
-        relay->onDisconnect([state](bedrock::RelayPlayer& player) {
+        relay->onDisconnect([this, state](bedrock::RelayPlayer& player) {
+            cancelLoginWatchdog(player.connection.peer);
             state->push(
                 "disconnect",
                 "downstream_session=" + player.sessionId() +
@@ -624,6 +847,7 @@ public:
                 "INFO",
                 "lifecycle"
             );
+            state->flushFlight("downstream_disconnect");
         });
         relay->onError([state](const std::string& message) {
             {
@@ -631,6 +855,7 @@ public:
                 state->lastError = safeMessage(message);
             }
             state->push("error", message, "ERROR", "relay");
+            state->flushFlight("relay_error");
         });
         relay->onParseError([state](const bedrock::RelayParseError& error) {
             state->push(
@@ -646,8 +871,15 @@ public:
                 "ERROR",
                 "packet"
             );
+            state->flushFlight("relay_parse_error");
         });
         relay->live().onServerbound([state](bedrock::BedrockRelayPacketEvent& event) {
+            if (isFlightPacket(event.packet.name)) {
+                state->recordFlight(
+                    "relay_seen",
+                    packetBreadcrumb("serverbound", event.packet)
+                );
+            }
             if (!isItemInteractionBreadcrumb(event.packet.name)) return;
             state->push(
                 "packet",
@@ -657,6 +889,12 @@ public:
             );
         });
         relay->live().onClientbound([state](bedrock::BedrockRelayPacketEvent& event) {
+            if (isFlightPacket(event.packet.name)) {
+                state->recordFlight(
+                    "relay_seen",
+                    packetBreadcrumb("clientbound", event.packet)
+                );
+            }
             if (isItemInteractionBreadcrumb(event.packet.name)) {
                 uint64_t sampleIndex = 0;
                 if (isClientboundEquipmentFlood(event.packet.name)) {
@@ -691,6 +929,22 @@ public:
                     packetBreadcrumb("clientbound", event.packet),
                     "DEBUG",
                     "join"
+                );
+            }
+        });
+        relay->live().onForwarded([state](
+            const bedrock::BedrockRelayPacketEvent& event
+        ) {
+            if (isFlightPacket(event.packet.name)) {
+                state->recordFlight(
+                    "relay_forwarded",
+                    packetBreadcrumb(
+                        event.direction ==
+                                bedrock::BedrockRelayDirection::Clientbound
+                            ? "clientbound"
+                            : "serverbound",
+                        event.packet
+                    )
                 );
             }
         });
@@ -859,6 +1113,7 @@ public:
 
     void stop() {
         if (stopped_.exchange(true)) return;
+        stopLoginWatchdog();
         std::unique_ptr<bedrock::Relay> relay;
         {
             std::lock_guard lock(relayMutex_);
@@ -900,10 +1155,143 @@ public:
     }
 
 private:
+    struct PendingLogin {
+        bedrock::BedrockServerConnection connection;
+        std::string sessionId;
+        std::string stage = "raknet_open";
+        std::chrono::steady_clock::time_point deadline;
+        uint64_t generation = 0;
+    };
+
     std::shared_ptr<RelayState> state_;
     std::mutex relayMutex_;
     std::unique_ptr<bedrock::Relay> relay_;
     std::atomic<bool> stopped_ {false};
+    std::mutex loginWatchdogMutex_;
+    std::condition_variable loginWatchdogCv_;
+    std::optional<PendingLogin> pendingLogin_;
+    uint64_t loginWatchdogGeneration_ = 0;
+    bool loginWatchdogStopping_ = false;
+    std::thread loginWatchdogThread_;
+
+    static bool samePeer(
+        const bedrock::RakNetServerPeer& lhs,
+        const bedrock::RakNetServerPeer& rhs
+    ) {
+        return lhs.address == rhs.address && lhs.port == rhs.port &&
+            lhs.clientGuid == rhs.clientGuid;
+    }
+
+    void armLoginWatchdog(
+        const bedrock::BedrockServerConnection& connection,
+        std::string sessionId
+    ) {
+        {
+            std::lock_guard lock(loginWatchdogMutex_);
+            if (loginWatchdogStopping_) return;
+            pendingLogin_ = PendingLogin {
+                connection,
+                std::move(sessionId),
+                "raknet_open",
+                std::chrono::steady_clock::now() +
+                    std::chrono::seconds(15),
+                ++loginWatchdogGeneration_
+            };
+        }
+        loginWatchdogCv_.notify_all();
+    }
+
+    void noteLoginStage(
+        const bedrock::RakNetServerPeer& peer,
+        const std::string& stage
+    ) {
+        std::lock_guard lock(loginWatchdogMutex_);
+        if (!pendingLogin_ ||
+            !samePeer(pendingLogin_->connection.peer, peer)) return;
+        pendingLogin_->stage = stage;
+    }
+
+    void completeLoginWatchdog(
+        const bedrock::RakNetServerPeer& peer,
+        const std::string& stage
+    ) {
+        {
+            std::lock_guard lock(loginWatchdogMutex_);
+            if (!pendingLogin_ ||
+                !samePeer(pendingLogin_->connection.peer, peer)) return;
+            pendingLogin_->stage = stage;
+            pendingLogin_.reset();
+            ++loginWatchdogGeneration_;
+        }
+        loginWatchdogCv_.notify_all();
+    }
+
+    void cancelLoginWatchdog(const bedrock::RakNetServerPeer& peer) {
+        completeLoginWatchdog(peer, "transport_closed");
+    }
+
+    void runLoginWatchdog() {
+        std::unique_lock lock(loginWatchdogMutex_);
+        while (!loginWatchdogStopping_) {
+            if (!pendingLogin_) {
+                loginWatchdogCv_.wait(lock, [this]() {
+                    return loginWatchdogStopping_ || pendingLogin_.has_value();
+                });
+                continue;
+            }
+
+            const auto generation = pendingLogin_->generation;
+            const auto deadline = pendingLogin_->deadline;
+            if (loginWatchdogCv_.wait_until(lock, deadline, [this, generation]() {
+                    return loginWatchdogStopping_ || !pendingLogin_ ||
+                        pendingLogin_->generation != generation;
+                })) {
+                continue;
+            }
+
+            const auto timedOut = *pendingLogin_;
+            pendingLogin_.reset();
+            ++loginWatchdogGeneration_;
+            lock.unlock();
+
+            state_->push(
+                "local_login_timeout",
+                "downstream_session=" + timedOut.sessionId +
+                    " last_stage=" + timedOut.stage +
+                    " timeoutMs=15000; closing stale local transport so "
+                    "the next Minecraft attempt is not blocked",
+                "ERROR",
+                "watchdog"
+            );
+            state_->flushFlight("local_login_timeout");
+            {
+                std::lock_guard relayLock(relayMutex_);
+                if (relay_) {
+                    relay_->live().disconnectDownstream(
+                        timedOut.connection,
+                        "Local Minecraft login timed out"
+                    );
+                }
+            }
+
+            lock.lock();
+        }
+    }
+
+    void stopLoginWatchdog() {
+        {
+            std::lock_guard lock(loginWatchdogMutex_);
+            if (loginWatchdogStopping_) return;
+            loginWatchdogStopping_ = true;
+            pendingLogin_.reset();
+            ++loginWatchdogGeneration_;
+        }
+        loginWatchdogCv_.notify_all();
+        if (loginWatchdogThread_.joinable() &&
+            loginWatchdogThread_.get_id() != std::this_thread::get_id()) {
+            loginWatchdogThread_.join();
+        }
+    }
 };
 
 std::mutex controllerMutex;

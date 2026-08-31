@@ -198,6 +198,31 @@ struct BedrockServerTestAccess {
         return server.scheduledPlayerCloses_.size();
     }
 
+    static void forceOutboundQueueFailure(
+        BedrockServer& server,
+        const BedrockServerConnection& connection,
+        const VersionedGamePacket& packet
+    ) {
+        const auto session = server.sessionSnapshot(connection);
+        if (!session) {
+            throw std::runtime_error("missing test session");
+        }
+        {
+            std::lock_guard<std::recursive_mutex> outboundLock(
+                session->outboundMutex
+            );
+            std::lock_guard<std::mutex> sessionLock(session->mutex);
+            session->hasEncryptionKeys = true;
+            session->encryptionEnabled = true;
+            session->encryptStream.reset();
+            session->queuedPackets.push_back({
+                packet,
+                VersionedMcpeCompression::Automatic
+            });
+        }
+        server.flushOutboundQueues();
+    }
+
     static std::pair<std::size_t, std::size_t> listenerCounts(
         const BedrockServerConnection& connection
     ) {
@@ -1115,6 +1140,134 @@ bool checkRakNetCallbackBoundary() {
 
     if (!bedrock::BedrockServerTestAccess::rakNetInternalMessageIsFiltered()) {
         std::cerr << "[SMOKE] RakNet internal/application boundary regressed\n";
+        return false;
+    }
+    return true;
+}
+
+bool checkTransportFailureDiagnostics() {
+    {
+        bedrock::BedrockServer server({
+            .version = "1.21.100",
+            .offline = true
+        });
+        const auto connection =
+            bedrock::BedrockServerTestAccess::addPlainPlayer(
+                server,
+                19205,
+                16,
+                false
+            );
+        std::vector<std::pair<
+            bedrock::BedrockServerTransportEventKind,
+            std::string
+        >> phases;
+        server.onTransport([&](
+            const bedrock::BedrockServerTransportEvent& event
+        ) {
+            phases.emplace_back(event.kind, event.packetName);
+        });
+
+        const auto codec =
+            bedrock::VersionedMcpeCodec::forVersion("1.21.100");
+        const uint32_t protocol = codec.definition().protocolVersion();
+        const auto request = codec.packetCodec().makePacketByName(
+            "request_network_settings",
+            {
+                static_cast<uint8_t>((protocol >> 24u) & 0xffu),
+                static_cast<uint8_t>((protocol >> 16u) & 0xffu),
+                static_cast<uint8_t>((protocol >> 8u) & 0xffu),
+                static_cast<uint8_t>(protocol & 0xffu)
+            }
+        );
+        const auto framed = codec.batchCodec().encodeFramedBatch({request});
+        std::vector<uint8_t> wire {0xfe};
+        wire.insert(wire.end(), framed.begin(), framed.end());
+        bedrock::BedrockServerTestAccess::handle(server, connection, wire);
+
+        const std::vector<std::pair<
+            bedrock::BedrockServerTransportEventKind,
+            std::string
+        >> expected {
+            {
+                bedrock::BedrockServerTransportEventKind::DecodedPacket,
+                "request_network_settings"
+            },
+            {
+                bedrock::BedrockServerTransportEventKind::SendPacket,
+                "network_settings"
+            },
+            {bedrock::BedrockServerTransportEventKind::SendBatch, ""}
+        };
+        if (phases != expected) {
+            std::cerr << "[SMOKE] transport phase diagnostics/order mismatch\n";
+            return false;
+        }
+    }
+
+    bedrock::BedrockServer server({.version = "1.21.100", .offline = true});
+    const auto connection = bedrock::BedrockServerTestAccess::addPlainPlayer(
+        server,
+        19206,
+        17,
+        true
+    );
+
+    std::atomic<int> closeCalls {0};
+    std::atomic<int> diagnosticCalls {0};
+    std::mutex diagnosticMutex;
+    std::vector<std::string> messages;
+    connection.onClose([&]() {
+        ++closeCalls;
+    });
+    // One broken observer must not suppress later observers or alter traffic.
+    server.onTransport([](const bedrock::BedrockServerTransportEvent&) {
+        throw std::runtime_error("diagnostic observer boom");
+    });
+    server.onTransport([&](const bedrock::BedrockServerTransportEvent& event) {
+        if (event.kind != bedrock::BedrockServerTransportEventKind::Error) {
+            return;
+        }
+        ++diagnosticCalls;
+        std::lock_guard<std::mutex> lock(diagnosticMutex);
+        messages.push_back(event.message);
+    });
+
+    const auto packet = bedrock::VersionedMcpeCodec::forVersion("1.21.100")
+        .packetCodec().makePacketByName("client_to_server_handshake", {});
+    bedrock::BedrockServerTestAccess::forceOutboundQueueFailure(
+        server,
+        connection,
+        packet
+    );
+
+    bool sawQueueFailure = false;
+    bool sawDisconnectFallback = false;
+    {
+        std::lock_guard<std::mutex> lock(diagnosticMutex);
+        for (const auto& message : messages) {
+            sawQueueFailure = sawQueueFailure ||
+                message.find(
+                    "outbound queue failure: server encrypt stream is not initialized"
+                ) != std::string::npos;
+            sawDisconnectFallback = sawDisconnectFallback ||
+                message.find(
+                    "outbound queue failure disconnect failure: "
+                    "server encrypt stream is not initialized"
+                ) != std::string::npos;
+        }
+    }
+
+    if (!sawQueueFailure || !sawDisconnectFallback ||
+        diagnosticCalls.load() < 2 || closeCalls.load() != 1 ||
+        server.status(connection) !=
+            bedrock::BedrockServerClientStatus::Disconnected) {
+        std::cerr << "[SMOKE] outbound worker failure was hidden or left active: "
+                  << "diagnostics=" << diagnosticCalls.load()
+                  << " close=" << closeCalls.load()
+                  << " status=" << static_cast<int>(server.status(connection))
+                  << " queue_error=" << sawQueueFailure
+                  << " fallback=" << sawDisconnectFallback << "\n";
         return false;
     }
     return true;
@@ -3132,6 +3285,7 @@ int main(int argc, char** argv) {
             !checkEncryptedPlayerErrorBranches() ||
             !checkPlayerReadPacketBoundaries() ||
             !checkRakNetCallbackBoundary() ||
+            !checkTransportFailureDiagnostics() ||
             !checkEncryptedReceiveVsDelayedClose() ||
             !checkDestroyWhileReceiving()) {
             return 1;
@@ -3151,6 +3305,7 @@ int main(int argc, char** argv) {
         !checkEncryptedPlayerErrorBranches() ||
         !checkPlayerReadPacketBoundaries() ||
         !checkRakNetCallbackBoundary() ||
+        !checkTransportFailureDiagnostics() ||
         !checkEncryptedReceiveVsDelayedClose() ||
         !checkDestroyWhileReceiving()) {
         return 1;
