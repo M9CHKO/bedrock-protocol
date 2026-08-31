@@ -35,6 +35,7 @@ import java.util.ArrayList;
 
 public final class MainActivity extends Activity {
     private static final int NOTIFICATION_PERMISSION_REQUEST = 100;
+    private static final int OVERLAY_PERMISSION_REQUEST = 101;
     private static final String MINECRAFT_PACKAGE = "com.mojang.minecraftpe";
 
     private final Handler handler = new Handler(Looper.getMainLooper());
@@ -57,18 +58,59 @@ public final class MainActivity extends Activity {
     private TextView logText;
     private boolean logVisible;
     private long nextLogRefreshAt;
+    private boolean pendingOverlayRelayStart;
+    private boolean pendingOverlayMinecraftLaunch;
+    private String pendingOverlayHost;
+    private int pendingOverlayPort;
+    private String pendingOverlayVersion;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         preferences = getSharedPreferences(RelayService.PREFERENCES, MODE_PRIVATE);
+        if (savedInstanceState != null) {
+            pendingOverlayRelayStart = savedInstanceState.getBoolean(
+                "pending_overlay_start",
+                false
+            );
+            pendingOverlayMinecraftLaunch = savedInstanceState.getBoolean(
+                "pending_overlay_launch_minecraft",
+                false
+            );
+            pendingOverlayHost = savedInstanceState.getString(
+                "pending_overlay_host"
+            );
+            pendingOverlayPort = savedInstanceState.getInt(
+                "pending_overlay_port",
+                19132
+            );
+            pendingOverlayVersion = savedInstanceState.getString(
+                "pending_overlay_version"
+            );
+        }
         DiagnosticsLog.append(this, "INFO", "ui", "Main screen opened");
         setContentView(buildContent());
     }
 
     @Override
+    protected void onSaveInstanceState(Bundle outState) {
+        outState.putBoolean("pending_overlay_start", pendingOverlayRelayStart);
+        outState.putBoolean(
+            "pending_overlay_launch_minecraft",
+            pendingOverlayMinecraftLaunch
+        );
+        outState.putString("pending_overlay_host", pendingOverlayHost);
+        outState.putInt("pending_overlay_port", pendingOverlayPort);
+        outState.putString("pending_overlay_version", pendingOverlayVersion);
+        super.onSaveInstanceState(outState);
+    }
+
+    @Override
     protected void onResume() {
         super.onResume();
+        if (pendingOverlayRelayStart && Settings.canDrawOverlays(this)) {
+            continuePendingOverlayStart();
+        }
         handler.removeCallbacks(refreshTask);
         handler.post(refreshTask);
     }
@@ -153,6 +195,15 @@ public final class MainActivity extends Activity {
         stop.setAllCaps(false);
         stop.setOnClickListener(view -> stopRelay());
         root.addView(stop, margins(-1, dp(50), 0, 0, 0, 22));
+
+        TextView overlayHint = text(
+            "После входа в мир поверх Minecraft откроется меню CPE Relay. " +
+                "Android один раз попросит разрешение «поверх других приложений».",
+            13,
+            false
+        );
+        overlayHint.setAlpha(0.7f);
+        root.addView(overlayHint, margins(-1, -2, 0, -10, 0, 18));
 
         statusText = text("Relay остановлен", 20, true);
         root.addView(statusText);
@@ -269,8 +320,41 @@ public final class MainActivity extends Activity {
                 " version=" + version +
                 " launchMinecraft=" + launchMinecraft
         );
-        requestNotificationPermissionIfNeeded();
+        if (!Settings.canDrawOverlays(this)) {
+            pendingOverlayRelayStart = true;
+            pendingOverlayMinecraftLaunch = launchMinecraft;
+            pendingOverlayHost = host;
+            pendingOverlayPort = port;
+            pendingOverlayVersion = version;
+            try {
+                Intent permission = new Intent(
+                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:" + getPackageName())
+                );
+                startActivityForResult(permission, OVERLAY_PERMISSION_REQUEST);
+                toast("Разреши меню CPE Relay поверх Minecraft");
+                return;
+            } catch (Throwable error) {
+                pendingOverlayRelayStart = false;
+                DiagnosticsLog.appendError(
+                    this,
+                    "overlay",
+                    "Could not open Android overlay permission screen",
+                    error
+                );
+                toast("Не удалось открыть настройку плавающего меню");
+            }
+        }
+        startRelayService(host, port, version, launchMinecraft);
+    }
 
+    private void startRelayService(
+        String host,
+        int port,
+        String version,
+        boolean launchMinecraft
+    ) {
+        requestNotificationPermissionIfNeeded();
         Intent intent = new Intent(this, RelayService.class)
             .setAction(RelayService.ACTION_START)
             .putExtra(RelayService.EXTRA_HOST, host)
@@ -283,6 +367,33 @@ public final class MainActivity extends Activity {
         }
         launchMinecraftWhenReady = launchMinecraft;
         statusText.setText("Запуск relay…");
+    }
+
+    private void continuePendingOverlayStart() {
+        if (!pendingOverlayRelayStart) return;
+        boolean launchMinecraft = pendingOverlayMinecraftLaunch;
+        String host = pendingOverlayHost;
+        int port = pendingOverlayPort;
+        String version = pendingOverlayVersion;
+        pendingOverlayRelayStart = false;
+        pendingOverlayHost = null;
+        pendingOverlayVersion = null;
+        if (!Settings.canDrawOverlays(this)) {
+            toast("Плавающее меню отключено: разрешение не выдано");
+        }
+        startRelayService(host, port, version, launchMinecraft);
+    }
+
+    @Override
+    protected void onActivityResult(
+        int requestCode,
+        int resultCode,
+        Intent data
+    ) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == OVERLAY_PERMISSION_REQUEST) {
+            continuePendingOverlayStart();
+        }
     }
 
     private void stopRelay() {

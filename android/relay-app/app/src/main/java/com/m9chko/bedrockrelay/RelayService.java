@@ -12,7 +12,9 @@ import android.content.pm.ServiceInfo;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Debug;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.os.PowerManager;
 
 import org.json.JSONArray;
@@ -34,6 +36,13 @@ public final class RelayService extends Service {
     public static final String KEY_AUTH_CODE = "auth_code";
     public static final String KEY_AUTH_URI = "auth_uri";
     public static final String KEY_RELAY_ACTIVE = "relay_active";
+    public static final String KEY_DETAILED_LOGS = "detailed_logs";
+    public static final String KEY_CHUNK_RETENTION = "chunk_retention";
+    public static final String KEY_RETAINED_RADIUS_CHUNKS =
+        "retained_radius_chunks";
+
+    public static final int MIN_RETAINED_RADIUS_CHUNKS = 10;
+    public static final int MAX_RETAINED_RADIUS_CHUNKS = 64;
 
     public static final String ACTION_START =
         "com.m9chko.bedrockrelay.action.START";
@@ -51,10 +60,13 @@ public final class RelayService extends Service {
     private final ScheduledExecutorService pollExecutor =
         Executors.newSingleThreadScheduledExecutor();
     private final AtomicBoolean pollingStarted = new AtomicBoolean(false);
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
     private SharedPreferences preferences;
     private PowerManager.WakeLock wakeLock;
+    private RelayOverlayController overlayController;
     private volatile boolean serviceStopping;
+    private volatile boolean overlayShouldBeVisible;
     private volatile String notificationStatus = "Запуск UDP relay…";
     private volatile String lastSnapshotFingerprint = "";
     private volatile long lastPollingErrorAt;
@@ -63,6 +75,11 @@ public final class RelayService extends Service {
     public void onCreate() {
         super.onCreate();
         preferences = getSharedPreferences(PREFERENCES, MODE_PRIVATE);
+        overlayController = new RelayOverlayController(
+            this,
+            preferences,
+            () -> applyRuntimeOptions(true)
+        );
         createNotificationChannel();
         DiagnosticsLog.append(
             this,
@@ -115,6 +132,8 @@ public final class RelayService extends Service {
 
         promoteToForeground(buildNotification());
         acquireWakeLock();
+        setOverlayVisible(false);
+        applyRuntimeOptions(false);
         startPolling();
         serviceStopping = false;
         final String destinationHost = host;
@@ -131,6 +150,8 @@ public final class RelayService extends Service {
     @Override
     public void onDestroy() {
         serviceStopping = true;
+        overlayShouldBeVisible = false;
+        if (overlayController != null) overlayController.hide();
         DiagnosticsLog.append(this, "INFO", "service", "Service destroying");
         try {
             NativeBridge.stopRelay();
@@ -264,6 +285,7 @@ public final class RelayService extends Service {
             return;
         }
         if ("error".equals(type)) {
+            setOverlayVisible(false);
             reportError(event.optString("message", "Неизвестная ошибка relay"));
             return;
         }
@@ -273,6 +295,9 @@ public final class RelayService extends Service {
             "level",
             "ping_warning".equals(type) ? "WARN" : "INFO"
         );
+        if ("DEBUG".equalsIgnoreCase(level) && !detailedLogsEnabled()) {
+            return;
+        }
         String component = event.optString("component", "native");
         DiagnosticsLog.appendAt(
             this,
@@ -281,11 +306,13 @@ public final class RelayService extends Service {
             "event=" + type + (message.isEmpty() ? "" : " " + message),
             event.optLong("timestampMs", 0)
         );
-        if ("disconnect".equals(type) ||
+        boolean sessionEnded = "disconnect".equals(type) ||
             "local_login_timeout".equals(type) ||
             "transport_error".equals(type) ||
-            "parse_error".equals(type)) {
+            "parse_error".equals(type);
+        if (sessionEnded) {
             logMemorySnapshot(type);
+            setOverlayVisible(false);
         }
         if ("upstream_ready".equals(type)) {
             preferences.edit()
@@ -294,10 +321,12 @@ public final class RelayService extends Service {
                 .apply();
             notificationStatus = "Relay подключён к серверу";
             refreshNotification();
+            setOverlayVisible(true);
         }
     }
 
     private void logMemorySnapshot(String trigger) {
+        if (!detailedLogsEnabled()) return;
         try {
             Runtime runtime = Runtime.getRuntime();
             long javaUsed = runtime.totalMemory() - runtime.freeMemory();
@@ -329,7 +358,13 @@ public final class RelayService extends Service {
     }
 
     private void updateStatusFromSnapshot(JSONObject state) {
-        if (!state.optBoolean("running", false)) {
+        boolean running = state.optBoolean("running", false);
+        boolean upstreamReady = state.optBoolean("upstreamReady", false);
+        setOverlayVisible(
+            running && upstreamReady &&
+                state.optInt("downstreamConnections", 0) > 0
+        );
+        if (!running) {
             return;
         }
         String fingerprint =
@@ -342,10 +377,17 @@ public final class RelayService extends Service {
             " destinationPing=" + state.optBoolean("destinationPingOk", false) +
             " destinationVersion=" + state.optString("destinationGameVersion", "") +
             " upstreamStarted=" + state.optInt("upstreamStartedCount", 0) +
-            " upstreamReady=" + state.optInt("upstreamReadyCount", 0);
+            " upstreamReady=" + state.optInt("upstreamReadyCount", 0) +
+            " detailedLogs=" + state.optBoolean("detailedLogging", true) +
+            " chunkRetention=" +
+                state.optBoolean("chunkRetentionEnabled", false) +
+            " retainedRadiusChunks=" +
+                state.optInt("retainedRadiusChunks", 24);
         if (!fingerprint.equals(lastSnapshotFingerprint)) {
             lastSnapshotFingerprint = fingerprint;
-            DiagnosticsLog.append(this, "DEBUG", "snapshot", fingerprint);
+            if (detailedLogsEnabled()) {
+                DiagnosticsLog.append(this, "DEBUG", "snapshot", fingerprint);
+            }
         }
         String authCode = preferences.getString(KEY_AUTH_CODE, "");
         if (!authCode.isEmpty()) {
@@ -366,6 +408,7 @@ public final class RelayService extends Service {
             return;
         }
         serviceStopping = true;
+        setOverlayVisible(false);
         DiagnosticsLog.append(
             this,
             "INFO",
@@ -525,5 +568,68 @@ public final class RelayService extends Service {
             DiagnosticsLog.append(this, "DEBUG", "power", "Partial wake lock released");
         }
         wakeLock = null;
+    }
+
+    private boolean detailedLogsEnabled() {
+        return preferences.getBoolean(KEY_DETAILED_LOGS, true);
+    }
+
+    private void applyRuntimeOptions(boolean logChange) {
+        boolean detailedLogs = detailedLogsEnabled();
+        boolean retainChunks = preferences.getBoolean(
+            KEY_CHUNK_RETENTION,
+            false
+        );
+        int radiusChunks = clampRetainedRadius(preferences.getInt(
+            KEY_RETAINED_RADIUS_CHUNKS,
+            24
+        ));
+        preferences.edit()
+            .putInt(KEY_RETAINED_RADIUS_CHUNKS, radiusChunks)
+            .apply();
+        try {
+            NativeBridge.configureRuntime(
+                detailedLogs,
+                retainChunks,
+                radiusChunks
+            );
+            if (logChange) {
+                DiagnosticsLog.append(
+                    this,
+                    "INFO",
+                    "settings",
+                    "Runtime settings changed: detailedLogs=" + detailedLogs +
+                        " chunkRetention=" + retainChunks +
+                        " retainedRadiusChunks=" + radiusChunks
+                );
+            }
+        } catch (Throwable error) {
+            DiagnosticsLog.appendError(
+                this,
+                "settings",
+                "Failed to apply runtime relay settings",
+                error
+            );
+        }
+    }
+
+    private void setOverlayVisible(boolean visible) {
+        if (overlayShouldBeVisible == visible) return;
+        overlayShouldBeVisible = visible;
+        mainHandler.post(() -> {
+            if (overlayController == null) return;
+            if (overlayShouldBeVisible) {
+                overlayController.show();
+            } else {
+                overlayController.hide();
+            }
+        });
+    }
+
+    public static int clampRetainedRadius(int radius) {
+        return Math.max(
+            MIN_RETAINED_RADIUS_CHUNKS,
+            Math.min(MAX_RETAINED_RADIUS_CHUNKS, radius)
+        );
     }
 }

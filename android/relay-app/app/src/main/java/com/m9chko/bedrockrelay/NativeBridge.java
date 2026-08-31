@@ -19,6 +19,12 @@ public final class NativeBridge {
 
     public static native void stopRelay();
 
+    public static native void configureRuntime(
+        boolean detailedLogging,
+        boolean chunkRetentionEnabled,
+        int retainedRadiusChunks
+    );
+
     public static native String snapshot();
 
     public static native String pollEvents();

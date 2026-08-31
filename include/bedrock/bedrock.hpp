@@ -32,6 +32,7 @@
 #include <bedrock/realms/BedrockRealms.hpp>
 #include <bedrock/relay/BedrockLiveRelay.hpp>
 #include <bedrock/relay/BedrockRelay.hpp>
+#include <bedrock/relay/ChunkPublisherRetention.hpp>
 #include <bedrock/server/BedrockServer.hpp>
 #include <bedrock/server/ServerAdvertisement.hpp>
 #include <bedrock/util/XxHash64.hpp>

@@ -31,6 +31,19 @@
 namespace {
 
 constexpr char LogTag[] = "CpeRelayNative";
+constexpr int MinimumRetainedRadiusChunks = 10;
+constexpr int MaximumRetainedRadiusChunks = 64;
+
+std::atomic<bool> configuredDetailedLogging {true};
+std::atomic<bool> configuredChunkRetention {false};
+std::atomic<int> configuredRetainedRadiusChunks {24};
+
+int clampRetainedRadiusChunks(int radius) {
+    return std::max(
+        MinimumRetainedRadiusChunks,
+        std::min(MaximumRetainedRadiusChunks, radius)
+    );
+}
 
 #if defined(BEDROCK_ANDROID_RELEASE_BUILD)
 constexpr std::string_view NativeBuildType = "release";
@@ -513,8 +526,36 @@ struct RelayState {
     std::atomic<uint64_t> clientboundEquipmentPackets {0};
     std::atomic<uint64_t> clientboundEquipmentTransportPackets {0};
     std::atomic<uint64_t> clientboundEquipmentForwardedPackets {0};
+    std::atomic<bool> detailedLogging {true};
+    std::atomic<bool> chunkRetentionEnabled {false};
+    std::atomic<int> retainedRadiusChunks {24};
+    std::atomic<uint64_t> chunkPublisherPacketsRewritten {0};
+    std::atomic<uint32_t> lastServerPublisherRadiusBlocks {0};
+    std::atomic<uint32_t> lastEffectivePublisherRadiusBlocks {0};
+
+    void configureRuntime(
+        bool detailed,
+        bool retainChunks,
+        int radiusChunks
+    ) {
+        detailedLogging.store(detailed, std::memory_order_relaxed);
+        chunkRetentionEnabled.store(retainChunks, std::memory_order_relaxed);
+        retainedRadiusChunks.store(
+            clampRetainedRadiusChunks(radiusChunks),
+            std::memory_order_relaxed
+        );
+        if (!detailed) resetFlight();
+    }
 
     void push(bedrock::JsRuntimeValue event) {
+        if (!detailedLogging.load(std::memory_order_relaxed) &&
+            event.isObject()) {
+            const auto* level = event.get("level");
+            if (level && level->isString() &&
+                level->stringValue() == "DEBUG") {
+                return;
+            }
+        }
         std::lock_guard lock(mutex);
         if (event.isObject()) {
             if (!event.get("timestampMs")) {
@@ -545,6 +586,7 @@ struct RelayState {
     }
 
     void recordFlight(std::string component, std::string message) {
+        if (!detailedLogging.load(std::memory_order_relaxed)) return;
         std::lock_guard lock(mutex);
         constexpr std::size_t MaximumFlightRecords = 768;
         constexpr std::size_t MaximumFlightMessage = 2048;
@@ -564,6 +606,7 @@ struct RelayState {
     }
 
     void flushFlight(std::string reason) {
+        if (!detailedLogging.load(std::memory_order_relaxed)) return;
         std::vector<FlightRecord> snapshot;
         uint64_t firstSequence = 0;
         uint64_t lastSequence = 0;
@@ -651,6 +694,32 @@ bedrock::JsRuntimeValue snapshotValue(
         )},
         {"upstreamReady", bedrock::JsRuntimeValue::boolean(
             state->upstreamReady
+        )},
+        {"detailedLogging", bedrock::JsRuntimeValue::boolean(
+            state->detailedLogging.load(std::memory_order_relaxed)
+        )},
+        {"chunkRetentionEnabled", bedrock::JsRuntimeValue::boolean(
+            state->chunkRetentionEnabled.load(std::memory_order_relaxed)
+        )},
+        {"retainedRadiusChunks", bedrock::JsRuntimeValue::number(
+            state->retainedRadiusChunks.load(std::memory_order_relaxed)
+        )},
+        {"chunkPublisherPacketsRewritten", bedrock::JsRuntimeValue::number(
+            static_cast<double>(
+                state->chunkPublisherPacketsRewritten.load(
+                    std::memory_order_relaxed
+                )
+            )
+        )},
+        {"lastServerPublisherRadiusBlocks", bedrock::JsRuntimeValue::number(
+            state->lastServerPublisherRadiusBlocks.load(
+                std::memory_order_relaxed
+            )
+        )},
+        {"lastEffectivePublisherRadiusBlocks", bedrock::JsRuntimeValue::number(
+            state->lastEffectivePublisherRadiusBlocks.load(
+                std::memory_order_relaxed
+            )
         )},
         {"boundPort", bedrock::JsRuntimeValue::number(state->boundPort)},
         {"downstreamConnections", bedrock::JsRuntimeValue::number(
@@ -941,6 +1010,48 @@ public:
             );
         });
         relay->live().onClientbound([state](bedrock::BedrockRelayPacketEvent& event) {
+            if (event.packet.name == "network_chunk_publisher_update" &&
+                state->chunkRetentionEnabled.load(std::memory_order_relaxed)) {
+                const auto minimumRadiusBlocks = static_cast<uint32_t>(
+                    state->retainedRadiusChunks.load(
+                        std::memory_order_relaxed
+                    ) * 16
+                );
+                const auto retention = bedrock::retainPublishedChunks(
+                    event.packet,
+                    minimumRadiusBlocks
+                );
+                if (retention.recognized) {
+                    state->lastServerPublisherRadiusBlocks.store(
+                        retention.originalRadiusBlocks,
+                        std::memory_order_relaxed
+                    );
+                    state->lastEffectivePublisherRadiusBlocks.store(
+                        retention.effectiveRadiusBlocks,
+                        std::memory_order_relaxed
+                    );
+                }
+                if (retention.rewritten) {
+                    const auto rewritten =
+                        state->chunkPublisherPacketsRewritten.fetch_add(
+                            1,
+                            std::memory_order_relaxed
+                        ) + 1;
+                    if (rewritten <= 3 || rewritten % 128 == 0) {
+                        state->push(
+                            "chunk_retention",
+                            "serverRadiusBlocks=" + std::to_string(
+                                retention.originalRadiusBlocks
+                            ) + " effectiveRadiusBlocks=" + std::to_string(
+                                retention.effectiveRadiusBlocks
+                            ) + " rewrittenPackets=" +
+                                std::to_string(rewritten),
+                            "DEBUG",
+                            "chunks"
+                        );
+                    }
+                }
+            }
             uint64_t sampleIndex = 0;
             bool sampled = true;
             if (isClientboundEquipmentFlood(event.packet.name)) {
@@ -1432,6 +1543,11 @@ Java_com_m9chko_bedrockrelay_NativeBridge_startRelay(
     jstring cacheDirectoryValue
 ) {
     auto state = std::make_shared<RelayState>();
+    state->configureRuntime(
+        configuredDetailedLogging.load(std::memory_order_relaxed),
+        configuredChunkRetention.load(std::memory_order_relaxed),
+        configuredRetainedRadiusChunks.load(std::memory_order_relaxed)
+    );
     try {
         initializeJavaBridge(environment, bridgeClass);
         const auto destinationHost = fromJavaString(
@@ -1531,6 +1647,44 @@ Java_com_m9chko_bedrockrelay_NativeBridge_stopRelay(
         previous = std::move(controller);
     }
     if (previous) previous->stop();
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_m9chko_bedrockrelay_NativeBridge_configureRuntime(
+    JNIEnv*,
+    jclass,
+    jboolean detailedLogging,
+    jboolean chunkRetentionEnabled,
+    jint retainedRadiusChunks
+) {
+    const int clampedRadius = clampRetainedRadiusChunks(
+        static_cast<int>(retainedRadiusChunks)
+    );
+    configuredDetailedLogging.store(
+        detailedLogging == JNI_TRUE,
+        std::memory_order_relaxed
+    );
+    configuredChunkRetention.store(
+        chunkRetentionEnabled == JNI_TRUE,
+        std::memory_order_relaxed
+    );
+    configuredRetainedRadiusChunks.store(
+        clampedRadius,
+        std::memory_order_relaxed
+    );
+
+    std::shared_ptr<RelayState> state;
+    {
+        std::lock_guard lock(controllerMutex);
+        state = currentState;
+    }
+    if (state) {
+        state->configureRuntime(
+            detailedLogging == JNI_TRUE,
+            chunkRetentionEnabled == JNI_TRUE,
+            clampedRadius
+        );
+    }
 }
 
 extern "C" JNIEXPORT jstring JNICALL

@@ -327,6 +327,15 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
     add_executable(chunk-smoke tools/chunk_smoke.cpp)
     target_link_libraries(chunk-smoke PRIVATE BedrockProtocol::bedrock_protocol)
 
+    add_executable(
+        chunk-publisher-retention-smoke
+        tools/chunk_publisher_retention_smoke.cpp
+    )
+    target_link_libraries(
+        chunk-publisher-retention-smoke
+        PRIVATE BedrockProtocol::bedrock_protocol
+    )
+
     add_executable(world-iterators-smoke tools/world_iterators_smoke.cpp)
     target_link_libraries(world-iterators-smoke PRIVATE BedrockProtocol::bedrock_protocol)
 
@@ -409,6 +418,10 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
         add_test(NAME create-client-factory-smoke COMMAND create-client-factory-smoke)
         add_test(NAME legacy-encryption-smoke COMMAND legacy-encryption-smoke)
         add_test(NAME chunk-smoke COMMAND chunk-smoke)
+        add_test(
+            NAME chunk-publisher-retention-smoke
+            COMMAND chunk-publisher-retention-smoke
+        )
         add_test(NAME world-iterators-smoke COMMAND world-iterators-smoke)
         add_test(NAME map-item-data-smoke COMMAND map-item-data-smoke)
         add_test(NAME bedrock-block-registry-smoke COMMAND bedrock-block-registry-smoke)
