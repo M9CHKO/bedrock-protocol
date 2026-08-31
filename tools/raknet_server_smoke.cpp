@@ -137,6 +137,9 @@ struct BedrockServerTestAccess {
         );
         session->sendCounter = 0;
         session->receiveCounter = 0;
+        session->inboundEncryptionFailed = false;
+        session->recentEncryptedBatchBytes = 0;
+        session->recentEncryptedBatches.clear();
         return true;
     }
 
@@ -744,11 +747,14 @@ bool checkEncryptedPlayerErrorBranches() {
             ++errorCalls;
             server.close();
         });
-        bedrock::BedrockServerTestAccess::handle(
-            server,
-            connection,
-            makeEncryptedPlayerWire("1.16.201", key, iv, badChecksumPlaintext)
+        const auto badWire = makeEncryptedPlayerWire(
+            "1.16.201",
+            key,
+            iv,
+            badChecksumPlaintext
         );
+        bedrock::BedrockServerTestAccess::handle(server, connection, badWire);
+        bedrock::BedrockServerTestAccess::handle(server, connection, badWire);
         if (errorCalls != 1 ||
             bedrock::BedrockServerTestAccess::hasPlayerState(server, connection)) {
             std::cerr << "[SMOKE] error listener close resurrected Player session\n";
@@ -781,11 +787,17 @@ bool checkEncryptedPlayerErrorBranches() {
             ++closeCalls;
             closeSequence = ++callbackSequence;
         });
-        bedrock::BedrockServerTestAccess::handle(
-            server,
-            connection,
-            makeEncryptedPlayerWire("1.16.201", key, iv, badChecksumPlaintext)
+        const auto badWire = makeEncryptedPlayerWire(
+            "1.16.201",
+            key,
+            iv,
+            badChecksumPlaintext
         );
+        bedrock::BedrockServerTestAccess::handle(server, connection, badWire);
+        // A delayed close leaves a short window where already queued RakNet
+        // payloads can arrive. Only the first checksum failure may advance the
+        // stream, emit Player error, or send a disconnect packet.
+        bedrock::BedrockServerTestAccess::handle(server, connection, badWire);
         if (errorCalls != 1 || observed != checksumMessage || !errorBeforeDisconnect ||
             bedrock::BedrockServerTestAccess::counters(server, connection) !=
                 std::pair<uint64_t, uint64_t>{1, 1} ||
@@ -967,6 +979,54 @@ bool checkEncryptedPlayerErrorBranches() {
                 std::pair<uint64_t, uint64_t>{1, 1} ||
             bedrock::BedrockServerTestAccess::scheduledCloses(server) != 1) {
             std::cerr << "[SMOKE] readPacket deserialize error did not disconnect Server error\n";
+            return false;
+        }
+    }
+
+    {
+        bedrock::BedrockServer server({.version = "1.20.61", .offline = true});
+        const auto connection = bedrock::BedrockServerTestAccess::addEncryptedPlayer(
+            server, key, iv, 19205, 16
+        );
+        int duplicateEvents = 0;
+        std::string duplicateDetail;
+        server.onTransport([&](
+            const bedrock::BedrockServerTransportEvent& event
+        ) {
+            if (event.kind ==
+                    bedrock::BedrockServerTransportEventKind::Receive &&
+                event.message.starts_with("duplicate encrypted batch ignored")) {
+                ++duplicateEvents;
+                duplicateDetail = event.message;
+            }
+        });
+
+        const auto codec = bedrock::VersionedMcpeCodec::forVersion("1.20.61");
+        const auto handshake = codec.packetCodec().makePacketByName(
+            "client_to_server_handshake",
+            {}
+        );
+        const auto compressionPacket = codec.encodeCompressionPacket(
+            {handshake},
+            bedrock::VersionedMcpeCompression::Uncompressed
+        );
+        const auto wire = makeValidEncryptedPlayerWire(
+            "1.20.61",
+            key,
+            iv,
+            compressionPacket
+        );
+        bedrock::BedrockServerTestAccess::handle(server, connection, wire);
+        bedrock::BedrockServerTestAccess::handle(server, connection, wire);
+
+        if (duplicateEvents != 1 ||
+            duplicateDetail !=
+                "duplicate encrypted batch ignored receive_counter=1" ||
+            bedrock::BedrockServerTestAccess::counters(server, connection) !=
+                std::pair<uint64_t, uint64_t>{1, 1} ||
+            bedrock::BedrockServerTestAccess::scheduledCloses(server) != 0) {
+            std::cerr << "[SMOKE] encrypted duplicate was not ignored before "
+                         "advancing cipher state\n";
             return false;
         }
     }

@@ -18,6 +18,9 @@ namespace {
 constexpr uint32_t protocolVersion = 827;
 constexpr std::size_t mapPayloadSize = 81937;
 constexpr std::size_t mapPacketCount = 64;
+constexpr std::size_t clientPacketPayloadSize = 95;
+constexpr std::size_t clientSplitPayloadSize = 4097;
+constexpr std::size_t clientPacketCount = 4096;
 
 std::vector<uint8_t> makePayload(uint64_t sequence, std::size_t size) {
     std::vector<uint8_t> payload(size);
@@ -65,13 +68,25 @@ int main() {
     }
     const std::vector<uint8_t> iv(key.begin(), key.begin() + 16);
 
-    auto encryptStream = bedrock::BedrockEncryption::createCipherStream(
+    auto serverEncryptStream = bedrock::BedrockEncryption::createCipherStream(
         protocolVersion,
         key,
         iv,
         bedrock::BedrockCipherMode::Encrypt
     );
-    auto decryptStream = bedrock::BedrockEncryption::createCipherStream(
+    auto clientDecryptStream = bedrock::BedrockEncryption::createCipherStream(
+        protocolVersion,
+        key,
+        iv,
+        bedrock::BedrockCipherMode::Decrypt
+    );
+    auto clientEncryptStream = bedrock::BedrockEncryption::createCipherStream(
+        protocolVersion,
+        key,
+        iv,
+        bedrock::BedrockCipherMode::Encrypt
+    );
+    auto serverDecryptStream = bedrock::BedrockEncryption::createCipherStream(
         protocolVersion,
         key,
         iv,
@@ -89,6 +104,11 @@ int main() {
     std::condition_variable peerCv;
     std::optional<bedrock::RakNetServerPeer> connectedPeer;
     std::atomic<int> prematureServerCloses {0};
+    std::mutex serverReceiveMutex;
+    std::condition_variable serverReceiveCv;
+    std::size_t serverReceived = 0;
+    uint64_t serverReceiveCounter = 0;
+    std::string serverFailure;
     server.onOpenConnection([&](const bedrock::RakNetServerPeer& peer) {
         {
             std::lock_guard<std::mutex> lock(peerMutex);
@@ -98,6 +118,54 @@ int main() {
     });
     server.onCloseConnection([&](const bedrock::RakNetServerPeer&) {
         ++prematureServerCloses;
+    });
+    server.onEncapsulated([
+        &
+    ](
+        const bedrock::RakNetServerPeer&,
+        const std::vector<uint8_t>& payload
+    ) {
+        std::lock_guard<std::mutex> lock(serverReceiveMutex);
+        if (!serverFailure.empty()) return;
+        try {
+            if (payload.empty() || payload.front() != 0xfe) {
+                serverFailure = "server received payload without MCPE 0xfe marker";
+            } else if (serverReceived >= clientPacketCount) {
+                serverFailure = "server received duplicate payload after ordered stream";
+            } else {
+                std::vector<uint8_t> encryptedOnly(
+                    payload.begin() + 1,
+                    payload.end()
+                );
+                auto verification =
+                    bedrock::BedrockEncryption::decryptAndVerify(
+                        *serverDecryptStream,
+                        encryptedOnly,
+                        serverReceiveCounter,
+                        key
+                    );
+                if (!verification) {
+                    serverFailure = "client payload produced no plaintext";
+                } else if (!verification->matches()) {
+                    serverFailure = verification->mismatchMessage();
+                } else {
+                    const auto expectedSize = serverReceived % 127 == 0
+                        ? clientSplitPayloadSize
+                        : clientPacketPayloadSize;
+                    const auto expected = makePayload(serverReceived, expectedSize);
+                    if (verification->packetPlaintext != expected) {
+                        serverFailure =
+                            "client payload order or bytes changed at sequence " +
+                            std::to_string(serverReceived);
+                    } else {
+                        ++serverReceived;
+                    }
+                }
+            }
+        } catch (const std::exception& error) {
+            serverFailure = error.what();
+        }
+        serverReceiveCv.notify_all();
     });
     server.listen();
 
@@ -111,19 +179,19 @@ int main() {
 
     std::mutex receiveMutex;
     std::condition_variable receiveCv;
-    std::size_t received = 0;
-    uint64_t receiveCounter = 0;
-    std::string failure;
+    std::size_t clientReceived = 0;
+    uint64_t clientReceiveCounter = 0;
+    std::string clientFailure;
     const std::size_t expectedCount = mapPacketCount + 1;
 
     client.onEncapsulated([&](const std::vector<uint8_t>& payload) {
         std::lock_guard<std::mutex> lock(receiveMutex);
-        if (!failure.empty()) return;
+        if (!clientFailure.empty()) return;
         try {
             if (payload.empty() || payload.front() != 0xfe) {
-                failure = "received payload without MCPE 0xfe marker";
-            } else if (received >= expectedCount) {
-                failure = "received duplicate payload after ordered stream";
+                clientFailure = "client received payload without MCPE 0xfe marker";
+            } else if (clientReceived >= expectedCount) {
+                clientFailure = "client received duplicate payload after ordered stream";
             } else {
                 std::vector<uint8_t> encryptedOnly(
                     payload.begin() + 1,
@@ -131,30 +199,31 @@ int main() {
                 );
                 auto verification =
                     bedrock::BedrockEncryption::decryptAndVerify(
-                        *decryptStream,
+                        *clientDecryptStream,
                         encryptedOnly,
-                        receiveCounter,
+                        clientReceiveCounter,
                         key
                     );
                 if (!verification) {
-                    failure = "encrypted payload produced no plaintext";
+                    clientFailure = "server payload produced no plaintext";
                 } else if (!verification->matches()) {
-                    failure = verification->mismatchMessage();
+                    clientFailure = verification->mismatchMessage();
                 } else {
-                    const auto expectedSize = received < mapPacketCount
+                    const auto expectedSize = clientReceived < mapPacketCount
                         ? mapPayloadSize
                         : std::size_t {37};
-                    const auto expected = makePayload(received, expectedSize);
+                    const auto expected = makePayload(clientReceived, expectedSize);
                     if (verification->packetPlaintext != expected) {
-                        failure = "payload order or bytes changed at sequence " +
-                            std::to_string(received);
+                        clientFailure =
+                            "server payload order or bytes changed at sequence " +
+                            std::to_string(clientReceived);
                     } else {
-                        ++received;
+                        ++clientReceived;
                     }
                 }
             }
         } catch (const std::exception& error) {
-            failure = error.what();
+            clientFailure = error.what();
         }
         receiveCv.notify_all();
     });
@@ -183,14 +252,30 @@ int main() {
         peer = *connectedPeer;
     }
 
-    // This is the failure mode from live 128x128 map traffic: every payload
-    // is large enough to require RakNet splitting, while Bedrock's cipher and
-    // checksum counters require delivery exactly once and in order.
+    // Exercise both directions concurrently. The server-to-client stream
+    // mirrors live 128x128 map traffic; the client-to-server stream is mostly
+    // 104-byte encrypted wire payloads, matching the Android checksum failure,
+    // with periodic split packets mixed into the same ordered channel.
+    std::thread clientSender([&]() {
+        for (std::size_t sequence = 0;
+             sequence < clientPacketCount;
+             ++sequence) {
+            const auto size = sequence % 127 == 0
+                ? clientSplitPayloadSize
+                : clientPacketPayloadSize;
+            client.sendReliable(encryptPayload(
+                *clientEncryptStream,
+                makePayload(sequence, size),
+                sequence,
+                key
+            ));
+        }
+    });
     for (std::size_t sequence = 0; sequence < mapPacketCount; ++sequence) {
         server.sendReliable(
             peer,
             encryptPayload(
-                *encryptStream,
+                *serverEncryptStream,
                 makePayload(sequence, mapPayloadSize),
                 sequence,
                 key
@@ -200,23 +285,45 @@ int main() {
     server.sendReliable(
         peer,
         encryptPayload(
-            *encryptStream,
+            *serverEncryptStream,
             makePayload(mapPacketCount, 37),
             mapPacketCount,
             key
         )
     );
+    clientSender.join();
 
     {
         std::unique_lock<std::mutex> lock(receiveMutex);
         (void) receiveCv.wait_for(
             lock,
             std::chrono::seconds(60),
-            [&]() { return !failure.empty() || received == expectedCount; }
+            [&]() {
+                return !clientFailure.empty() ||
+                    clientReceived == expectedCount;
+            }
         );
-        if (failure.empty() && received != expectedCount) {
-            failure = "timed out after " + std::to_string(received) +
+        if (clientFailure.empty() && clientReceived != expectedCount) {
+            clientFailure = "timed out after " +
+                std::to_string(clientReceived) +
                 "/" + std::to_string(expectedCount) + " ordered payloads";
+        }
+    }
+    {
+        std::unique_lock<std::mutex> lock(serverReceiveMutex);
+        (void) serverReceiveCv.wait_for(
+            lock,
+            std::chrono::seconds(60),
+            [&]() {
+                return !serverFailure.empty() ||
+                    serverReceived == clientPacketCount;
+            }
+        );
+        if (serverFailure.empty() && serverReceived != clientPacketCount) {
+            serverFailure = "timed out after " +
+                std::to_string(serverReceived) + "/" +
+                std::to_string(clientPacketCount) +
+                " client ordered payloads";
         }
     }
 
@@ -225,8 +332,10 @@ int main() {
     client.close();
     server.close();
 
-    if (!failure.empty()) {
-        std::cerr << "[RAKNET-ORDERED-ENCRYPTION-FLOOD] " << failure << "\n";
+    if (!clientFailure.empty() || !serverFailure.empty()) {
+        std::cerr << "[RAKNET-ORDERED-ENCRYPTION-FLOOD] "
+                  << (!clientFailure.empty() ? clientFailure : serverFailure)
+                  << "\n";
         return 1;
     }
     if (!sessionAlive) {
@@ -234,14 +343,18 @@ int main() {
                      "during map-sized traffic\n";
         return 1;
     }
-    if (receiveCounter != expectedCount) {
-        std::cerr << "[RAKNET-ORDERED-ENCRYPTION-FLOOD] checksum counter "
-                  << receiveCounter << " != " << expectedCount << "\n";
+    if (clientReceiveCounter != expectedCount ||
+        serverReceiveCounter != clientPacketCount) {
+        std::cerr << "[RAKNET-ORDERED-ENCRYPTION-FLOOD] checksum counters "
+                  << clientReceiveCounter << "/" << serverReceiveCounter
+                  << " != " << expectedCount << "/" << clientPacketCount
+                  << "\n";
         return 1;
     }
 
     std::cout << "[RAKNET-ORDERED-ENCRYPTION-FLOOD] ok: "
               << mapPacketCount << " x " << mapPayloadSize
-              << " byte encrypted payloads plus ordered tail\n";
+              << " byte server payloads and " << clientPacketCount
+              << " ordered client payloads\n";
     return 0;
 }

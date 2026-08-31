@@ -1863,6 +1863,9 @@ private:
         int compressionLevel = 7;
         uint64_t sendCounter = 0;
         uint64_t receiveCounter = 0;
+        bool inboundEncryptionFailed = false;
+        std::size_t recentEncryptedBatchBytes = 0;
+        std::vector<std::vector<uint8_t>> recentEncryptedBatches;
         ProtoDefVariableStorePtr protoDefVariables = makeProtoDefVariableStore();
         std::vector<QueuedPacket> queuedPackets;
     };
@@ -2550,26 +2553,83 @@ private:
         std::vector<VersionedGamePacket> packets;
         bool encryptedSession = false;
         bool compressionReady = false;
+        bool duplicateEncryptedBatch = false;
+        uint64_t encryptedReceiveCounter = 0;
         std::optional<BedrockChecksumVerification> verification;
         {
             std::lock_guard<std::mutex> lock(session->mutex);
             encryptedSession = session->encryptionEnabled && session->hasEncryptionKeys;
             compressionReady = session->compressionReady;
             if (encryptedSession) {
+                if (session->inboundEncryptionFailed) {
+                    return;
+                }
                 if (!session->decryptStream) {
                     throw std::runtime_error("server decrypt stream is not initialized");
                 }
 
                 std::vector<uint8_t> encryptedOnly(payload.begin() + 1, payload.end());
-                verification = BedrockEncryption::decryptAndVerify(
-                    *session->decryptStream,
-                    encryptedOnly,
-                    session->receiveCounter,
-                    session->encryptionKeys.secretKeyBytes
+                duplicateEncryptedBatch = std::any_of(
+                    session->recentEncryptedBatches.begin(),
+                    session->recentEncryptedBatches.end(),
+                    [&](const auto& recent) {
+                        return recent == encryptedOnly;
+                    }
                 );
+                encryptedReceiveCounter = session->receiveCounter;
+                if (!duplicateEncryptedBatch) {
+                    verification = BedrockEncryption::decryptAndVerify(
+                        *session->decryptStream,
+                        encryptedOnly,
+                        session->receiveCounter,
+                        session->encryptionKeys.secretKeyBytes
+                    );
+                    if (verification && verification->matches()) {
+                        constexpr std::size_t maxRecentBatchCount = 32;
+                        constexpr std::size_t maxRecentBatchBytes = 1024 * 1024;
+                        if (encryptedOnly.size() <= maxRecentBatchBytes) {
+                            while (!session->recentEncryptedBatches.empty() &&
+                                   (session->recentEncryptedBatches.size() >=
+                                        maxRecentBatchCount ||
+                                    session->recentEncryptedBatchBytes +
+                                            encryptedOnly.size() >
+                                        maxRecentBatchBytes)) {
+                                session->recentEncryptedBatchBytes -=
+                                    session->recentEncryptedBatches.front().size();
+                                session->recentEncryptedBatches.erase(
+                                    session->recentEncryptedBatches.begin()
+                                );
+                            }
+                            session->recentEncryptedBatchBytes +=
+                                encryptedOnly.size();
+                            session->recentEncryptedBatches.push_back(
+                                std::move(encryptedOnly)
+                            );
+                        }
+                    } else if (verification) {
+                        // The continuous cipher cannot safely consume any
+                        // later batch after a failed checksum. Suppress the
+                        // queued-packet error cascade while the delayed
+                        // disconnect is delivered.
+                        session->inboundEncryptionFailed = true;
+                    }
+                }
             }
         }
         if (encryptedSession) {
+            if (duplicateEncryptedBatch) {
+                emitTransport(
+                    BedrockServerTransportEventKind::Receive,
+                    connection.peer,
+                    payload,
+                    payload.empty() ? 0 : payload.front(),
+                    0,
+                    {},
+                    "duplicate encrypted batch ignored receive_counter=" +
+                        std::to_string(encryptedReceiveCounter)
+                );
+                return;
+            }
             if (!verification) {
                 return;
             }
@@ -2582,7 +2642,9 @@ private:
                     payload.empty() ? 0 : payload.front(),
                     0,
                     {},
-                    "downstream encryption " + message
+                    "downstream encryption " + message +
+                        " receive_counter=" +
+                        std::to_string(encryptedReceiveCounter)
                 );
                 emitPlayerError(connection, message);
                 // A listener can synchronously close the player/server. Avoid
@@ -2891,6 +2953,9 @@ private:
             session->encryptionEnabled = true;
             session->sendCounter = 0;
             session->receiveCounter = 0;
+            session->inboundEncryptionFailed = false;
+            session->recentEncryptedBatchBytes = 0;
+            session->recentEncryptedBatches.clear();
         }
 
         BedrockServerClientHandshakeEvent clientHandshakeEvent;

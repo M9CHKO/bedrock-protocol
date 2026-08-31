@@ -14,6 +14,15 @@
 
 namespace {
 
+uint64_t fnv1a64(const std::vector<uint8_t>& bytes) {
+    uint64_t hash = UINT64_C(0xcbf29ce484222325);
+    for (const auto byte : bytes) {
+        hash ^= byte;
+        hash *= UINT64_C(0x100000001b3);
+    }
+    return hash;
+}
+
 bool checkAlgorithmBoundary(
     const std::vector<uint8_t>& key,
     const std::vector<uint8_t>& iv
@@ -155,6 +164,76 @@ bool checkNodeCfb8Goldens(
         return false;
     }
 
+    return true;
+}
+
+bool checkNodeGcmGoldens(
+    const std::vector<uint8_t>& key,
+    const std::vector<uint8_t>& iv
+) {
+    // Generated with Node's crypto.createCipheriv('aes-256-gcm') using one
+    // continuous cipher and four update() calls. The 103-byte chunk matches
+    // the encrypted body size from the Android checksum failure.
+    const std::vector<std::size_t> sizes {9, 17, 103, 4097};
+    const std::vector<uint64_t> expectedHashes {
+        UINT64_C(0xbf614c097c48f4d6),
+        UINT64_C(0xaf2ca5ff94b1d8e0),
+        UINT64_C(0x184e50c574aab1cd),
+        UINT64_C(0x76324096aa124763)
+    };
+
+    std::vector<std::vector<uint8_t>> chunks;
+    chunks.reserve(sizes.size());
+    for (std::size_t chunkIndex = 0;
+         chunkIndex < sizes.size();
+         ++chunkIndex) {
+        std::vector<uint8_t> chunk(sizes[chunkIndex]);
+        for (std::size_t i = 0; i < chunk.size(); ++i) {
+            chunk[i] = static_cast<uint8_t>(
+                i * 131u + chunkIndex * 29u + 0x4du
+            );
+        }
+        chunks.push_back(std::move(chunk));
+    }
+
+    auto encrypt = bedrock::BedrockEncryption::createCipherStream(
+        827,
+        key,
+        iv,
+        bedrock::BedrockCipherMode::Encrypt
+    );
+    auto decrypt = bedrock::BedrockEncryption::createCipherStream(
+        827,
+        key,
+        iv,
+        bedrock::BedrockCipherMode::Decrypt
+    );
+
+    std::vector<uint8_t> allCiphertext;
+    for (std::size_t i = 0; i < chunks.size(); ++i) {
+        const auto encrypted = encrypt->process(chunks[i]);
+        if (encrypted.size() != chunks[i].size() ||
+            fnv1a64(encrypted) != expectedHashes[i]) {
+            std::cerr << "[LEGACY-ENCRYPTION-SMOKE] sequential Node GCM "
+                         "ciphertext mismatch at chunk " << i << "\n";
+            return false;
+        }
+        if (decrypt->process(encrypted) != chunks[i]) {
+            std::cerr << "[LEGACY-ENCRYPTION-SMOKE] sequential GCM decrypt "
+                         "mismatch at chunk " << i << "\n";
+            return false;
+        }
+        allCiphertext.insert(
+            allCiphertext.end(),
+            encrypted.begin(),
+            encrypted.end()
+        );
+    }
+    if (fnv1a64(allCiphertext) != UINT64_C(0x02cd55986d14d647)) {
+        std::cerr << "[LEGACY-ENCRYPTION-SMOKE] aggregate Node GCM "
+                     "ciphertext mismatch\n";
+        return false;
+    }
     return true;
 }
 
@@ -382,6 +461,7 @@ int main() {
     bool ok = true;
     ok = checkAlgorithmBoundary(key, iv) && ok;
     ok = checkNodeCfb8Goldens(key, iv) && ok;
+    ok = checkNodeGcmGoldens(key, iv) && ok;
     ok = checkChecksumEdgeSemantics(key, iv) && ok;
     ok = checkStrictLegacyCompression() && ok;
     ok = checkLocalLegacyHandshake() && ok;

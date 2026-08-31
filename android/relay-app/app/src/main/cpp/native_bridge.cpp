@@ -770,10 +770,12 @@ public:
             if (event.kind ==
                 bedrock::BedrockServerTransportEventKind::Receive) {
                 std::lock_guard lock(state->mutex);
-                // Raw RakNet datagrams are essential before Bedrock login but
+                // Raw RakNet payloads are essential before Bedrock login but
                 // become high-volume duplicates once decoded packet events
-                // are available.
-                record = state->downstreamJoinedCount == 0;
+                // are available. Keep exceptional receive breadcrumbs, such
+                // as a safely ignored encrypted retransmission.
+                record = state->downstreamJoinedCount == 0 ||
+                    !event.message.empty();
             } else if (
                 event.kind ==
                     bedrock::BedrockServerTransportEventKind::SendPacket &&
