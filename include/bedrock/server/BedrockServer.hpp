@@ -1015,6 +1015,12 @@ public:
         return raknet_.boundPort();
     }
 
+    RakNetServerPeerStatistics transportStatistics(
+        const BedrockServerConnection& connection
+    ) const {
+        return raknet_.peerStatistics(connection.peer);
+    }
+
     int clientCount() const {
         return clientCount_.load();
     }
@@ -1964,7 +1970,22 @@ private:
                     packet.name
                 );
             }
-            raknet_.sendReliable(connection.peer, mcpe);
+            const auto sendResult = raknet_.sendReliable(
+                connection.peer,
+                mcpe
+            );
+            if (!sendResult.accepted()) {
+                emitTransport(
+                    BedrockServerTransportEventKind::Error,
+                    connection.peer,
+                    mcpe,
+                    mcpe.empty() ? 0 : mcpe.front(),
+                    0,
+                    {},
+                    sendFailureMessage("RakNet batch send rejected", sendResult)
+                );
+                return;
+            }
             emitTransport(
                 BedrockServerTransportEventKind::SendBatch,
                 connection.peer,
@@ -1972,7 +1993,10 @@ private:
                 mcpe.empty() ? 0 : mcpe.front(),
                 0,
                 {},
-                "packets=" + std::to_string(packets.size())
+                sendResultDetail(
+                    "packets=" + std::to_string(packets.size()),
+                    sendResult
+                )
             );
         }
     }
@@ -2092,6 +2116,25 @@ private:
             hash *= 1099511628211ull;
         }
         return hash;
+    }
+
+    static std::string sendResultDetail(
+        std::string prefix,
+        const RakNetServerSendResult& result
+    ) {
+        prefix += " raknet_status=";
+        prefix += rakNetServerSendStatusName(result.status);
+        prefix += " raknet_receipt=" + std::to_string(result.receipt);
+        prefix += " connection_state=" +
+            std::to_string(result.connectionState);
+        return prefix;
+    }
+
+    static std::string sendFailureMessage(
+        const std::string& prefix,
+        const RakNetServerSendResult& result
+    ) {
+        return sendResultDetail(prefix, result);
     }
 
     void emitTransport(
@@ -2902,16 +2945,16 @@ private:
         return static_cast<int32_t>(raw);
     }
 
-    void sendPreCompression(
+    bool sendPreCompression(
         const BedrockServerConnection& connection,
         const std::string& packetName,
         const ProtoDefValue& value
     ) {
         if (!hasActivePlayer(connection)) {
-            return;
+            return false;
         }
         const auto session = sessionSnapshot(connection);
-        if (!session) return;
+        if (!session) return false;
         ProtoDefPacketEncoder encoder(
             options_.version,
             playerProtocolTypes_,
@@ -2934,7 +2977,31 @@ private:
                 packet.packetId,
                 packet.name
             );
-            raknet_.sendReliable(connection.peer, mcpe);
+            // The response to request_network_settings is the first payload
+            // Minecraft waits on before it can send Login. Wake RakNet's
+            // network loop immediately instead of relying on its periodic
+            // medium-priority flush, which is not reliable while Android is
+            // moving the app between foreground processes.
+            const auto sendResult = raknet_.sendReliable(
+                connection.peer,
+                mcpe,
+                true
+            );
+            if (!sendResult.accepted()) {
+                emitTransport(
+                    BedrockServerTransportEventKind::Error,
+                    connection.peer,
+                    mcpe,
+                    0xfe,
+                    packet.packetId,
+                    packet.name,
+                    sendFailureMessage(
+                        "RakNet pre-compression send rejected",
+                        sendResult
+                    )
+                );
+                return false;
+            }
             emitTransport(
                 BedrockServerTransportEventKind::SendBatch,
                 connection.peer,
@@ -2942,9 +3009,14 @@ private:
                 0xfe,
                 0,
                 {},
-                "packets=1 pre_compression=true"
+                sendResultDetail(
+                    "packets=1 pre_compression=true priority=immediate",
+                    sendResult
+                )
             );
+            return true;
         }
+        return false;
     }
 
     void sendNetworkSettings(
@@ -2959,7 +3031,9 @@ private:
             {"client_throttle_scalar", ProtoDefValue::floating(0.0)}
         });
         if (preLoginRequest) {
-            sendPreCompression(connection, "network_settings", value);
+            if (!sendPreCompression(connection, "network_settings", value)) {
+                return;
+            }
         } else {
             send(connection, "network_settings", value);
         }

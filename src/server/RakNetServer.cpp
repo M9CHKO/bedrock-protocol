@@ -1,6 +1,7 @@
 #include <bedrock/server/RakNetServer.hpp>
 
 #include <MessageIdentifiers.h>
+#include <RakNetStatistics.h>
 #include <RakNetTypes.h>
 #include <RakPeerInterface.h>
 #include <RakSleep.h>
@@ -50,6 +51,22 @@ bool isDisconnectMessage(uint8_t id) {
 }
 
 } // namespace
+
+const char* rakNetServerSendStatusName(
+    RakNetServerSendStatus status
+) noexcept {
+    switch (status) {
+        case RakNetServerSendStatus::Accepted: return "accepted";
+        case RakNetServerSendStatus::EmptyPayload: return "empty_payload";
+        case RakNetServerSendStatus::ServerStopped: return "server_stopped";
+        case RakNetServerSendStatus::UnknownPeer: return "unknown_peer";
+        case RakNetServerSendStatus::NativeUnavailable:
+            return "native_unavailable";
+        case RakNetServerSendStatus::NotConnected: return "not_connected";
+        case RakNetServerSendStatus::Rejected: return "rejected";
+    }
+    return "unknown";
+}
 
 RakNetServer::RakNetServer(RakNetServerOptions options)
     : options_(std::move(options)),
@@ -189,40 +206,104 @@ void RakNetServer::setAdvertisement(std::string advertisement) {
     );
 }
 
-void RakNetServer::sendReliable(
+RakNetServerSendResult RakNetServer::sendReliable(
     const RakNetServerPeer& peer,
-    const std::vector<uint8_t>& payload
+    const std::vector<uint8_t>& payload,
+    bool immediate
 ) {
-    if (payload.empty() || !running_.load()) return;
+    RakNetServerSendResult result;
+    if (payload.empty()) {
+        result.status = RakNetServerSendStatus::EmptyPayload;
+        return result;
+    }
+    if (!running_.load()) {
+        result.status = RakNetServerSendStatus::ServerStopped;
+        return result;
+    }
     {
         std::lock_guard<std::mutex> lock(peersMutex_);
         const auto found = peers_.find(peerKey(peer));
         if (found == peers_.end() ||
             found->second.clientGuid != peer.clientGuid) {
-            return;
+            result.status = RakNetServerSendStatus::UnknownPeer;
+            return result;
         }
     }
 
-    RakNet::SystemAddress address;
-    if (!address.FromStringExplicitPort(
-            peer.address.c_str(), peer.port, 4) &&
-        !address.FromStringExplicitPort(peer.address.c_str(), peer.port, 6)) {
-        return;
-    }
     std::lock_guard<std::mutex> lock(nativeMutex_);
-    if (!native_ || !native_->peer ||
-        native_->peer->GetConnectionState(address) != RakNet::IS_CONNECTED) {
-        return;
+    if (!native_ || !native_->peer || !native_->peer->IsActive()) {
+        result.status = RakNetServerSendStatus::NativeUnavailable;
+        return result;
     }
-    (void) native_->peer->Send(
+    const RakNet::RakNetGUID guid(peer.clientGuid);
+    result.connectionState = static_cast<int>(
+        native_->peer->GetConnectionState(guid)
+    );
+    if (result.connectionState != static_cast<int>(RakNet::IS_CONNECTED)) {
+        result.status = RakNetServerSendStatus::NotConnected;
+        return result;
+    }
+    result.receipt = native_->peer->Send(
         reinterpret_cast<const char*>(payload.data()),
         static_cast<int>(payload.size()),
-        MEDIUM_PRIORITY,
+        immediate ? IMMEDIATE_PRIORITY : MEDIUM_PRIORITY,
         RELIABLE_ORDERED,
         0,
-        address,
+        guid,
         false
     );
+    result.status = result.receipt == 0
+        ? RakNetServerSendStatus::Rejected
+        : RakNetServerSendStatus::Accepted;
+    return result;
+}
+
+RakNetServerPeerStatistics RakNetServer::peerStatistics(
+    const RakNetServerPeer& peer
+) const {
+    RakNetServerPeerStatistics result;
+    {
+        std::lock_guard<std::mutex> lock(peersMutex_);
+        const auto found = peers_.find(peerKey(peer));
+        result.peerKnown = found != peers_.end() &&
+            found->second.clientGuid == peer.clientGuid;
+    }
+    if (!result.peerKnown) return result;
+
+    std::lock_guard<std::mutex> lock(nativeMutex_);
+    if (!native_ || !native_->peer || !native_->peer->IsActive()) {
+        return result;
+    }
+    result.nativeActive = true;
+    const RakNet::RakNetGUID guid(peer.clientGuid);
+    result.connectionState = static_cast<int>(
+        native_->peer->GetConnectionState(guid)
+    );
+    const auto address = native_->peer->GetSystemAddressFromGuid(guid);
+    if (address == RakNet::UNASSIGNED_SYSTEM_ADDRESS) return result;
+
+    RakNet::RakNetStatistics statistics {};
+    if (!native_->peer->GetStatistics(address, &statistics)) return result;
+    result.statisticsAvailable = true;
+    result.userMessageBytesPushed =
+        statistics.runningTotal[RakNet::USER_MESSAGE_BYTES_PUSHED];
+    result.userMessageBytesSent =
+        statistics.runningTotal[RakNet::USER_MESSAGE_BYTES_SENT];
+    result.userMessageBytesResent =
+        statistics.runningTotal[RakNet::USER_MESSAGE_BYTES_RESENT];
+    result.actualBytesSent =
+        statistics.runningTotal[RakNet::ACTUAL_BYTES_SENT];
+    result.actualBytesReceived =
+        statistics.runningTotal[RakNet::ACTUAL_BYTES_RECEIVED];
+    for (int priority = 0; priority < NUMBER_OF_PRIORITIES; ++priority) {
+        result.sendBufferMessages += statistics.messageInSendBuffer[priority];
+        result.sendBufferBytes += static_cast<uint64_t>(
+            statistics.bytesInSendBuffer[priority]
+        );
+    }
+    result.resendBufferMessages = statistics.messagesInResendBuffer;
+    result.resendBufferBytes = statistics.bytesInResendBuffer;
+    return result;
 }
 
 void RakNetServer::runLoop() {

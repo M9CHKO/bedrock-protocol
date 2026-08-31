@@ -8,8 +8,16 @@ UDP-порту `19132` и подключает его к серверу, кот�
 
 ## Готовый APK
 
-- [CPE Relay 1.0.4 (arm64-v8a, optimized Release, debug-signed)](apk/CPE-Relay-v1.0.4-arm64-v8a-release-debug-signed.apk)
-- [SHA-256](apk/CPE-Relay-v1.0.4-arm64-v8a-release-debug-signed.apk.sha256)
+- [CPE Relay 1.0.5 (arm64-v8a, optimized Release, debug-signed)](apk/CPE-Relay-v1.0.5-arm64-v8a-release-debug-signed.apk)
+- [SHA-256](apk/CPE-Relay-v1.0.5-arm64-v8a-release-debug-signed.apk.sha256)
+
+Версия 1.0.5 исправляет доказанный разрыв локального login сразу после
+`request_network_settings`: первый `network_settings` теперь адресуется
+стабильному RakNet GUID, немедленно будит сетевой цикл Android и считается
+отправленным только после ненулевого transport receipt. Журнал больше не
+показывает ложный `send_batch` при отвергнутой отправке. При login timeout он
+дополнительно выводит connection state, send/resend queues и фактические
+счётчики отправленных/полученных UDP-байтов.
 
 Версия 1.0.4 добавляет native flight-recorder последних 768 транспортных
 событий. Для каждого пакета фиксируются безопасные размер и hash на этапах

@@ -29,6 +29,44 @@ struct RakNetServerPeer {
     int mtu = 1400;
 };
 
+enum class RakNetServerSendStatus {
+    Accepted,
+    EmptyPayload,
+    ServerStopped,
+    UnknownPeer,
+    NativeUnavailable,
+    NotConnected,
+    Rejected
+};
+
+const char* rakNetServerSendStatusName(RakNetServerSendStatus status) noexcept;
+
+struct RakNetServerSendResult {
+    RakNetServerSendStatus status = RakNetServerSendStatus::Rejected;
+    uint32_t receipt = 0;
+    int connectionState = -1;
+
+    bool accepted() const noexcept {
+        return status == RakNetServerSendStatus::Accepted;
+    }
+};
+
+struct RakNetServerPeerStatistics {
+    bool peerKnown = false;
+    bool nativeActive = false;
+    bool statisticsAvailable = false;
+    int connectionState = -1;
+    uint64_t userMessageBytesPushed = 0;
+    uint64_t userMessageBytesSent = 0;
+    uint64_t userMessageBytesResent = 0;
+    uint64_t actualBytesSent = 0;
+    uint64_t actualBytesReceived = 0;
+    uint64_t sendBufferMessages = 0;
+    uint64_t sendBufferBytes = 0;
+    uint64_t resendBufferMessages = 0;
+    uint64_t resendBufferBytes = 0;
+};
+
 class RakNetServer {
 public:
     using OpenConnectionHandler =
@@ -109,10 +147,15 @@ public:
         encapsulatedHandler_ = std::move(handler);
     }
 
-    void sendReliable(
+    RakNetServerSendResult sendReliable(
         const RakNetServerPeer& peer,
-        const std::vector<uint8_t>& payload
+        const std::vector<uint8_t>& payload,
+        bool immediate = false
     );
+
+    RakNetServerPeerStatistics peerStatistics(
+        const RakNetServerPeer& peer
+    ) const;
 
 private:
     friend struct BedrockServerTestAccess;

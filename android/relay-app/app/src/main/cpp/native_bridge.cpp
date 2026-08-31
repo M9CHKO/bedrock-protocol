@@ -240,6 +240,27 @@ std::string transportBreadcrumb(
     return detail.str();
 }
 
+std::string rakNetStatisticsBreadcrumb(
+    const bedrock::RakNetServerPeerStatistics& statistics
+) {
+    std::ostringstream detail;
+    detail << std::boolalpha
+           << "peerKnown=" << statistics.peerKnown
+           << " nativeActive=" << statistics.nativeActive
+           << " statisticsAvailable=" << statistics.statisticsAvailable
+           << " connectionState=" << statistics.connectionState
+           << " userPushed=" << statistics.userMessageBytesPushed
+           << " userSent=" << statistics.userMessageBytesSent
+           << " userResent=" << statistics.userMessageBytesResent
+           << " actualSent=" << statistics.actualBytesSent
+           << " actualReceived=" << statistics.actualBytesReceived
+           << " sendQueueMessages=" << statistics.sendBufferMessages
+           << " sendQueueBytes=" << statistics.sendBufferBytes
+           << " resendMessages=" << statistics.resendBufferMessages
+           << " resendBytes=" << statistics.resendBufferBytes;
+    return detail.str();
+}
+
 bool isLoginStagePacket(std::string_view name) {
     return name == "request_network_settings" ||
         name == "login" ||
@@ -1254,11 +1275,24 @@ private:
             ++loginWatchdogGeneration_;
             lock.unlock();
 
+            std::string rakNetDetail = "unavailable";
+            {
+                std::lock_guard relayLock(relayMutex_);
+                if (relay_) {
+                    rakNetDetail = rakNetStatisticsBreadcrumb(
+                        relay_->live().server().transportStatistics(
+                            timedOut.connection
+                        )
+                    );
+                }
+            }
+
             state_->push(
                 "local_login_timeout",
                 "downstream_session=" + timedOut.sessionId +
                     " last_stage=" + timedOut.stage +
-                    " timeoutMs=15000; closing stale local transport so "
+                    " timeoutMs=15000 raknet={" + rakNetDetail +
+                    "}; closing stale local transport so "
                     "the next Minecraft attempt is not blocked",
                 "ERROR",
                 "watchdog"

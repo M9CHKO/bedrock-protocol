@@ -1162,10 +1162,23 @@ bool checkTransportFailureDiagnostics() {
             bedrock::BedrockServerTransportEventKind,
             std::string
         >> phases;
+        std::size_t networkSettingsBytes = 0;
+        uint64_t networkSettingsHash = 0;
+        std::string sendRejection;
         server.onTransport([&](
             const bedrock::BedrockServerTransportEvent& event
         ) {
             phases.emplace_back(event.kind, event.packetName);
+            if (event.kind ==
+                    bedrock::BedrockServerTransportEventKind::SendPacket &&
+                event.packetName == "network_settings") {
+                networkSettingsBytes = event.byteLength;
+                networkSettingsHash = event.byteHash;
+            }
+            if (event.kind ==
+                bedrock::BedrockServerTransportEventKind::Error) {
+                sendRejection = event.message;
+            }
         });
 
         const auto codec =
@@ -1183,7 +1196,11 @@ bool checkTransportFailureDiagnostics() {
         const auto framed = codec.batchCodec().encodeFramedBatch({request});
         std::vector<uint8_t> wire {0xfe};
         wire.insert(wire.end(), framed.begin(), framed.end());
-        bedrock::BedrockServerTestAccess::handle(server, connection, wire);
+        bedrock::BedrockServerTestAccess::handle(
+            server,
+            connection,
+            wire
+        );
 
         const std::vector<std::pair<
             bedrock::BedrockServerTransportEventKind,
@@ -1197,10 +1214,21 @@ bool checkTransportFailureDiagnostics() {
                 bedrock::BedrockServerTransportEventKind::SendPacket,
                 "network_settings"
             },
-            {bedrock::BedrockServerTransportEventKind::SendBatch, ""}
+            {
+                bedrock::BedrockServerTransportEventKind::Error,
+                "network_settings"
+            }
         };
-        if (phases != expected) {
-            std::cerr << "[SMOKE] transport phase diagnostics/order mismatch\n";
+        const bool sendRejected = sendRejection.find(
+            "RakNet pre-compression send rejected "
+            "raknet_status=server_stopped raknet_receipt=0 "
+            "connection_state=-1"
+        ) != std::string::npos;
+        if (phases != expected || !sendRejected ||
+            networkSettingsBytes != 12 ||
+            networkSettingsHash != 0x1853c5e83e41e97dull) {
+            std::cerr << "[SMOKE] rejected transport reported a false send or "
+                         "changed protocol-827 network_settings identity\n";
             return false;
         }
     }
@@ -2710,6 +2738,179 @@ bool checkNetworkSettingsResponse(uint16_t port) {
     return false;
 }
 
+uint64_t transportDiagnosticHash(const std::vector<uint8_t>& bytes) {
+    uint64_t hash = 1469598103934665603ull;
+    for (const auto byte : bytes) {
+        hash ^= byte;
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+bool checkProtocol827NetworkSettingsDelivery() {
+    std::atomic<bool> sendPacketIdentity {false};
+    std::atomic<bool> acceptedBatchIdentity {false};
+    bedrock::BedrockServer server({
+        .host = "127.0.0.1",
+        .port = 0,
+        .version = "1.21.100",
+        .motd = {{"motd", "Protocol 827 network settings"}},
+        .offline = true
+    });
+    server.onTransport([&](
+        const bedrock::BedrockServerTransportEvent& event
+    ) {
+        if (event.kind ==
+                bedrock::BedrockServerTransportEventKind::SendPacket &&
+            event.packetName == "network_settings") {
+            sendPacketIdentity = event.byteLength == 12 &&
+                event.byteHash == 0x1853c5e83e41e97dull;
+        }
+        if (event.kind ==
+                bedrock::BedrockServerTransportEventKind::SendBatch &&
+            event.byteLength == 14 &&
+            event.byteHash == 0x8742a95bb29ed2e3ull &&
+            event.message.find("pre_compression=true") != std::string::npos &&
+            event.message.find("priority=immediate") != std::string::npos &&
+            event.message.find("raknet_status=accepted") != std::string::npos &&
+            event.message.find("raknet_receipt=0") == std::string::npos &&
+            event.message.find("connection_state=2") != std::string::npos) {
+            acceptedBatchIdentity = true;
+        }
+    });
+    server.listen();
+
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0) {
+        server.close();
+        return false;
+    }
+    sockaddr_in target {};
+    target.sin_family = AF_INET;
+    target.sin_port = htons(server.boundPort());
+    inet_pton(AF_INET, "127.0.0.1", &target.sin_addr);
+    if (!establishConnectedSession(sock, target, server.boundPort())) {
+        close(sock);
+        server.close();
+        return false;
+    }
+
+    const auto codec =
+        bedrock::VersionedMcpeCodec::forVersion("1.21.100");
+    const uint32_t protocol = codec.definition().protocolVersion();
+    const auto request = codec.packetCodec().makePacketByName(
+        "request_network_settings",
+        {
+            static_cast<uint8_t>((protocol >> 24u) & 0xffu),
+            static_cast<uint8_t>((protocol >> 16u) & 0xffu),
+            static_cast<uint8_t>((protocol >> 8u) & 0xffu),
+            static_cast<uint8_t>(protocol & 0xffu)
+        }
+    );
+    const auto framed = codec.batchCodec().encodeFramedBatch({request});
+    std::vector<uint8_t> mcpe {0xfe};
+    mcpe.insert(mcpe.end(), framed.begin(), framed.end());
+    const auto splitAt = mcpe.size() / 2;
+    const std::vector<uint8_t> part0(
+        mcpe.begin(),
+        mcpe.begin() + static_cast<std::ptrdiff_t>(splitAt)
+    );
+    const std::vector<uint8_t> part1(
+        mcpe.begin() + static_cast<std::ptrdiff_t>(splitAt),
+        mcpe.end()
+    );
+    const auto datagram0 = buildSplitReliableDatagram(
+        part0,
+        2,
+        2,
+        2,
+        2,
+        17,
+        0
+    );
+    const auto datagram1 = buildSplitReliableDatagram(
+        part1,
+        3,
+        3,
+        2,
+        2,
+        17,
+        1
+    );
+    (void) sendto(
+        sock,
+        datagram0.data(),
+        datagram0.size(),
+        0,
+        reinterpret_cast<const sockaddr*>(&target),
+        sizeof(target)
+    );
+    (void) sendto(
+        sock,
+        datagram1.data(),
+        datagram1.size(),
+        0,
+        reinterpret_cast<const sockaddr*>(&target),
+        sizeof(target)
+    );
+
+    bool wireBatchIdentity = false;
+    bool wirePacketIdentity = false;
+    for (int attempt = 0; attempt < 15 && !wirePacketIdentity; ++attempt) {
+        fd_set readfds;
+        FD_ZERO(&readfds);
+        FD_SET(sock, &readfds);
+        timeval timeout {};
+        timeout.tv_sec = 0;
+        timeout.tv_usec = 200000;
+        const int ready = select(
+            sock + 1,
+            &readfds,
+            nullptr,
+            nullptr,
+            &timeout
+        );
+        if (ready <= 0) continue;
+
+        std::vector<uint8_t> reply(8192);
+        const ssize_t received = recvfrom(
+            sock,
+            reply.data(),
+            reply.size(),
+            0,
+            nullptr,
+            nullptr
+        );
+        if (received <= 0) continue;
+        reply.resize(static_cast<std::size_t>(received));
+        acknowledgeDatagram(sock, target, reply);
+
+        for (const auto& payload : parseDatagramPayloads(reply)) {
+            if (payload.empty() || payload.front() != 0xfe) continue;
+            wireBatchIdentity = payload.size() == 14 &&
+                transportDiagnosticHash(payload) == 0x8742a95bb29ed2e3ull;
+            const auto decoded = codec.decodeUncompressedMcpePayload(payload);
+            for (const auto& packet : decoded.batch.packets) {
+                if (packet.name != "network_settings") continue;
+                wirePacketIdentity = packet.fullPacket.size() == 12 &&
+                    transportDiagnosticHash(packet.fullPacket) ==
+                        0x1853c5e83e41e97dull;
+            }
+        }
+    }
+
+    close(sock);
+    server.close();
+    const bool ok = protocol == 827 && wireBatchIdentity &&
+        wirePacketIdentity && sendPacketIdentity.load() &&
+        acceptedBatchIdentity.load();
+    if (!ok) {
+        std::cerr << "[SMOKE] protocol-827 network_settings was not accepted "
+                     "and delivered with byte identity\n";
+    }
+    return ok;
+}
+
 bool checkLoginHandshakeResponse(
     uint16_t port,
     bool& sawOutboundSplit,
@@ -3317,6 +3518,9 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (!checkReliableSendBackpressure()) {
+        return 1;
+    }
+    if (!checkProtocol827NetworkSettingsDelivery()) {
         return 1;
     }
 
