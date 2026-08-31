@@ -1853,7 +1853,7 @@ private:
             playerProtocolTypes_,
             session->protoDefVariables
         );
-        (void) decoder.decodePacket(packet.name, packet.payload);
+        decoder.updatePacketVariables(packet.name, packet.payload);
     }
 
     void ensureOutboundQueueScheduler() {

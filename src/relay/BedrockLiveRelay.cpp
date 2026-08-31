@@ -295,57 +295,6 @@ bool needsStructuredDiagnostic(
     return name != "creative_content";
 }
 
-std::vector<std::pair<int64_t, std::string>> paletteEntries(
-    const std::vector<ProtoDefField>& fields
-) {
-    struct Entry {
-        std::optional<int64_t> runtimeId;
-        std::string name;
-    };
-
-    std::unordered_map<std::size_t, Entry> byIndex;
-    std::vector<std::size_t> indexes;
-    for (const auto& field : fields) {
-        const auto nameIndex = indexedField(field.path, "itemstates", ".name");
-        const auto runtimeIndex = indexedField(
-            field.path,
-            "itemstates",
-            ".runtime_id"
-        );
-        const auto index = nameIndex.has_value() ? nameIndex : runtimeIndex;
-        if (!index.has_value()) continue;
-
-        auto [entry, inserted] = byIndex.try_emplace(*index);
-        if (inserted) indexes.push_back(*index);
-        if (nameIndex.has_value()) {
-            entry->second.name = field.value;
-        } else {
-            auto text = field.value;
-            if (const auto slash = text.find('/'); slash != std::string::npos) {
-                text.resize(slash);
-            }
-            try {
-                std::size_t consumed = 0;
-                const auto value = std::stoll(text, &consumed, 10);
-                if (consumed == text.size()) entry->second.runtimeId = value;
-            } catch (const std::exception&) {
-            }
-        }
-    }
-
-    std::sort(indexes.begin(), indexes.end());
-    std::vector<std::pair<int64_t, std::string>> out;
-    out.reserve(indexes.size());
-    for (const auto index : indexes) {
-        const auto found = byIndex.find(index);
-        if (found != byIndex.end() && found->second.runtimeId.has_value() &&
-            !found->second.name.empty()) {
-            out.emplace_back(*found->second.runtimeId, found->second.name);
-        }
-    }
-    return out;
-}
-
 std::vector<std::string> itemPrefixes(
     const std::string& packetName,
     const std::vector<ProtoDefField>& fields
@@ -1703,16 +1652,26 @@ void BedrockLiveRelay::diagnosePacket(
     }
 
     std::vector<ProtoDefField> fields;
+    std::vector<std::pair<int64_t, std::string>> entries;
     std::string decodeError;
     if (needsStructuredDiagnostic(version, packet.name)) {
         try {
             ProtoDefPacketDecoder decoder(version, variables);
-            fields = decoder.decodePacketStrict(packet.name, packet.payload);
+            if (detail::packetCarriesItemPalette(packet.name)) {
+                entries = decoder.decodeItemPaletteStrict(
+                    packet.name,
+                    packet.payload
+                );
+            } else {
+                fields = decoder.decodePacketStrict(
+                    packet.name,
+                    packet.payload
+                );
+            }
         } catch (const std::exception& error) {
             decodeError = error.what();
         }
     }
-    const auto entries = paletteEntries(fields);
 
     uint64_t sequence = 0;
     std::size_t registryOccurrence = 0;

@@ -266,11 +266,12 @@ public final class RelayService extends Service {
             "ping_warning".equals(type) ? "WARN" : "INFO"
         );
         String component = event.optString("component", "native");
-        DiagnosticsLog.append(
+        DiagnosticsLog.appendAt(
             this,
             level,
             component,
-            "event=" + type + (message.isEmpty() ? "" : " " + message)
+            "event=" + type + (message.isEmpty() ? "" : " " + message),
+            event.optLong("timestampMs", 0)
         );
         if ("upstream_ready".equals(type)) {
             preferences.edit()

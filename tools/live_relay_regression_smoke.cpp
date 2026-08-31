@@ -508,13 +508,65 @@ bool checkItemRegistryVersionBoundary() {
         "1.21.60 must move itemstates out of start_game"
     );
 
-    const std::vector<bedrock::BedrockItemState> states {{
-        .name = "minecraft:firework_rocket",
-        .runtimeId = 552,
-        .componentBased = false,
-        .version = bedrock::ProtoDefValue::string("none"),
-        .nbt = emptyPacketNbtValue()
-    }};
+    const bedrock::ProtoDefField* legacyItemCount = nullptr;
+    for (const auto& field : beforeFields) {
+        if (field.path == "itemstates.$count") {
+            legacyItemCount = &field;
+            break;
+        }
+    }
+    if (legacyItemCount != nullptr) {
+        bedrock::ProtoDefWriter itemstates;
+        itemstates.varuint32(2);
+        itemstates.string("minecraft:firework_rocket");
+        itemstates.u16le(552);
+        itemstates.boolValue(false);
+        itemstates.string("minecraft:shield");
+        itemstates.u16le(355);
+        itemstates.boolValue(false);
+        auto itemstateBytes = itemstates.take();
+        auto legacyStartPayload = beforeStart.payload;
+        legacyStartPayload.erase(
+            legacyStartPayload.begin() +
+                static_cast<std::ptrdiff_t>(legacyItemCount->offset),
+            legacyStartPayload.begin() +
+                static_cast<std::ptrdiff_t>(
+                    legacyItemCount->offset + legacyItemCount->size
+                )
+        );
+        legacyStartPayload.insert(
+            legacyStartPayload.begin() +
+                static_cast<std::ptrdiff_t>(legacyItemCount->offset),
+            itemstateBytes.begin(),
+            itemstateBytes.end()
+        );
+        auto legacyVariables = bedrock::makeProtoDefVariableStore();
+        bedrock::ProtoDefPacketDecoder(
+            beforeVersion,
+            legacyVariables
+        ).validatePacketStrict("start_game", legacyStartPayload);
+        ok &= check(
+            legacyVariables->variable("ShieldItemID") == "355",
+            "1.21.50 streamed start_game lost legacy itemstates palette"
+        );
+    }
+
+    const std::vector<bedrock::BedrockItemState> states {
+        {
+            .name = "minecraft:firework_rocket",
+            .runtimeId = 552,
+            .componentBased = false,
+            .version = bedrock::ProtoDefValue::string("none"),
+            .nbt = emptyPacketNbtValue()
+        },
+        {
+            .name = "minecraft:shield",
+            .runtimeId = 355,
+            .componentBased = false,
+            .version = bedrock::ProtoDefValue::string("none"),
+            .nbt = emptyPacketNbtValue()
+        }
+    };
     const auto registry = itemRegistryPacket(afterVersion, states);
     const auto registryFields = bedrock::ProtoDefPacketDecoder(afterVersion)
         .decodePacketStrict("item_registry", registry.payload);
@@ -537,6 +589,46 @@ bool checkItemRegistryVersionBoundary() {
         decoded.name == "item_registry" &&
             decoded.fullPacket == registry.fullPacket,
         "1.21.60 item_registry full-packet identity failed"
+    );
+
+    auto streamedVariables = bedrock::makeProtoDefVariableStore();
+    bedrock::ProtoDefPacketDecoder streamedDecoder(
+        afterVersion,
+        streamedVariables
+    );
+    const auto streamedPalette = streamedDecoder.decodeItemPaletteStrict(
+        "item_registry",
+        registry.payload
+    );
+    ok &= check(
+        streamedPalette.size() == states.size() &&
+            streamedPalette[0].first == 552 &&
+            streamedPalette[0].second == "minecraft:firework_rocket" &&
+            streamedPalette[1].first == 355 &&
+            streamedPalette[1].second == "minecraft:shield" &&
+            streamedVariables->variable("ShieldItemID") == "355",
+        "1.21.60 compact item_registry validation lost palette state"
+    );
+
+    const auto rejects = [&](std::vector<uint8_t> payload) {
+        try {
+            streamedDecoder.validatePacketStrict("item_registry", payload);
+            return false;
+        } catch (const std::exception&) {
+            return true;
+        }
+    };
+    auto trailing = registry.payload;
+    trailing.push_back(0);
+    ok &= check(
+        rejects(std::move(trailing)),
+        "compact item_registry validation accepted trailing bytes"
+    );
+    auto truncatedNbt = registry.payload;
+    truncatedNbt.pop_back();
+    ok &= check(
+        rejects(std::move(truncatedNbt)),
+        "compact item_registry validation accepted truncated NBT"
     );
     return ok;
 }
@@ -1090,6 +1182,43 @@ bool checkMapFloodAndItemOrdering() {
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - registryDecodeStarted
         );
+
+    // Production 1.21.100 registries carry component NBT and are commonly
+    // around 135 KiB. The minecraft-data registry uses empty NBT, so enrich it
+    // to reproduce the Android relay stall instead of testing only the small
+    // 60 KiB control fixture.
+    auto relayRegistry = registry;
+    if (!capturedRegistry.has_value()) {
+        auto componentRichStates = registryStates;
+        for (auto& state : componentRichStates) {
+            state.nbt = bedrock::nbtDocumentToProtoDefValue({
+                "",
+                bedrock::NbtValue::compound({{
+                    "component",
+                    bedrock::NbtValue::string("relay_component_payload_data")
+                }})
+            });
+        }
+        relayRegistry = itemRegistryPacket(version, componentRichStates);
+    }
+
+    auto streamedVariables = bedrock::makeProtoDefVariableStore();
+    const auto streamedDecodeStarted = std::chrono::steady_clock::now();
+    const auto streamedPalette = bedrock::ProtoDefPacketDecoder(
+        version,
+        streamedVariables
+    ).decodeItemPaletteStrict("item_registry", relayRegistry.payload);
+    const auto streamedDecodeElapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - streamedDecodeStarted
+        );
+    std::optional<int64_t> streamedShieldId;
+    for (const auto& [runtimeId, name] : streamedPalette) {
+        if (name == "minecraft:shield") {
+            streamedShieldId = runtimeId;
+            break;
+        }
+    }
     const auto creativeContent = encodedPacket(
         version,
         "creative_content",
@@ -1259,6 +1388,7 @@ bool checkMapFloodAndItemOrdering() {
     std::atomic<int> itemBearingPackets {0};
     std::atomic<int64_t> registrySentAtNs {0};
     std::atomic<int64_t> registryDeliveryMs {-1};
+    std::atomic<int64_t> sequenceDeliveryMs {-1};
     std::atomic<bool> bytesMismatch {false};
     std::atomic<bool> missingRuntimeId {false};
     std::atomic<bool> downstreamDecodeFailed {false};
@@ -1299,7 +1429,7 @@ bool checkMapFloodAndItemOrdering() {
                 registryDeliveryMs = (receivedAt - sentAt) / 1'000'000;
             }
             ++registries;
-            if (event.packet.fullPacket != registry.fullPacket) {
+            if (event.packet.fullPacket != relayRegistry.fullPacket) {
                 bytesMismatch = true;
             }
         }
@@ -1311,6 +1441,16 @@ bool checkMapFloodAndItemOrdering() {
                 bytesMismatch = true;
             }
             return;
+        }
+        if (event.packet.name == "add_item_entity") {
+            const auto sentAt = registrySentAtNs.load();
+            if (sentAt != 0) {
+                const auto receivedAt =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()
+                    ).count();
+                sequenceDeliveryMs = (receivedAt - sentAt) / 1'000'000;
+            }
         }
 
         const bool itemBearing =
@@ -1382,6 +1522,24 @@ bool checkMapFloodAndItemOrdering() {
         registryDecodeElapsed < 2s,
         "full 1.21.100 item_registry strict decode exceeded two seconds"
     );
+    ok &= check(
+        relayRegistry.fullPacket.size() >= 130'000,
+        "component-rich 1.21.100 item_registry did not reproduce production size"
+    );
+    ok &= check(
+        streamedPalette.size() == expectedRegistryCount,
+        "streamed item_registry palette count mismatch"
+    );
+    ok &= check(
+        streamedShieldId.has_value() &&
+            streamedVariables->variable("ShieldItemID") ==
+                std::to_string(*streamedShieldId),
+        "streamed item_registry did not update ShieldItemID"
+    );
+    ok &= check(
+        streamedDecodeElapsed < 250ms,
+        "component-rich item_registry streaming decode exceeded 250 ms"
+    );
     const bool connected = downstream.connect();
     const bool ready = connected && waitFor([&]() {
         return joins.load() == 1 && hasUpstreamConnection &&
@@ -1417,26 +1575,10 @@ bool checkMapFloodAndItemOrdering() {
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()
             ).count();
-        upstream.sendPacket(target, registry);
-    }
-    const bool paletteReady = ready && waitFor([&]() {
-        return registries.load() == 1;
-    }, 60s);
-    ok &= check(paletteReady, "item_registry was not delivered before items");
-    if (paletteReady) {
-        ok &= check(
-            registryDeliveryMs.load() >= 0 && registryDeliveryMs.load() < 6'000,
-            "full 1.21.100 item_registry relay delivery exceeded six seconds"
-        );
-    }
-    std::cerr << "[item-registry-regression] entries=" << expectedRegistryCount
-              << " bytes=" << registry.fullPacket.size()
-              << " fields=" << registryFields.size()
-              << " strict_decode_ms=" << registryDecodeElapsed.count()
-              << " relay_delivery_ms=" << registryDeliveryMs.load()
-              << "\n";
-
-    if (paletteReady) {
+        // Send the registry and the item/map burst together. Before the fix,
+        // synchronous registry materialization blocked this stream and then
+        // released a large accumulated burst toward Minecraft.
+        upstream.queuePacket(target, relayRegistry);
         upstream.queuePacket(target, creativeContent);
         upstream.queuePacket(target, inventoryContent);
         upstream.queuePackets(target, maps);
@@ -1445,9 +1587,26 @@ bool checkMapFloodAndItemOrdering() {
         upstream.queuePacket(target, addItemEntity);
         upstream.sendQueued(target);
     }
+    const bool paletteReady = ready && waitFor([&]() {
+        return registries.load() == 1;
+    }, 60s);
+    ok &= check(paletteReady, "item_registry was not delivered before items");
+    if (paletteReady) {
+        ok &= check(
+            registryDeliveryMs.load() >= 0 && registryDeliveryMs.load() < 1'500,
+            "component-rich item_registry relay delivery exceeded 1.5 seconds"
+        );
+    }
+    std::cerr << "[item-registry-regression] entries=" << expectedRegistryCount
+              << " bytes=" << relayRegistry.fullPacket.size()
+              << " fields=" << registryFields.size()
+              << " strict_decode_ms=" << registryDecodeElapsed.count()
+              << " streamed_decode_ms=" << streamedDecodeElapsed.count()
+              << " relay_delivery_ms=" << registryDeliveryMs.load()
+              << "\n";
     std::vector<bedrock::VersionedGamePacket> expected {
         startGame,
-        registry,
+        relayRegistry,
         creativeContent,
         inventoryContent
     };
@@ -1462,6 +1621,16 @@ bool checkMapFloodAndItemOrdering() {
             slots.load() == 1 && itemBearingPackets.load() == 4;
     }, 20s);
     ok &= check(floodDelivered, "map flood or following inventory item stalled");
+    if (floodDelivered) {
+        std::cerr << "[item-map-burst] packets=" << expected.size()
+                  << " sequence_delivery_ms=" << sequenceDeliveryMs.load()
+                  << "\n";
+        ok &= check(
+            sequenceDeliveryMs.load() >= 0 &&
+                sequenceDeliveryMs.load() < 2'500,
+            "item/map sequence remained backlogged behind item_registry"
+        );
+    }
     if (floodDelivered) {
         std::lock_guard<std::mutex> lock(downstreamStateMutex);
         for (std::size_t index = 0; index < expected.size(); ++index) {

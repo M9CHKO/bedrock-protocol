@@ -3062,7 +3062,10 @@ public:
         replacements_.clear();
         if (replacement.name == "start_game" || replacement.name == "item_registry") {
             ProtoDefPacketDecoder decoder(version_, variables_);
-            (void) decoder.decodePacket(replacement.name, replacement.payload);
+            decoder.updatePacketVariables(
+                replacement.name,
+                replacement.payload
+            );
         }
         replacements_.push_back(std::move(replacement));
     }
@@ -4219,20 +4222,13 @@ private:
                     options_.version,
                     packetVariables
                 );
-                if (event.packet.name == "start_game" ||
-                    event.packet.name == "item_registry") {
-                    // These two packets update connection-scoped ProtoDef
-                    // variables used by later item packets.
-                    (void) decoder.decodePacketStrict(
-                        event.packet.name,
-                        event.packet.payload
-                    );
-                } else {
-                    decoder.validatePacketStrict(
-                        event.packet.name,
-                        event.packet.payload
-                    );
-                }
+                // Validation streams the small connection-scoped state needed
+                // from start_game/item_registry without materializing their
+                // complete field trees. Raw packet bytes remain untouched.
+                decoder.validatePacketStrict(
+                    event.packet.name,
+                    event.packet.payload
+                );
                 return;
             }
 

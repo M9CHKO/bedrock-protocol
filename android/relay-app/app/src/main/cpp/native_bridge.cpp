@@ -149,6 +149,10 @@ bool isItemInteractionBreadcrumb(std::string_view name) {
         name == "container_close";
 }
 
+bool isClientboundEquipmentFlood(std::string_view name) {
+    return name == "mob_equipment" || name == "mob_armor_equipment";
+}
+
 std::string packetBreadcrumb(
     std::string_view direction,
     const bedrock::VersionedGamePacket& packet
@@ -389,6 +393,7 @@ struct RelayState {
     std::string lastError;
     std::deque<bedrock::JsRuntimeValue> events;
     uint64_t droppedEvents = 0;
+    std::atomic<uint64_t> clientboundEquipmentPackets {0};
 
     void push(bedrock::JsRuntimeValue event) {
         std::lock_guard lock(mutex);
@@ -550,6 +555,7 @@ public:
 
         auto relay = std::make_unique<bedrock::Relay>(std::move(options));
         relay->onConnect([state](bedrock::RelayPlayer& player) {
+            state->clientboundEquipmentPackets = 0;
             int64_t relayElapsed = 0;
             {
                 std::lock_guard lock(state->mutex);
@@ -591,7 +597,11 @@ public:
             state->push(
                 "disconnect",
                 "downstream_session=" + player.sessionId() +
-                    "; matching upstream was notified and closed",
+                    "; matching upstream was notified and closed; "
+                    "clientbound_equipment_packets=" +
+                    std::to_string(
+                        state->clientboundEquipmentPackets.load()
+                    ),
                 "INFO",
                 "lifecycle"
             );
@@ -629,9 +639,27 @@ public:
         });
         relay->live().onClientbound([state](bedrock::BedrockRelayPacketEvent& event) {
             if (isItemInteractionBreadcrumb(event.packet.name)) {
+                uint64_t sampleIndex = 0;
+                if (isClientboundEquipmentFlood(event.packet.name)) {
+                    sampleIndex =
+                        state->clientboundEquipmentPackets.fetch_add(1) + 1;
+                    // A populated server can emit hundreds of equipment
+                    // updates immediately after the registry. Keep enough
+                    // samples for diagnosis without doing hundreds of JNI,
+                    // JSON and file writes in one Android scheduler slice.
+                    if (sampleIndex > 8 && sampleIndex % 128 != 0) return;
+                }
+                auto breadcrumb = packetBreadcrumb(
+                    "clientbound",
+                    event.packet
+                );
+                if (sampleIndex != 0) {
+                    breadcrumb += " sample_index=" +
+                        std::to_string(sampleIndex);
+                }
                 state->push(
                     "packet",
-                    packetBreadcrumb("clientbound", event.packet),
+                    std::move(breadcrumb),
                     "DEBUG",
                     "packet"
                 );

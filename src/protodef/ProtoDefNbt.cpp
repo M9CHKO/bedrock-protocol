@@ -426,4 +426,30 @@ ProtoDefValue readProtoDefNbt(
     return nbtDocumentToProtoDefValue(document);
 }
 
+void skipProtoDefNbt(
+    ProtoDefReader& reader,
+    BedrockNbtEncoding encoding
+) {
+    if (reader.remaining() == 0) {
+        throw BedrockNbtError("not enough bytes for NBT root tag");
+    }
+
+    const auto start = reader.offset();
+    BinaryStream stream = BinaryStream::view(reader.data(), start);
+
+    if (reader.data()[start] == static_cast<uint8_t>(NbtTagType::End)) {
+        stream.readU8();
+        if (encoding == BedrockNbtEncoding::LittleVarInt) {
+            (void) stream.readString();
+        }
+    } else {
+        // BedrockNbtCodec still performs the complete recursive parse and all
+        // bounds checks. Avoid only the additional NbtValue -> ProtoDefValue
+        // conversion required by structured packet consumers.
+        (void) BedrockNbtCodec::read(stream, encoding);
+    }
+
+    reader.skip(stream.offset() - start);
+}
+
 } // namespace bedrock

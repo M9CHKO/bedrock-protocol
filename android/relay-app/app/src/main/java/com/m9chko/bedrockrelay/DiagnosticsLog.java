@@ -55,6 +55,16 @@ final class DiagnosticsLog {
         String component,
         String message
     ) {
+        appendAt(context, level, component, message, 0);
+    }
+
+    static void appendAt(
+        Context context,
+        String level,
+        String component,
+        String message,
+        long timestampMillis
+    ) {
         if (context == null) return;
         synchronized (LOCK) {
             try {
@@ -63,7 +73,11 @@ final class DiagnosticsLog {
                 String timestamp = new SimpleDateFormat(
                     "yyyy-MM-dd'T'HH:mm:ss.SSSXXX",
                     Locale.US
-                ).format(new Date());
+                ).format(new Date(
+                    timestampMillis > 0
+                        ? timestampMillis
+                        : System.currentTimeMillis()
+                ));
                 String normalizedLevel = cleanTag(level, "INFO");
                 String line = timestamp + " [" + normalizedLevel +
                     "] [" + cleanTag(component, "app") + "] " +

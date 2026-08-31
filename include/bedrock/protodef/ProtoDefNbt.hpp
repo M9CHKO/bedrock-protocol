@@ -33,4 +33,13 @@ ProtoDefValue readProtoDefNbt(
     BedrockNbtEncoding encoding
 );
 
+// Parse and validate one complete packet NBT value while discarding its
+// materialized representation. Transparent relay validation uses this path:
+// it must reject malformed NBT, but does not need to allocate a second
+// ProtoDefValue tree or stringify it to JSON before forwarding raw bytes.
+void skipProtoDefNbt(
+    ProtoDefReader& reader,
+    BedrockNbtEncoding encoding
+);
+
 } // namespace bedrock

@@ -25,6 +25,7 @@ namespace bedrock {
 class ProtoDefDecoder {
 public:
     using TypeResolver = std::function<std::optional<std::string>(const std::string&)>;
+    using FieldObserver = std::function<void(const ProtoDefField&)>;
 
     ProtoDefDecoder() = default;
 
@@ -64,12 +65,20 @@ public:
         variables_ = variables;
     }
 
-    // Strict packet validation only needs the reader/context side effects.
-    // Avoid retaining one ProtoDefField per array element (for example the
-    // 16,384 colours in clientbound_map_item_data) when no caller will read
-    // the structured result.
+    // Strict packet validation only needs reader/context side effects. Avoid
+    // retaining fields for large arrays such as item_registry definitions or
+    // the 16,384 colours in clientbound_map_item_data.
     void setCollectFields(bool collectFields) {
         collectFields_ = collectFields;
+    }
+
+    // Validation paths may need a tiny subset of decoded scalar values for
+    // connection state (currently the item palette's shield runtime ID), but
+    // retaining every field of a large packet is prohibitively expensive.
+    // The observer receives fields as they are decoded without changing wire
+    // validation or forcing them into the returned field vector.
+    void setFieldObserver(FieldObserver observer) {
+        fieldObserver_ = std::move(observer);
     }
 
     std::optional<std::string> variable(const std::string& key) const {
@@ -86,7 +95,18 @@ public:
         std::vector<ProtoDefField>& out,
         ProtoDefContext& context
     ) const {
-        const std::string type = trim(typeJson);
+        // Generated schemas are already normalized. Avoid copying the entire
+        // inline container definition for every array element; only allocate
+        // when an external schema actually has surrounding whitespace.
+        std::string normalizedType;
+        const std::string* typePointer = &typeJson;
+        if (typeJson.empty() ||
+            std::isspace(static_cast<unsigned char>(typeJson.front())) ||
+            std::isspace(static_cast<unsigned char>(typeJson.back()))) {
+            normalizedType = trim(typeJson);
+            typePointer = &normalizedType;
+        }
+        const std::string& type = *typePointer;
 
         if (isJsonString(type)) {
             decodeTypeName(unquote(type), reader, path, out, context);
@@ -193,12 +213,30 @@ public:
     }
 
 private:
+    struct ContainerFieldDefinition {
+        std::optional<std::string> name;
+        std::string type;
+        bool anonymous = false;
+    };
+
+    struct MapperDefinition {
+        std::string baseType;
+        std::unordered_map<std::string, std::string> mappings;
+    };
+
     bool collectFields_ = true;
+    FieldObserver fieldObserver_;
+    mutable std::unordered_map<
+        std::string,
+        std::vector<ContainerFieldDefinition>
+    > containerFieldsCache_;
+    mutable std::unordered_map<std::string, MapperDefinition> mapperCache_;
 
     void appendField(
         std::vector<ProtoDefField>& out,
         const ProtoDefField& field
     ) const {
+        if (fieldObserver_) fieldObserver_(field);
         if (collectFields_) out.push_back(field);
     }
 
@@ -206,24 +244,8 @@ private:
         std::vector<ProtoDefField>& out,
         ProtoDefField&& field
     ) const {
+        if (fieldObserver_) fieldObserver_(field);
         if (collectFields_) out.push_back(std::move(field));
-    }
-
-    static bool isScalarArrayType(const std::string& typeJson) {
-        if (!isJsonString(trim(typeJson))) return false;
-        const auto type = unquote(trim(typeJson));
-        return type == "void" || type == "bool" || type == "byte" ||
-            type == "u8" || type == "lu8" || type == "i8" ||
-            type == "li8" || type == "u16" || type == "lu16" ||
-            type == "i16" || type == "li16" || type == "u32" ||
-            type == "lu32" || type == "i32" || type == "li32" ||
-            type == "u64" || type == "lu64" || type == "i64" ||
-            type == "li64" || type == "varint" || type == "varuint" ||
-            type == "varint64" || type == "varuint64" ||
-            type == "varlong" || type == "zigzag32" ||
-            type == "zigzag64" || type == "varint128" ||
-            type == "f32" || type == "lf32" || type == "f64" ||
-            type == "lf64";
     }
 
     static std::string enumSizeBasedOnValuesLen(const ProtoDefContext& context) {
@@ -593,54 +615,55 @@ private:
         std::vector<ProtoDefField>& out,
         ProtoDefContext& context
     ) const {
-        auto baseType = readJsonStringField(mapperJson, "type");
-        if (!baseType.has_value()) {
-            throw std::runtime_error("mapper base type not found");
-        }
+        const auto& mapper = parsedMapper(mapperJson);
+        const auto& baseType = mapper.baseType;
 
         const std::size_t start = reader.offset();
 
         std::string numeric;
-        if (*baseType == "u8" || *baseType == "lu8") {
+        if (baseType == "u8" || baseType == "lu8") {
             uint8_t v = 0;
             if (!reader.tryU8(v)) {
                 numeric = "<missing:u8>";
             } else {
                 numeric = std::to_string(v);
             }
-        } else if (*baseType == "i8" || *baseType == "li8") {
+        } else if (baseType == "i8" || baseType == "li8") {
             numeric = std::to_string(static_cast<int8_t>(reader.u8()));
-        } else if (*baseType == "u16") {
+        } else if (baseType == "u16") {
             numeric = std::to_string(reader.u16be());
-        } else if (*baseType == "lu16") {
+        } else if (baseType == "lu16") {
             numeric = std::to_string(reader.u16le());
-        } else if (*baseType == "i16") {
+        } else if (baseType == "i16") {
             numeric = std::to_string(static_cast<int16_t>(reader.u16be()));
-        } else if (*baseType == "li16") {
+        } else if (baseType == "li16") {
             numeric = std::to_string(static_cast<int16_t>(reader.u16le()));
-        } else if (*baseType == "u32") {
+        } else if (baseType == "u32") {
             numeric = std::to_string(reader.u32be());
-        } else if (*baseType == "lu32") {
+        } else if (baseType == "lu32") {
             numeric = std::to_string(reader.u32le());
-        } else if (*baseType == "i32") {
+        } else if (baseType == "i32") {
             numeric = std::to_string(reader.i32be());
-        } else if (*baseType == "li32") {
+        } else if (baseType == "li32") {
             numeric = std::to_string(reader.i32le());
-        } else if (*baseType == "varint" || *baseType == "varuint") {
+        } else if (baseType == "varint" || baseType == "varuint") {
             numeric = std::to_string(reader.varuint32());
-        } else if (*baseType == "varint64" || *baseType == "varuint64") {
+        } else if (baseType == "varint64" || baseType == "varuint64") {
             numeric = std::to_string(reader.varuint64());
-        } else if (*baseType == "zigzag32") {
+        } else if (baseType == "zigzag32") {
             numeric = std::to_string(reader.zigzag32());
         } else {
-            throw std::runtime_error("mapper unsupported base type: " + *baseType);
+            throw std::runtime_error("mapper unsupported base type: " + baseType);
         }
 
-        std::string mapped = readMapperValue(mapperJson, numeric).value_or(numeric);
+        const auto mapping = mapper.mappings.find(numeric);
+        const std::string mapped = mapping == mapper.mappings.end()
+            ? numeric
+            : mapping->second;
 
         ProtoDefField field;
         field.path = path.empty() ? "$value" : path;
-        field.type = "mapper<" + *baseType + ">";
+        field.type = "mapper<" + baseType + ">";
         field.value = numeric + "/" + mapped;
         field.offset = start;
         field.size = reader.offset() - start;
@@ -649,6 +672,80 @@ private:
 
         // В context кладём именно mapped, как protodef switch сравнивает по enum name.
         context.set(field.path, mapped);
+    }
+
+    const MapperDefinition& parsedMapper(const std::string& mapperJson) const {
+        if (const auto cached = mapperCache_.find(mapperJson);
+            cached != mapperCache_.end()) {
+            return cached->second;
+        }
+
+        MapperDefinition parsed;
+        const auto baseType = readJsonStringField(mapperJson, "type");
+        if (!baseType.has_value()) {
+            throw std::runtime_error("mapper base type not found");
+        }
+        parsed.baseType = *baseType;
+
+        if (const auto mappings = readJsonValueField(mapperJson, "mappings")) {
+            const auto objectStart = mappings->find('{');
+            const auto objectEnd = objectStart == std::string::npos
+                ? std::string::npos
+                : findMatching(*mappings, objectStart, '{', '}');
+            if (objectEnd != std::string::npos) {
+                std::size_t position = objectStart + 1;
+                while (position < objectEnd) {
+                    while (position < objectEnd &&
+                           (std::isspace(static_cast<unsigned char>(
+                                (*mappings)[position]
+                            )) || (*mappings)[position] == ',')) {
+                        ++position;
+                    }
+                    if (position >= objectEnd || (*mappings)[position] != '"') {
+                        break;
+                    }
+                    const auto keyEnd = findStringEnd(*mappings, position);
+                    if (keyEnd == std::string::npos || keyEnd >= objectEnd) break;
+                    const std::string key = mappings->substr(
+                        position + 1,
+                        keyEnd - position - 1
+                    );
+                    position = keyEnd + 1;
+                    while (position < objectEnd &&
+                           std::isspace(static_cast<unsigned char>(
+                               (*mappings)[position]
+                           ))) {
+                        ++position;
+                    }
+                    if (position >= objectEnd || (*mappings)[position] != ':') break;
+                    ++position;
+                    while (position < objectEnd &&
+                           std::isspace(static_cast<unsigned char>(
+                               (*mappings)[position]
+                           ))) {
+                        ++position;
+                    }
+                    const auto valueEnd = findJsonValueEnd(
+                        *mappings,
+                        position,
+                        objectEnd
+                    );
+                    if (valueEnd == std::string::npos) break;
+                    const auto value = trim(mappings->substr(
+                        position,
+                        valueEnd - position
+                    ));
+                    if (isJsonString(value)) {
+                        parsed.mappings.emplace(key, unquote(value));
+                    }
+                    position = valueEnd;
+                }
+            }
+        }
+
+        return mapperCache_
+            .emplace(mapperJson, std::move(parsed))
+            .first->second;
     }
 
 
@@ -719,13 +816,17 @@ private:
         appendField(out, countField);
         context.set(countField.path, countField.value);
 
-        const bool compactScalarValidation =
-            !collectFields_ && isScalarArrayType(*itemType);
-        const std::string validationPath = compactScalarValidation
+        // A validation-only pass never exposes indexed field paths. Reusing
+        // one path for every element keeps ProtoDefContext bounded instead of
+        // accumulating thousands of itemstates[i].* keys. Relative sibling
+        // references remain correct because each sequential element replaces
+        // the previous value under the same compact path.
+        const bool compactValidation = !collectFields_;
+        const std::string validationPath = compactValidation
             ? path + "[]"
             : std::string();
         for (int64_t i = 0; i < count; ++i) {
-            std::string childPath = compactScalarValidation
+            std::string childPath = compactValidation
                 ? validationPath
                 : path + "[" + std::to_string(i) + "]";
             try {
@@ -753,7 +854,11 @@ private:
 
         int64_t index = 0;
         while (reader.remaining() > 0) {
-            decode(*itemType, reader, path + "[" + std::to_string(index++) + "]", out, context);
+            const std::string childPath = !collectFields_
+                ? path + "[]"
+                : path + "[" + std::to_string(index) + "]";
+            ++index;
+            decode(*itemType, reader, childPath, out, context);
         }
     }
 
@@ -787,7 +892,11 @@ private:
             }
 
             reader.rewindTo(before);
-            decode(*itemType, reader, path + "[" + std::to_string(index++) + "]", out, context);
+            const std::string childPath = !collectFields_
+                ? path + "[]"
+                : path + "[" + std::to_string(index) + "]";
+            ++index;
+            decode(*itemType, reader, childPath, out, context);
         }
     }
 
@@ -798,46 +907,81 @@ private:
         std::vector<ProtoDefField>& out,
         ProtoDefContext& context
     ) const {
-        auto fields = readSecondElement(containerJson);
-        if (!fields.has_value()) {
+        const auto& fields = parsedContainerFields(containerJson);
+        for (const auto& field : fields) {
+            std::string childPath = path;
+            if (!field.anonymous && field.name.has_value()) {
+                childPath = path.empty()
+                    ? *field.name
+                    : path + "." + *field.name;
+            }
+
+            try {
+                decode(field.type, reader, childPath, out, context);
+            } catch (const std::exception& e) {
+                throw std::runtime_error(
+                    "at " +
+                    (childPath.empty()
+                        ? std::string("$container")
+                        : childPath) +
+                    ": " + e.what()
+                );
+            }
+        }
+    }
+
+    const std::vector<ContainerFieldDefinition>& parsedContainerFields(
+        const std::string& containerJson
+    ) const {
+        if (const auto cached = containerFieldsCache_.find(containerJson);
+            cached != containerFieldsCache_.end()) {
+            return cached->second;
+        }
+
+        auto fieldsJson = readSecondElement(containerJson);
+        if (!fieldsJson.has_value()) {
             throw std::runtime_error("container fields array not found");
         }
-        if (!startsWith(trim(*fields), "[")) {
+        if (!startsWith(trim(*fieldsJson), "[")) {
             throw std::runtime_error("container fields value is not an array");
         }
 
+        std::vector<ContainerFieldDefinition> parsed;
         std::size_t pos = 0;
         while (true) {
-            auto objStart = fields->find('{', pos);
+            const auto objStart = fieldsJson->find('{', pos);
             if (objStart == std::string::npos) break;
 
-            auto objEnd = findMatching(*fields, objStart, '{', '}');
+            const auto objEnd = findMatching(
+                *fieldsJson,
+                objStart,
+                '{',
+                '}'
+            );
             if (objEnd == std::string::npos) {
                 throw std::runtime_error("container field object not closed");
             }
 
-            std::string fieldObj = fields->substr(objStart, objEnd - objStart + 1);
-
-            auto name = readJsonStringField(fieldObj, "name");
-            auto type = readJsonValueField(fieldObj, "type");
-            bool anon = readJsonBoolField(fieldObj, "anon").value_or(false);
-
-            if (type.has_value()) {
-                std::string childPath = path;
-
-                if (!anon && name.has_value()) {
-                    childPath = path.empty() ? *name : path + "." + *name;
-                }
-
-                try {
-                    decode(*type, reader, childPath, out, context);
-                } catch (const std::exception& e) {
-                    throw std::runtime_error("at " + (childPath.empty() ? std::string("$container") : childPath) + ": " + e.what());
-                }
+            const std::string fieldObject = fieldsJson->substr(
+                objStart,
+                objEnd - objStart + 1
+            );
+            if (auto type = readJsonValueField(fieldObject, "type")) {
+                parsed.push_back({
+                    .name = readJsonStringField(fieldObject, "name"),
+                    .type = std::move(*type),
+                    .anonymous = readJsonBoolField(
+                        fieldObject,
+                        "anon"
+                    ).value_or(false)
+                });
             }
-
             pos = objEnd + 1;
         }
+
+        return containerFieldsCache_
+            .emplace(containerJson, std::move(parsed))
+            .first->second;
     }
 
     void decodeBitflags(
@@ -1174,13 +1318,24 @@ private:
                     break;
                 }
                 reader.rewindTo(before);
-                values.push_back(readProtoDefNbt(reader, BedrockNbtEncoding::LittleVarInt));
+                if (collectFields_) {
+                    values.push_back(readProtoDefNbt(
+                        reader,
+                        BedrockNbtEncoding::LittleVarInt
+                    ));
+                } else {
+                    skipProtoDefNbt(reader, BedrockNbtEncoding::LittleVarInt);
+                }
             }
             if (!terminated) {
                 throw std::runtime_error("nbtLoop is missing its TAG_End terminator");
             }
-            field.structuredValue = ProtoDefValue::array(std::move(values));
-            field.value = ProtoDefJson::stringify(*field.structuredValue);
+            if (collectFields_) {
+                field.structuredValue = ProtoDefValue::array(std::move(values));
+                field.value = ProtoDefJson::stringify(*field.structuredValue);
+            } else {
+                field.value = "<nbtLoop>";
+            }
         } else if (typeName == "u8" || typeName == "lu8" || typeName == "byte") {
             if (reader.remaining() < 1) {
                 field.value = "<missing:u8>";
@@ -1268,15 +1423,28 @@ private:
                 std::to_string(x) + "," +
                 std::to_string(y) + "," +
                 std::to_string(z);
-        } else if (typeName == "native") {
-            field.structuredValue = readProtoDefNbt(reader, BedrockNbtEncoding::LittleVarInt);
-            field.value = ProtoDefJson::stringify(*field.structuredValue);
-        }  else if (typeName == "nbt") {
-            field.structuredValue = readProtoDefNbt(reader, BedrockNbtEncoding::LittleVarInt);
-            field.value = ProtoDefJson::stringify(*field.structuredValue);
+        } else if (typeName == "native" || typeName == "nbt") {
+            if (collectFields_) {
+                field.structuredValue = readProtoDefNbt(
+                    reader,
+                    BedrockNbtEncoding::LittleVarInt
+                );
+                field.value = ProtoDefJson::stringify(*field.structuredValue);
+            } else {
+                skipProtoDefNbt(reader, BedrockNbtEncoding::LittleVarInt);
+                field.value = typeName == "native" ? "<native>" : "<nbt>";
+            }
         } else if (typeName == "lnbt") {
-            field.structuredValue = readProtoDefNbt(reader, BedrockNbtEncoding::LittleEndian);
-            field.value = ProtoDefJson::stringify(*field.structuredValue);
+            if (collectFields_) {
+                field.structuredValue = readProtoDefNbt(
+                    reader,
+                    BedrockNbtEncoding::LittleEndian
+                );
+                field.value = ProtoDefJson::stringify(*field.structuredValue);
+            } else {
+                skipProtoDefNbt(reader, BedrockNbtEncoding::LittleEndian);
+                field.value = "<lnbt>";
+            }
         } else {
             if (resolver_) {
                 auto resolved = resolver_(typeName);
@@ -1474,25 +1642,6 @@ private:
         }
         return out;
     }
-
-    static std::optional<std::string> readMapperValue(
-        const std::string& mapperJson,
-        const std::string& numeric
-    ) {
-        auto mappings = readJsonValueField(mapperJson, "mappings");
-        if (!mappings.has_value()) return std::nullopt;
-
-        auto mapped = readJsonStringField(*mappings, numeric);
-        if (mapped.has_value()) return mapped;
-
-        auto quoted = readJsonValueField(*mappings, numeric);
-        if (quoted.has_value() && isJsonString(trim(*quoted))) {
-            return unquote(trim(*quoted));
-        }
-
-        return std::nullopt;
-    }
-
 
     static std::optional<std::string> findSecondArray(const std::string& json) {
         auto first = json.find('[');
