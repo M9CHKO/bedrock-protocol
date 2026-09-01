@@ -8,8 +8,18 @@ UDP-порту `19132` и подключает его к серверу, кот�
 
 ## Готовый APK
 
-- [CPE Relay 1.0.10 (arm64-v8a, optimized Release, debug-signed)](apk/CPE-Relay-v1.0.10-arm64-v8a-release-debug-signed.apk)
-- [SHA-256](apk/CPE-Relay-v1.0.10-arm64-v8a-release-debug-signed.apk.sha256)
+- [CPE Relay 1.0.11 (arm64-v8a, optimized Release, debug-signed)](apk/CPE-Relay-v1.0.11-arm64-v8a-release-debug-signed.apk)
+- [SHA-256](apk/CPE-Relay-v1.0.11-arm64-v8a-release-debug-signed.apk.sha256)
+
+Версия 1.0.11 исправляет зависшую локальную сессию после выхода из сервера.
+Если первая следующая отправка обнаруживает, что RakNet уже перешёл в
+`not_connected`, relay теперь считает это обычным закрытием клиента, сразу и
+ровно один раз удаляет native- и Bedrock-состояние и уведомляет соответствующий
+upstream. Старая очередь больше не создаёт поток `RakNet batch send rejected`.
+Состояние плавающего меню дополнительно привязано к событию
+`upstream_ready`: после `disconnect` или ошибки устаревший snapshot уже не
+может снова открыть drawer, поэтому панель и вкладка исчезают при выходе из
+Minecraft-сервера.
 
 Версия 1.0.10 исправляет оставшийся длительный `Checksum mismatch` на
 входящем потоке Minecraft. Проверка encrypted batch теперь выполняется на

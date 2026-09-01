@@ -75,6 +75,7 @@ struct BedrockServerTestAccess {
             std::lock_guard<std::mutex> lock(server.serverStateMutex_);
             server.connections_[mapKey] = connection;
             server.sessions_[mapKey] = std::move(session);
+            ++server.clientCount_;
         }
         return connection;
     }
@@ -103,6 +104,7 @@ struct BedrockServerTestAccess {
             std::lock_guard<std::mutex> lock(server.serverStateMutex_);
             server.connections_[mapKey] = connection;
             server.sessions_[mapKey] = std::move(session);
+            ++server.clientCount_;
         }
         return connection;
     }
@@ -225,6 +227,24 @@ struct BedrockServerTestAccess {
             });
         }
         server.flushOutboundQueues();
+    }
+
+    static void rejectBatchAsDisconnected(
+        BedrockServer& server,
+        const BedrockServerConnection& connection
+    ) {
+        RakNetServerSendResult result;
+        result.status = RakNetServerSendStatus::NotConnected;
+        result.connectionState = 3;
+        server.handleRejectedBatchSend(
+            connection,
+            {0xfe, 0x00},
+            0xfe,
+            0,
+            {},
+            "RakNet batch send rejected",
+            result
+        );
     }
 
     static std::pair<std::size_t, std::size_t> listenerCounts(
@@ -1614,6 +1634,61 @@ bool checkTransportFailureDiagnostics() {
             networkSettingsHash != 0x1853c5e83e41e97dull) {
             std::cerr << "[SMOKE] rejected transport reported a false send or "
                          "changed protocol-827 network_settings identity\n";
+            return false;
+        }
+    }
+
+    {
+        bedrock::BedrockServer server({
+            .version = "1.21.100",
+            .offline = true
+        });
+        const auto connection =
+            bedrock::BedrockServerTestAccess::addPlainPlayer(
+                server,
+                19207,
+                18,
+                true
+            );
+        std::atomic<int> closeCalls {0};
+        std::atomic<int> errorCalls {0};
+        connection.onClose([&]() {
+            ++closeCalls;
+        });
+        server.onTransport([&](
+            const bedrock::BedrockServerTransportEvent& event
+        ) {
+            if (event.kind ==
+                bedrock::BedrockServerTransportEventKind::Error) {
+                ++errorCalls;
+            }
+        });
+
+        bedrock::BedrockServerTestAccess::rejectBatchAsDisconnected(
+            server,
+            connection
+        );
+        // A stale producer retaining Player must be inert after the first
+        // not-connected result; it must not recreate the previous log flood.
+        bedrock::BedrockServerTestAccess::rejectBatchAsDisconnected(
+            server,
+            connection
+        );
+
+        if (closeCalls.load() != 1 || errorCalls.load() != 0 ||
+            bedrock::BedrockServerTestAccess::hasPlayerState(
+                server,
+                connection
+            ) || server.clientCount() != 0) {
+            std::cerr << "[SMOKE] not-connected send did not finalize the "
+                         "session exactly once: close="
+                      << closeCalls.load() << " errors=" << errorCalls.load()
+                      << " state="
+                      << bedrock::BedrockServerTestAccess::hasPlayerState(
+                             server,
+                             connection
+                         )
+                      << " clients=" << server.clientCount() << "\n";
             return false;
         }
     }

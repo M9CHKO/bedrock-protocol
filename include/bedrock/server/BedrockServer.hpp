@@ -1783,6 +1783,12 @@ private:
         // the old status. The global callback is an existing C++ extension.
         emitPlayerClose(connection);
         raknet_.closePeer(connection.peer);
+        // A remote peer can already be absent from RakNet's native connection
+        // table when an application write discovers the disconnect. In that
+        // case closePeer() has no native close callback to drive our logical
+        // cleanup. Finalize it here as well; handlePeerClosed() is idempotent
+        // when closePeer() did invoke the callback synchronously.
+        handlePeerClosed(connection.peer);
         clearPlayerListeners(connection);
 
         const auto session = sessionSnapshot(connection);
@@ -2135,14 +2141,14 @@ private:
                 mcpe
             );
             if (!sendResult.accepted()) {
-                emitTransport(
-                    BedrockServerTransportEventKind::Error,
-                    connection.peer,
+                handleRejectedBatchSend(
+                    connection,
                     mcpe,
                     mcpe.empty() ? 0 : mcpe.front(),
                     0,
                     {},
-                    sendFailureMessage("RakNet batch send rejected", sendResult)
+                    "RakNet batch send rejected",
+                    sendResult
                 );
                 return;
             }
@@ -2295,6 +2301,51 @@ private:
         const RakNetServerSendResult& result
     ) {
         return sendResultDetail(prefix, result);
+    }
+
+    static bool sendFailureMeansPeerGone(
+        RakNetServerSendStatus status
+    ) noexcept {
+        return status == RakNetServerSendStatus::UnknownPeer ||
+            status == RakNetServerSendStatus::NotConnected;
+    }
+
+    void handleRejectedBatchSend(
+        const BedrockServerConnection& connection,
+        const std::vector<uint8_t>& mcpe,
+        uint8_t raknetPacketId,
+        uint32_t gamePacketId,
+        const std::string& packetName,
+        const std::string& messagePrefix,
+        const RakNetServerSendResult& sendResult
+    ) {
+        if (!hasActivePlayer(connection)) {
+            return;
+        }
+
+        // NotConnected/UnknownPeer is the normal race when Minecraft has
+        // already left but RakNet's close notification has not reached the
+        // server loop yet. Treat it as a close, not as an error. Any failed
+        // encrypted write has advanced the stream counter, so all rejection
+        // modes must terminate this session instead of retrying it forever.
+        if (!sendFailureMeansPeerGone(sendResult.status)) {
+            emitTransport(
+                BedrockServerTransportEventKind::Error,
+                connection.peer,
+                mcpe,
+                raknetPacketId,
+                gamePacketId,
+                packetName,
+                sendFailureMessage(messagePrefix, sendResult)
+            );
+        }
+        // Server#close owns and clears the detached player table when the
+        // RakNet backend is already stopped. Other failures belong to a live
+        // logical session and must close it before another encrypted write.
+        if (sendResult.status == RakNetServerSendStatus::ServerStopped) {
+            return;
+        }
+        closePlayer(connection);
     }
 
     void emitTransport(
@@ -3415,17 +3466,14 @@ private:
                 true
             );
             if (!sendResult.accepted()) {
-                emitTransport(
-                    BedrockServerTransportEventKind::Error,
-                    connection.peer,
+                handleRejectedBatchSend(
+                    connection,
                     mcpe,
                     0xfe,
                     packet.packetId,
                     packet.name,
-                    sendFailureMessage(
-                        "RakNet pre-compression send rejected",
-                        sendResult
-                    )
+                    "RakNet pre-compression send rejected",
+                    sendResult
                 );
                 return false;
             }

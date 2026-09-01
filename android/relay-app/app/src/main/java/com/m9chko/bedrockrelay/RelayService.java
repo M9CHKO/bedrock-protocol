@@ -67,6 +67,7 @@ public final class RelayService extends Service {
     private RelayOverlayController overlayController;
     private volatile boolean serviceStopping;
     private volatile boolean overlayShouldBeVisible;
+    private volatile boolean overlaySessionReady;
     private volatile String notificationStatus = "Запуск UDP relay…";
     private volatile String lastSnapshotFingerprint = "";
     private volatile long lastPollingErrorAt;
@@ -132,6 +133,7 @@ public final class RelayService extends Service {
 
         promoteToForeground(buildNotification());
         acquireWakeLock();
+        overlaySessionReady = false;
         setOverlayVisible(false);
         applyRuntimeOptions(false);
         startPolling();
@@ -150,6 +152,7 @@ public final class RelayService extends Service {
     @Override
     public void onDestroy() {
         serviceStopping = true;
+        overlaySessionReady = false;
         overlayShouldBeVisible = false;
         if (overlayController != null) overlayController.hide();
         DiagnosticsLog.append(this, "INFO", "service", "Service destroying");
@@ -285,6 +288,7 @@ public final class RelayService extends Service {
             return;
         }
         if ("error".equals(type)) {
+            overlaySessionReady = false;
             setOverlayVisible(false);
             reportError(event.optString("message", "Неизвестная ошибка relay"));
             return;
@@ -311,10 +315,12 @@ public final class RelayService extends Service {
             "transport_error".equals(type) ||
             "parse_error".equals(type);
         if (sessionEnded) {
+            overlaySessionReady = false;
             logMemorySnapshot(type);
             setOverlayVisible(false);
         }
         if ("upstream_ready".equals(type)) {
+            overlaySessionReady = true;
             preferences.edit()
                 .remove(KEY_AUTH_CODE)
                 .remove(KEY_AUTH_URI)
@@ -360,9 +366,13 @@ public final class RelayService extends Service {
     private void updateStatusFromSnapshot(JSONObject state) {
         boolean running = state.optBoolean("running", false);
         boolean upstreamReady = state.optBoolean("upstreamReady", false);
+        int downstreamConnections = state.optInt("downstreamConnections", 0);
+        if (!running || !upstreamReady || downstreamConnections <= 0) {
+            overlaySessionReady = false;
+        }
         setOverlayVisible(
-            running && upstreamReady &&
-                state.optInt("downstreamConnections", 0) > 0
+            overlaySessionReady && running && upstreamReady &&
+                downstreamConnections > 0
         );
         if (!running) {
             return;
@@ -408,6 +418,7 @@ public final class RelayService extends Service {
             return;
         }
         serviceStopping = true;
+        overlaySessionReady = false;
         setOverlayVisible(false);
         DiagnosticsLog.append(
             this,
