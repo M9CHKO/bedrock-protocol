@@ -132,6 +132,8 @@ final class MotionSmoother {
         private double olderSlope;
         private int slopeCount;
         private double confidence = 1.0;
+        private double pendingStartDelta;
+        private double pendingStartSeconds;
 
         void reset() {
             initialized = false;
@@ -141,6 +143,8 @@ final class MotionSmoother {
             olderSlope = 0.0;
             slopeCount = 0;
             confidence = 1.0;
+            pendingStartDelta = 0.0;
+            pendingStartSeconds = 0.0;
         }
 
         double velocity() {
@@ -156,6 +160,29 @@ final class MotionSmoother {
             double intervalSeconds,
             double maximumVelocity,
             double zeroDelta
+        ) {
+            return update(
+                delta,
+                intervalSeconds,
+                maximumVelocity,
+                zeroDelta,
+                zeroDelta
+            );
+        }
+
+        /**
+         * Variant with a larger threshold for starting from rest. Tiny
+         * coherent samples are accumulated instead of being promoted to a
+         * full camera velocity immediately. This rejects float/vector noise
+         * without dead-zoning a genuine slow turn: several small samples in
+         * one direction still cross the threshold and start motion.
+         */
+        double update(
+            double delta,
+            double intervalSeconds,
+            double maximumVelocity,
+            double zeroDelta,
+            double startDelta
         ) {
             if (!Double.isFinite(delta) ||
                 !Double.isFinite(intervalSeconds) ||
@@ -176,11 +203,42 @@ final class MotionSmoother {
                 olderSlope = 0.0;
                 slopeCount = 0;
                 confidence = 1.0;
+                pendingStartDelta = 0.0;
+                pendingStartSeconds = 0.0;
                 return velocity;
             }
 
+            double measuredDelta = delta;
+            double measuredSeconds = intervalSeconds;
+            if (!initialized || stationary) {
+                double startThreshold = Math.max(
+                    epsilon,
+                    Math.max(0.0, startDelta)
+                );
+                if (Math.abs(delta) < startThreshold) {
+                    if (pendingStartDelta != 0.0 &&
+                        pendingStartDelta * delta < 0.0) {
+                        pendingStartDelta = 0.0;
+                        pendingStartSeconds = 0.0;
+                    }
+                    pendingStartDelta += delta;
+                    pendingStartSeconds += intervalSeconds;
+                    if (Math.abs(pendingStartDelta) < startThreshold) {
+                        initialized = true;
+                        stationary = true;
+                        velocity = 0.0;
+                        confidence = 0.9;
+                        return velocity;
+                    }
+                    measuredDelta = pendingStartDelta;
+                    measuredSeconds = pendingStartSeconds;
+                }
+                pendingStartDelta = 0.0;
+                pendingStartSeconds = 0.0;
+            }
+
             double measured = clamp(
-                delta / intervalSeconds,
+                measuredDelta / measuredSeconds,
                 -maximum,
                 maximum
             );
@@ -427,6 +485,14 @@ final class MotionSmoother {
         private static final double SizeDerivativeCutoffHz = 0.5;
         private static final double SizeMaximumCutoffHz = 8.0;
         private static final double SizeRelativeSpeedGain = 9.0;
+        private static final double CameraCenterMinimumCutoffHz = 3.8;
+        private static final double CameraCenterDerivativeCutoffHz = 1.1;
+        private static final double CameraCenterMaximumCutoffHz = 34.0;
+        private static final double CameraCenterRelativeSpeedGain = 52.0;
+        private static final double CameraSizeMinimumCutoffHz = 2.8;
+        private static final double CameraSizeDerivativeCutoffHz = 0.9;
+        private static final double CameraSizeMaximumCutoffHz = 24.0;
+        private static final double CameraSizeRelativeSpeedGain = 34.0;
 
         private final AdaptivePair center = new AdaptivePair();
         private final AdaptivePair size = new AdaptivePair();
@@ -483,15 +549,8 @@ final class MotionSmoother {
 
             long frameGap = Math.max(0, frameNanos - lastFrameNanos);
             if (!initialized || lastFrameNanos == 0 ||
-                cameraProjectionActive ||
                 frameGap > MaximumFrameGapNanos) {
                 initialized = true;
-                // Camera motion is already predicted and smoothed once for
-                // the whole overlay. Applying a second per-entity screen
-                // filter here makes every box trail the Minecraft image.
-                // Follow the shared projection directly while that global
-                // camera transform is active. World-space entity smoothing
-                // still keeps independently moving mobs continuous.
                 center.reset(targetCenterX, targetCenterY);
                 size.reset(targetWidth, targetHeight);
                 lastFrameNanos = frameNanos;
@@ -507,23 +566,47 @@ final class MotionSmoother {
                 1.0,
                 Math.max(viewportWidth, viewportHeight)
             );
+            double centerMinimum = cameraProjectionActive
+                ? CameraCenterMinimumCutoffHz
+                : CenterMinimumCutoffHz;
+            double centerGain = cameraProjectionActive
+                ? CameraCenterRelativeSpeedGain
+                : CenterRelativeSpeedGain;
+            double centerDerivative = cameraProjectionActive
+                ? CameraCenterDerivativeCutoffHz
+                : CenterDerivativeCutoffHz;
+            double centerMaximum = cameraProjectionActive
+                ? CameraCenterMaximumCutoffHz
+                : CenterMaximumCutoffHz;
+            double sizeMinimum = cameraProjectionActive
+                ? CameraSizeMinimumCutoffHz
+                : SizeMinimumCutoffHz;
+            double sizeGain = cameraProjectionActive
+                ? CameraSizeRelativeSpeedGain
+                : SizeRelativeSpeedGain;
+            double sizeDerivative = cameraProjectionActive
+                ? CameraSizeDerivativeCutoffHz
+                : SizeDerivativeCutoffHz;
+            double sizeMaximum = cameraProjectionActive
+                ? CameraSizeMaximumCutoffHz
+                : SizeMaximumCutoffHz;
             center.step(
                 targetCenterX,
                 targetCenterY,
                 deltaSeconds,
-                CenterMinimumCutoffHz,
-                CenterRelativeSpeedGain / viewportSpan,
-                CenterDerivativeCutoffHz,
-                CenterMaximumCutoffHz
+                centerMinimum,
+                centerGain / viewportSpan,
+                centerDerivative,
+                centerMaximum
             );
             size.step(
                 targetWidth,
                 targetHeight,
                 deltaSeconds,
-                SizeMinimumCutoffHz,
-                SizeRelativeSpeedGain / viewportSpan,
-                SizeDerivativeCutoffHz,
-                SizeMaximumCutoffHz
+                sizeMinimum,
+                sizeGain / viewportSpan,
+                sizeDerivative,
+                sizeMaximum
             );
             if (size.first() <= 0.0 || size.second() <= 0.0) {
                 size.reset(targetWidth, targetHeight);

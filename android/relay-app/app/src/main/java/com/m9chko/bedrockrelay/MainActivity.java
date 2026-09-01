@@ -8,7 +8,9 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.graphics.Color;
 import android.graphics.Typeface;
+import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -22,9 +24,11 @@ import android.view.View;
 import android.widget.Button;
 import android.widget.ArrayAdapter;
 import android.widget.EditText;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.Spinner;
+import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -57,6 +61,10 @@ public final class MainActivity extends Activity {
     private boolean launchMinecraftWhenReady;
     private TextView logText;
     private boolean logVisible;
+    private LinearLayout connectionPage;
+    private LinearLayout logsPage;
+    private TextView connectionTab;
+    private TextView logsTab;
     private long nextLogRefreshAt;
     private boolean pendingOverlayRelayStart;
     private boolean pendingOverlayMinecraftLaunch;
@@ -122,169 +130,262 @@ public final class MainActivity extends Activity {
     }
 
     private View buildContent() {
-        int padding = dp(20);
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(padding, dp(18), padding, dp(28));
+        LinearLayout shell = new LinearLayout(this);
+        shell.setOrientation(LinearLayout.VERTICAL);
+        shell.setPadding(dp(18), dp(18), dp(18), dp(14));
+        shell.setBackgroundColor(0xff0b1118);
 
-        TextView title = text("CPE Relay", 30, true);
-        root.addView(title);
-        TextView subtitle = text(
-            "Автономный Minecraft Bedrock relay без Termux",
-            15,
-            false
-        );
-        subtitle.setAlpha(0.75f);
-        root.addView(subtitle, margins(-1, -2, 0, 4, 0, 22));
-
-        root.addView(text("Сервер назначения", 14, true));
-        hostInput = new EditText(this);
-        hostInput.setSingleLine(true);
-        hostInput.setHint("cpe.ign.gg");
-        hostInput.setText(preferences.getString(RelayService.KEY_HOST, "cpe.ign.gg"));
-        root.addView(hostInput, margins(-1, -2, 0, 2, 0, 12));
-
-        root.addView(text("UDP-порт назначения", 14, true));
-        portInput = new EditText(this);
-        portInput.setSingleLine(true);
-        portInput.setInputType(InputType.TYPE_CLASS_NUMBER);
-        portInput.setText(String.valueOf(
-            preferences.getInt(RelayService.KEY_PORT, 19132)
+        LinearLayout heading = new LinearLayout(this);
+        heading.setOrientation(LinearLayout.HORIZONTAL);
+        heading.setGravity(Gravity.CENTER_VERTICAL);
+        TextView brand = text("CPE RELAY", 26, true);
+        heading.addView(brand, new LinearLayout.LayoutParams(
+            0,
+            -2,
+            1f
         ));
-        root.addView(portInput, margins(-1, -2, 0, 2, 0, 18));
-
-        root.addView(text("Версия Minecraft Bedrock", 14, true));
-        versionInput = new Spinner(this);
-        configureVersions();
-        root.addView(versionInput, margins(-1, dp(52), 0, 2, 0, 18));
-
-        TextView versionHint = text(
-            "Выбери точную версию клиента и сервера. Relay не переводит " +
-                "пакеты между разными версиями.",
+        TextView version = text("v" + BuildConfig.VERSION_NAME, 11, true);
+        version.setTextColor(0xff7ee6a4);
+        version.setPadding(dp(9), dp(5), dp(9), dp(5));
+        version.setBackground(pillBackground());
+        heading.addView(version);
+        shell.addView(heading);
+        TextView subtitle = text(
+            "Bedrock relay и пакетный HUD — без Termux и захвата экрана",
             12,
             false
         );
-        versionHint.setAlpha(0.65f);
-        root.addView(versionHint, margins(-1, -2, 0, -10, 0, 16));
+        subtitle.setTextColor(0xff91a0b2);
+        shell.addView(subtitle, margins(-1, -2, 0, dp(3), 0, dp(14)));
+
+        LinearLayout tabs = new LinearLayout(this);
+        tabs.setOrientation(LinearLayout.HORIZONTAL);
+        tabs.setPadding(dp(4), dp(4), dp(4), dp(4));
+        tabs.setBackground(cardBackground());
+        connectionTab = tab("ПОДКЛЮЧЕНИЕ");
+        logsTab = tab("ЖУРНАЛ");
+        tabs.addView(connectionTab, new LinearLayout.LayoutParams(0, dp(42), 1f));
+        tabs.addView(logsTab, new LinearLayout.LayoutParams(0, dp(42), 1f));
+        shell.addView(tabs, margins(-1, -2, 0, 0, 0, dp(12)));
+
+        FrameLayout pages = new FrameLayout(this);
+        connectionPage = buildConnectionPage();
+        logsPage = buildLogsPage();
+        pages.addView(connectionPage);
+        pages.addView(logsPage);
+        shell.addView(pages, new LinearLayout.LayoutParams(
+            -1,
+            0,
+            1f
+        ));
+        connectionTab.setOnClickListener(view -> showMainPage(false));
+        logsTab.setOnClickListener(view -> showMainPage(true));
+        showMainPage(false);
+        return shell;
+    }
+
+    private LinearLayout buildConnectionPage() {
+        LinearLayout content = new LinearLayout(this);
+        content.setOrientation(LinearLayout.VERTICAL);
+        content.setPadding(dp(2), 0, dp(2), dp(18));
+
+        LinearLayout statusCard = card();
+        statusText = text("Relay остановлен", 19, true);
+        statusText.setTextColor(0xffedf5ff);
+        statusCard.addView(statusText);
+        detailText = text("Локальный порт: 19132", 12, false);
+        detailText.setTextColor(0xff9dabbb);
+        detailText.setPadding(0, dp(4), 0, 0);
+        statusCard.addView(detailText);
+        content.addView(statusCard, margins(-1, -2, 0, 0, 0, dp(10)));
+
+        LinearLayout serverCard = card();
+        TextView serverTitle = text("СЕРВЕР НАЗНАЧЕНИЯ", 12, true);
+        serverTitle.setTextColor(0xff7fdcff);
+        serverCard.addView(serverTitle, margins(-1, -2, 0, 0, 0, dp(8)));
+        serverCard.addView(fieldLabel("Адрес"));
+        hostInput = new EditText(this);
+        hostInput.setSingleLine(true);
+        hostInput.setHint("cpe.ign.gg");
+        hostInput.setText(preferences.getString(
+            RelayService.KEY_HOST,
+            "cpe.ign.gg"
+        ));
+        serverCard.addView(hostInput, margins(-1, dp(48), 0, 0, 0, dp(7)));
+
+        serverCard.addView(fieldLabel("UDP-порт"));
+        portInput = new EditText(this);
+        portInput.setSingleLine(true);
+        portInput.setInputType(InputType.TYPE_CLASS_NUMBER);
+        portInput.setText(String.valueOf(preferences.getInt(
+            RelayService.KEY_PORT,
+            19132
+        )));
+        serverCard.addView(portInput, margins(-1, dp(48), 0, 0, 0, dp(7)));
+
+        serverCard.addView(fieldLabel("Версия Bedrock"));
+        versionInput = new Spinner(this);
+        configureVersions();
+        serverCard.addView(versionInput, margins(-1, dp(48), 0, 0, 0, dp(6)));
+        TextView versionHint = text(
+            "Клиент и сервер должны использовать одну версию протокола.",
+            10,
+            false
+        );
+        versionHint.setTextColor(0xff8291a3);
+        serverCard.addView(versionHint);
+        content.addView(serverCard, margins(-1, -2, 0, 0, 0, dp(10)));
 
         TextView localAddress = text(
-            "Minecraft подключается к 127.0.0.1:19132",
-            14,
+            "ЛОКАЛЬНЫЙ АДРЕС   127.0.0.1:19132   ⧉",
+            11,
             true
         );
+        localAddress.setGravity(Gravity.CENTER);
+        localAddress.setPadding(dp(10), dp(10), dp(10), dp(10));
+        localAddress.setBackground(pillBackground());
         localAddress.setOnClickListener(view -> copyText(
             "Адрес relay",
             "127.0.0.1:19132"
         ));
-        root.addView(localAddress, margins(-1, -2, 0, 0, 0, 18));
+        content.addView(localAddress, margins(-1, -2, 0, 0, 0, dp(10)));
 
-        Button start = new Button(this);
-        start.setText("Запустить relay и Minecraft");
-        start.setAllCaps(false);
+        Button start = primaryButton("Запустить relay и Minecraft");
         start.setOnClickListener(view -> startRelay(true));
-        root.addView(start, margins(-1, dp(54), 0, 0, 0, 8));
-
-        Button relayOnly = new Button(this);
-        relayOnly.setText("Запустить только relay");
-        relayOnly.setAllCaps(false);
+        content.addView(start, margins(-1, dp(54), 0, 0, 0, dp(7)));
+        Button relayOnly = secondaryButton("Запустить только relay");
         relayOnly.setOnClickListener(view -> startRelay(false));
-        root.addView(relayOnly, margins(-1, dp(50), 0, 0, 0, 8));
-
-        Button stop = new Button(this);
-        stop.setText("Остановить relay");
-        stop.setAllCaps(false);
+        content.addView(relayOnly, margins(-1, dp(50), 0, 0, 0, dp(7)));
+        Button stop = secondaryButton("Остановить relay");
+        stop.setTextColor(0xffff7d89);
         stop.setOnClickListener(view -> stopRelay());
-        root.addView(stop, margins(-1, dp(50), 0, 0, 0, 22));
+        content.addView(stop, margins(-1, dp(50), 0, 0, 0, dp(10)));
 
-        TextView overlayHint = text(
-            "После входа в мир поверх Minecraft откроется меню CPE Relay. " +
-                "Android один раз попросит разрешение «поверх других приложений».",
-            13,
-            false
-        );
-        overlayHint.setAlpha(0.7f);
-        root.addView(overlayHint, margins(-1, -2, 0, -10, 0, 18));
-
-        statusText = text("Relay остановлен", 20, true);
-        root.addView(statusText);
-        detailText = text("Локальный порт: 19132", 14, false);
-        detailText.setAlpha(0.8f);
-        root.addView(detailText, margins(-1, -2, 0, 4, 0, 20));
-
-        authText = text("", 16, true);
+        authText = text("", 15, true);
         authText.setVisibility(View.GONE);
-        root.addView(authText);
-        authButton = new Button(this);
-        authButton.setText("Скопировать код и открыть вход Microsoft");
-        authButton.setAllCaps(false);
+        content.addView(authText);
+        authButton = primaryButton("Скопировать код и открыть Microsoft");
         authButton.setVisibility(View.GONE);
         authButton.setOnClickListener(view -> openAuthentication());
-        root.addView(authButton, margins(-1, dp(52), 0, 6, 0, 14));
+        content.addView(authButton, margins(-1, dp(52), 0, dp(5), 0, dp(8)));
 
-        Button openMinecraft = new Button(this);
-        openMinecraft.setText("Открыть Minecraft");
-        openMinecraft.setAllCaps(false);
+        Button openMinecraft = secondaryButton("Открыть Minecraft");
         openMinecraft.setOnClickListener(view -> openMinecraft());
-        root.addView(openMinecraft, margins(-1, dp(50), 0, 8, 0, 8));
-
+        content.addView(openMinecraft, margins(-1, dp(48), 0, 0, 0, dp(8)));
         TextView hint = text(
-            "При первом входе код Xbox появится здесь и в уведомлении. " +
-                "После авторизации токены сохраняются только во внутреннем " +
-                "хранилище приложения.",
-            13,
+            "Разрешение «поверх других приложений» Android запрашивает один " +
+                "раз. После входа в мир откроется аккуратное меню CPE; HUD-слои " +
+                "можно включать независимо.",
+            10,
             false
         );
-        hint.setAlpha(0.7f);
-        root.addView(hint);
+        hint.setTextColor(0xff8291a3);
+        content.addView(hint);
 
-        Button showLog = new Button(this);
-        showLog.setText("Показать подробный журнал");
-        showLog.setAllCaps(false);
-        showLog.setOnClickListener(view -> {
-            logVisible = !logVisible;
-            logText.setVisibility(logVisible ? View.VISIBLE : View.GONE);
-            showLog.setText(logVisible
-                ? "Скрыть подробный журнал"
-                : "Показать подробный журнал");
-            if (logVisible) refreshLogNow();
+        ScrollView scroll = new ScrollView(this);
+        scroll.setFillViewport(false);
+        scroll.addView(content);
+        LinearLayout wrapper = new LinearLayout(this);
+        wrapper.setOrientation(LinearLayout.VERTICAL);
+        wrapper.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1f));
+        return wrapper;
+    }
+
+    private LinearLayout buildLogsPage() {
+        LinearLayout content = new LinearLayout(this);
+        content.setOrientation(LinearLayout.VERTICAL);
+        content.setPadding(dp(2), 0, dp(2), dp(18));
+        LinearLayout controls = card();
+        Switch enabled = new Switch(this);
+        enabled.setText("Записывать журнал");
+        enabled.setTextSize(14);
+        enabled.setTextColor(Color.WHITE);
+        enabled.setChecked(preferences.getBoolean(
+            RelayService.KEY_DETAILED_LOGS,
+            true
+        ));
+        controls.addView(enabled);
+        TextView note = text(
+            enabled.isChecked()
+                ? "Запись включена."
+                : "Запись полностью выключена — новые строки не создаются.",
+            10,
+            true
+        );
+        note.setTextColor(enabled.isChecked() ? 0xff74df9c : 0xffffc76c);
+        controls.addView(note, margins(-1, -2, 0, 0, 0, dp(8)));
+        enabled.setOnCheckedChangeListener((button, checked) -> {
+            preferences.edit()
+                .putBoolean(RelayService.KEY_DETAILED_LOGS, checked)
+                .apply();
+            note.setText(checked
+                ? "Запись включена."
+                : "Запись полностью выключена — новые строки не создаются.");
+            note.setTextColor(checked ? 0xff74df9c : 0xffffc76c);
+            applyLoggingPreferenceToNative(checked);
         });
-        root.addView(showLog, margins(-1, dp(50), 0, 18, 0, 8));
-
-        Button copyLog = new Button(this);
-        copyLog.setText("Копировать журнал");
-        copyLog.setAllCaps(false);
-        copyLog.setOnClickListener(view -> copyLog());
-        root.addView(copyLog, margins(-1, dp(48), 0, 0, 0, 8));
-
-        Button clearLog = new Button(this);
-        clearLog.setText("Очистить журнал");
-        clearLog.setAllCaps(false);
-        clearLog.setOnClickListener(view -> {
+        Button copy = secondaryButton("Копировать журнал");
+        copy.setOnClickListener(view -> copyLog());
+        controls.addView(copy, margins(-1, dp(46), 0, 0, 0, dp(6)));
+        Button clear = secondaryButton("Очистить журнал");
+        clear.setOnClickListener(view -> {
             DiagnosticsLog.clear(this);
-            DiagnosticsLog.append(this, "INFO", "ui", "Diagnostics log cleared");
             refreshLogNow();
             toast("Журнал очищен");
         });
-        root.addView(clearLog, margins(-1, dp(48), 0, 0, 0, 8));
+        controls.addView(clear, margins(-1, dp(46), 0, 0, 0, dp(6)));
+        TextView path = text(DiagnosticsLog.path(this), 9, false);
+        path.setTextColor(0xff718094);
+        path.setTextIsSelectable(true);
+        controls.addView(path);
+        content.addView(controls, margins(-1, -2, 0, 0, 0, dp(9)));
 
-        TextView logPath = text(
-            "Файл журнала: " + DiagnosticsLog.path(this),
-            11,
-            false
-        );
-        logPath.setAlpha(0.6f);
-        logPath.setTextIsSelectable(true);
-        root.addView(logPath, margins(-1, -2, 0, 0, 0, 6));
-
-        logText = text("", 11, false);
+        logText = text("Журнал пока пуст.", 9, false);
         logText.setTypeface(Typeface.MONOSPACE);
+        logText.setTextColor(0xffb9c7d6);
         logText.setTextIsSelectable(true);
-        logText.setVisibility(View.GONE);
-        root.addView(logText, margins(-1, -2, 0, 0, 0, 18));
-
+        logText.setPadding(dp(10), dp(10), dp(10), dp(10));
+        logText.setBackground(cardBackground());
+        content.addView(logText);
         ScrollView scroll = new ScrollView(this);
-        scroll.addView(root);
-        return scroll;
+        scroll.addView(content);
+        LinearLayout wrapper = new LinearLayout(this);
+        wrapper.setOrientation(LinearLayout.VERTICAL);
+        wrapper.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1f));
+        return wrapper;
+    }
+
+    private void showMainPage(boolean logs) {
+        logVisible = logs;
+        if (connectionPage != null) {
+            connectionPage.setVisibility(logs ? View.GONE : View.VISIBLE);
+        }
+        if (logsPage != null) {
+            logsPage.setVisibility(logs ? View.VISIBLE : View.GONE);
+        }
+        if (connectionTab != null) {
+            connectionTab.setBackground(tabBackground(!logs));
+            connectionTab.setTextColor(!logs ? Color.WHITE : 0xff8291a3);
+        }
+        if (logsTab != null) {
+            logsTab.setBackground(tabBackground(logs));
+            logsTab.setTextColor(logs ? Color.WHITE : 0xff8291a3);
+        }
+        if (logs) refreshLogNow();
+    }
+
+    private void applyLoggingPreferenceToNative(boolean enabled) {
+        try {
+            NativeBridge.configureRuntime(
+                enabled,
+                preferences.getBoolean(RelayService.KEY_CHUNK_RETENTION, false),
+                RelayService.clampRetainedRadius(preferences.getInt(
+                    RelayService.KEY_RETAINED_RADIUS_CHUNKS,
+                    24
+                ))
+            );
+        } catch (Throwable ignored) {
+        }
     }
 
     private void startRelay(boolean launchMinecraft) {
@@ -633,10 +734,85 @@ public final class MainActivity extends Activity {
         toast("Скопировано: " + value);
     }
 
+    private LinearLayout card() {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(dp(14), dp(12), dp(14), dp(12));
+        card.setBackground(cardBackground());
+        card.setElevation(dp(2));
+        return card;
+    }
+
+    private TextView fieldLabel(String value) {
+        TextView label = text(value, 11, true);
+        label.setTextColor(0xffa9b7c7);
+        return label;
+    }
+
+    private TextView tab(String value) {
+        TextView tab = text(value, 11, true);
+        tab.setGravity(Gravity.CENTER);
+        tab.setClickable(true);
+        return tab;
+    }
+
+    private Button primaryButton(String value) {
+        Button button = new Button(this);
+        button.setText(value);
+        button.setTextSize(14);
+        button.setTextColor(0xff061018);
+        button.setAllCaps(false);
+        GradientDrawable background = new GradientDrawable(
+            GradientDrawable.Orientation.LEFT_RIGHT,
+            new int[] {0xff57d7ff, 0xff71e6a4}
+        );
+        background.setCornerRadius(dp(13));
+        button.setBackground(background);
+        return button;
+    }
+
+    private Button secondaryButton(String value) {
+        Button button = new Button(this);
+        button.setText(value);
+        button.setTextSize(13);
+        button.setTextColor(0xffe8f2fc);
+        button.setAllCaps(false);
+        GradientDrawable background = new GradientDrawable();
+        background.setColor(0xff1a2532);
+        background.setCornerRadius(dp(12));
+        background.setStroke(dp(1), 0xff3c5068);
+        button.setBackground(background);
+        return button;
+    }
+
+    private GradientDrawable cardBackground() {
+        GradientDrawable background = new GradientDrawable();
+        background.setColor(0xff131c27);
+        background.setCornerRadius(dp(15));
+        background.setStroke(dp(1), 0xff26384a);
+        return background;
+    }
+
+    private GradientDrawable pillBackground() {
+        GradientDrawable background = new GradientDrawable();
+        background.setColor(0xff172532);
+        background.setCornerRadius(dp(12));
+        background.setStroke(dp(1), 0xff34506a);
+        return background;
+    }
+
+    private GradientDrawable tabBackground(boolean selected) {
+        GradientDrawable background = new GradientDrawable();
+        background.setColor(selected ? 0xff26384b : Color.TRANSPARENT);
+        background.setCornerRadius(dp(11));
+        return background;
+    }
+
     private TextView text(String value, int sp, boolean bold) {
         TextView view = new TextView(this);
         view.setText(value);
         view.setTextSize(sp);
+        view.setTextColor(Color.WHITE);
         if (bold) {
             view.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         }
@@ -655,7 +831,7 @@ public final class MainActivity extends Activity {
             width,
             height
         );
-        params.setMargins(dp(left), dp(top), dp(right), dp(bottom));
+        params.setMargins(left, top, right, bottom);
         return params;
     }
 

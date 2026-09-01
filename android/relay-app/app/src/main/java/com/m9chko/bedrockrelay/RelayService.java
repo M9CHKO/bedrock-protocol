@@ -42,6 +42,28 @@ public final class RelayService extends Service {
         "retained_radius_chunks";
     public static final String KEY_ENTITY_OUTLINES = "entity_outlines";
     public static final String KEY_ENTITY_FOV = "entity_outline_fov";
+    public static final String KEY_ENTITY_PLAYERS = "entity_outline_players";
+    public static final String KEY_ENTITY_MOBS = "entity_outline_mobs";
+    public static final String KEY_ENTITY_ITEMS = "entity_outline_items";
+    public static final String KEY_PLAYER_COLOR = "entity_player_color";
+    public static final String KEY_MOB_COLOR = "entity_mob_color";
+    public static final String KEY_ITEM_COLOR = "entity_item_color";
+    public static final String KEY_OUTLINE_THICKNESS_TENTHS =
+        "entity_outline_thickness_tenths";
+    public static final String KEY_ENTITY_MAX_DISTANCE =
+        "entity_outline_max_distance";
+    public static final String KEY_CHUNK_WIDGET = "chunk_widget";
+    public static final String KEY_CHUNK_WIDGET_SCALE = "chunk_widget_scale";
+    public static final String KEY_CHUNK_WIDGET_X = "chunk_widget_x";
+    public static final String KEY_CHUNK_WIDGET_Y = "chunk_widget_y";
+    public static final String KEY_CHUNK_WIDGET_MINIMIZED =
+        "chunk_widget_minimized";
+    public static final String KEY_EQUIPMENT_HUD = "equipment_hud";
+    public static final String KEY_EQUIPMENT_HUD_SCALE = "equipment_hud_scale";
+
+    public static final int DEFAULT_PLAYER_COLOR = 0xff4fd5ff;
+    public static final int DEFAULT_MOB_COLOR = 0xffff5b62;
+    public static final int DEFAULT_ITEM_COLOR = 0xffffcf4a;
 
     public static final int MIN_RETAINED_RADIUS_CHUNKS = 10;
     public static final int MAX_RETAINED_RADIUS_CHUNKS = 64;
@@ -75,6 +97,8 @@ public final class RelayService extends Service {
     private PowerManager.WakeLock wakeLock;
     private RelayOverlayController overlayController;
     private EntityOutlineOverlayController entityOverlayController;
+    private ChunkStatusOverlayController chunkOverlayController;
+    private EquipmentOverlayController equipmentOverlayController;
     private volatile boolean serviceStopping;
     private volatile boolean overlayShouldBeVisible;
     private volatile boolean overlaySessionReady;
@@ -94,6 +118,11 @@ public final class RelayService extends Service {
             () -> applyRuntimeOptions(true)
         );
         entityOverlayController = new EntityOutlineOverlayController(this);
+        chunkOverlayController = new ChunkStatusOverlayController(
+            this,
+            preferences
+        );
+        equipmentOverlayController = new EquipmentOverlayController(this);
         createNotificationChannel();
         DiagnosticsLog.append(
             this,
@@ -170,6 +199,12 @@ public final class RelayService extends Service {
         if (overlayController != null) overlayController.hide();
         if (entityOverlayController != null) {
             entityOverlayController.hideImmediately();
+        }
+        if (chunkOverlayController != null) {
+            chunkOverlayController.hideImmediately();
+        }
+        if (equipmentOverlayController != null) {
+            equipmentOverlayController.hideImmediately();
         }
         DiagnosticsLog.append(this, "INFO", "service", "Service destroying");
         try {
@@ -425,6 +460,7 @@ public final class RelayService extends Service {
                 downstreamConnections > 0
         );
         updateOverlayChunkStatus(state);
+        updateOverlayEquipment(state);
         if (!running) {
             return;
         }
@@ -473,7 +509,7 @@ public final class RelayService extends Service {
     }
 
     private void updateOverlayChunkStatus(JSONObject state) {
-        if (overlayController == null) return;
+        if (overlayController == null && chunkOverlayController == null) return;
         final boolean retentionEnabled = state.optBoolean(
             "chunkRetentionEnabled",
             false
@@ -522,19 +558,49 @@ public final class RelayService extends Service {
             "retainedLevelChunkParseFailures",
             0
         ) + state.optLong("chunkPublisherDecodeFailures", 0);
-        mainHandler.post(() -> overlayController.updateChunkStatus(
-            retentionEnabled,
-            configuredRadiusChunks,
-            publisherUpdates,
-            publisherRewrites,
-            serverRadiusBlocks,
-            effectiveRadiusBlocks,
-            retainedChunks,
-            retainedBytes,
-            maximumBytes,
-            evictedRadius,
-            evictedMemory,
-            parseFailures
+        mainHandler.post(() -> {
+            if (overlayController != null) {
+                overlayController.updateChunkStatus(
+                    retentionEnabled,
+                    configuredRadiusChunks,
+                    publisherUpdates,
+                    publisherRewrites,
+                    serverRadiusBlocks,
+                    effectiveRadiusBlocks,
+                    retainedChunks,
+                    retainedBytes,
+                    maximumBytes,
+                    evictedRadius,
+                    evictedMemory,
+                    parseFailures
+                );
+            }
+            if (chunkOverlayController != null) {
+                chunkOverlayController.updateStatus(
+                    retentionEnabled,
+                    configuredRadiusChunks,
+                    publisherUpdates,
+                    publisherRewrites,
+                    serverRadiusBlocks,
+                    effectiveRadiusBlocks,
+                    retainedChunks,
+                    retainedBytes,
+                    maximumBytes,
+                    evictedRadius,
+                    evictedMemory,
+                    parseFailures
+                );
+            }
+        });
+    }
+
+    private void updateOverlayEquipment(JSONObject state) {
+        if (equipmentOverlayController == null) return;
+        final JSONArray equipment = state.optJSONArray("equipment");
+        final long revision = state.optLong("equipmentRevision", 0);
+        mainHandler.post(() -> equipmentOverlayController.update(
+            equipment,
+            revision
         ));
     }
 
@@ -728,14 +794,68 @@ public final class RelayService extends Service {
             KEY_ENTITY_FOV,
             70
         ));
+        boolean showPlayers = preferences.getBoolean(KEY_ENTITY_PLAYERS, true);
+        boolean showMobs = preferences.getBoolean(KEY_ENTITY_MOBS, true);
+        boolean showItems = preferences.getBoolean(KEY_ENTITY_ITEMS, true);
+        int playerColor = preferences.getInt(
+            KEY_PLAYER_COLOR,
+            DEFAULT_PLAYER_COLOR
+        );
+        int mobColor = preferences.getInt(KEY_MOB_COLOR, DEFAULT_MOB_COLOR);
+        int itemColor = preferences.getInt(KEY_ITEM_COLOR, DEFAULT_ITEM_COLOR);
+        int thicknessTenths = clampOutlineThicknessTenths(preferences.getInt(
+            KEY_OUTLINE_THICKNESS_TENTHS,
+            17
+        ));
+        int maximumDistance = clampEntityDistance(preferences.getInt(
+            KEY_ENTITY_MAX_DISTANCE,
+            128
+        ));
+        boolean chunkWidget = preferences.getBoolean(KEY_CHUNK_WIDGET, true);
+        int chunkWidgetScale = clampOverlayScale(preferences.getInt(
+            KEY_CHUNK_WIDGET_SCALE,
+            85
+        ));
+        boolean equipmentHud = preferences.getBoolean(KEY_EQUIPMENT_HUD, true);
+        int equipmentScale = clampOverlayScale(preferences.getInt(
+            KEY_EQUIPMENT_HUD_SCALE,
+            80
+        ));
         preferences.edit()
             .putInt(KEY_RETAINED_RADIUS_CHUNKS, radiusChunks)
             .putInt(KEY_ENTITY_FOV, entityFov)
+            .putInt(KEY_OUTLINE_THICKNESS_TENTHS, thicknessTenths)
+            .putInt(KEY_ENTITY_MAX_DISTANCE, maximumDistance)
+            .putInt(KEY_CHUNK_WIDGET_SCALE, chunkWidgetScale)
+            .putInt(KEY_EQUIPMENT_HUD_SCALE, equipmentScale)
             .apply();
         mainHandler.post(() -> {
-            if (entityOverlayController == null) return;
-            entityOverlayController.setFieldOfView(entityFov);
-            entityOverlayController.setEnabled(entityOutlines);
+            if (entityOverlayController != null) {
+                entityOverlayController.setFieldOfView(entityFov);
+                entityOverlayController.setDisplayOptions(
+                    showPlayers,
+                    showMobs,
+                    showItems,
+                    playerColor,
+                    mobColor,
+                    itemColor,
+                    thicknessTenths / 10.0f,
+                    maximumDistance
+                );
+                entityOverlayController.setEnabled(entityOutlines);
+            }
+            if (chunkOverlayController != null) {
+                chunkOverlayController.configure(
+                    retainChunks && chunkWidget,
+                    chunkWidgetScale
+                );
+            }
+            if (equipmentOverlayController != null) {
+                equipmentOverlayController.configure(
+                    equipmentHud,
+                    equipmentScale
+                );
+            }
         });
         try {
             NativeBridge.configureRuntime(
@@ -752,7 +872,14 @@ public final class RelayService extends Service {
                         " chunkRetention=" + retainChunks +
                         " retainedRadiusChunks=" + radiusChunks +
                         " entityOutlines=" + entityOutlines +
-                        " entityFov=" + entityFov
+                        " entityFov=" + entityFov +
+                        " players=" + showPlayers +
+                        " mobs=" + showMobs +
+                        " items=" + showItems +
+                        " thickness=" + (thicknessTenths / 10.0f) +
+                        " maxDistance=" + maximumDistance +
+                        " chunkWidget=" + chunkWidget +
+                        " equipmentHud=" + equipmentHud
                 );
             }
         } catch (Throwable error) {
@@ -769,15 +896,28 @@ public final class RelayService extends Service {
         if (overlayShouldBeVisible == visible) return;
         overlayShouldBeVisible = visible;
         mainHandler.post(() -> {
-            if (overlayController == null || entityOverlayController == null) {
-                return;
-            }
             if (overlayShouldBeVisible) {
-                entityOverlayController.setSessionVisible(true);
-                overlayController.show();
+                if (entityOverlayController != null) {
+                    entityOverlayController.setSessionVisible(true);
+                }
+                if (chunkOverlayController != null) {
+                    chunkOverlayController.setSessionVisible(true);
+                }
+                if (equipmentOverlayController != null) {
+                    equipmentOverlayController.setSessionVisible(true);
+                }
+                if (overlayController != null) overlayController.show();
             } else {
-                overlayController.hide();
-                entityOverlayController.setSessionVisible(false);
+                if (overlayController != null) overlayController.hide();
+                if (entityOverlayController != null) {
+                    entityOverlayController.setSessionVisible(false);
+                }
+                if (chunkOverlayController != null) {
+                    chunkOverlayController.setSessionVisible(false);
+                }
+                if (equipmentOverlayController != null) {
+                    equipmentOverlayController.setSessionVisible(false);
+                }
             }
         });
     }
@@ -791,5 +931,17 @@ public final class RelayService extends Service {
 
     public static int clampEntityFov(int fov) {
         return Math.max(MIN_ENTITY_FOV, Math.min(MAX_ENTITY_FOV, fov));
+    }
+
+    public static int clampOutlineThicknessTenths(int value) {
+        return Math.max(8, Math.min(60, value));
+    }
+
+    public static int clampEntityDistance(int value) {
+        return Math.max(16, Math.min(256, value));
+    }
+
+    public static int clampOverlayScale(int value) {
+        return Math.max(70, Math.min(150, value));
     }
 }

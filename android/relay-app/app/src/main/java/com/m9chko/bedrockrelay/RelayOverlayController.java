@@ -34,6 +34,11 @@ final class RelayOverlayController {
     private LinearLayout windowRoot;
     private TextView drawerTab;
     private TextView chunkStatus;
+    private TextView pageTitle;
+    private TextView backButton;
+    private LinearLayout pageContent;
+    private TextView logText;
+    private String currentPage = "home";
     private ValueAnimator drawerAnimator;
     private int drawerPanelWidth;
     private boolean drawerOpen;
@@ -146,6 +151,11 @@ final class RelayOverlayController {
         windowRoot = null;
         drawerTab = null;
         chunkStatus = null;
+        pageTitle = null;
+        backButton = null;
+        pageContent = null;
+        logText = null;
+        currentPage = "home";
         windowParams = null;
         if (root == null) return;
         try {
@@ -190,234 +200,38 @@ final class RelayOverlayController {
 
         LinearLayout panel = new LinearLayout(context);
         panel.setOrientation(LinearLayout.VERTICAL);
-        panel.setPadding(dp(14), dp(10), dp(14), dp(14));
+        panel.setPadding(dp(12), dp(10), dp(12), dp(14));
 
-        TextView title = text("CPE Relay  •  подключено", 16, true);
-        title.setTextColor(Color.WHITE);
-        title.setPadding(dp(2), dp(6), dp(4), dp(10));
-        panel.addView(title);
-
-        Switch entityOutlines = new Switch(context);
-        entityOutlines.setText("Обводка сущностей (2D)");
-        entityOutlines.setTextSize(15);
-        entityOutlines.setTextColor(Color.WHITE);
-        entityOutlines.setChecked(preferences.getBoolean(
-            RelayService.KEY_ENTITY_OUTLINES,
-            true
-        ));
-        panel.addView(entityOutlines, margins(-1, -2, 0, 2, 0, 0));
-
-        int initialEntityFov = RelayService.clampEntityFov(
-            preferences.getInt(RelayService.KEY_ENTITY_FOV, 70)
-        );
-        TextView entityFovLabel = text("", 12, true);
-        entityFovLabel.setTextColor(0xffdce6f5);
-        panel.addView(
-            entityFovLabel,
-            margins(-1, -2, dp(2), 0, dp(2), 0)
-        );
-        SeekBar entityFov = new SeekBar(context);
-        entityFov.setMin(RelayService.MIN_ENTITY_FOV);
-        entityFov.setMax(RelayService.MAX_ENTITY_FOV);
-        entityFov.setProgress(initialEntityFov);
-        panel.addView(entityFov, margins(-1, -2, 0, 0, 0, 0));
-        TextView entityHint = text(
-            "Поставьте такое же значение, как FOV в настройках Minecraft; " +
-                "точнее всего совпадает вид от первого лица.",
-            11,
-            false
-        );
-        entityHint.setTextColor(0xffc4cad3);
-        panel.addView(
-            entityHint,
-            margins(-1, -2, dp(2), 0, dp(2), dp(8))
-        );
-
-        Runnable refreshEntityFov = () -> entityFovLabel.setText(
-            String.format(
-                Locale.getDefault(),
-                "FOV Minecraft: %d°",
-                entityFov.getProgress()
-            )
-        );
-        Runnable updateEntityControls = () -> {
-            boolean enabled = entityOutlines.isChecked();
-            entityFov.setEnabled(enabled);
-            entityFovLabel.setAlpha(enabled ? 1f : 0.55f);
-            entityHint.setAlpha(enabled ? 1f : 0.55f);
-        };
-        refreshEntityFov.run();
-        updateEntityControls.run();
-
-        Switch detailedLogs = new Switch(context);
-        detailedLogs.setText("Подробные логи");
-        detailedLogs.setTextSize(15);
-        detailedLogs.setTextColor(Color.WHITE);
-        detailedLogs.setChecked(preferences.getBoolean(
-            RelayService.KEY_DETAILED_LOGS,
-            true
-        ));
-        panel.addView(detailedLogs, margins(-1, -2, 0, 4, 0, 0));
-        TextView logsHint = text(
-            "При выключении ошибки и основные события всё равно сохраняются.",
-            12,
-            false
-        );
-        logsHint.setTextColor(0xffc4cad3);
-        panel.addView(logsHint, margins(-1, -2, dp(2), 0, dp(2), dp(10)));
-
-        Switch retention = new Switch(context);
-        retention.setText("Удерживать старые чанки");
-        retention.setTextSize(15);
-        retention.setTextColor(Color.WHITE);
-        retention.setChecked(preferences.getBoolean(
-            RelayService.KEY_CHUNK_RETENTION,
-            false
-        ));
-        panel.addView(retention, margins(-1, -2, 0, 2, 0, 2));
-
-        int initialRadius = RelayService.clampRetainedRadius(
-            preferences.getInt(RelayService.KEY_RETAINED_RADIUS_CHUNKS, 24)
-        );
-        statusRetentionEnabled = retention.isChecked();
-        statusConfiguredRadiusChunks = initialRadius;
-        TextView radiusLabel = text("", 13, true);
-        radiusLabel.setTextColor(0xffdce6f5);
-        panel.addView(radiusLabel, margins(-1, -2, dp(2), 2, dp(2), 0));
-
-        LinearLayout radiusRow = new LinearLayout(context);
-        radiusRow.setOrientation(LinearLayout.HORIZONTAL);
-        radiusRow.setGravity(Gravity.CENTER_VERTICAL);
-        Button minus = smallButton("−");
-        minus.setContentDescription("Уменьшить радиус удержания");
-        radiusRow.addView(minus, new LinearLayout.LayoutParams(dp(46), dp(42)));
-        SeekBar radius = new SeekBar(context);
-        radius.setMin(RelayService.MIN_RETAINED_RADIUS_CHUNKS);
-        radius.setMax(RelayService.MAX_RETAINED_RADIUS_CHUNKS);
-        radius.setProgress(initialRadius);
-        radiusRow.addView(radius, new LinearLayout.LayoutParams(
+        LinearLayout header = new LinearLayout(context);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        backButton = text("‹", 25, true);
+        backButton.setGravity(Gravity.CENTER);
+        backButton.setBackground(actionBackground());
+        backButton.setOnClickListener(view -> showPage("home"));
+        header.addView(backButton, new LinearLayout.LayoutParams(dp(38), dp(38)));
+        pageTitle = text("CPE RELAY", 16, true);
+        pageTitle.setPadding(dp(10), 0, 0, 0);
+        header.addView(pageTitle, new LinearLayout.LayoutParams(
             0,
             ViewGroup.LayoutParams.WRAP_CONTENT,
             1f
         ));
-        Button plus = smallButton("+");
-        plus.setContentDescription("Увеличить радиус удержания");
-        radiusRow.addView(plus, new LinearLayout.LayoutParams(dp(46), dp(42)));
-        panel.addView(radiusRow);
+        TextView live = text("● LIVE", 10, true);
+        live.setTextColor(0xff73e49a);
+        live.setPadding(dp(8), dp(5), dp(8), dp(5));
+        live.setBackground(statusBackground());
+        header.addView(live);
+        panel.addView(header, margins(-1, dp(42), 0, 0, 0, dp(8)));
 
-        chunkStatus = text("", 12, true);
-        chunkStatus.setPadding(dp(10), dp(8), dp(10), dp(8));
-        chunkStatus.setBackground(statusBackground());
-        panel.addView(
-            chunkStatus,
-            margins(-1, -2, dp(2), dp(4), dp(2), dp(8))
-        );
-        refreshChunkStatus();
-
-        TextView chunksHint = text(
-            "Туман и дальность отрисовки Minecraft не показывают, выгружен " +
-                "ли чанк. Проверяйте кэш и переданный клиенту радиус по " +
-                "статусу выше. Новые чанки по-прежнему ограничены сервером.",
-            12,
-            false
-        );
-        chunksHint.setTextColor(0xffc4cad3);
-        panel.addView(chunksHint, margins(-1, -2, dp(2), 2, dp(2), 0));
-
-        Runnable refreshRadius = () -> radiusLabel.setText(String.format(
-            Locale.getDefault(),
-            "Радиус удержания: %d чанков (%d блоков)",
-            radius.getProgress(),
-            radius.getProgress() * 16
+        pageContent = new LinearLayout(context);
+        pageContent.setOrientation(LinearLayout.VERTICAL);
+        panel.addView(pageContent, new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT
         ));
-        Runnable updateEnabled = () -> {
-            boolean enabled = retention.isChecked();
-            radius.setEnabled(enabled);
-            minus.setEnabled(enabled);
-            plus.setEnabled(enabled);
-            radiusLabel.setAlpha(enabled ? 1f : 0.55f);
-        };
-        refreshRadius.run();
-        updateEnabled.run();
+        showPage("home");
 
-        detailedLogs.setOnCheckedChangeListener((button, checked) -> {
-            preferences.edit()
-                .putBoolean(RelayService.KEY_DETAILED_LOGS, checked)
-                .apply();
-            settingsChanged.run();
-        });
-        entityOutlines.setOnCheckedChangeListener((button, checked) -> {
-            preferences.edit()
-                .putBoolean(RelayService.KEY_ENTITY_OUTLINES, checked)
-                .apply();
-            updateEntityControls.run();
-            settingsChanged.run();
-        });
-        entityFov.setOnSeekBarChangeListener(
-            new SeekBar.OnSeekBarChangeListener() {
-                @Override public void onProgressChanged(
-                    SeekBar seekBar,
-                    int progress,
-                    boolean fromUser
-                ) {
-                    refreshEntityFov.run();
-                }
-
-                @Override public void onStartTrackingTouch(SeekBar seekBar) {}
-
-                @Override public void onStopTrackingTouch(SeekBar seekBar) {
-                    preferences.edit()
-                        .putInt(
-                            RelayService.KEY_ENTITY_FOV,
-                            RelayService.clampEntityFov(seekBar.getProgress())
-                        )
-                        .apply();
-                    settingsChanged.run();
-                }
-            }
-        );
-        retention.setOnCheckedChangeListener((button, checked) -> {
-            preferences.edit()
-                .putBoolean(RelayService.KEY_CHUNK_RETENTION, checked)
-                .apply();
-            statusRetentionEnabled = checked;
-            statusConfiguredRadiusChunks = radius.getProgress();
-            if (!checked) clearLiveChunkStatus();
-            refreshChunkStatus();
-            updateEnabled.run();
-            settingsChanged.run();
-        });
-        radius.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-            @Override public void onProgressChanged(
-                SeekBar seekBar,
-                int progress,
-                boolean fromUser
-            ) {
-                statusConfiguredRadiusChunks = progress;
-                refreshRadius.run();
-                refreshChunkStatus();
-            }
-
-            @Override public void onStartTrackingTouch(SeekBar seekBar) {}
-
-            @Override public void onStopTrackingTouch(SeekBar seekBar) {
-                saveRadius(seekBar.getProgress());
-            }
-        });
-        minus.setOnClickListener(view -> {
-            radius.setProgress(Math.max(
-                RelayService.MIN_RETAINED_RADIUS_CHUNKS,
-                radius.getProgress() - 1
-            ));
-            saveRadius(radius.getProgress());
-        });
-        plus.setOnClickListener(view -> {
-            radius.setProgress(Math.min(
-                RelayService.MAX_RETAINED_RADIUS_CHUNKS,
-                radius.getProgress() + 1
-            ));
-            saveRadius(radius.getProgress());
-        });
         scroll.addView(
             panel,
             new ScrollView.LayoutParams(
@@ -426,6 +240,448 @@ final class RelayOverlayController {
             )
         );
         return scroll;
+    }
+
+    private void showPage(String page) {
+        if (pageContent == null || pageTitle == null || backButton == null) {
+            return;
+        }
+        currentPage = page;
+        pageContent.removeAllViews();
+        chunkStatus = null;
+        logText = null;
+        backButton.setVisibility("home".equals(page) ? View.INVISIBLE : View.VISIBLE);
+        switch (page) {
+            case "outline":
+                pageTitle.setText("ОБВОДКА");
+                buildOutlinePage(pageContent);
+                break;
+            case "chunks":
+                pageTitle.setText("ЧАНКИ");
+                buildChunksPage(pageContent);
+                break;
+            case "equipment":
+                pageTitle.setText("СНАРЯЖЕНИЕ");
+                buildEquipmentPage(pageContent);
+                break;
+            case "logs":
+                pageTitle.setText("ЖУРНАЛ");
+                buildLogsPage(pageContent);
+                break;
+            default:
+                currentPage = "home";
+                pageTitle.setText("CPE RELAY");
+                buildHomePage(pageContent);
+                break;
+        }
+    }
+
+    private void buildHomePage(LinearLayout root) {
+        TextView subtitle = text(
+            "Пакетный HUD работает отдельными слоями поверх Minecraft",
+            11,
+            false
+        );
+        subtitle.setTextColor(0xffaab8c8);
+        subtitle.setPadding(dp(2), 0, dp(2), dp(8));
+        root.addView(subtitle);
+        root.addView(menuCard(
+            "◎  ОБВОДКА",
+            "Игроки, мобы, предметы • цвета • толщина",
+            "outline"
+        ));
+        root.addView(menuCard(
+            "▦  ЧАНКИ",
+            "Удержание и отдельный перемещаемый счётчик",
+            "chunks"
+        ));
+        root.addView(menuCard(
+            "♢  СНАРЯЖЕНИЕ",
+            "Прочность брони и перелив зачарований",
+            "equipment"
+        ));
+        root.addView(menuCard(
+            "≡  ЖУРНАЛ",
+            "Запись полностью отключается одним переключателем",
+            "logs"
+        ));
+        TextView note = text(
+            "Точная привязка зависит от FOV и пакетной камеры. " +
+                "Захват экрана и вмешательство в процесс Minecraft не используются.",
+            10,
+            false
+        );
+        note.setTextColor(0xff8391a2);
+        note.setPadding(dp(3), dp(7), dp(3), 0);
+        root.addView(note);
+    }
+
+    private View menuCard(String title, String subtitle, String page) {
+        LinearLayout card = new LinearLayout(context);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(dp(13), dp(11), dp(13), dp(11));
+        card.setBackground(cardBackground(false));
+        TextView heading = text(title, 13, true);
+        heading.setTextColor(0xffedf5ff);
+        card.addView(heading);
+        TextView detail = text(subtitle, 10, false);
+        detail.setTextColor(0xff9eacbc);
+        detail.setPadding(0, dp(3), 0, 0);
+        card.addView(detail);
+        card.setOnClickListener(view -> showPage(page));
+        card.setClickable(true);
+        card.setElevation(dp(3));
+        card.setLayoutParams(margins(-1, -2, 0, 0, 0, dp(7)));
+        return card;
+    }
+
+    private void buildOutlinePage(LinearLayout root) {
+        root.addView(toggle(
+            "Показывать обводку",
+            RelayService.KEY_ENTITY_OUTLINES,
+            true
+        ));
+        TextView hint = text(
+            "Микродвижения камеры фильтруются отдельно; несколько " +
+                "согласованных малых пакетов запускают плавный поворот.",
+            10,
+            false
+        );
+        hint.setTextColor(0xff98a7b8);
+        root.addView(hint, margins(-1, -2, dp(3), 0, dp(3), dp(8)));
+
+        addOutlineCategory(
+            root,
+            "Игроки",
+            RelayService.KEY_ENTITY_PLAYERS,
+            RelayService.KEY_PLAYER_COLOR,
+            RelayService.DEFAULT_PLAYER_COLOR
+        );
+        addOutlineCategory(
+            root,
+            "Мобы",
+            RelayService.KEY_ENTITY_MOBS,
+            RelayService.KEY_MOB_COLOR,
+            RelayService.DEFAULT_MOB_COLOR
+        );
+        addOutlineCategory(
+            root,
+            "Выпавшие предметы",
+            RelayService.KEY_ENTITY_ITEMS,
+            RelayService.KEY_ITEM_COLOR,
+            RelayService.DEFAULT_ITEM_COLOR
+        );
+
+        int fovValue = RelayService.clampEntityFov(preferences.getInt(
+            RelayService.KEY_ENTITY_FOV,
+            70
+        ));
+        TextView fovLabel = settingLabel("FOV Minecraft: " + fovValue + "°");
+        root.addView(fovLabel);
+        SeekBar fov = slider(
+            RelayService.MIN_ENTITY_FOV,
+            RelayService.MAX_ENTITY_FOV,
+            fovValue
+        );
+        root.addView(fov);
+        fov.setOnSeekBarChangeListener(seekListener(
+            progress -> fovLabel.setText("FOV Minecraft: " + progress + "°"),
+            progress -> saveInt(
+                RelayService.KEY_ENTITY_FOV,
+                RelayService.clampEntityFov(progress)
+            )
+        ));
+
+        int thickness = RelayService.clampOutlineThicknessTenths(
+            preferences.getInt(RelayService.KEY_OUTLINE_THICKNESS_TENTHS, 17)
+        );
+        TextView thicknessLabel = settingLabel(String.format(
+            Locale.getDefault(),
+            "Толщина рамки: %.1f",
+            thickness / 10.0
+        ));
+        root.addView(thicknessLabel);
+        SeekBar thicknessSlider = slider(8, 60, thickness);
+        root.addView(thicknessSlider);
+        thicknessSlider.setOnSeekBarChangeListener(seekListener(
+            progress -> thicknessLabel.setText(String.format(
+                Locale.getDefault(),
+                "Толщина рамки: %.1f",
+                progress / 10.0
+            )),
+            progress -> saveInt(
+                RelayService.KEY_OUTLINE_THICKNESS_TENTHS,
+                RelayService.clampOutlineThicknessTenths(progress)
+            )
+        ));
+
+        int distance = RelayService.clampEntityDistance(preferences.getInt(
+            RelayService.KEY_ENTITY_MAX_DISTANCE,
+            128
+        ));
+        TextView distanceLabel = settingLabel("Максимальная дальность: " +
+            distance + " м");
+        root.addView(distanceLabel);
+        SeekBar distanceSlider = slider(16, 256, distance);
+        root.addView(distanceSlider);
+        distanceSlider.setOnSeekBarChangeListener(seekListener(
+            progress -> distanceLabel.setText(
+                "Максимальная дальность: " + progress + " м"
+            ),
+            progress -> saveInt(
+                RelayService.KEY_ENTITY_MAX_DISTANCE,
+                RelayService.clampEntityDistance(progress)
+            )
+        ));
+    }
+
+    private void addOutlineCategory(
+        LinearLayout root,
+        String title,
+        String enabledKey,
+        String colorKey,
+        int defaultColor
+    ) {
+        LinearLayout card = new LinearLayout(context);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(dp(10), dp(5), dp(10), dp(8));
+        card.setBackground(cardBackground(false));
+        card.addView(toggle(title, enabledKey, true));
+        card.addView(colorPicker(colorKey, defaultColor));
+        root.addView(card, margins(-1, -2, 0, 0, 0, dp(7)));
+    }
+
+    private View colorPicker(String key, int defaultColor) {
+        int selected = preferences.getInt(key, defaultColor) | 0xff000000;
+        int[] colors = {
+            0xff4fd5ff, 0xff5df0a2, 0xffffcf4a, 0xffff8a4c,
+            0xffff5b62, 0xffd56cff, 0xffffffff, 0xff8094aa
+        };
+        LinearLayout row = new LinearLayout(context);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        for (int color : colors) {
+            TextView swatch = text("", 1, false);
+            swatch.setBackground(colorBackground(color, color == selected));
+            swatch.setContentDescription("Выбрать цвет обводки");
+            swatch.setOnClickListener(view -> {
+                preferences.edit().putInt(key, color).apply();
+                settingsChanged.run();
+                showPage("outline");
+            });
+            row.addView(swatch, margins(dp(28), dp(28), dp(2), 0, dp(3), 0));
+        }
+        return row;
+    }
+
+    private void buildChunksPage(LinearLayout root) {
+        Switch retention = toggle(
+            "Удерживать старые чанки",
+            RelayService.KEY_CHUNK_RETENTION,
+            false
+        );
+        root.addView(retention);
+        root.addView(toggle(
+            "Отдельный счётчик на экране",
+            RelayService.KEY_CHUNK_WIDGET,
+            true
+        ));
+
+        int radiusValue = RelayService.clampRetainedRadius(preferences.getInt(
+            RelayService.KEY_RETAINED_RADIUS_CHUNKS,
+            24
+        ));
+        statusRetentionEnabled = retention.isChecked();
+        statusConfiguredRadiusChunks = radiusValue;
+        TextView radiusLabel = settingLabel(
+            "Радиус: " + radiusValue + " чанков (" +
+                radiusValue * 16 + " блоков)"
+        );
+        root.addView(radiusLabel);
+        SeekBar radius = slider(
+            RelayService.MIN_RETAINED_RADIUS_CHUNKS,
+            RelayService.MAX_RETAINED_RADIUS_CHUNKS,
+            radiusValue
+        );
+        root.addView(radius);
+        radius.setOnSeekBarChangeListener(seekListener(progress -> {
+            statusConfiguredRadiusChunks = progress;
+            radiusLabel.setText("Радиус: " + progress + " чанков (" +
+                progress * 16 + " блоков)");
+            refreshChunkStatus();
+        }, this::saveRadius));
+
+        int scale = RelayService.clampOverlayScale(preferences.getInt(
+            RelayService.KEY_CHUNK_WIDGET_SCALE,
+            85
+        ));
+        TextView scaleLabel = settingLabel("Размер счётчика: " + scale + "%");
+        root.addView(scaleLabel);
+        SeekBar scaleSlider = slider(70, 150, scale);
+        root.addView(scaleSlider);
+        scaleSlider.setOnSeekBarChangeListener(seekListener(
+            progress -> scaleLabel.setText("Размер счётчика: " + progress + "%"),
+            progress -> saveInt(
+                RelayService.KEY_CHUNK_WIDGET_SCALE,
+                RelayService.clampOverlayScale(progress)
+            )
+        ));
+
+        chunkStatus = text("", 11, true);
+        chunkStatus.setPadding(dp(10), dp(9), dp(10), dp(9));
+        chunkStatus.setBackground(statusBackground());
+        root.addView(chunkStatus, margins(-1, -2, 0, dp(6), 0, dp(7)));
+        refreshChunkStatus();
+        TextView note = text(
+            "Счётчик можно перетаскивать. Коснитесь его без движения, чтобы " +
+                "свернуть; кнопки −/+ меняют размер. Туман Minecraft не " +
+                "доказывает выгрузку чанка — ориентируйтесь на этот счётчик.",
+            10,
+            false
+        );
+        note.setTextColor(0xff98a7b8);
+        root.addView(note);
+    }
+
+    private void buildEquipmentPage(LinearLayout root) {
+        root.addView(toggle(
+            "HUD снаряжения справа",
+            RelayService.KEY_EQUIPMENT_HUD,
+            true
+        ));
+        int scale = RelayService.clampOverlayScale(preferences.getInt(
+            RelayService.KEY_EQUIPMENT_HUD_SCALE,
+            80
+        ));
+        TextView scaleLabel = settingLabel("Размер HUD: " + scale + "%");
+        root.addView(scaleLabel);
+        SeekBar scaleSlider = slider(70, 150, scale);
+        root.addView(scaleSlider);
+        scaleSlider.setOnSeekBarChangeListener(seekListener(
+            progress -> scaleLabel.setText("Размер HUD: " + progress + "%"),
+            progress -> saveInt(
+                RelayService.KEY_EQUIPMENT_HUD_SCALE,
+                RelayService.clampOverlayScale(progress)
+            )
+        ));
+        TextView info = text(
+            "HUD показывает предмет в руке, четыре слота брони и остаток " +
+                "прочности. Зачарованные вещи получают плавный фиолетовый " +
+                "перелив. Данные приходят только из пакетов текущего игрока.",
+            10,
+            false
+        );
+        info.setTextColor(0xffaab8c8);
+        info.setPadding(dp(3), dp(8), dp(3), dp(8));
+        root.addView(info);
+        TextView attribution = text(
+            "Силуэты: Game-icons.net — Lorc и Delapouite, CC BY 3.0; " +
+                "адаптированы и динамически окрашиваются.",
+            9,
+            false
+        );
+        attribution.setTextColor(0xff78889b);
+        root.addView(attribution);
+    }
+
+    private void buildLogsPage(LinearLayout root) {
+        Switch logging = toggle(
+            "Записывать журнал",
+            RelayService.KEY_DETAILED_LOGS,
+            true
+        );
+        root.addView(logging);
+        TextView rule = text(
+            logging.isChecked()
+                ? "Запись включена: события и ошибки сохраняются."
+                : "Запись выключена полностью: новые строки и аварийный буфер не пишутся.",
+            10,
+            true
+        );
+        rule.setTextColor(logging.isChecked() ? 0xff73e49a : 0xffffc76c);
+        root.addView(rule, margins(-1, -2, dp(3), 0, dp(3), dp(7)));
+        TextView clear = text("ОЧИСТИТЬ ЖУРНАЛ", 11, true);
+        clear.setGravity(Gravity.CENTER);
+        clear.setPadding(dp(10), dp(9), dp(10), dp(9));
+        clear.setBackground(actionBackground());
+        clear.setOnClickListener(view -> {
+            DiagnosticsLog.clear(context);
+            if (logText != null) logText.setText("Журнал пока пуст.");
+        });
+        root.addView(clear, margins(-1, -2, 0, 0, 0, dp(7)));
+        logText = text(DiagnosticsLog.readTail(context, 32 * 1024), 8, false);
+        logText.setTypeface(android.graphics.Typeface.MONOSPACE);
+        logText.setTextColor(0xffb9c7d6);
+        logText.setTextIsSelectable(true);
+        logText.setPadding(dp(8), dp(8), dp(8), dp(8));
+        logText.setBackground(statusBackground());
+        root.addView(logText);
+    }
+
+    private Switch toggle(String label, String key, boolean defaultValue) {
+        Switch control = new Switch(context);
+        control.setText(label);
+        control.setTextSize(13);
+        control.setTextColor(Color.WHITE);
+        control.setChecked(preferences.getBoolean(key, defaultValue));
+        control.setPadding(dp(1), dp(2), dp(1), dp(2));
+        control.setOnCheckedChangeListener((button, checked) -> {
+            preferences.edit().putBoolean(key, checked).apply();
+            if (RelayService.KEY_CHUNK_RETENTION.equals(key)) {
+                statusRetentionEnabled = checked;
+                if (!checked) clearLiveChunkStatus();
+                refreshChunkStatus();
+            }
+            settingsChanged.run();
+            if (RelayService.KEY_DETAILED_LOGS.equals(key)) {
+                showPage("logs");
+            }
+        });
+        return control;
+    }
+
+    private SeekBar slider(int minimum, int maximum, int value) {
+        SeekBar slider = new SeekBar(context);
+        slider.setMin(minimum);
+        slider.setMax(maximum);
+        slider.setProgress(value);
+        slider.setPadding(0, 0, 0, 0);
+        return slider;
+    }
+
+    private interface ProgressAction { void apply(int value); }
+
+    private SeekBar.OnSeekBarChangeListener seekListener(
+        ProgressAction changed,
+        ProgressAction saved
+    ) {
+        return new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(
+                SeekBar seekBar,
+                int progress,
+                boolean fromUser
+            ) {
+                changed.apply(progress);
+            }
+
+            @Override public void onStartTrackingTouch(SeekBar seekBar) {}
+
+            @Override public void onStopTrackingTouch(SeekBar seekBar) {
+                saved.apply(seekBar.getProgress());
+            }
+        };
+    }
+
+    private TextView settingLabel(String value) {
+        TextView label = text(value, 11, true);
+        label.setTextColor(0xffdce6f5);
+        label.setPadding(dp(3), dp(6), dp(3), 0);
+        return label;
+    }
+
+    private void saveInt(String key, int value) {
+        preferences.edit().putInt(key, value).apply();
+        settingsChanged.run();
     }
 
     void updateChunkStatus(
@@ -470,6 +726,9 @@ final class RelayOverlayController {
     }
 
     private void refreshChunkStatus() {
+        if (logText != null && "logs".equals(currentPage)) {
+            logText.setText(DiagnosticsLog.readTail(context, 32 * 1024));
+        }
         if (chunkStatus == null) return;
         if (!statusRetentionEnabled) {
             chunkStatus.setText("Проверка чанков: удержание выключено");
@@ -712,6 +971,36 @@ final class RelayOverlayController {
         background.setColor(0x66101720);
         background.setCornerRadius(dp(10));
         background.setStroke(dp(1), 0x665f789d);
+        return background;
+    }
+
+    private GradientDrawable actionBackground() {
+        GradientDrawable background = new GradientDrawable();
+        background.setColor(0xff263446);
+        background.setCornerRadius(dp(10));
+        background.setStroke(dp(1), 0x665f789d);
+        return background;
+    }
+
+    private GradientDrawable cardBackground(boolean selected) {
+        GradientDrawable background = new GradientDrawable();
+        background.setColor(selected ? 0xff24364a : 0xbb1d2734);
+        background.setCornerRadius(dp(12));
+        background.setStroke(
+            dp(1),
+            selected ? 0xff4fd5ff : 0x554f6682
+        );
+        return background;
+    }
+
+    private GradientDrawable colorBackground(int color, boolean selected) {
+        GradientDrawable background = new GradientDrawable();
+        background.setShape(GradientDrawable.OVAL);
+        background.setColor(color);
+        background.setStroke(
+            dp(selected ? 3 : 1),
+            selected ? Color.WHITE : 0x99667688
+        );
         return background;
     }
 

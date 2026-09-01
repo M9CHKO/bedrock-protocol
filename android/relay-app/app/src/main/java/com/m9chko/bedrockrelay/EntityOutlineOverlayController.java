@@ -39,6 +39,14 @@ final class EntityOutlineOverlayController {
     private volatile boolean sessionVisible;
     private volatile boolean enabled = true;
     private volatile int fieldOfView = 70;
+    private volatile boolean showPlayers = true;
+    private volatile boolean showMobs = true;
+    private volatile boolean showItems = true;
+    private volatile int playerColor = 0xff4fd5ff;
+    private volatile int mobColor = 0xffff5b62;
+    private volatile int itemColor = 0xffffcf4a;
+    private volatile float outlineThickness = 1.7f;
+    private volatile int maximumDistance = 128;
     private boolean missingPermissionLogged;
     private EntityOutlineView outlineView;
 
@@ -63,6 +71,42 @@ final class EntityOutlineOverlayController {
         fieldOfView = RelayService.clampEntityFov(value);
         if (outlineView != null) {
             outlineView.setFieldOfView(fieldOfView);
+        }
+    }
+
+    void setDisplayOptions(
+        boolean players,
+        boolean mobs,
+        boolean items,
+        int playersColor,
+        int mobsColor,
+        int itemsColor,
+        float thickness,
+        int maxDistance
+    ) {
+        showPlayers = players;
+        showMobs = mobs;
+        showItems = items;
+        playerColor = playersColor | 0xff000000;
+        mobColor = mobsColor | 0xff000000;
+        itemColor = itemsColor | 0xff000000;
+        outlineThickness = (float) MotionSmoother.clamp(
+            thickness,
+            0.75,
+            6.0
+        );
+        maximumDistance = Math.max(16, Math.min(256, maxDistance));
+        if (outlineView != null) {
+            outlineView.setDisplayOptions(
+                showPlayers,
+                showMobs,
+                showItems,
+                playerColor,
+                mobColor,
+                itemColor,
+                outlineThickness,
+                maximumDistance
+            );
         }
     }
 
@@ -131,6 +175,16 @@ final class EntityOutlineOverlayController {
         missingPermissionLogged = false;
         EntityOutlineView view = new EntityOutlineView(context);
         view.setFieldOfView(fieldOfView);
+        view.setDisplayOptions(
+            showPlayers,
+            showMobs,
+            showItems,
+            playerColor,
+            mobColor,
+            itemColor,
+            outlineThickness,
+            maximumDistance
+        );
         view.setSystemUiVisibility(
             View.SYSTEM_UI_FLAG_LAYOUT_STABLE |
                 View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN |
@@ -326,6 +380,7 @@ final class EntityOutlineOverlayController {
         final String id;
         final String label;
         final boolean player;
+        final boolean item;
         final double x;
         final double y;
         final double z;
@@ -338,6 +393,7 @@ final class EntityOutlineOverlayController {
             String id,
             String label,
             boolean player,
+            boolean item,
             double x,
             double y,
             double z,
@@ -349,6 +405,7 @@ final class EntityOutlineOverlayController {
             this.id = id;
             this.label = label;
             this.player = player;
+            this.item = item;
             this.x = x;
             this.y = y;
             this.z = z;
@@ -378,6 +435,7 @@ final class EntityOutlineOverlayController {
                 id,
                 label,
                 value.optBoolean("player", false),
+                value.optBoolean("item", false),
                 x,
                 y,
                 z,
@@ -405,6 +463,7 @@ final class EntityOutlineOverlayController {
         final String id;
         String label;
         boolean player;
+        boolean item;
         final MotionSmoother.Axis renderX = new MotionSmoother.Axis();
         final MotionSmoother.Axis renderY = new MotionSmoother.Axis();
         final MotionSmoother.Axis renderZ = new MotionSmoother.Axis();
@@ -433,11 +492,13 @@ final class EntityOutlineOverlayController {
         String displayText = "";
         int displayDistance = Integer.MIN_VALUE;
         float displayTextWidth;
+        double drawDistanceSquared;
 
         RenderTrack(EntitySample sample, long now, long generation) {
             id = sample.id;
             label = sample.label;
             player = sample.player;
+            item = sample.item;
             sampleX = sample.x;
             sampleY = sample.y;
             sampleZ = sample.z;
@@ -460,6 +521,7 @@ final class EntityOutlineOverlayController {
             seenGeneration = generation;
             label = sample.label;
             player = sample.player;
+            item = sample.item;
             width = sample.width;
             height = sample.height;
             if (nativeUpdatedAtMs > 0 && sample.updatedAtMs > 0 &&
@@ -608,6 +670,8 @@ final class EntityOutlineOverlayController {
         private final Paint textBackgroundPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final RectF rectangle = new RectF();
         private final RectF labelRectangle = new RectF();
+        private final List<RectF> occupiedLabels = new ArrayList<>();
+        private final List<RenderTrack> renderOrder = new ArrayList<>();
         private final float density;
 
         private boolean cameraKnown;
@@ -651,6 +715,14 @@ final class EntityOutlineOverlayController {
         private long cameraLastFrameNanos;
         private long generation;
         private int fieldOfView = 70;
+        private boolean showPlayers = true;
+        private boolean showMobs = true;
+        private boolean showItems = true;
+        private int playerColor = 0xff4fd5ff;
+        private int mobColor = 0xffff5b62;
+        private int itemColor = 0xffffcf4a;
+        private float outlineThickness = 1.7f;
+        private int maximumDistance = 128;
 
         EntityOutlineView(Context context) {
             super(context);
@@ -672,6 +744,35 @@ final class EntityOutlineOverlayController {
 
         void setFieldOfView(int value) {
             fieldOfView = RelayService.clampEntityFov(value);
+            postInvalidateOnAnimation();
+        }
+
+        void setDisplayOptions(
+            boolean players,
+            boolean mobs,
+            boolean items,
+            int playersColor,
+            int mobsColor,
+            int itemsColor,
+            float thickness,
+            int maxDistance
+        ) {
+            showPlayers = players;
+            showMobs = mobs;
+            showItems = items;
+            playerColor = playersColor;
+            mobColor = mobsColor;
+            itemColor = itemsColor;
+            outlineThickness = thickness;
+            maximumDistance = maxDistance;
+            outlinePaint.setStrokeWidth(Math.max(
+                density * 0.75f,
+                density * outlineThickness
+            ));
+            glowPaint.setStrokeWidth(Math.max(
+                density * 2.5f,
+                density * (outlineThickness + 2.6f)
+            ));
             postInvalidateOnAnimation();
         }
 
@@ -795,13 +896,15 @@ final class EntityOutlineOverlayController {
                         sample.pitch - cameraSamplePitch,
                         elapsedSeconds,
                         2160.0,
-                        0.0001
+                        0.002,
+                        0.025
                     );
                     cameraVelocityYaw = cameraVelocityEstimatorYaw.update(
                         unwrappedYaw - cameraSampleYaw,
                         elapsedSeconds,
                         2160.0,
-                        0.0001
+                        0.002,
+                        0.025
                     );
                 } else if (inputTickDiscontinuity ||
                     sample.updatedAtMs - cameraUpdatedAtMs > 500) {
@@ -1054,8 +1157,27 @@ final class EntityOutlineOverlayController {
                     0.02
                 );
             boolean animating = cameraProjectionActive;
+            renderOrder.clear();
             for (RenderTrack track : tracks.values()) {
+                double dx = track.renderX.value() - cameraX;
+                double dy = track.renderY.value() - cameraY;
+                double dz = track.renderZ.value() - cameraZ;
+                track.drawDistanceSquared = dx * dx + dy * dy + dz * dz;
+                renderOrder.add(track);
+            }
+            renderOrder.sort((left, right) -> Double.compare(
+                left.drawDistanceSquared,
+                right.drawDistanceSquared
+            ));
+            occupiedLabels.clear();
+            for (RenderTrack track : renderOrder) {
                 animating |= track.advance(now);
+                if ((track.player && !showPlayers) ||
+                    (track.item && !showItems) ||
+                    (!track.player && !track.item && !showMobs)) {
+                    track.screenBox.hide();
+                    continue;
+                }
                 animating |= drawTrack(
                     canvas,
                     track,
@@ -1094,6 +1216,15 @@ final class EntityOutlineOverlayController {
             double centerDx = entityX - cameraX;
             double centerDy = entityY + track.height * 0.5 - cameraY;
             double centerDz = entityZ - cameraZ;
+            double distanceSquared =
+                (entityX - cameraX) * (entityX - cameraX) +
+                (entityY - cameraY) * (entityY - cameraY) +
+                (entityZ - cameraZ) * (entityZ - cameraZ);
+            if (!Double.isFinite(distanceSquared) ||
+                distanceSquared > maximumDistance * maximumDistance) {
+                track.screenBox.hide();
+                return false;
+            }
             double centerDepth = depth(
                 centerDx,
                 centerDy,
@@ -1154,7 +1285,7 @@ final class EntityOutlineOverlayController {
                     }
                 }
             }
-            if (projected < 4) {
+            if (projected != 8) {
                 track.screenBox.hide();
                 return false;
             }
@@ -1163,17 +1294,16 @@ final class EntityOutlineOverlayController {
             float top = (float) minimumY;
             float right = (float) maximumX;
             float bottom = (float) maximumY;
-            float minimumWidth = density * 8f;
-            float minimumHeight = density * 15f;
-            if (right - left < minimumWidth) {
-                float center = (left + right) * 0.5f;
-                left = center - minimumWidth * 0.5f;
-                right = center + minimumWidth * 0.5f;
-            }
-            if (bottom - top < minimumHeight) {
-                float center = (top + bottom) * 0.5f;
-                top = center - minimumHeight * 0.5f;
-                bottom = center + minimumHeight * 0.5f;
+            float projectedWidth = right - left;
+            float projectedHeight = bottom - top;
+            float minimumWidth = density * (track.item ? 1.5f : 2.5f);
+            float minimumHeight = density * (track.item ? 3.5f : 7f);
+            if (projectedWidth < minimumWidth ||
+                projectedHeight < minimumHeight ||
+                projectedWidth > getWidth() * 2f ||
+                projectedHeight > getHeight() * 2f) {
+                track.screenBox.hide();
+                return false;
             }
             if (right < 0 || bottom < 0 || left > getWidth() ||
                 top > getHeight()) {
@@ -1196,7 +1326,9 @@ final class EntityOutlineOverlayController {
             right = (float) track.screenBox.right();
             bottom = (float) track.screenBox.bottom();
 
-            int color = track.player ? 0xff4fd5ff : 0xffff5b62;
+            int color = track.player
+                ? playerColor
+                : track.item ? itemColor : mobColor;
             rectangle.set(left, top, right, bottom);
             fillPaint.setColor(withAlpha(color, 24));
             glowPaint.setColor(withAlpha(color, 78));
@@ -1206,11 +1338,7 @@ final class EntityOutlineOverlayController {
             canvas.drawRoundRect(rectangle, corner, corner, glowPaint);
             canvas.drawRoundRect(rectangle, corner, corner, outlinePaint);
 
-            double distance = Math.sqrt(
-                (entityX - cameraX) * (entityX - cameraX) +
-                (entityY - cameraY) * (entityY - cameraY) +
-                (entityZ - cameraZ) * (entityZ - cameraZ)
-            );
+            double distance = Math.sqrt(distanceSquared);
             int roundedDistance = (int) Math.round(distance);
             if (!track.label.equals(track.displayLabel) ||
                 roundedDistance != track.displayDistance) {
@@ -1239,6 +1367,20 @@ final class EntityOutlineOverlayController {
                 textX + textWidth + density * 3f,
                 baseline + density * 2f
             );
+            if (labelOverlapsExisting(labelRectangle)) {
+                baseline = Math.min(
+                    getHeight() - density * 3f,
+                    bottom + textHeight + density * 5f
+                );
+                labelRectangle.set(
+                    textX - density * 3f,
+                    baseline - textHeight - density * 3f,
+                    textX + textWidth + density * 3f,
+                    baseline + density * 2f
+                );
+            }
+            if (labelOverlapsExisting(labelRectangle)) return screenAnimating;
+            occupiedLabels.add(new RectF(labelRectangle));
             canvas.drawRoundRect(
                 labelRectangle,
                 density * 3f,
@@ -1247,6 +1389,13 @@ final class EntityOutlineOverlayController {
             );
             canvas.drawText(text, textX, baseline, textPaint);
             return screenAnimating;
+        }
+
+        private boolean labelOverlapsExisting(RectF candidate) {
+            for (RectF occupied : occupiedLabels) {
+                if (RectF.intersects(candidate, occupied)) return true;
+            }
+            return false;
         }
 
         private static double depth(

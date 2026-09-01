@@ -193,7 +193,7 @@ public final class MotionSmootherTest {
     }
 
     @Test
-    public void stationaryEntityFollowsGlobalCameraProjectionWithoutLag() {
+    public void globalCameraProjectionRemainsContinuousWithoutLongTrail() {
         MotionSmoother.ScreenBox box = new MotionSmoother.ScreenBox();
         long now = 1_000_000_000L;
         box.step(520.0, 400.0, 560.0, 500.0, now, 1080.0, 1920.0);
@@ -213,13 +213,17 @@ public final class MotionSmootherTest {
                 1920.0,
                 true
             );
-            assertEquals(projectedCenter, box.centerX(), 1.0e-9);
+            assertTrue(Double.isFinite(box.centerX()));
+            if (frame > 12) {
+                assertTrue(Math.abs(box.centerX() - projectedCenter) < 55.0);
+            }
             assertEquals(40.0, box.right() - box.left(), 1.0e-9);
             finalCenter = projectedCenter;
         }
 
         // Once the camera stops, entering stationary noise filtering must not
         // create a delayed catch-up or continue the old camera trajectory.
+        double previousError = Math.abs(finalCenter - box.centerX());
         for (int frame = 0; frame < 120; ++frame) {
             now += 8_333_333L;
             box.step(
@@ -232,8 +236,84 @@ public final class MotionSmootherTest {
                 1920.0,
                 false
             );
-            assertEquals(finalCenter, box.centerX(), 1.0e-9);
+            double error = Math.abs(finalCenter - box.centerX());
+            assertTrue(error <= previousError + 1.0e-6);
+            previousError = error;
         }
+        assertTrue(previousError < 0.2);
+    }
+
+    @Test
+    public void cameraProjectionFiltersTinyActiveMotionInsteadOfSnapping() {
+        MotionSmoother.ScreenBox box = new MotionSmoother.ScreenBox();
+        long now = 1_000_000_000L;
+        box.step(480.0, 400.0, 520.0, 500.0, now, 1080.0, 1920.0);
+        double previous = box.centerX();
+
+        for (int frame = 1; frame <= 180; ++frame) {
+            now += 8_333_333L;
+            double quantizedJitter = (frame % 6 == 0)
+                ? ((frame / 6 & 1) == 0 ? 7.0 : -7.0)
+                : 0.0;
+            double target = 500.0 + frame * 0.35 + quantizedJitter;
+            box.step(
+                target - 20.0,
+                400.0,
+                target + 20.0,
+                500.0,
+                now,
+                1080.0,
+                1920.0,
+                true
+            );
+            double current = box.centerX();
+            assertTrue(Math.abs(current - previous) < 5.0);
+            previous = current;
+        }
+        assertEquals(563.0, box.centerX(), 10.0);
+    }
+
+    @Test
+    public void packetVelocityAccumulatesCoherentMicroTurnFromRest() {
+        MotionSmoother.PacketVelocity velocity =
+            new MotionSmoother.PacketVelocity();
+        velocity.reset();
+
+        assertEquals(0.0, velocity.update(
+            0.009,
+            0.05,
+            2160.0,
+            0.002,
+            0.025
+        ), 0.0);
+        assertEquals(0.0, velocity.update(
+            -0.008,
+            0.05,
+            2160.0,
+            0.002,
+            0.025
+        ), 0.0);
+        assertEquals(0.0, velocity.update(
+            0.010,
+            0.05,
+            2160.0,
+            0.002,
+            0.025
+        ), 0.0);
+        assertEquals(0.0, velocity.update(
+            0.010,
+            0.05,
+            2160.0,
+            0.002,
+            0.025
+        ), 0.0);
+        assertEquals(0.2, velocity.update(
+            0.010,
+            0.05,
+            2160.0,
+            0.002,
+            0.025
+        ), 0.03);
     }
 
     @Test

@@ -8,6 +8,7 @@
 #include <jni.h>
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -25,6 +26,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <unordered_map>
 #include <vector>
 
 #if defined(BEDROCK_ANDROID_RELEASE_BUILD) && !defined(__OPTIMIZE__)
@@ -163,6 +165,92 @@ uint64_t steadyMilliseconds() {
             std::chrono::steady_clock::now().time_since_epoch()
         ).count()
     );
+}
+
+std::optional<int64_t> packetInteger(
+    const bedrock::PacketValue* value
+) noexcept {
+    if (value == nullptr) return std::nullopt;
+    switch (value->kind) {
+        case bedrock::PacketValue::Kind::Int:
+            return value->intValue;
+        case bedrock::PacketValue::Kind::UInt:
+            return static_cast<int64_t>(value->uintValue);
+        case bedrock::PacketValue::Kind::Double:
+            return static_cast<int64_t>(value->doubleValue);
+        case bedrock::PacketValue::Kind::Bool:
+            return value->boolValue ? 1 : 0;
+        default:
+            return std::nullopt;
+    }
+}
+
+const bedrock::PacketValue* findNamedPacketValue(
+    const bedrock::PacketValue& value,
+    std::string_view name,
+    int depth = 0
+) noexcept {
+    if (depth > 24) return nullptr;
+    if (value.kind == bedrock::PacketValue::Kind::Object) {
+        const auto direct = value.objectValue.find(std::string(name));
+        if (direct != value.objectValue.end()) return &direct->second;
+        for (const auto& [_, child] : value.objectValue) {
+            if (const auto* found = findNamedPacketValue(
+                    child,
+                    name,
+                    depth + 1
+                )) {
+                return found;
+            }
+        }
+    } else if (value.kind == bedrock::PacketValue::Kind::Array) {
+        for (const auto& child : value.arrayValue) {
+            if (const auto* found = findNamedPacketValue(
+                    child,
+                    name,
+                    depth + 1
+                )) {
+                return found;
+            }
+        }
+    }
+    return nullptr;
+}
+
+std::optional<int32_t> nbtInteger(
+    const bedrock::PacketValue* item,
+    std::string_view name
+) noexcept {
+    if (item == nullptr) return std::nullopt;
+    const auto* node = findNamedPacketValue(*item, name);
+    if (node == nullptr) return std::nullopt;
+    if (const auto direct = packetInteger(node)) {
+        return static_cast<int32_t>(*direct);
+    }
+    if (node->kind == bedrock::PacketValue::Kind::Object) {
+        const auto payload = node->objectValue.find("value");
+        if (payload != node->objectValue.end()) {
+            if (const auto number = packetInteger(&payload->second)) {
+                return static_cast<int32_t>(*number);
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+bool packetValueHasContent(const bedrock::PacketValue* value) noexcept {
+    if (value == nullptr) return false;
+    if (value->kind == bedrock::PacketValue::Kind::Array) {
+        return !value->arrayValue.empty();
+    }
+    if (value->kind == bedrock::PacketValue::Kind::Object) {
+        const auto payload = value->objectValue.find("value");
+        if (payload != value->objectValue.end()) {
+            return packetValueHasContent(&payload->second);
+        }
+        return !value->objectValue.empty();
+    }
+    return value->kind != bedrock::PacketValue::Kind::Null;
 }
 
 uint64_t packetHash(const std::vector<uint8_t>& bytes) {
@@ -500,6 +588,14 @@ private:
 };
 
 struct RelayState {
+    struct EquipmentItem {
+        bool present = false;
+        int64_t networkId = 0;
+        std::string name;
+        int32_t damage = 0;
+        bool enchanted = false;
+    };
+
     struct FlightRecord {
         uint64_t sequence = 0;
         int64_t timestampMs = 0;
@@ -558,6 +654,231 @@ struct RelayState {
     std::atomic<uint64_t> cameraOrientationUpdates {0};
     std::atomic<uint64_t> cameraOrientationDecodeFailures {0};
     bedrock::EntityPositionTracker entityPositions;
+    std::array<EquipmentItem, 5> equipment;
+    uint64_t equipmentRevision = 0;
+    std::unordered_map<int64_t, std::string> itemNames;
+    bedrock::ProtoDefVariableStorePtr itemProtocolVariables =
+        bedrock::makeProtoDefVariableStore();
+    std::mutex itemDecodeMutex;
+
+    EquipmentItem decodedItem(
+        const bedrock::RelayPacketEvent& decoded,
+        const std::string& prefix
+    ) {
+        EquipmentItem item;
+        item.networkId = decoded.getInt(prefix + ".network_id", 0);
+        item.present = item.networkId != 0;
+        if (!item.present) return item;
+        const auto protocolDamage = decoded.getInt(
+            prefix + ".metadata",
+            -1
+        );
+        item.damage = std::max(0, static_cast<int32_t>(
+            protocolDamage >= 0
+                ? protocolDamage
+                : nbtInteger(decoded.value(prefix), "Damage").value_or(0)
+        ));
+        item.enchanted = packetValueHasContent(
+            decoded.value(prefix + ".extra.nbt.nbt.value.ench")
+        );
+        const auto* itemValue = decoded.value(prefix);
+        if (!item.enchanted && itemValue != nullptr) {
+            item.enchanted = packetValueHasContent(
+                findNamedPacketValue(*itemValue, "ench")
+            );
+        }
+        {
+            std::lock_guard lock(mutex);
+            const auto known = itemNames.find(item.networkId);
+            item.name = known == itemNames.end()
+                ? "minecraft:item_" + std::to_string(item.networkId)
+                : known->second;
+        }
+        return item;
+    }
+
+    void observeItemRegistry(
+        const std::string& version,
+        const bedrock::VersionedGamePacket& packet
+    ) noexcept {
+        try {
+            std::vector<std::pair<int64_t, std::string>> palette;
+            {
+                std::lock_guard decodeLock(itemDecodeMutex);
+                palette = bedrock::ProtoDefPacketDecoder(
+                    version,
+                    itemProtocolVariables
+                ).decodeItemPaletteStrict(packet.name, packet.payload);
+            }
+            std::lock_guard lock(mutex);
+            itemNames.clear();
+            itemNames.reserve(palette.size());
+            for (auto& [runtimeId, name] : palette) {
+                itemNames.insert_or_assign(runtimeId, std::move(name));
+            }
+        } catch (...) {
+        }
+    }
+
+    void observeDecodedGameplayPacket(
+        const std::string& version,
+        bedrock::BedrockRelayPacketEvent& event,
+        bool serverbound
+    ) noexcept {
+        const auto& name = event.packet.name;
+        if (!serverbound && name == "item_registry") {
+            observeItemRegistry(version, event.packet);
+            return;
+        }
+        if (!serverbound && name == "start_game") {
+            std::lock_guard lock(mutex);
+            equipment = {};
+            ++equipmentRevision;
+            return;
+        }
+        const bool relevant = name == "add_item_entity" ||
+            name == "mob_equipment" ||
+            name == "mob_armor_equipment" ||
+            name == "inventory_content" ||
+            name == "inventory_slot" ||
+            name == "player_armor_damage";
+        if (!relevant) return;
+
+        try {
+            std::lock_guard decodeLock(itemDecodeMutex);
+            bedrock::RelayPacketEvent decoded(
+                version,
+                event,
+                itemProtocolVariables,
+                true
+            );
+            if (!serverbound && name == "add_item_entity") {
+                const auto networkId = decoded.getInt("item.network_id", 0);
+                const auto runtimeId = decoded.getUInt(
+                    "runtime_entity_id",
+                    0
+                );
+                if (networkId == 0 || runtimeId == 0) return;
+                std::string label;
+                {
+                    std::lock_guard lock(mutex);
+                    const auto known = itemNames.find(networkId);
+                    label = known == itemNames.end()
+                        ? "Предмет"
+                        : known->second;
+                }
+                entityPositions.observeDecodedItemEntity(
+                    decoded.getInt("entity_id_self", 0),
+                    runtimeId,
+                    std::move(label),
+                    static_cast<float>(decoded.getDouble("position.x", 0.0)),
+                    static_cast<float>(decoded.getDouble("position.y", 0.0)),
+                    static_cast<float>(decoded.getDouble("position.z", 0.0))
+                );
+                return;
+            }
+
+            const auto camera = entityPositions.cameraSnapshot();
+            if (name == "mob_equipment") {
+                const auto runtimeId = decoded.getUInt(
+                    "runtime_entity_id",
+                    0
+                );
+                if (camera.runtimeId != 0 && runtimeId != camera.runtimeId) {
+                    return;
+                }
+                auto hand = decodedItem(decoded, "item");
+                std::lock_guard lock(mutex);
+                equipment[0] = std::move(hand);
+                ++equipmentRevision;
+                return;
+            }
+            if (!serverbound && name == "mob_armor_equipment") {
+                const auto runtimeId = decoded.getUInt(
+                    "runtime_entity_id",
+                    0
+                );
+                if (camera.runtimeId != 0 && runtimeId != camera.runtimeId) {
+                    return;
+                }
+                std::array<EquipmentItem, 4> armor {
+                    decodedItem(decoded, "helmet"),
+                    decodedItem(decoded, "chestplate"),
+                    decodedItem(decoded, "leggings"),
+                    decodedItem(decoded, "boots")
+                };
+                std::lock_guard lock(mutex);
+                for (std::size_t index = 0; index < armor.size(); ++index) {
+                    equipment[index + 1] = std::move(armor[index]);
+                }
+                ++equipmentRevision;
+                return;
+            }
+            if (!serverbound && name == "inventory_content" &&
+                decoded.getString("window_id", "") == "armor") {
+                const auto* items = decoded.value("input");
+                if (items == nullptr ||
+                    items->kind != bedrock::PacketValue::Kind::Array) {
+                    return;
+                }
+                std::array<EquipmentItem, 4> armor;
+                for (std::size_t index = 0; index < armor.size(); ++index) {
+                    armor[index] = index < items->arrayValue.size()
+                        ? decodedItem(
+                            decoded,
+                            "input[" + std::to_string(index) + "]"
+                        )
+                        : EquipmentItem {};
+                }
+                std::lock_guard lock(mutex);
+                for (std::size_t index = 0; index < armor.size(); ++index) {
+                    equipment[index + 1] = std::move(armor[index]);
+                }
+                ++equipmentRevision;
+                return;
+            }
+            if (!serverbound && name == "inventory_slot" &&
+                decoded.getString("window_id", "") == "armor") {
+                const auto slot = decoded.getUInt("slot", 99);
+                if (slot < 4) {
+                    auto armor = decodedItem(decoded, "item");
+                    std::lock_guard lock(mutex);
+                    equipment[static_cast<std::size_t>(slot) + 1] =
+                        std::move(armor);
+                    ++equipmentRevision;
+                }
+                return;
+            }
+            if (!serverbound && name == "player_armor_damage") {
+                static constexpr std::array<const char*, 4> DamageFields {
+                    "helmet_damage",
+                    "chestplate_damage",
+                    "leggings_damage",
+                    "boots_damage"
+                };
+                std::lock_guard lock(mutex);
+                for (std::size_t index = 0; index < DamageFields.size(); ++index) {
+                    if (decoded.has(DamageFields[index])) {
+                        equipment[index + 1].damage = std::max(
+                            0,
+                            equipment[index + 1].damage + static_cast<int32_t>(
+                                decoded.getInt(DamageFields[index], 0)
+                            )
+                        );
+                    }
+                }
+                ++equipmentRevision;
+            }
+        } catch (...) {
+        }
+    }
+
+    void clearGameplayTelemetry() {
+        std::lock_guard lock(mutex);
+        equipment = {};
+        itemNames.clear();
+        ++equipmentRevision;
+    }
 
     void configureRuntime(
         bool detailed,
@@ -592,7 +913,12 @@ struct RelayState {
             retainedLevelChunkCount.store(0, std::memory_order_relaxed);
             retainedLevelChunkBytes.store(0, std::memory_order_relaxed);
         }
-        if (!detailed) resetFlight();
+        if (!detailed) {
+            std::lock_guard lock(mutex);
+            events.clear();
+            flight.clear();
+            lastFlushedFlightSequence = flightSequence;
+        }
     }
 
     void updateLevelChunkRetentionStats(
@@ -633,14 +959,7 @@ struct RelayState {
     }
 
     void push(bedrock::JsRuntimeValue event) {
-        if (!detailedLogging.load(std::memory_order_relaxed) &&
-            event.isObject()) {
-            const auto* level = event.get("level");
-            if (level && level->isString() &&
-                level->stringValue() == "DEBUG") {
-                return;
-            }
-        }
+        if (!detailedLogging.load(std::memory_order_relaxed)) return;
         std::lock_guard lock(mutex);
         if (event.isObject()) {
             if (!event.get("timestampMs")) {
@@ -766,6 +1085,26 @@ bedrock::JsRuntimeValue snapshotValue(
     std::optional<bool> ok = std::nullopt
 ) {
     std::lock_guard lock(state->mutex);
+    static constexpr std::array<std::string_view, 5> EquipmentSlots {
+        "hand", "helmet", "chestplate", "leggings", "boots"
+    };
+    std::vector<bedrock::JsRuntimeValue> equipment;
+    equipment.reserve(state->equipment.size());
+    for (std::size_t index = 0; index < state->equipment.size(); ++index) {
+        const auto& item = state->equipment[index];
+        equipment.push_back(bedrock::JsRuntimeValue::object({
+            {"slot", bedrock::JsRuntimeValue::string(
+                std::string(EquipmentSlots[index])
+            )},
+            {"present", bedrock::JsRuntimeValue::boolean(item.present)},
+            {"networkId", bedrock::JsRuntimeValue::number(
+                static_cast<double>(item.networkId)
+            )},
+            {"name", bedrock::JsRuntimeValue::string(item.name)},
+            {"damage", bedrock::JsRuntimeValue::number(item.damage)},
+            {"enchanted", bedrock::JsRuntimeValue::boolean(item.enchanted)}
+        }));
+    }
     auto result = bedrock::JsRuntimeValue::object({
         {"running", bedrock::JsRuntimeValue::boolean(state->running)},
         {"listening", bedrock::JsRuntimeValue::boolean(state->listening)},
@@ -889,6 +1228,10 @@ bedrock::JsRuntimeValue snapshotValue(
         {"destinationLatencyMs", bedrock::JsRuntimeValue::number(
             static_cast<double>(state->destinationLatencyMs)
         )},
+        {"equipmentRevision", bedrock::JsRuntimeValue::number(
+            static_cast<double>(state->equipmentRevision)
+        )},
+        {"equipment", bedrock::JsRuntimeValue::array(std::move(equipment))},
         {"error", bedrock::JsRuntimeValue::string(state->lastError)}
     });
     if (ok.has_value()) {
@@ -955,6 +1298,7 @@ bedrock::JsRuntimeValue entityOverlaySnapshotValue(
             {"type", bedrock::JsRuntimeValue::string(entity.type)},
             {"label", bedrock::JsRuntimeValue::string(entity.label)},
             {"player", bedrock::JsRuntimeValue::boolean(entity.player)},
+            {"item", bedrock::JsRuntimeValue::boolean(entity.item)},
             {"x", bedrock::JsRuntimeValue::number(entity.x)},
             {"y", bedrock::JsRuntimeValue::number(entity.y)},
             {"z", bedrock::JsRuntimeValue::number(entity.z)},
@@ -1240,6 +1584,7 @@ public:
         relay->onDisconnect([this, state](bedrock::RelayPlayer& player) {
             cancelLoginWatchdog(player.connection.peer);
             state->entityPositions.clear();
+            state->clearGameplayTelemetry();
             state->push(
                 "disconnect",
                 "downstream_session=" + player.sessionId() +
@@ -1255,6 +1600,7 @@ public:
         });
         relay->onError([state](const std::string& message) {
             state->entityPositions.clear();
+            state->clearGameplayTelemetry();
             {
                 std::lock_guard lock(state->mutex);
                 state->lastError = safeMessage(message);
@@ -1344,6 +1690,7 @@ public:
             if (!positionObserved) {
                 state->entityPositions.observeServerbound(event.packet);
             }
+            state->observeDecodedGameplayPacket(version, event, true);
             if (isFlightPacket(event.packet.name)) {
                 state->recordFlight(
                     "relay_seen",
@@ -1358,8 +1705,11 @@ public:
                 "packet"
             );
         });
-        relay->live().onClientbound([state](bedrock::BedrockRelayPacketEvent& event) {
+        relay->live().onClientbound([state, version](
+            bedrock::BedrockRelayPacketEvent& event
+        ) {
             state->entityPositions.observeClientbound(event.packet);
+            state->observeDecodedGameplayPacket(version, event, false);
             if (event.packet.name == "network_chunk_publisher_update" &&
                 state->chunkRetentionEnabled.load(std::memory_order_relaxed)) {
                 const auto minimumRadiusBlocks = static_cast<uint32_t>(
@@ -2036,7 +2386,14 @@ Java_com_m9chko_bedrockrelay_NativeBridge_startRelay(
         state->push("error", message, "ERROR", "native");
         auto result = snapshotValue(state, false);
         result.set("error", bedrock::JsRuntimeValue::string(message));
-        __android_log_print(ANDROID_LOG_ERROR, LogTag, "%s", message.c_str());
+        if (configuredDetailedLogging.load(std::memory_order_relaxed)) {
+            __android_log_print(
+                ANDROID_LOG_ERROR,
+                LogTag,
+                "%s",
+                message.c_str()
+            );
+        }
         return toJavaString(environment, jsonString(result));
     }
 }

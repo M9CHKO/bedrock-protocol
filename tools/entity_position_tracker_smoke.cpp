@@ -109,6 +109,31 @@ int main() {
         return 1;
     }
 
+    tracker.observeDecodedItemEntity(
+        8,
+        78,
+        "minecraft:diamond",
+        101.0f,
+        64.0f,
+        -50.0f
+    );
+    state = tracker.snapshot();
+    if (state.entities.size() != 2 || !state.entities[1].item ||
+        state.entities[1].runtimeId != 78 ||
+        state.entities[1].label != "minecraft:diamond") {
+        std::cerr << "decoded dropped item was not tracked separately\n";
+        return 1;
+    }
+
+    std::vector<uint8_t> takeItem;
+    writeVarUInt(takeItem, 78);
+    tracker.observeClientbound(packet("take_item_entity", std::move(takeItem)));
+    state = tracker.snapshot();
+    if (state.entities.size() != 1 || state.entities[0].item) {
+        std::cerr << "taken dropped item was not removed\n";
+        return 1;
+    }
+
     std::vector<uint8_t> delta;
     writeVarUInt(delta, 77);
     delta.push_back(0x05);
@@ -228,6 +253,30 @@ int main() {
         state.recognizedPackets != recognizedBeforeAtomic + 1 ||
         state.decodedPackets != decodedBeforeAtomic + 1) {
         std::cerr << "atomic camera sample was not published as one packet\n";
+        return 1;
+    }
+
+    std::vector<uint8_t> verticalAuth;
+    writeFloat(verticalAuth, 89.9f);
+    writeFloat(verticalAuth, 37.0f);
+    writeFloat(verticalAuth, 103.0f);
+    writeFloat(verticalAuth, 71.0f);
+    writeFloat(verticalAuth, -48.0f);
+    if (!tracker.observeServerboundWithCameraForward(
+            packet("player_auth_input", std::move(verticalAuth)),
+            0.00001f,
+            -1.0f,
+            -0.00001f,
+            12'346,
+            true
+        )) {
+        std::cerr << "near-vertical camera-forward update was rejected\n";
+        return 1;
+    }
+    state = tracker.snapshot();
+    if (!near(state.camera.pitch, 90.0f) ||
+        !near(state.camera.yaw, 37.0f)) {
+        std::cerr << "near-vertical camera yaw was not stabilised\n";
         return 1;
     }
 

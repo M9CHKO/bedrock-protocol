@@ -1,0 +1,14 @@
+Equipment HUD silhouettes are adapted from Game-icons.net under CC BY 3.0.
+
+Authors and source pages:
+- Lorc, “Broadsword”: https://game-icons.net/1x1/lorc/broadsword.html
+- Delapouite, “Black knight helm”: https://game-icons.net/1x1/delapouite/black-knight-helm.html
+- Delapouite, “Leather armor”: https://game-icons.net/1x1/delapouite/leather-armor.html
+- Delapouite, “Leg armor”: https://game-icons.net/1x1/delapouite/leg-armor.html
+- Delapouite, “Metal boot”: https://game-icons.net/1x1/delapouite/metal-boot.html
+
+License: https://creativecommons.org/licenses/by/3.0/
+Project license notice: https://game-icons.net/about.html
+
+Changes: background paths removed, paths simplified where appropriate, and
+colors are applied dynamically by CPE Relay.

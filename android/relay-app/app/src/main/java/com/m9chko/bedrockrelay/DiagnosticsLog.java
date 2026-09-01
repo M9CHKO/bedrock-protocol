@@ -66,11 +66,10 @@ final class DiagnosticsLog {
         long timestampMillis
     ) {
         if (context == null) return;
-        if ("DEBUG".equalsIgnoreCase(level) &&
-            !context.getSharedPreferences(
-                RelayService.PREFERENCES,
-                Context.MODE_PRIVATE
-            ).getBoolean(RelayService.KEY_DETAILED_LOGS, true)) {
+        if (!context.getSharedPreferences(
+            RelayService.PREFERENCES,
+            Context.MODE_PRIVATE
+        ).getBoolean(RelayService.KEY_DETAILED_LOGS, true)) {
             return;
         }
         synchronized (LOCK) {

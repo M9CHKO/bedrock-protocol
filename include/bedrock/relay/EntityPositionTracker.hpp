@@ -36,6 +36,7 @@ struct TrackedEntityPosition {
     std::string type;
     std::string label;
     bool player = false;
+    bool item = false;
     float x = 0.0f;
     float y = 0.0f;
     float z = 0.0f;
@@ -152,7 +153,46 @@ public:
                 readMovePlayerLocked(packet, false);
             } else if (packet.name == "player_list") {
                 readPlayerListLocked(packet);
+            } else if (packet.name == "take_item_entity") {
+                readTakeItemEntityLocked(packet);
             }
+            ++decodedPackets_;
+        } catch (...) {
+            ++parseFailures_;
+        }
+    }
+
+    /** Adds a dropped item after the versioned packet decoder skipped Item. */
+    void observeDecodedItemEntity(
+        int64_t uniqueId,
+        uint64_t runtimeId,
+        std::string label,
+        float x,
+        float y,
+        float z
+    ) noexcept {
+        std::lock_guard lock(mutex_);
+        ++recognizedPackets_;
+        try {
+            requirePosition(x, y, z);
+            eraseRuntimeLocked(runtimeId);
+            if (runtimeId == camera_.runtimeId) return;
+
+            EntityRecord entity;
+            entity.runtimeId = runtimeId;
+            entity.uniqueId = uniqueId;
+            entity.type = "minecraft:item";
+            entity.label = label.empty() ? "Предмет" : std::move(label);
+            entity.item = true;
+            entity.x = x;
+            entity.y = y;
+            entity.z = z;
+            entity.width = 0.25f;
+            entity.height = 0.25f;
+            entity.updatedAtMs = monotonicMilliseconds();
+            entities_[runtimeId] = std::move(entity);
+            if (uniqueId != 0) uniqueToRuntime_[uniqueId] = runtimeId;
+            trimLocked();
             ++decodedPackets_;
         } catch (...) {
             ++parseFailures_;
@@ -197,6 +237,7 @@ public:
             out.entities.end(),
             [](const auto& left, const auto& right) {
                 if (left.player != right.player) return left.player;
+                if (left.item != right.item) return !left.item;
                 return left.distanceSquared < right.distanceSquared;
             }
         );
@@ -257,8 +298,31 @@ private:
         const float normalizedZ = forwardZ / length;
         constexpr float RadiansToDegrees = 57.29577951308232f;
         camera_.pitch = std::asin(-normalizedY) * RadiansToDegrees;
-        camera_.yaw = std::atan2(-normalizedX, normalizedZ) *
+        const float horizontalLength = std::sqrt(
+            normalizedX * normalizedX + normalizedZ * normalizedZ
+        );
+        const float vectorYaw = std::atan2(-normalizedX, normalizedZ) *
             RadiansToDegrees;
+        // Yaw becomes mathematically undefined when the camera points nearly
+        // straight up/down. A few float bits in X/Z can otherwise turn a
+        // microscopic touch into a 90-180 degree screen-space jump. The
+        // PlayerAuthInput body yaw was installed immediately before this
+        // vector, so use it at the pole and blend continuously back to the
+        // dedicated camera yaw outside the unstable cone.
+        constexpr float StableYawBlendStart = 0.035f;
+        constexpr float StableYawBlendEnd = 0.14f;
+        float yawWeight = std::clamp(
+            (horizontalLength - StableYawBlendStart) /
+                (StableYawBlendEnd - StableYawBlendStart),
+            0.0f,
+            1.0f
+        );
+        yawWeight = yawWeight * yawWeight * (3.0f - 2.0f * yawWeight);
+        float yawDelta = std::fmod(
+            vectorYaw - camera_.yaw + 540.0f,
+            360.0f
+        ) - 180.0f;
+        camera_.yaw += yawDelta * yawWeight;
         camera_.inputTick = inputTick;
         camera_.inputTickKnown = inputTickKnown;
         camera_.updatedAtMs = monotonicMilliseconds();
@@ -270,7 +334,7 @@ private:
             name == "add_player" || name == "add_entity" ||
             name == "remove_entity" || name == "move_entity" ||
             name == "move_entity_delta" || name == "move_player" ||
-            name == "player_list";
+            name == "player_list" || name == "take_item_entity";
     }
 
     static uint64_t monotonicMilliseconds() noexcept {
@@ -597,6 +661,11 @@ private:
         if (uniqueId >= 0) {
             eraseRuntimeLocked(static_cast<uint64_t>(uniqueId));
         }
+    }
+
+    void readTakeItemEntityLocked(const VersionedGamePacket& packet) {
+        VersionedPayloadCursor cursor(packet.payload);
+        eraseRuntimeLocked(cursor.readVarULong());
     }
 
     void readMoveEntityLocked(const VersionedGamePacket& packet) {

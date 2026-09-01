@@ -5,6 +5,13 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# Android release builds do not ship native debug symbols. Keeping `-g` in
+# RelWithDebInfo makes clang use substantially more memory while compiling the
+# generated protocol sources and can exhaust memory on 8 GiB development
+# machines. Runtime diagnostics are implemented by the application itself and
+# are unaffected by this compiler-only setting.
+set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -g0 -DNDEBUG" CACHE STRING "" FORCE)
+
 set(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
 set(BEDROCK_PROTOCOL_CPP_BUILD_BOT OFF CACHE BOOL "" FORCE)
 set(BEDROCK_PROTOCOL_CPP_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
