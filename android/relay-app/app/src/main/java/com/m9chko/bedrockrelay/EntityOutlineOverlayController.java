@@ -167,7 +167,8 @@ final class EntityOutlineOverlayController {
                 "entities",
                 "Entity outline overlay opened; mode=2d_boxes " +
                     "smoothing=world+global_camera_direct+stationary_screen " +
-                    "predictor=monotonic cameraSample=atomic cameraPollMs=12"
+                    "predictor=client_tick_robust_no_overshoot " +
+                    "cameraSample=atomic cameraPollMs=12"
             );
         } catch (Throwable error) {
             outlineView = null;
@@ -249,6 +250,8 @@ final class EntityOutlineOverlayController {
 
     private static final class CameraSample {
         final boolean known;
+        final boolean inputTickKnown;
+        final long inputTick;
         final double x;
         final double y;
         final double z;
@@ -259,6 +262,8 @@ final class EntityOutlineOverlayController {
 
         CameraSample(
             boolean known,
+            boolean inputTickKnown,
+            long inputTick,
             double x,
             double y,
             double z,
@@ -268,6 +273,8 @@ final class EntityOutlineOverlayController {
             long ageMs
         ) {
             this.known = known;
+            this.inputTickKnown = inputTickKnown;
+            this.inputTick = inputTick;
             this.x = x;
             this.y = y;
             this.z = z;
@@ -278,7 +285,18 @@ final class EntityOutlineOverlayController {
         }
 
         static CameraSample unknown() {
-            return new CameraSample(false, 0, 0, 0, 0, 0, 0, 0);
+            return new CameraSample(
+                false,
+                false,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0
+            );
         }
 
         static CameraSample from(JSONObject value) {
@@ -291,6 +309,8 @@ final class EntityOutlineOverlayController {
             if (!finite(x, y, z, pitch, yaw)) known = false;
             return new CameraSample(
                 known,
+                value.optBoolean("inputTickKnown", false),
+                value.optLong("inputTick", 0),
                 x,
                 y,
                 z,
@@ -381,7 +401,6 @@ final class EntityOutlineOverlayController {
         private static final long MaxPredictionNanos = 130_000_000L;
         private static final long RenderLeadNanos = 18_000_000L;
         private static final long MaximumFrameGapNanos = 250_000_000L;
-        private static final double VelocityResponseSeconds = 0.075;
 
         final String id;
         String label;
@@ -389,6 +408,12 @@ final class EntityOutlineOverlayController {
         final MotionSmoother.Axis renderX = new MotionSmoother.Axis();
         final MotionSmoother.Axis renderY = new MotionSmoother.Axis();
         final MotionSmoother.Axis renderZ = new MotionSmoother.Axis();
+        final MotionSmoother.PacketVelocity velocityEstimatorX =
+            new MotionSmoother.PacketVelocity();
+        final MotionSmoother.PacketVelocity velocityEstimatorY =
+            new MotionSmoother.PacketVelocity();
+        final MotionSmoother.PacketVelocity velocityEstimatorZ =
+            new MotionSmoother.PacketVelocity();
         final MotionSmoother.ScreenBox screenBox =
             new MotionSmoother.ScreenBox();
         double sampleX;
@@ -419,6 +444,9 @@ final class EntityOutlineOverlayController {
             renderX.reset(sample.x, 0.0);
             renderY.reset(sample.y, 0.0);
             renderZ.reset(sample.z, 0.0);
+            velocityEstimatorX.reset();
+            velocityEstimatorY.reset();
+            velocityEstimatorZ.reset();
             width = sample.width;
             height = sample.height;
             seenGeneration = generation;
@@ -451,38 +479,29 @@ final class EntityOutlineOverlayController {
                 deltaZ * deltaZ > 64.0;
             if (!teleport && elapsedSeconds >= 0.005 &&
                 elapsedSeconds <= 0.5) {
-                velocityX = MotionSmoother.filterVelocity(
-                    velocityX,
-                    MotionSmoother.clamp(
-                        deltaX / elapsedSeconds,
-                        -80.0,
-                        80.0
-                    ),
+                velocityX = velocityEstimatorX.update(
+                    deltaX,
                     elapsedSeconds,
-                    VelocityResponseSeconds
+                    80.0,
+                    0.00001
                 );
-                velocityY = MotionSmoother.filterVelocity(
-                    velocityY,
-                    MotionSmoother.clamp(
-                        deltaY / elapsedSeconds,
-                        -80.0,
-                        80.0
-                    ),
+                velocityY = velocityEstimatorY.update(
+                    deltaY,
                     elapsedSeconds,
-                    VelocityResponseSeconds
+                    80.0,
+                    0.00001
                 );
-                velocityZ = MotionSmoother.filterVelocity(
-                    velocityZ,
-                    MotionSmoother.clamp(
-                        deltaZ / elapsedSeconds,
-                        -80.0,
-                        80.0
-                    ),
+                velocityZ = velocityEstimatorZ.update(
+                    deltaZ,
                     elapsedSeconds,
-                    VelocityResponseSeconds
+                    80.0,
+                    0.00001
                 );
             } else if (teleport) {
                 velocityX = velocityY = velocityZ = 0.0;
+                velocityEstimatorX.reset();
+                velocityEstimatorY.reset();
+                velocityEstimatorZ.reset();
                 renderX.reset(sample.x, 0.0);
                 renderY.reset(sample.y, 0.0);
                 renderZ.reset(sample.z, 0.0);
@@ -490,6 +509,9 @@ final class EntityOutlineOverlayController {
                 // Do not extrapolate a fresh packet with velocity measured
                 // before a long network pause.
                 velocityX = velocityY = velocityZ = 0.0;
+                velocityEstimatorX.reset();
+                velocityEstimatorY.reset();
+                velocityEstimatorZ.reset();
             }
 
             sampleX = sample.x;
@@ -572,12 +594,10 @@ final class EntityOutlineOverlayController {
     }
 
     private static final class EntityOutlineView extends View {
-        private static final long LinearCameraPredictionNanos = 40_000_000L;
-        private static final long MaxCameraPredictionNanos = 95_000_000L;
-        private static final long CameraRenderLeadNanos = 18_000_000L;
+        private static final long LinearCameraPredictionNanos = 55_000_000L;
+        private static final long MaxCameraPredictionNanos = 85_000_000L;
+        private static final long CameraRenderLeadNanos = 8_000_000L;
         private static final long MaximumFrameGapNanos = 250_000_000L;
-        private static final double CameraPositionVelocityResponse = 0.045;
-        private static final double CameraAngleVelocityResponse = 0.028;
         private static final double NearPlane = 0.12;
 
         private final Map<String, RenderTrack> tracks = new HashMap<>();
@@ -601,6 +621,18 @@ final class EntityOutlineOverlayController {
             new MotionSmoother.Axis();
         private final MotionSmoother.Axis renderedCameraYaw =
             new MotionSmoother.Axis();
+        private final MotionSmoother.PacketVelocity cameraVelocityEstimatorX =
+            new MotionSmoother.PacketVelocity();
+        private final MotionSmoother.PacketVelocity cameraVelocityEstimatorY =
+            new MotionSmoother.PacketVelocity();
+        private final MotionSmoother.PacketVelocity cameraVelocityEstimatorZ =
+            new MotionSmoother.PacketVelocity();
+        private final MotionSmoother.PacketVelocity
+            cameraVelocityEstimatorPitch =
+                new MotionSmoother.PacketVelocity();
+        private final MotionSmoother.PacketVelocity
+            cameraVelocityEstimatorYaw =
+                new MotionSmoother.PacketVelocity();
         private double cameraSampleX;
         private double cameraSampleY;
         private double cameraSampleZ;
@@ -611,6 +643,8 @@ final class EntityOutlineOverlayController {
         private double cameraVelocityZ;
         private double cameraVelocityPitch;
         private double cameraVelocityYaw;
+        private boolean cameraInputTickKnown;
+        private long cameraInputTick;
         private long cameraUpdatedAtMs;
         private long cameraReceivedNanos;
         private long cameraSampleAgeNanos;
@@ -682,6 +716,11 @@ final class EntityOutlineOverlayController {
                 cameraSampleYaw = sample.yaw;
                 cameraVelocityX = cameraVelocityY = cameraVelocityZ = 0;
                 cameraVelocityPitch = cameraVelocityYaw = 0;
+                cameraVelocityEstimatorX.reset();
+                cameraVelocityEstimatorY.reset();
+                cameraVelocityEstimatorZ.reset();
+                cameraVelocityEstimatorPitch.reset();
+                cameraVelocityEstimatorYaw.reset();
                 renderedCameraX.reset(sample.x, 0.0);
                 renderedCameraY.reset(sample.y, 0.0);
                 renderedCameraZ.reset(sample.z, 0.0);
@@ -696,62 +735,89 @@ final class EntityOutlineOverlayController {
                     cameraSampleYaw,
                     sample.yaw
                 );
-                boolean duplicate = sample.updatedAtMs == cameraUpdatedAtMs &&
+                boolean samePacket = cameraInputTickKnown &&
+                    sample.inputTickKnown
+                        ? sample.inputTick == cameraInputTick
+                        : sample.updatedAtMs == cameraUpdatedAtMs;
+                boolean duplicate = samePacket &&
                     sample.x == cameraSampleX && sample.y == cameraSampleY &&
                     sample.z == cameraSampleZ &&
                     sample.pitch == cameraSamplePitch &&
                     unwrappedYaw == cameraSampleYaw;
                 if (duplicate) return;
 
-                double elapsedSeconds = (sample.updatedAtMs -
-                    cameraUpdatedAtMs) / 1000.0;
+                boolean inputTickReset = cameraInputTickKnown &&
+                    sample.inputTickKnown &&
+                    sample.inputTick < cameraInputTick;
+                boolean inputTickGap = cameraInputTickKnown &&
+                    sample.inputTickKnown &&
+                    sample.inputTick > cameraInputTick &&
+                    sample.inputTick - cameraInputTick > 20;
+                boolean inputTickDiscontinuity = inputTickReset ||
+                    inputTickGap;
+                double elapsedSeconds = inputTickDiscontinuity
+                    ? Double.NaN
+                    : MotionSmoother.packetIntervalSeconds(
+                        cameraInputTickKnown,
+                        cameraInputTick,
+                        sample.inputTickKnown,
+                        sample.inputTick,
+                        cameraUpdatedAtMs,
+                        sample.updatedAtMs
+                    );
                 double deltaX = sample.x - cameraSampleX;
                 double deltaY = sample.y - cameraSampleY;
                 double deltaZ = sample.z - cameraSampleZ;
                 boolean teleport = deltaX * deltaX + deltaY * deltaY +
                     deltaZ * deltaZ > 64.0;
-                if (elapsedSeconds >= 0.005 && elapsedSeconds <= 0.25) {
-                    cameraVelocityX = filteredCameraVelocity(
-                        cameraVelocityX,
+                if (Double.isFinite(elapsedSeconds) &&
+                    elapsedSeconds >= 0.005 && elapsedSeconds <= 0.5) {
+                    cameraVelocityX = cameraVelocityEstimatorX.update(
                         deltaX,
                         elapsedSeconds,
                         100.0,
-                        CameraPositionVelocityResponse
+                        0.00001
                     );
-                    cameraVelocityY = filteredCameraVelocity(
-                        cameraVelocityY,
+                    cameraVelocityY = cameraVelocityEstimatorY.update(
                         deltaY,
                         elapsedSeconds,
                         100.0,
-                        CameraPositionVelocityResponse
+                        0.00001
                     );
-                    cameraVelocityZ = filteredCameraVelocity(
-                        cameraVelocityZ,
+                    cameraVelocityZ = cameraVelocityEstimatorZ.update(
                         deltaZ,
                         elapsedSeconds,
                         100.0,
-                        CameraPositionVelocityResponse
+                        0.00001
                     );
-                    cameraVelocityPitch = filteredCameraVelocity(
-                        cameraVelocityPitch,
+                    cameraVelocityPitch =
+                        cameraVelocityEstimatorPitch.update(
                         sample.pitch - cameraSamplePitch,
                         elapsedSeconds,
                         2160.0,
-                        CameraAngleVelocityResponse
+                        0.0001
                     );
-                    cameraVelocityYaw = filteredCameraVelocity(
-                        cameraVelocityYaw,
+                    cameraVelocityYaw = cameraVelocityEstimatorYaw.update(
                         unwrappedYaw - cameraSampleYaw,
                         elapsedSeconds,
                         2160.0,
-                        CameraAngleVelocityResponse
+                        0.0001
                     );
-                } else if (elapsedSeconds > 0.25) {
+                } else if (inputTickDiscontinuity ||
+                    sample.updatedAtMs - cameraUpdatedAtMs > 500) {
                     cameraVelocityX = cameraVelocityY = cameraVelocityZ = 0;
                     cameraVelocityPitch = cameraVelocityYaw = 0;
+                    cameraVelocityEstimatorX.reset();
+                    cameraVelocityEstimatorY.reset();
+                    cameraVelocityEstimatorZ.reset();
+                    cameraVelocityEstimatorPitch.reset();
+                    cameraVelocityEstimatorYaw.reset();
                 }
                 if (teleport) {
                     cameraVelocityX = cameraVelocityY = cameraVelocityZ = 0;
+                    cameraVelocityEstimatorX.reset();
+                    cameraVelocityEstimatorY.reset();
+                    cameraVelocityEstimatorZ.reset();
                     renderedCameraX.reset(sample.x, 0.0);
                     renderedCameraY.reset(sample.y, 0.0);
                     renderedCameraZ.reset(sample.z, 0.0);
@@ -764,32 +830,12 @@ final class EntityOutlineOverlayController {
                 cameraSampleYaw = unwrappedYaw;
             }
 
+            cameraInputTickKnown = sample.inputTickKnown;
+            cameraInputTick = sample.inputTick;
             cameraUpdatedAtMs = sample.updatedAtMs;
             cameraReceivedNanos = now;
             cameraSampleAgeNanos = Math.min(sample.ageMs, 500) *
                 1_000_000L;
-        }
-
-        private static double filteredCameraVelocity(
-            double current,
-            double delta,
-            double elapsedSeconds,
-            double maximum,
-            double responseSeconds
-        ) {
-            double measured = Math.abs(delta) < 0.00001
-                ? 0.0
-                : MotionSmoother.clamp(
-                    delta / elapsedSeconds,
-                    -maximum,
-                    maximum
-                );
-            return MotionSmoother.filterVelocity(
-                current,
-                measured,
-                elapsedSeconds,
-                responseSeconds
-            );
         }
 
         @Override
@@ -803,38 +849,79 @@ final class EntityOutlineOverlayController {
                 10_000_000_000L,
                 cameraSampleAgeNanos + elapsedSinceReceipt
             );
-            double predictionSeconds = MotionSmoother.predictionSeconds(
+            double positionConfidence = Math.min(
+                cameraVelocityEstimatorX.confidence(),
+                Math.min(
+                    cameraVelocityEstimatorY.confidence(),
+                    cameraVelocityEstimatorZ.confidence()
+                )
+            );
+            double angleConfidence = Math.min(
+                cameraVelocityEstimatorPitch.confidence(),
+                cameraVelocityEstimatorYaw.confidence()
+            );
+            long positionRenderLeadNanos = Math.round(
+                CameraRenderLeadNanos * MotionSmoother.clamp(
+                    positionConfidence,
+                    0.0,
+                    1.0
+                )
+            );
+            long angleRenderLeadNanos = Math.round(
+                CameraRenderLeadNanos * MotionSmoother.clamp(
+                    angleConfidence,
+                    0.0,
+                    1.0
+                )
+            );
+            double positionPredictionSeconds =
+                MotionSmoother.predictionSeconds(
                 totalCameraAgeNanos,
-                CameraRenderLeadNanos,
+                positionRenderLeadNanos,
                 LinearCameraPredictionNanos,
                 MaxCameraPredictionNanos
             );
-            double predictionVelocityScale =
+            double anglePredictionSeconds = MotionSmoother.predictionSeconds(
+                totalCameraAgeNanos,
+                angleRenderLeadNanos,
+                LinearCameraPredictionNanos,
+                MaxCameraPredictionNanos
+            );
+            double positionPredictionVelocityScale =
                 MotionSmoother.predictionVelocityScale(
                     totalCameraAgeNanos,
-                    CameraRenderLeadNanos,
+                    positionRenderLeadNanos,
                     LinearCameraPredictionNanos,
                     MaxCameraPredictionNanos
                 );
-            boolean predictionActive = predictionVelocityScale > 0.0001;
+            double anglePredictionVelocityScale =
+                MotionSmoother.predictionVelocityScale(
+                    totalCameraAgeNanos,
+                    angleRenderLeadNanos,
+                    LinearCameraPredictionNanos,
+                    MaxCameraPredictionNanos
+                );
+            boolean predictionActive =
+                positionPredictionVelocityScale > 0.0001 ||
+                anglePredictionVelocityScale > 0.0001;
             double targetVelocityX = cameraVelocityX *
-                predictionVelocityScale;
+                positionPredictionVelocityScale;
             double targetVelocityY = cameraVelocityY *
-                predictionVelocityScale;
+                positionPredictionVelocityScale;
             double targetVelocityZ = cameraVelocityZ *
-                predictionVelocityScale;
+                positionPredictionVelocityScale;
             double targetVelocityPitch = cameraVelocityPitch *
-                predictionVelocityScale;
+                anglePredictionVelocityScale;
             double targetVelocityYaw = cameraVelocityYaw *
-                predictionVelocityScale;
+                anglePredictionVelocityScale;
             double targetCameraX = cameraSampleX +
-                cameraVelocityX * predictionSeconds;
+                cameraVelocityX * positionPredictionSeconds;
             double targetCameraY = cameraSampleY +
-                cameraVelocityY * predictionSeconds;
+                cameraVelocityY * positionPredictionSeconds;
             double targetCameraZ = cameraSampleZ +
-                cameraVelocityZ * predictionSeconds;
+                cameraVelocityZ * positionPredictionSeconds;
             double rawTargetPitch = cameraSamplePitch +
-                cameraVelocityPitch * predictionSeconds;
+                cameraVelocityPitch * anglePredictionSeconds;
             double targetCameraPitch = MotionSmoother.clamp(
                 rawTargetPitch,
                 -90.0,
@@ -842,7 +929,7 @@ final class EntityOutlineOverlayController {
             );
             if (targetCameraPitch != rawTargetPitch) targetVelocityPitch = 0.0;
             double targetCameraYaw = cameraSampleYaw +
-                cameraVelocityYaw * predictionSeconds;
+                cameraVelocityYaw * anglePredictionSeconds;
 
             long frameGap = Math.max(0, now - cameraLastFrameNanos);
             if (cameraLastFrameNanos == 0 ||
@@ -866,15 +953,17 @@ final class EntityOutlineOverlayController {
                     Math.abs(cameraVelocityPitch),
                     Math.abs(cameraVelocityYaw)
                 );
-                double positionSmoothTime = 0.042 -
+                double positionSmoothTime = 0.032 -
                     MotionSmoother.clamp(
                         positionSpeed / 30.0,
                         0.0,
                         1.0
-                    ) * 0.018;
-                double angleSmoothTime = 0.025 -
+                    ) * 0.014 +
+                    (1.0 - positionConfidence) * 0.012;
+                double angleSmoothTime = 0.016 -
                     MotionSmoother.clamp(angleSpeed / 720.0, 0.0, 1.0) *
-                        0.013;
+                        0.008 +
+                    (1.0 - angleConfidence) * 0.010;
                 renderedCameraX.step(
                     targetCameraX,
                     targetVelocityX,

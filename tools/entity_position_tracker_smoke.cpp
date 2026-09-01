@@ -211,7 +211,9 @@ int main() {
             packet("player_auth_input", std::move(atomicAuth)),
             0.0f,
             0.0f,
-            1.0f
+            1.0f,
+            12'345,
+            true
         )) {
         std::cerr << "atomic camera-forward update was rejected\n";
         return 1;
@@ -221,6 +223,8 @@ int main() {
         !near(state.camera.z, -48.0f) ||
         !near(state.camera.pitch, 0.0f) ||
         !near(state.camera.yaw, 0.0f) ||
+        !state.camera.inputTickKnown ||
+        state.camera.inputTick != 12'345 ||
         state.recognizedPackets != recognizedBeforeAtomic + 1 ||
         state.decodedPackets != decodedBeforeAtomic + 1) {
         std::cerr << "atomic camera sample was not published as one packet\n";
@@ -233,6 +237,8 @@ int main() {
         !near(cameraOnly.z, state.camera.z) ||
         !near(cameraOnly.pitch, state.camera.pitch) ||
         !near(cameraOnly.yaw, state.camera.yaw) ||
+        cameraOnly.inputTickKnown != state.camera.inputTickKnown ||
+        cameraOnly.inputTick != state.camera.inputTick ||
         cameraOnly.updatedAtMs != state.camera.updatedAtMs) {
         std::cerr << "camera-only snapshot did not match full snapshot\n";
         return 1;

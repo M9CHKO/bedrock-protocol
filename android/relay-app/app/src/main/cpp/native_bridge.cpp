@@ -907,6 +907,12 @@ bedrock::JsRuntimeValue entityOverlayCameraValue(
             : 0;
     return bedrock::JsRuntimeValue::object({
         {"known", bedrock::JsRuntimeValue::boolean(camera.known)},
+        {"inputTickKnown", bedrock::JsRuntimeValue::boolean(
+            camera.inputTickKnown
+        )},
+        {"inputTick", bedrock::JsRuntimeValue::number(
+            static_cast<double>(camera.inputTick)
+        )},
         {"x", bedrock::JsRuntimeValue::number(camera.x)},
         {"y", bedrock::JsRuntimeValue::number(camera.y)},
         {"z", bedrock::JsRuntimeValue::number(camera.z)},
@@ -1293,6 +1299,10 @@ public:
                         "camera_orientation.z",
                         Missing
                     );
+                    const bool inputTickKnown = decoded.has("tick");
+                    const uint64_t inputTick = inputTickKnown
+                        ? decoded.getUInt("tick", 0)
+                        : 0;
                     if (std::isfinite(forwardX) &&
                         std::isfinite(forwardY) &&
                         std::isfinite(forwardZ)) {
@@ -1302,7 +1312,9 @@ public:
                                     event.packet,
                                     static_cast<float>(forwardX),
                                     static_cast<float>(forwardY),
-                                    static_cast<float>(forwardZ)
+                                    static_cast<float>(forwardZ),
+                                    inputTick,
+                                    inputTickKnown
                                 );
                         positionObserved = true;
                         if (orientationApplied) {

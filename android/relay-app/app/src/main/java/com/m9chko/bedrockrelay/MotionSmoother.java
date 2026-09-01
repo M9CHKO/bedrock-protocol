@@ -82,8 +82,202 @@ final class MotionSmoother {
         return current + (measured - current) * clamp(alpha, 0.0, 1.0);
     }
 
+    /**
+     * Chooses the time represented by two packet samples. PlayerAuthInput's
+     * client tick is preferred because Android/native delivery jitter must
+     * not be mistaken for a change in camera speed. Bedrock runs game ticks
+     * at 20 Hz. Native monotonic timestamps remain a guarded fallback for
+     * legacy movement packets and protocol versions without a decoded tick.
+     */
+    static double packetIntervalSeconds(
+        boolean previousTickKnown,
+        long previousTick,
+        boolean currentTickKnown,
+        long currentTick,
+        long previousUpdatedAtMs,
+        long currentUpdatedAtMs
+    ) {
+        if (previousTickKnown && currentTickKnown) {
+            if (currentTick > previousTick) {
+                long tickDelta = currentTick - previousTick;
+                if (tickDelta <= 20) return tickDelta * 0.05;
+            }
+            // Do not silently replace an invalid decoded tick sequence with
+            // delivery timing. That would reintroduce the exact jitter this
+            // method is meant to remove.
+            return Double.NaN;
+        }
+
+        long elapsedMs = currentUpdatedAtMs - previousUpdatedAtMs;
+        if (previousUpdatedAtMs > 0 && currentUpdatedAtMs > 0 &&
+            elapsedMs >= 5 && elapsedMs <= 500) {
+            return elapsedMs / 1000.0;
+        }
+        return Double.NaN;
+    }
+
+    /**
+     * Robust velocity estimate for packet-spaced motion.
+     *
+     * It reacts immediately to a true stop or direction change, while a
+     * three-slope median clips a single noisy acceleration sample. The
+     * estimate has no independent position state, so it cannot ring or keep
+     * moving an outline after the newest packets say that motion stopped.
+     */
+    static final class PacketVelocity {
+        private boolean initialized;
+        private boolean stationary = true;
+        private double velocity;
+        private double newestSlope;
+        private double olderSlope;
+        private int slopeCount;
+        private double confidence = 1.0;
+
+        void reset() {
+            initialized = false;
+            stationary = true;
+            velocity = 0.0;
+            newestSlope = 0.0;
+            olderSlope = 0.0;
+            slopeCount = 0;
+            confidence = 1.0;
+        }
+
+        double velocity() {
+            return velocity;
+        }
+
+        double confidence() {
+            return confidence;
+        }
+
+        double update(
+            double delta,
+            double intervalSeconds,
+            double maximumVelocity,
+            double zeroDelta
+        ) {
+            if (!Double.isFinite(delta) ||
+                !Double.isFinite(intervalSeconds) ||
+                intervalSeconds <= 0.0) {
+                return velocity;
+            }
+
+            double maximum = Math.max(0.001, maximumVelocity);
+            double epsilon = Math.max(0.0, zeroDelta);
+            if (Math.abs(delta) <= epsilon) {
+                // One complete client tick with no displacement is stronger
+                // evidence than an old filtered derivative. Kill it now so
+                // the projection cannot overshoot and then travel backwards.
+                initialized = true;
+                stationary = true;
+                velocity = 0.0;
+                newestSlope = 0.0;
+                olderSlope = 0.0;
+                slopeCount = 0;
+                confidence = 1.0;
+                return velocity;
+            }
+
+            double measured = clamp(
+                delta / intervalSeconds,
+                -maximum,
+                maximum
+            );
+            if (!initialized || stationary) {
+                initialized = true;
+                stationary = false;
+                velocity = measured;
+                newestSlope = measured;
+                olderSlope = measured;
+                slopeCount = 1;
+                confidence = 0.55;
+                return velocity;
+            }
+
+            boolean reversed = measured * velocity < 0.0 ||
+                (slopeCount > 0 && measured * newestSlope < 0.0);
+            if (reversed) {
+                // Do not average opposite directions: that is precisely what
+                // creates a visible forward/backward wobble after a turn.
+                velocity = measured;
+                newestSlope = measured;
+                olderSlope = measured;
+                slopeCount = 1;
+                confidence = 0.35;
+                return velocity;
+            }
+
+            double previousSlope = newestSlope;
+            double candidate = measured;
+            if (slopeCount >= 2) {
+                double median = median(measured, newestSlope, olderSlope);
+                double allowedDeviation = Math.max(
+                    maximum * 0.002,
+                    Math.abs(median) * 0.65
+                );
+                candidate = median + clamp(
+                    measured - median,
+                    -allowedDeviation,
+                    allowedDeviation
+                );
+            } else if (slopeCount == 1) {
+                candidate = measured * 0.72 + newestSlope * 0.28;
+            }
+
+            double measuredMagnitude = Math.abs(measured);
+            double currentMagnitude = Math.abs(velocity);
+            double responseSeconds;
+            if (measuredMagnitude < currentMagnitude * 0.78) {
+                // Braking must beat smoothing or prediction flies past the
+                // newest camera sample and has to visibly correct backwards.
+                candidate = measured;
+                responseSeconds = 0.010;
+            } else if (measuredMagnitude > currentMagnitude * 1.35) {
+                responseSeconds = 0.028;
+            } else {
+                responseSeconds = 0.055;
+            }
+            velocity = filterVelocity(
+                velocity,
+                candidate,
+                intervalSeconds,
+                responseSeconds
+            );
+            velocity = clamp(velocity, -maximum, maximum);
+
+            double agreementScale = Math.max(
+                maximum * 0.002,
+                Math.max(Math.abs(measured), Math.abs(previousSlope))
+            );
+            double agreement = 1.0 - clamp(
+                Math.abs(measured - previousSlope) / agreementScale,
+                0.0,
+                1.0
+            );
+            confidence = filterVelocity(
+                confidence,
+                agreement,
+                intervalSeconds,
+                0.12
+            );
+
+            olderSlope = newestSlope;
+            newestSlope = measured;
+            slopeCount = Math.min(3, slopeCount + 1);
+            return velocity;
+        }
+    }
+
     static double unwrapAngle(double previous, double wrapped) {
         return previous + angleDifference(previous, wrapped);
+    }
+
+    private static double median(double first, double second, double third) {
+        return first + second + third - Math.min(
+            first,
+            Math.min(second, third)
+        ) - Math.max(first, Math.max(second, third));
     }
 
     static double predictionSeconds(

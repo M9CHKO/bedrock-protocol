@@ -353,4 +353,204 @@ public final class MotionSmootherTest {
         assertEquals(1, directionChanges);
         assertEquals(100.0, box.centerX(), 0.1);
     }
+
+    @Test
+    public void packetIntervalPrefersClientTickOverArrivalJitter() {
+        assertEquals(
+            0.05,
+            MotionSmoother.packetIntervalSeconds(
+                true,
+                100,
+                true,
+                101,
+                1_000,
+                1_031
+            ),
+            0.0
+        );
+        assertEquals(
+            0.10,
+            MotionSmoother.packetIntervalSeconds(
+                true,
+                101,
+                true,
+                103,
+                1_031,
+                1_143
+            ),
+            0.0
+        );
+        assertEquals(
+            0.064,
+            MotionSmoother.packetIntervalSeconds(
+                false,
+                0,
+                false,
+                0,
+                2_000,
+                2_064
+            ),
+            0.0
+        );
+        assertTrue(Double.isNaN(
+            MotionSmoother.packetIntervalSeconds(
+                true,
+                103,
+                true,
+                103,
+                1_143,
+                1_193
+            )
+        ));
+        assertTrue(Double.isNaN(
+            MotionSmoother.packetIntervalSeconds(
+                true,
+                103,
+                true,
+                140,
+                1_143,
+                1_193
+            )
+        ));
+    }
+
+    @Test
+    public void packetVelocityIgnoresDeliveryTimingJitter() {
+        MotionSmoother.PacketVelocity velocity =
+            new MotionSmoother.PacketVelocity();
+        velocity.reset();
+        long previousTick = 400;
+        long previousArrival = 10_000;
+        long[] arrivalDeltas = {31, 68, 42, 57, 36, 64};
+
+        for (long arrivalDelta : arrivalDeltas) {
+            long nextTick = previousTick + 1;
+            long nextArrival = previousArrival + arrivalDelta;
+            double interval = MotionSmoother.packetIntervalSeconds(
+                true,
+                previousTick,
+                true,
+                nextTick,
+                previousArrival,
+                nextArrival
+            );
+            assertEquals(
+                180.0,
+                velocity.update(9.0, interval, 2160.0, 0.0001),
+                1.0e-9
+            );
+            previousTick = nextTick;
+            previousArrival = nextArrival;
+        }
+    }
+
+    @Test
+    public void packetVelocityClipsOneSpikeThenRecovers() {
+        MotionSmoother.PacketVelocity velocity =
+            new MotionSmoother.PacketVelocity();
+        velocity.reset();
+        for (int sample = 0; sample < 3; ++sample) {
+            velocity.update(9.0, 0.05, 2160.0, 0.0001);
+        }
+
+        double clipped = velocity.update(36.0, 0.05, 2160.0, 0.0001);
+        assertTrue(clipped > 180.0);
+        assertTrue(clipped < 320.0);
+        assertTrue(velocity.confidence() < 0.8);
+
+        double recovered = velocity.update(
+            9.0,
+            0.05,
+            2160.0,
+            0.0001
+        );
+        assertEquals(180.0, recovered, 2.0);
+    }
+
+    @Test
+    public void packetVelocityStopsAndReversesWithoutOldInertia() {
+        MotionSmoother.PacketVelocity velocity =
+            new MotionSmoother.PacketVelocity();
+        velocity.reset();
+        velocity.update(9.0, 0.05, 2160.0, 0.0001);
+        velocity.update(9.0, 0.05, 2160.0, 0.0001);
+
+        assertEquals(
+            0.0,
+            velocity.update(0.0, 0.05, 2160.0, 0.0001),
+            0.0
+        );
+        assertEquals(1.0, velocity.confidence(), 0.0);
+        assertEquals(
+            -180.0,
+            velocity.update(-9.0, 0.05, 2160.0, 0.0001),
+            1.0e-9
+        );
+    }
+
+    @Test
+    public void tickDrivenCameraPredictionIsContinuousAt120Fps() {
+        MotionSmoother.PacketVelocity estimator =
+            new MotionSmoother.PacketVelocity();
+        MotionSmoother.Axis rendered = new MotionSmoother.Axis();
+        estimator.reset();
+        rendered.reset(0.0, 0.0);
+        double sample = 0.0;
+        double velocity = 0.0;
+        double previous = 0.0;
+        double maximumFrameStep = 0.0;
+
+        for (int frame = 1; frame <= 720; ++frame) {
+            if (frame % 6 == 0) {
+                sample += 9.0;
+                velocity = estimator.update(
+                    9.0,
+                    0.05,
+                    2160.0,
+                    0.0001
+                );
+            }
+            long ageNanos = (frame % 6) * 8_333_333L;
+            long leadNanos = Math.round(
+                8_000_000L * estimator.confidence()
+            );
+            double horizon = MotionSmoother.predictionSeconds(
+                ageNanos,
+                leadNanos,
+                55_000_000L,
+                85_000_000L
+            );
+            double target = sample + velocity * horizon;
+            double smoothTime = 0.016 -
+                MotionSmoother.clamp(
+                    Math.abs(velocity) / 720.0,
+                    0.0,
+                    1.0
+                ) * 0.008 +
+                (1.0 - estimator.confidence()) * 0.010;
+            rendered.step(
+                target,
+                velocity,
+                smoothTime,
+                1.0 / 120.0
+            );
+
+            double current = rendered.value();
+            assertTrue(Double.isFinite(current));
+            assertTrue(current >= previous - 1.0e-9);
+            if (frame > 24) {
+                maximumFrameStep = Math.max(
+                    maximumFrameStep,
+                    current - previous
+                );
+            }
+            previous = current;
+        }
+
+        assertTrue(
+            "maximum frame step=" + maximumFrameStep,
+            maximumFrameStep < 3.0
+        );
+        assertEquals(1_080.0, rendered.value(), 4.0);
+    }
 }

@@ -20,7 +20,9 @@ namespace bedrock {
 
 struct TrackedCameraPosition {
     bool known = false;
+    bool inputTickKnown = false;
     uint64_t runtimeId = 0;
+    uint64_t inputTick = 0;
     float x = 0.0f;
     float y = 0.0f;
     float z = 0.0f;
@@ -85,7 +87,9 @@ public:
         const VersionedGamePacket& packet,
         float forwardX,
         float forwardY,
-        float forwardZ
+        float forwardZ,
+        uint64_t inputTick = 0,
+        bool inputTickKnown = false
     ) noexcept {
         if (packet.name != "player_auth_input") {
             observeServerbound(packet);
@@ -99,7 +103,9 @@ public:
             const bool applied = applyCameraForwardLocked(
                 forwardX,
                 forwardY,
-                forwardZ
+                forwardZ,
+                inputTick,
+                inputTickKnown
             );
             ++decodedPackets_;
             return applied;
@@ -230,7 +236,9 @@ private:
     bool applyCameraForwardLocked(
         float forwardX,
         float forwardY,
-        float forwardZ
+        float forwardZ,
+        uint64_t inputTick = 0,
+        bool inputTickKnown = false
     ) noexcept {
         if (!camera_.known || !std::isfinite(forwardX) ||
             !std::isfinite(forwardY) || !std::isfinite(forwardZ)) {
@@ -251,6 +259,8 @@ private:
         camera_.pitch = std::asin(-normalizedY) * RadiansToDegrees;
         camera_.yaw = std::atan2(-normalizedX, normalizedZ) *
             RadiansToDegrees;
+        camera_.inputTick = inputTick;
+        camera_.inputTickKnown = inputTickKnown;
         camera_.updatedAtMs = monotonicMilliseconds();
         return true;
     }
@@ -461,6 +471,8 @@ private:
         camera_.z = z;
         camera_.pitch = pitch;
         camera_.yaw = yaw;
+        camera_.inputTickKnown = false;
+        camera_.inputTick = 0;
         camera_.updatedAtMs = monotonicMilliseconds();
     }
 
