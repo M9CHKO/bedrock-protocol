@@ -193,6 +193,50 @@ public final class MotionSmootherTest {
     }
 
     @Test
+    public void stationaryEntityFollowsGlobalCameraProjectionWithoutLag() {
+        MotionSmoother.ScreenBox box = new MotionSmoother.ScreenBox();
+        long now = 1_000_000_000L;
+        box.step(520.0, 400.0, 560.0, 500.0, now, 1080.0, 1920.0);
+
+        double finalCenter = 0.0;
+        for (int frame = 1; frame <= 120; ++frame) {
+            now += 8_333_333L;
+            double yaw = Math.toRadians(-28.0 + frame * (56.0 / 120.0));
+            double projectedCenter = 540.0 - Math.tan(yaw) * 700.0;
+            box.step(
+                projectedCenter - 20.0,
+                400.0,
+                projectedCenter + 20.0,
+                500.0,
+                now,
+                1080.0,
+                1920.0,
+                true
+            );
+            assertEquals(projectedCenter, box.centerX(), 1.0e-9);
+            assertEquals(40.0, box.right() - box.left(), 1.0e-9);
+            finalCenter = projectedCenter;
+        }
+
+        // Once the camera stops, entering stationary noise filtering must not
+        // create a delayed catch-up or continue the old camera trajectory.
+        for (int frame = 0; frame < 120; ++frame) {
+            now += 8_333_333L;
+            box.step(
+                finalCenter - 20.0,
+                400.0,
+                finalCenter + 20.0,
+                500.0,
+                now,
+                1080.0,
+                1920.0,
+                false
+            );
+            assertEquals(finalCenter, box.centerX(), 1.0e-9);
+        }
+    }
+
+    @Test
     public void stationaryScreenBoxRejectsSubpixelPacketFlicker() {
         MotionSmoother.ScreenBox box = new MotionSmoother.ScreenBox();
         long now = 1_000_000_000L;

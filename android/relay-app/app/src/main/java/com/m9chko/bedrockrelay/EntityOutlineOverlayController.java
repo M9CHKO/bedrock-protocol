@@ -166,7 +166,7 @@ final class EntityOutlineOverlayController {
                 "INFO",
                 "entities",
                 "Entity outline overlay opened; mode=2d_boxes " +
-                    "smoothing=world+screen_adaptive_no_inertia " +
+                    "smoothing=world+global_camera_direct+stationary_screen " +
                     "predictor=monotonic cameraSample=atomic cameraPollMs=12"
             );
         } catch (Throwable error) {
@@ -933,7 +933,7 @@ final class EntityOutlineOverlayController {
                  Math.abs(cameraVelocityZ) > 0.001 ||
                  Math.abs(cameraVelocityPitch) > 0.01 ||
                  Math.abs(cameraVelocityYaw) > 0.01);
-            boolean animating = cameraVelocityActive ||
+            boolean cameraProjectionActive = cameraVelocityActive ||
                 !renderedCameraX.isSettled(
                     targetCameraX,
                     targetVelocityX,
@@ -964,6 +964,7 @@ final class EntityOutlineOverlayController {
                     0.002,
                     0.02
                 );
+            boolean animating = cameraProjectionActive;
             for (RenderTrack track : tracks.values()) {
                 animating |= track.advance(now);
                 animating |= drawTrack(
@@ -977,7 +978,8 @@ final class EntityOutlineOverlayController {
                     sinPitch,
                     cosPitch,
                     focal,
-                    now
+                    now,
+                    cameraProjectionActive
                 );
             }
             if (animating) postInvalidateOnAnimation();
@@ -994,7 +996,8 @@ final class EntityOutlineOverlayController {
             double sinPitch,
             double cosPitch,
             double focal,
-            long now
+            long now,
+            boolean cameraProjectionActive
         ) {
             double entityX = track.renderX.value();
             double entityY = track.renderY.value();
@@ -1096,7 +1099,8 @@ final class EntityOutlineOverlayController {
                 bottom,
                 now,
                 getWidth(),
-                getHeight()
+                getHeight(),
+                cameraProjectionActive
             );
             left = (float) track.screenBox.left();
             top = (float) track.screenBox.top();

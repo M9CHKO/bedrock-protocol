@@ -253,6 +253,28 @@ final class MotionSmoother {
             double viewportWidth,
             double viewportHeight
         ) {
+            return step(
+                left,
+                top,
+                right,
+                bottom,
+                frameNanos,
+                viewportWidth,
+                viewportHeight,
+                false
+            );
+        }
+
+        boolean step(
+            double left,
+            double top,
+            double right,
+            double bottom,
+            long frameNanos,
+            double viewportWidth,
+            double viewportHeight,
+            boolean cameraProjectionActive
+        ) {
             double targetCenterX = (left + right) * 0.5;
             double targetCenterY = (top + bottom) * 0.5;
             double targetWidth = Math.max(1.0, right - left);
@@ -267,8 +289,15 @@ final class MotionSmoother {
 
             long frameGap = Math.max(0, frameNanos - lastFrameNanos);
             if (!initialized || lastFrameNanos == 0 ||
+                cameraProjectionActive ||
                 frameGap > MaximumFrameGapNanos) {
                 initialized = true;
+                // Camera motion is already predicted and smoothed once for
+                // the whole overlay. Applying a second per-entity screen
+                // filter here makes every box trail the Minecraft image.
+                // Follow the shared projection directly while that global
+                // camera transform is active. World-space entity smoothing
+                // still keeps independently moving mobs continuous.
                 center.reset(targetCenterX, targetCenterY);
                 size.reset(targetWidth, targetHeight);
                 lastFrameNanos = frameNanos;
