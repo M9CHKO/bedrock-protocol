@@ -725,7 +725,7 @@ public final class RelayService extends Service {
             .apply();
         mainHandler.post(() -> {
             if (entityOverlayController == null) return;
-            entityOverlayController.setHorizontalFov(entityFov);
+            entityOverlayController.setFieldOfView(entityFov);
             entityOverlayController.setEnabled(entityOutlines);
         });
         try {

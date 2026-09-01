@@ -9,11 +9,13 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <filesystem>
 #include <future>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -153,6 +155,14 @@ int64_t unixMilliseconds() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()
     ).count();
+}
+
+uint64_t steadyMilliseconds() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()
+        ).count()
+    );
 }
 
 uint64_t packetHash(const std::vector<uint8_t>& bytes) {
@@ -545,6 +555,8 @@ struct RelayState {
     std::atomic<uint64_t> retainedLevelChunksEvictedRadius {0};
     std::atomic<uint64_t> retainedLevelChunksEvictedMemory {0};
     std::atomic<uint64_t> retainedLevelChunkParseFailures {0};
+    std::atomic<uint64_t> cameraOrientationUpdates {0};
+    std::atomic<uint64_t> cameraOrientationDecodeFailures {0};
     bedrock::EntityPositionTracker entityPositions;
 
     void configureRuntime(
@@ -889,6 +901,11 @@ bedrock::JsRuntimeValue entityOverlaySnapshotValue(
     const std::shared_ptr<RelayState>& state
 ) {
     const auto snapshot = state->entityPositions.snapshot(320.0f, 96);
+    const auto capturedSteadyAtMs = steadyMilliseconds();
+    const auto cameraAgeMs = snapshot.camera.updatedAtMs > 0 &&
+        capturedSteadyAtMs >= snapshot.camera.updatedAtMs
+            ? capturedSteadyAtMs - snapshot.camera.updatedAtMs
+            : 0;
     std::vector<bedrock::JsRuntimeValue> entities;
     entities.reserve(snapshot.entities.size());
     for (const auto& entity : snapshot.entities) {
@@ -925,6 +942,9 @@ bedrock::JsRuntimeValue entityOverlaySnapshotValue(
                 snapshot.camera.pitch
             )},
             {"yaw", bedrock::JsRuntimeValue::number(snapshot.camera.yaw)},
+            {"ageMs", bedrock::JsRuntimeValue::number(
+                static_cast<double>(cameraAgeMs)
+            )},
             {"updatedAtMs", bedrock::JsRuntimeValue::number(
                 static_cast<double>(snapshot.camera.updatedAtMs)
             )}
@@ -938,6 +958,16 @@ bedrock::JsRuntimeValue entityOverlaySnapshotValue(
         )},
         {"decodedPackets", bedrock::JsRuntimeValue::number(
             static_cast<double>(snapshot.decodedPackets)
+        )},
+        {"cameraOrientationUpdates", bedrock::JsRuntimeValue::number(
+            static_cast<double>(state->cameraOrientationUpdates.load(
+                std::memory_order_relaxed
+            ))
+        )},
+        {"cameraOrientationDecodeFailures", bedrock::JsRuntimeValue::number(
+            static_cast<double>(state->cameraOrientationDecodeFailures.load(
+                std::memory_order_relaxed
+            ))
         )},
         {"parseFailures", bedrock::JsRuntimeValue::number(
             static_cast<double>(snapshot.parseFailures)
@@ -1139,6 +1169,8 @@ public:
             state->retainedLevelChunksEvictedRadius = 0;
             state->retainedLevelChunksEvictedMemory = 0;
             state->retainedLevelChunkParseFailures = 0;
+            state->cameraOrientationUpdates = 0;
+            state->cameraOrientationDecodeFailures = 0;
             int64_t relayElapsed = 0;
             {
                 std::lock_guard lock(state->mutex);
@@ -1218,8 +1250,57 @@ public:
             );
             state->flushFlight("relay_parse_error");
         });
-        relay->live().onServerbound([state](bedrock::BedrockRelayPacketEvent& event) {
+        relay->live().onServerbound([state, version](
+            bedrock::BedrockRelayPacketEvent& event
+        ) {
             state->entityPositions.observeServerbound(event.packet);
+            if (event.packet.name == "player_auth_input") {
+                try {
+                    bedrock::RelayPacketEvent decoded(version, event);
+                    constexpr double Missing =
+                        std::numeric_limits<double>::quiet_NaN();
+                    const double forwardX = decoded.getDouble(
+                        "camera_orientation.x",
+                        Missing
+                    );
+                    const double forwardY = decoded.getDouble(
+                        "camera_orientation.y",
+                        Missing
+                    );
+                    const double forwardZ = decoded.getDouble(
+                        "camera_orientation.z",
+                        Missing
+                    );
+                    if (std::isfinite(forwardX) &&
+                        std::isfinite(forwardY) &&
+                        std::isfinite(forwardZ) &&
+                        state->entityPositions.observeCameraForward(
+                            static_cast<float>(forwardX),
+                            static_cast<float>(forwardY),
+                            static_cast<float>(forwardZ)
+                        )) {
+                        state->cameraOrientationUpdates.fetch_add(
+                            1,
+                            std::memory_order_relaxed
+                        );
+                    }
+                } catch (const std::exception& error) {
+                    const auto failures =
+                        state->cameraOrientationDecodeFailures.fetch_add(
+                            1,
+                            std::memory_order_relaxed
+                        ) + 1;
+                    if (failures == 1) {
+                        state->push(
+                            "camera_orientation_fallback",
+                            "PlayerAuthInput camera_orientation decode failed; "
+                                "using pitch/yaw: " + safeMessage(error.what()),
+                            "WARN",
+                            "entities"
+                        );
+                    }
+                }
+            }
             if (isFlightPacket(event.packet.name)) {
                 state->recordFlight(
                     "relay_seen",

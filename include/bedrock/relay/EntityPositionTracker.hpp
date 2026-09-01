@@ -77,6 +77,39 @@ public:
         }
     }
 
+    // PlayerAuthInput carries a dedicated camera forward vector on modern
+    // Bedrock versions. It may differ from the player's body rotation (for
+    // example while flying or when a camera preset is active), so prefer it
+    // for screen-space projection whenever the packet decoder exposes it.
+    bool observeCameraForward(
+        float forwardX,
+        float forwardY,
+        float forwardZ
+    ) noexcept {
+        std::lock_guard lock(mutex_);
+        if (!camera_.known || !std::isfinite(forwardX) ||
+            !std::isfinite(forwardY) || !std::isfinite(forwardZ)) {
+            return false;
+        }
+
+        const float length = std::sqrt(
+            forwardX * forwardX +
+            forwardY * forwardY +
+            forwardZ * forwardZ
+        );
+        if (!std::isfinite(length) || length < 0.0001f) return false;
+
+        const float normalizedX = forwardX / length;
+        const float normalizedY = std::clamp(forwardY / length, -1.0f, 1.0f);
+        const float normalizedZ = forwardZ / length;
+        constexpr float RadiansToDegrees = 57.29577951308232f;
+        camera_.pitch = std::asin(-normalizedY) * RadiansToDegrees;
+        camera_.yaw = std::atan2(-normalizedX, normalizedZ) *
+            RadiansToDegrees;
+        camera_.updatedAtMs = monotonicMilliseconds();
+        return true;
+    }
+
     void observeClientbound(const VersionedGamePacket& packet) noexcept {
         if (!isRecognizedClientbound(packet.name)) return;
 

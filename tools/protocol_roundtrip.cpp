@@ -765,7 +765,7 @@ bool checkRelayPacketApi() {
             {"tick", bedrock::ProtoDefValue::uinteger(1)},
             {"delta", vec3f(0.0, 0.0, 0.0)},
             {"analogue_move_vector", vec2f(0.0, 1.0)},
-            {"camera_orientation", vec3f(0.0, 90.0, 0.0)},
+            {"camera_orientation", vec3f(-1.0, 0.0, 0.0)},
             {"raw_move_vector", vec2f(0.0, 1.0)}
         }));
 
@@ -780,11 +780,17 @@ bool checkRelayPacketApi() {
         const double x = wrapped.getDouble("position.x");
         const double y = wrapped.getDouble("position.y");
         const double z = wrapped.getDouble("position.z");
-        if (!startGliding || !up || x != 10.0 || y != 70.0 || z != 20.0) {
+        const double cameraX = wrapped.getDouble("camera_orientation.x");
+        const double cameraY = wrapped.getDouble("camera_orientation.y");
+        const double cameraZ = wrapped.getDouble("camera_orientation.z");
+        if (!startGliding || !up || x != 10.0 || y != 70.0 || z != 20.0 ||
+            cameraX != -1.0 || cameraY != 0.0 || cameraZ != 0.0) {
             std::cerr << "[FAIL] relay api player_auth_input decoded params mismatch"
                       << " start_gliding=" << startGliding
                       << " up=" << up
                       << " pos=(" << x << "," << y << "," << z << ")"
+                      << " camera=(" << cameraX << "," << cameraY << ","
+                      << cameraZ << ")"
                       << "\n";
             ok = false;
         }

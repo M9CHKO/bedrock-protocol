@@ -8,8 +8,15 @@ UDP-порту `19132` и подключает его к серверу, кот�
 
 ## Готовый APK
 
-- [CPE Relay 1.0.14 (arm64-v8a, optimized Release, debug-signed)](apk/CPE-Relay-v1.0.14-arm64-v8a-release-debug-signed.apk)
-- [SHA-256](apk/CPE-Relay-v1.0.14-arm64-v8a-release-debug-signed.apk.sha256)
+- [CPE Relay 1.0.15 (arm64-v8a, optimized Release, debug-signed)](apk/CPE-Relay-v1.0.15-arm64-v8a-release-debug-signed.apk)
+- [SHA-256](apk/CPE-Relay-v1.0.15-arm64-v8a-release-debug-signed.apk.sha256)
+
+Версия 1.0.15 исправляет привязку 2D-рамок при движении камеры. Проекция
+теперь использует фактический вектор `camera_orientation` из
+`player_auth_input`, а не только поворот тела игрока; запаздывающая
+интерполяция камеры заменена коротким предсказанием между сетевыми кадрами.
+FOV применяется по вертикальной оси с учётом соотношения сторон экрана, поэтому
+рамки не должны оставаться на прежнем месте экрана при повороте взгляда.
 
 Версия 1.0.14 добавляет плавные 2D-рамки игроков и мобов поверх Minecraft.
 Native-трекер читает позиции из штатных Bedrock-пакетов `add_player`,

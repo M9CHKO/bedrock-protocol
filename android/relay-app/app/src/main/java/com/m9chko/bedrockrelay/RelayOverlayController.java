@@ -222,8 +222,8 @@ final class RelayOverlayController {
         entityFov.setProgress(initialEntityFov);
         panel.addView(entityFov, margins(-1, -2, 0, 0, 0, 0));
         TextView entityHint = text(
-            "Рамки плавно следуют за игроками и мобами. Подстройте FOV " +
-                "под Minecraft; точнее всего вид от первого лица.",
+            "Поставьте такое же значение, как FOV в настройках Minecraft; " +
+                "точнее всего совпадает вид от первого лица.",
             11,
             false
         );
@@ -236,7 +236,7 @@ final class RelayOverlayController {
         Runnable refreshEntityFov = () -> entityFovLabel.setText(
             String.format(
                 Locale.getDefault(),
-                "FOV рамок: %d°",
+                "FOV Minecraft: %d°",
                 entityFov.getProgress()
             )
         );

@@ -37,7 +37,7 @@ final class EntityOutlineOverlayController {
 
     private volatile boolean sessionVisible;
     private volatile boolean enabled = true;
-    private volatile int horizontalFov = 70;
+    private volatile int fieldOfView = 70;
     private boolean missingPermissionLogged;
     private EntityOutlineView outlineView;
 
@@ -58,10 +58,10 @@ final class EntityOutlineOverlayController {
         reconcileWindow();
     }
 
-    void setHorizontalFov(int value) {
-        horizontalFov = RelayService.clampEntityFov(value);
+    void setFieldOfView(int value) {
+        fieldOfView = RelayService.clampEntityFov(value);
         if (outlineView != null) {
-            outlineView.setHorizontalFov(horizontalFov);
+            outlineView.setFieldOfView(fieldOfView);
         }
     }
 
@@ -118,7 +118,7 @@ final class EntityOutlineOverlayController {
 
         missingPermissionLogged = false;
         EntityOutlineView view = new EntityOutlineView(context);
-        view.setHorizontalFov(horizontalFov);
+        view.setFieldOfView(fieldOfView);
         view.setSystemUiVisibility(
             View.SYSTEM_UI_FLAG_LAYOUT_STABLE |
                 View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN |
@@ -236,6 +236,8 @@ final class EntityOutlineOverlayController {
         final double z;
         final double pitch;
         final double yaw;
+        final long updatedAtMs;
+        final long ageMs;
 
         CameraSample(
             boolean known,
@@ -243,7 +245,9 @@ final class EntityOutlineOverlayController {
             double y,
             double z,
             double pitch,
-            double yaw
+            double yaw,
+            long updatedAtMs,
+            long ageMs
         ) {
             this.known = known;
             this.x = x;
@@ -251,10 +255,12 @@ final class EntityOutlineOverlayController {
             this.z = z;
             this.pitch = pitch;
             this.yaw = yaw;
+            this.updatedAtMs = updatedAtMs;
+            this.ageMs = ageMs;
         }
 
         static CameraSample unknown() {
-            return new CameraSample(false, 0, 0, 0, 0, 0);
+            return new CameraSample(false, 0, 0, 0, 0, 0, 0, 0);
         }
 
         static CameraSample from(JSONObject value) {
@@ -265,7 +271,16 @@ final class EntityOutlineOverlayController {
             double pitch = value.optDouble("pitch", 0);
             double yaw = value.optDouble("yaw", 0);
             if (!finite(x, y, z, pitch, yaw)) known = false;
-            return new CameraSample(known, x, y, z, pitch, yaw);
+            return new CameraSample(
+                known,
+                x,
+                y,
+                z,
+                pitch,
+                yaw,
+                value.optLong("updatedAtMs", 0),
+                Math.max(0, value.optLong("ageMs", 0))
+            );
         }
     }
 
@@ -278,6 +293,7 @@ final class EntityOutlineOverlayController {
         final double z;
         final double width;
         final double height;
+        final long updatedAtMs;
 
         EntitySample(
             String id,
@@ -287,7 +303,8 @@ final class EntityOutlineOverlayController {
             double y,
             double z,
             double width,
-            double height
+            double height,
+            long updatedAtMs
         ) {
             this.id = id;
             this.label = label;
@@ -297,6 +314,7 @@ final class EntityOutlineOverlayController {
             this.z = z;
             this.width = width;
             this.height = height;
+            this.updatedAtMs = updatedAtMs;
         }
 
         static EntitySample from(JSONObject value) {
@@ -323,7 +341,8 @@ final class EntityOutlineOverlayController {
                 y,
                 z,
                 Math.min(width, 16.0),
-                Math.min(height, 16.0)
+                Math.min(height, 16.0),
+                value.optLong("updatedAtMs", 0)
             );
         }
     }
@@ -349,6 +368,7 @@ final class EntityOutlineOverlayController {
         double height;
         long transitionStartedNanos;
         long seenGeneration;
+        long nativeUpdatedAtMs;
 
         RenderTrack(EntitySample sample, long now, long generation) {
             id = sample.id;
@@ -361,9 +381,20 @@ final class EntityOutlineOverlayController {
             height = sample.height;
             transitionStartedNanos = now;
             seenGeneration = generation;
+            nativeUpdatedAtMs = sample.updatedAtMs;
         }
 
         void retarget(EntitySample sample, long now, long generation) {
+            seenGeneration = generation;
+            label = sample.label;
+            player = sample.player;
+            width = sample.width;
+            height = sample.height;
+            if (sample.updatedAtMs == nativeUpdatedAtMs &&
+                sample.x == toX && sample.y == toY && sample.z == toZ) {
+                return;
+            }
+
             double progress = progress(now, transitionStartedNanos);
             fromX = mix(fromX, toX, progress);
             fromY = mix(fromY, toY, progress);
@@ -371,17 +402,15 @@ final class EntityOutlineOverlayController {
             toX = sample.x;
             toY = sample.y;
             toZ = sample.z;
-            width = sample.width;
-            height = sample.height;
-            label = sample.label;
-            player = sample.player;
             transitionStartedNanos = now;
-            seenGeneration = generation;
+            nativeUpdatedAtMs = sample.updatedAtMs;
         }
     }
 
     private static final class EntityOutlineView extends View {
         private static final long TransitionNanos = 90_000_000L;
+        private static final long MaxCameraPredictionNanos = 90_000_000L;
+        private static final long RenderLeadNanos = 8_000_000L;
         private static final double NearPlane = 0.12;
 
         private final Map<String, RenderTrack> tracks = new HashMap<>();
@@ -395,19 +424,21 @@ final class EntityOutlineOverlayController {
         private final float density;
 
         private boolean cameraKnown;
-        private double cameraFromX;
-        private double cameraFromY;
-        private double cameraFromZ;
-        private double cameraFromPitch;
-        private double cameraFromYaw;
-        private double cameraToX;
-        private double cameraToY;
-        private double cameraToZ;
-        private double cameraToPitch;
-        private double cameraToYaw;
-        private long cameraTransitionStartedNanos;
+        private double cameraX;
+        private double cameraY;
+        private double cameraZ;
+        private double cameraPitch;
+        private double cameraYaw;
+        private double cameraVelocityX;
+        private double cameraVelocityY;
+        private double cameraVelocityZ;
+        private double cameraVelocityPitch;
+        private double cameraVelocityYaw;
+        private long cameraUpdatedAtMs;
+        private long cameraReceivedNanos;
+        private long cameraSampleAgeNanos;
         private long generation;
-        private int horizontalFov = 70;
+        private int fieldOfView = 70;
 
         EntityOutlineView(Context context) {
             super(context);
@@ -427,8 +458,8 @@ final class EntityOutlineOverlayController {
             textBackgroundPaint.setStyle(Paint.Style.FILL);
         }
 
-        void setHorizontalFov(int value) {
-            horizontalFov = RelayService.clampEntityFov(value);
+        void setFieldOfView(int value) {
+            fieldOfView = RelayService.clampEntityFov(value);
             postInvalidateOnAnimation();
         }
 
@@ -460,34 +491,63 @@ final class EntityOutlineOverlayController {
                 return;
             }
             if (!cameraKnown) {
-                cameraFromX = cameraToX = sample.x;
-                cameraFromY = cameraToY = sample.y;
-                cameraFromZ = cameraToZ = sample.z;
-                cameraFromPitch = cameraToPitch = sample.pitch;
-                cameraFromYaw = cameraToYaw = sample.yaw;
                 cameraKnown = true;
+                cameraVelocityX = cameraVelocityY = cameraVelocityZ = 0;
+                cameraVelocityPitch = cameraVelocityYaw = 0;
             } else {
-                double progress = progress(now, cameraTransitionStartedNanos);
-                cameraFromX = mix(cameraFromX, cameraToX, progress);
-                cameraFromY = mix(cameraFromY, cameraToY, progress);
-                cameraFromZ = mix(cameraFromZ, cameraToZ, progress);
-                cameraFromPitch = mixAngle(
-                    cameraFromPitch,
-                    cameraToPitch,
-                    progress
-                );
-                cameraFromYaw = mixAngle(
-                    cameraFromYaw,
-                    cameraToYaw,
-                    progress
-                );
-                cameraToX = sample.x;
-                cameraToY = sample.y;
-                cameraToZ = sample.z;
-                cameraToPitch = sample.pitch;
-                cameraToYaw = sample.yaw;
+                boolean duplicate = sample.updatedAtMs == cameraUpdatedAtMs &&
+                    sample.x == cameraX && sample.y == cameraY &&
+                    sample.z == cameraZ && sample.pitch == cameraPitch &&
+                    sample.yaw == cameraYaw;
+                if (duplicate) return;
+
+                double elapsedSeconds = (sample.updatedAtMs -
+                    cameraUpdatedAtMs) / 1000.0;
+                if (elapsedSeconds >= 0.005 && elapsedSeconds <= 0.25) {
+                    cameraVelocityX = clamp(
+                        (sample.x - cameraX) / elapsedSeconds,
+                        -100.0,
+                        100.0
+                    );
+                    cameraVelocityY = clamp(
+                        (sample.y - cameraY) / elapsedSeconds,
+                        -100.0,
+                        100.0
+                    );
+                    cameraVelocityZ = clamp(
+                        (sample.z - cameraZ) / elapsedSeconds,
+                        -100.0,
+                        100.0
+                    );
+                    cameraVelocityPitch = clamp(
+                        angleDifference(cameraPitch, sample.pitch) /
+                            elapsedSeconds,
+                        -2160.0,
+                        2160.0
+                    );
+                    cameraVelocityYaw = clamp(
+                        angleDifference(cameraYaw, sample.yaw) /
+                            elapsedSeconds,
+                        -2160.0,
+                        2160.0
+                    );
+                } else {
+                    cameraVelocityX = cameraVelocityY = cameraVelocityZ = 0;
+                    cameraVelocityPitch = cameraVelocityYaw = 0;
+                }
             }
-            cameraTransitionStartedNanos = now;
+
+            cameraX = sample.x;
+            cameraY = sample.y;
+            cameraZ = sample.z;
+            cameraPitch = sample.pitch;
+            cameraYaw = sample.yaw;
+            cameraUpdatedAtMs = sample.updatedAtMs;
+            cameraReceivedNanos = now;
+            cameraSampleAgeNanos = Math.min(
+                MaxCameraPredictionNanos,
+                Math.min(sample.ageMs, 90) * 1_000_000L
+            );
         }
 
         @Override
@@ -496,32 +556,40 @@ final class EntityOutlineOverlayController {
             if (!cameraKnown || getWidth() <= 0 || getHeight() <= 0) return;
 
             long now = System.nanoTime();
-            double cameraProgress = progress(
-                now,
-                cameraTransitionStartedNanos
+            long predictionNanos = Math.min(
+                MaxCameraPredictionNanos,
+                cameraSampleAgeNanos +
+                    Math.max(0, now - cameraReceivedNanos) +
+                    RenderLeadNanos
             );
-            double cameraX = mix(cameraFromX, cameraToX, cameraProgress);
-            double cameraY = mix(cameraFromY, cameraToY, cameraProgress);
-            double cameraZ = mix(cameraFromZ, cameraToZ, cameraProgress);
-            double pitch = Math.toRadians(mixAngle(
-                cameraFromPitch,
-                cameraToPitch,
-                cameraProgress
+            double predictionSeconds = predictionNanos / 1_000_000_000.0;
+            double predictedCameraX = cameraX +
+                cameraVelocityX * predictionSeconds;
+            double predictedCameraY = cameraY +
+                cameraVelocityY * predictionSeconds;
+            double predictedCameraZ = cameraZ +
+                cameraVelocityZ * predictionSeconds;
+            double pitch = Math.toRadians(clamp(
+                cameraPitch + cameraVelocityPitch * predictionSeconds,
+                -90.0,
+                90.0
             ));
-            double yaw = Math.toRadians(mixAngle(
-                cameraFromYaw,
-                cameraToYaw,
-                cameraProgress
-            ));
+            double yaw = Math.toRadians(
+                cameraYaw + cameraVelocityYaw * predictionSeconds
+            );
 
             double sinYaw = Math.sin(yaw);
             double cosYaw = Math.cos(yaw);
             double sinPitch = Math.sin(pitch);
             double cosPitch = Math.cos(pitch);
-            double focal = (getWidth() * 0.5) /
-                Math.tan(Math.toRadians(horizontalFov * 0.5));
+            // Minecraft's FOV setting is applied vertically. Using the view
+            // height keeps horizontal projection correct on wide phones.
+            double focal = (getHeight() * 0.5) /
+                Math.tan(Math.toRadians(fieldOfView * 0.5));
 
-            boolean animating = cameraProgress < 1.0;
+            boolean animating = cameraSampleAgeNanos +
+                Math.max(0, now - cameraReceivedNanos) <
+                MaxCameraPredictionNanos;
             for (RenderTrack track : tracks.values()) {
                 double entityProgress = progress(
                     now,
@@ -532,9 +600,9 @@ final class EntityOutlineOverlayController {
                     canvas,
                     track,
                     entityProgress,
-                    cameraX,
-                    cameraY,
-                    cameraZ,
+                    predictedCameraX,
+                    predictedCameraY,
+                    predictedCameraZ,
                     sinYaw,
                     cosYaw,
                     sinPitch,
@@ -728,14 +796,14 @@ final class EntityOutlineOverlayController {
         return from + (to - from) * progress;
     }
 
-    private static double mixAngle(
-        double from,
-        double to,
-        double progress
-    ) {
+    private static double angleDifference(double from, double to) {
         double difference = (to - from) % 360.0;
         if (difference > 180.0) difference -= 360.0;
         if (difference < -180.0) difference += 360.0;
-        return from + difference * progress;
+        return difference;
+    }
+
+    private static double clamp(double value, double minimum, double maximum) {
+        return Math.max(minimum, Math.min(maximum, value));
     }
 }

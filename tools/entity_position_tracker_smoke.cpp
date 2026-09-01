@@ -188,6 +188,22 @@ int main() {
         return 1;
     }
 
+    if (!tracker.observeCameraForward(-1.0f, 0.0f, 0.0f)) {
+        std::cerr << "camera forward vector was rejected\n";
+        return 1;
+    }
+    state = tracker.snapshot();
+    if (!near(state.camera.pitch, 0.0f) ||
+        !near(state.camera.yaw, 90.0f)) {
+        std::cerr << "camera forward vector did not override body rotation\n";
+        return 1;
+    }
+
+    if (tracker.observeCameraForward(0.0f, 0.0f, 0.0f)) {
+        std::cerr << "zero camera forward vector was accepted\n";
+        return 1;
+    }
+
     std::vector<uint8_t> removePlayer;
     removePlayer.push_back(1);
     writeVarUInt(removePlayer, 1);
