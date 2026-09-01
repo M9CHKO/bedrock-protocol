@@ -56,6 +56,9 @@ int main() {
     );
     const auto result = bedrock::retainPublishedChunks(packet, 512);
     ok &= check(result.recognized, "publisher packet was not recognized");
+    ok &= check(result.decoded, "publisher packet fields were not decoded");
+    ok &= check(result.centerXBlocks == -1, "publisher X was misread");
+    ok &= check(result.centerZBlocks == 300, "publisher Z was misread");
     ok &= check(result.rewritten, "larger configured radius was not applied");
     ok &= check(result.originalRadiusBlocks == 160, "server radius was misread");
     ok &= check(result.effectiveRadiusBlocks == 512, "effective radius is wrong");
@@ -90,6 +93,7 @@ int main() {
     malformed.fullPacket = {0x79, 0x80};
     const auto malformedBytes = malformed.fullPacket;
     const auto malformedResult = bedrock::retainPublishedChunks(malformed, 512);
+    ok &= check(!malformedResult.decoded, "malformed packet was marked decoded");
     ok &= check(!malformedResult.rewritten, "malformed packet was rewritten");
     ok &= check(
         malformed.fullPacket == malformedBytes,

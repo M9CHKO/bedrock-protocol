@@ -3,6 +3,7 @@
 #include <bedrock/client/BedrockNetworkClient.hpp>
 #include <bedrock/realms/BedrockRealms.hpp>
 #include <bedrock/relay/BedrockRelay.hpp>
+#include <bedrock/relay/LevelChunkRetentionCache.hpp>
 #include <bedrock/server/BedrockServer.hpp>
 
 #include <atomic>
@@ -141,6 +142,12 @@ public:
     uint16_t boundPort() const;
     const BedrockLiveRelayOptions& options() const;
 
+    // Keeps exact level_chunk packet bytes for the active downstream session.
+    // NetworkChunkPublisherUpdate still controls the client's visible window;
+    // the cache is cleared on dimension/session changes and bounded by memory.
+    void configureLevelChunkRetention(bool enabled, uint32_t radiusChunks);
+    LevelChunkRetentionStats levelChunkRetentionStats() const noexcept;
+
     BedrockServer& server();
     // Compatibility view of the first active relay session.
     BedrockNetworkClient* upstream();
@@ -180,6 +187,9 @@ private:
     std::unordered_set<std::string> rejectedConnections_;
     std::string primarySessionId_;
     mutable std::recursive_mutex handlerDispatchMutex_;
+    mutable std::mutex levelChunkRetentionConfigMutex_;
+    bool levelChunkRetentionEnabled_ = false;
+    uint32_t retainedLevelChunkRadius_ = 24;
 
     std::atomic<bool> closed_ {true};
     std::atomic<bool> listening_ {false};
@@ -251,6 +261,10 @@ private:
         const std::shared_ptr<Session>& session,
         const VersionedGamePacket& packet
     );
+    void retainClientboundLevelChunk(
+        const std::shared_ptr<Session>& session,
+        const VersionedGamePacket& packet
+    ) noexcept;
     void forwardServerbound(
         const std::shared_ptr<Session>& session,
         const VersionedGamePacket& packet,

@@ -532,6 +532,16 @@ struct RelayState {
     std::atomic<uint64_t> chunkPublisherPacketsRewritten {0};
     std::atomic<uint32_t> lastServerPublisherRadiusBlocks {0};
     std::atomic<uint32_t> lastEffectivePublisherRadiusBlocks {0};
+    std::atomic<uint64_t> retainedLevelChunkCount {0};
+    std::atomic<uint64_t> retainedLevelChunkBytes {0};
+    std::atomic<uint64_t> retainedLevelChunkMaximumBytes {
+        bedrock::DefaultLevelChunkRetentionMaximumBytes
+    };
+    std::atomic<uint64_t> retainedLevelChunksStored {0};
+    std::atomic<uint64_t> retainedLevelChunksReplaced {0};
+    std::atomic<uint64_t> retainedLevelChunksEvictedRadius {0};
+    std::atomic<uint64_t> retainedLevelChunksEvictedMemory {0};
+    std::atomic<uint64_t> retainedLevelChunkParseFailures {0};
 
     void configureRuntime(
         bool detailed,
@@ -544,7 +554,48 @@ struct RelayState {
             clampRetainedRadiusChunks(radiusChunks),
             std::memory_order_relaxed
         );
+        if (!retainChunks) {
+            retainedLevelChunkCount.store(0, std::memory_order_relaxed);
+            retainedLevelChunkBytes.store(0, std::memory_order_relaxed);
+        }
         if (!detailed) resetFlight();
+    }
+
+    void updateLevelChunkRetentionStats(
+        const bedrock::LevelChunkRetentionStats& stats
+    ) noexcept {
+        retainedLevelChunkCount.store(
+            stats.residentChunks,
+            std::memory_order_relaxed
+        );
+        retainedLevelChunkBytes.store(
+            stats.residentBytes,
+            std::memory_order_relaxed
+        );
+        retainedLevelChunkMaximumBytes.store(
+            stats.maximumBytes,
+            std::memory_order_relaxed
+        );
+        retainedLevelChunksStored.store(
+            stats.storedLevelChunks,
+            std::memory_order_relaxed
+        );
+        retainedLevelChunksReplaced.store(
+            stats.replacedLevelChunks,
+            std::memory_order_relaxed
+        );
+        retainedLevelChunksEvictedRadius.store(
+            stats.evictedOutsideRadius,
+            std::memory_order_relaxed
+        );
+        retainedLevelChunksEvictedMemory.store(
+            stats.evictedForMemory,
+            std::memory_order_relaxed
+        );
+        retainedLevelChunkParseFailures.store(
+            stats.parseFailures,
+            std::memory_order_relaxed
+        );
     }
 
     void push(bedrock::JsRuntimeValue event) {
@@ -721,6 +772,46 @@ bedrock::JsRuntimeValue snapshotValue(
                 std::memory_order_relaxed
             )
         )},
+        {"retainedLevelChunkCount", bedrock::JsRuntimeValue::number(
+            static_cast<double>(state->retainedLevelChunkCount.load(
+                std::memory_order_relaxed
+            ))
+        )},
+        {"retainedLevelChunkBytes", bedrock::JsRuntimeValue::number(
+            static_cast<double>(state->retainedLevelChunkBytes.load(
+                std::memory_order_relaxed
+            ))
+        )},
+        {"retainedLevelChunkMaximumBytes", bedrock::JsRuntimeValue::number(
+            static_cast<double>(state->retainedLevelChunkMaximumBytes.load(
+                std::memory_order_relaxed
+            ))
+        )},
+        {"retainedLevelChunksStored", bedrock::JsRuntimeValue::number(
+            static_cast<double>(state->retainedLevelChunksStored.load(
+                std::memory_order_relaxed
+            ))
+        )},
+        {"retainedLevelChunksReplaced", bedrock::JsRuntimeValue::number(
+            static_cast<double>(state->retainedLevelChunksReplaced.load(
+                std::memory_order_relaxed
+            ))
+        )},
+        {"retainedLevelChunksEvictedRadius", bedrock::JsRuntimeValue::number(
+            static_cast<double>(state->retainedLevelChunksEvictedRadius.load(
+                std::memory_order_relaxed
+            ))
+        )},
+        {"retainedLevelChunksEvictedMemory", bedrock::JsRuntimeValue::number(
+            static_cast<double>(state->retainedLevelChunksEvictedMemory.load(
+                std::memory_order_relaxed
+            ))
+        )},
+        {"retainedLevelChunkParseFailures", bedrock::JsRuntimeValue::number(
+            static_cast<double>(state->retainedLevelChunkParseFailures.load(
+                std::memory_order_relaxed
+            ))
+        )},
         {"boundPort", bedrock::JsRuntimeValue::number(state->boundPort)},
         {"downstreamConnections", bedrock::JsRuntimeValue::number(
             static_cast<double>(state->downstreamConnections)
@@ -827,6 +918,13 @@ public:
         );
 
         auto relay = std::make_unique<bedrock::Relay>(std::move(options));
+        relay->live().configureLevelChunkRetention(
+            state->chunkRetentionEnabled.load(std::memory_order_relaxed),
+            static_cast<uint32_t>(state->retainedRadiusChunks.load(
+                std::memory_order_relaxed
+            ))
+        );
+        auto* liveRelay = &relay->live();
 
         relay->live().server().onTransport([this, state](
             const bedrock::BedrockServerTransportEvent& event
@@ -932,6 +1030,13 @@ public:
             state->clientboundEquipmentPackets = 0;
             state->clientboundEquipmentTransportPackets = 0;
             state->clientboundEquipmentForwardedPackets = 0;
+            state->retainedLevelChunkCount = 0;
+            state->retainedLevelChunkBytes = 0;
+            state->retainedLevelChunksStored = 0;
+            state->retainedLevelChunksReplaced = 0;
+            state->retainedLevelChunksEvictedRadius = 0;
+            state->retainedLevelChunksEvictedMemory = 0;
+            state->retainedLevelChunkParseFailures = 0;
             int64_t relayElapsed = 0;
             {
                 std::lock_guard lock(state->mutex);
@@ -1112,9 +1217,41 @@ public:
                 );
             }
         });
-        relay->live().onForwarded([state](
+        relay->live().onForwarded([state, liveRelay](
             const bedrock::BedrockRelayPacketEvent& event
         ) {
+            if (event.direction ==
+                    bedrock::BedrockRelayDirection::Clientbound &&
+                (event.packet.name == "level_chunk" ||
+                 event.packet.name == "network_chunk_publisher_update" ||
+                 event.packet.name == "change_dimension")) {
+                const auto stats = liveRelay->levelChunkRetentionStats();
+                state->updateLevelChunkRetentionStats(stats);
+                if (stats.enabled && event.packet.name == "level_chunk" &&
+                    (stats.storedLevelChunks <= 3 ||
+                     stats.storedLevelChunks % 256 == 0 ||
+                     (stats.evictedForMemory != 0 &&
+                      stats.storedLevelChunks % 64 == 0))) {
+                    state->push(
+                        "level_chunk_cache",
+                        "residentChunks=" + std::to_string(
+                            stats.residentChunks
+                        ) + " residentBytes=" + std::to_string(
+                            stats.residentBytes
+                        ) + " stored=" + std::to_string(
+                            stats.storedLevelChunks
+                        ) + " replaced=" + std::to_string(
+                            stats.replacedLevelChunks
+                        ) + " evictedRadius=" + std::to_string(
+                            stats.evictedOutsideRadius
+                        ) + " evictedMemory=" + std::to_string(
+                            stats.evictedForMemory
+                        ),
+                        stats.evictedForMemory == 0 ? "DEBUG" : "WARN",
+                        "chunks"
+                    );
+                }
+            }
             bool record = isFlightPacket(event.packet.name);
             uint64_t sampleIndex = 0;
             if (event.direction ==
@@ -1346,6 +1483,18 @@ public:
             state_->upstreamReadyCount = 0;
         }
         state_->push("stopped", "Relay stopped", "INFO", "lifecycle");
+    }
+
+    void configureLevelChunkRetention(bool enabled, int radiusChunks) {
+        std::lock_guard lock(relayMutex_);
+        if (!relay_) return;
+        relay_->live().configureLevelChunkRetention(
+            enabled,
+            static_cast<uint32_t>(clampRetainedRadiusChunks(radiusChunks))
+        );
+        state_->updateLevelChunkRetentionStats(
+            relay_->live().levelChunkRetentionStats()
+        );
     }
 
 private:
@@ -1689,13 +1838,21 @@ Java_com_m9chko_bedrockrelay_NativeBridge_configureRuntime(
     );
 
     std::shared_ptr<RelayState> state;
+    std::shared_ptr<RelayController> activeController;
     {
         std::lock_guard lock(controllerMutex);
         state = currentState;
+        activeController = controller;
     }
     if (state) {
         state->configureRuntime(
             detailedLogging == JNI_TRUE,
+            chunkRetentionEnabled == JNI_TRUE,
+            clampedRadius
+        );
+    }
+    if (activeController) {
+        activeController->configureLevelChunkRetention(
             chunkRetentionEnabled == JNI_TRUE,
             clampedRadius
         );

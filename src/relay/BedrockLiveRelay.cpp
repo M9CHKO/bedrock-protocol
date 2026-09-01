@@ -9,6 +9,7 @@
 #include <bedrock/protocol/VersionedPayloadReader.hpp>
 #include <bedrock/protodef/ProtoDefPacketDecoder.hpp>
 #include <bedrock/protodef/ProtoDefValue.hpp>
+#include <bedrock/relay/ChunkPublisherRetention.hpp>
 
 #include <atomic>
 #include <algorithm>
@@ -534,6 +535,7 @@ struct BedrockLiveRelay::Session {
     std::vector<VersionedGamePacket> pendingPostSpawnServerbound;
     std::vector<VersionedGamePacket> pendingClientbound;
     std::vector<VersionedGamePacket> heldClientboundLevelChunks;
+    LevelChunkRetentionCache retainedLevelChunks;
     std::chrono::steady_clock::time_point clientboundChunkReleaseAt {};
     BedrockRelayDownstreamProfile downstreamProfile;
     RelaySessionLifecycle lifecycle = RelaySessionLifecycle::Open;
@@ -628,6 +630,22 @@ ServerListenResult BedrockLiveRelay::listen() {
                 sessions_[id] = session;
                 if (primarySessionId_.empty()) primarySessionId_ = id;
             }
+        }
+
+        if (session) {
+            bool retentionEnabled = false;
+            uint32_t retentionRadius = 0;
+            {
+                std::lock_guard<std::mutex> lock(
+                    levelChunkRetentionConfigMutex_
+                );
+                retentionEnabled = levelChunkRetentionEnabled_;
+                retentionRadius = retainedLevelChunkRadius_;
+            }
+            session->retainedLevelChunks.configure(
+                retentionEnabled,
+                retentionRadius
+            );
         }
 
         if (rejected) {
@@ -895,6 +913,43 @@ uint16_t BedrockLiveRelay::boundPort() const {
 
 const BedrockLiveRelayOptions& BedrockLiveRelay::options() const {
     return options_;
+}
+
+void BedrockLiveRelay::configureLevelChunkRetention(
+    bool enabled,
+    uint32_t radiusChunks
+) {
+    {
+        std::lock_guard<std::mutex> lock(levelChunkRetentionConfigMutex_);
+        levelChunkRetentionEnabled_ = enabled;
+        retainedLevelChunkRadius_ = radiusChunks;
+    }
+
+    std::vector<std::shared_ptr<Session>> sessions;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        sessions.reserve(sessions_.size());
+        for (const auto& [id, session] : sessions_) {
+            (void) id;
+            sessions.push_back(session);
+        }
+    }
+    for (const auto& session : sessions) {
+        session->retainedLevelChunks.configure(enabled, radiusChunks);
+    }
+}
+
+LevelChunkRetentionStats BedrockLiveRelay::levelChunkRetentionStats() const noexcept {
+    const auto session = primarySession();
+    if (session) return session->retainedLevelChunks.stats();
+
+    LevelChunkRetentionStats out;
+    std::lock_guard<std::mutex> lock(levelChunkRetentionConfigMutex_);
+    out.enabled = levelChunkRetentionEnabled_;
+    out.configuredRadiusChunks = retainedLevelChunkRadius_;
+    out.effectiveRadiusChunks = retainedLevelChunkRadius_;
+    out.maximumBytes = DefaultLevelChunkRetentionMaximumBytes;
+    return out;
 }
 
 BedrockServer& BedrockLiveRelay::server() {
@@ -1363,6 +1418,7 @@ bool BedrockLiveRelay::resetRelaySession(
             handlerDispatchMutex_
         );
     }
+    session->retainedLevelChunks.resetSession();
 
     // A downstream departure is a Bedrock session departure, not merely a
     // local transport teardown. Notify the backend before RakNet shutdown so
@@ -2208,6 +2264,7 @@ void BedrockLiveRelay::forwardClientbound(
         queued = true;
     }
     if (queued) {
+        retainClientboundLevelChunk(session, packet);
         emitForwarded(
             session,
             BedrockRelayDirection::Clientbound,
@@ -2235,6 +2292,7 @@ void BedrockLiveRelay::forwardClientbound(
         }
         if (chunksQueued) {
             for (const auto& held : heldChunks) {
+                retainClientboundLevelChunk(session, held);
                 emitForwarded(
                     session,
                     BedrockRelayDirection::Clientbound,
@@ -2243,6 +2301,30 @@ void BedrockLiveRelay::forwardClientbound(
             }
         }
     }
+}
+
+void BedrockLiveRelay::retainClientboundLevelChunk(
+    const std::shared_ptr<Session>& session,
+    const VersionedGamePacket& packet
+) noexcept {
+    if (packet.name == "change_dimension") {
+        session->retainedLevelChunks.resetWorld();
+        return;
+    }
+    if (packet.name == "level_chunk") {
+        (void) session->retainedLevelChunks.observeLevelChunk(packet);
+        return;
+    }
+    if (packet.name != "network_chunk_publisher_update") return;
+
+    auto inspected = packet;
+    const auto publisher = retainPublishedChunks(inspected, 0);
+    if (!publisher.decoded) return;
+    (void) session->retainedLevelChunks.updatePublisherWindow(
+        publisher.centerXBlocks,
+        publisher.centerZBlocks,
+        publisher.effectiveRadiusBlocks
+    );
 }
 
 void BedrockLiveRelay::forwardServerbound(

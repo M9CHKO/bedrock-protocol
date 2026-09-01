@@ -11,7 +11,10 @@ namespace bedrock {
 
 struct ChunkPublisherRetentionResult {
     bool recognized = false;
+    bool decoded = false;
     bool rewritten = false;
+    int32_t centerXBlocks = 0;
+    int32_t centerZBlocks = 0;
     uint32_t originalRadiusBlocks = 0;
     uint32_t effectiveRadiusBlocks = 0;
 };
@@ -45,10 +48,12 @@ inline ChunkPublisherRetentionResult retainPublishedChunks(
         };
 
         std::size_t offset = 0;
-        uint32_t ignored = 0;
-        if (!readVarUInt(offset, ignored) ||
-            !readVarUInt(offset, ignored) ||
-            !readVarUInt(offset, ignored)) {
+        uint32_t rawX = 0;
+        uint32_t ignoredY = 0;
+        uint32_t rawZ = 0;
+        if (!readVarUInt(offset, rawX) ||
+            !readVarUInt(offset, ignoredY) ||
+            !readVarUInt(offset, rawZ)) {
             return result;
         }
 
@@ -57,6 +62,14 @@ inline ChunkPublisherRetentionResult retainPublishedChunks(
         if (!readVarUInt(offset, serverRadiusBlocks)) {
             return result;
         }
+        const auto decodeZigZag32 = [](uint32_t raw) {
+            return static_cast<int32_t>(
+                (raw >> 1u) ^ (0u - (raw & 1u))
+            );
+        };
+        result.decoded = true;
+        result.centerXBlocks = decodeZigZag32(rawX);
+        result.centerZBlocks = decodeZigZag32(rawZ);
         result.originalRadiusBlocks = serverRadiusBlocks;
         result.effectiveRadiusBlocks = std::max(
             serverRadiusBlocks,
