@@ -144,7 +144,8 @@ final class EntityOutlineOverlayController {
                 WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE |
                 WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL |
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN |
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS |
+                WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
             PixelFormat.TRANSLUCENT
         );
         params.gravity = Gravity.TOP | Gravity.START;
@@ -165,7 +166,8 @@ final class EntityOutlineOverlayController {
                 "INFO",
                 "entities",
                 "Entity outline overlay opened; mode=2d_boxes " +
-                    "smoothing=critical_damped cameraPollMs=12"
+                    "smoothing=world+screen_no_overshoot " +
+                    "predictor=monotonic cameraPollMs=12"
             );
         } catch (Throwable error) {
             outlineView = null;
@@ -375,8 +377,8 @@ final class EntityOutlineOverlayController {
     }
 
     private static final class RenderTrack {
-        private static final long MaxPredictionNanos = 120_000_000L;
-        private static final long PredictionDecayNanos = 180_000_000L;
+        private static final long LinearPredictionNanos = 65_000_000L;
+        private static final long MaxPredictionNanos = 130_000_000L;
         private static final long RenderLeadNanos = 18_000_000L;
         private static final long MaximumFrameGapNanos = 250_000_000L;
         private static final double VelocityResponseSeconds = 0.075;
@@ -387,6 +389,8 @@ final class EntityOutlineOverlayController {
         final MotionSmoother.Axis renderX = new MotionSmoother.Axis();
         final MotionSmoother.Axis renderY = new MotionSmoother.Axis();
         final MotionSmoother.Axis renderZ = new MotionSmoother.Axis();
+        final MotionSmoother.ScreenBox screenBox =
+            new MotionSmoother.ScreenBox();
         double sampleX;
         double sampleY;
         double sampleZ;
@@ -499,24 +503,23 @@ final class EntityOutlineOverlayController {
         boolean advance(long now) {
             long elapsedSinceReceipt = Math.max(0, now - sampleReceivedNanos);
             long totalAgeNanos = Math.min(
-                500_000_000L,
+                10_000_000_000L,
                 sampleAgeNanos + elapsedSinceReceipt
             );
             double predictionSeconds = MotionSmoother.predictionSeconds(
                 totalAgeNanos,
                 RenderLeadNanos,
-                MaxPredictionNanos,
-                PredictionDecayNanos
+                LinearPredictionNanos,
+                MaxPredictionNanos
             );
             double predictionVelocityScale =
                 MotionSmoother.predictionVelocityScale(
                     totalAgeNanos,
                     RenderLeadNanos,
-                    MaxPredictionNanos,
-                    PredictionDecayNanos
+                    LinearPredictionNanos,
+                    MaxPredictionNanos
                 );
-            boolean predictionActive = predictionSeconds > 0.0 ||
-                Math.abs(predictionVelocityScale) > 0.0001;
+            boolean predictionActive = predictionVelocityScale > 0.0001;
             double targetVelocityX = velocityX * predictionVelocityScale;
             double targetVelocityY = velocityY * predictionVelocityScale;
             double targetVelocityZ = velocityZ * predictionVelocityScale;
@@ -569,8 +572,8 @@ final class EntityOutlineOverlayController {
     }
 
     private static final class EntityOutlineView extends View {
-        private static final long MaxCameraPredictionNanos = 120_000_000L;
-        private static final long CameraPredictionDecayNanos = 160_000_000L;
+        private static final long LinearCameraPredictionNanos = 40_000_000L;
+        private static final long MaxCameraPredictionNanos = 95_000_000L;
         private static final long CameraRenderLeadNanos = 18_000_000L;
         private static final long MaximumFrameGapNanos = 250_000_000L;
         private static final double CameraPositionVelocityResponse = 0.045;
@@ -797,24 +800,23 @@ final class EntityOutlineOverlayController {
             long now = System.nanoTime();
             long elapsedSinceReceipt = Math.max(0, now - cameraReceivedNanos);
             long totalCameraAgeNanos = Math.min(
-                500_000_000L,
+                10_000_000_000L,
                 cameraSampleAgeNanos + elapsedSinceReceipt
             );
             double predictionSeconds = MotionSmoother.predictionSeconds(
                 totalCameraAgeNanos,
                 CameraRenderLeadNanos,
-                MaxCameraPredictionNanos,
-                CameraPredictionDecayNanos
+                LinearCameraPredictionNanos,
+                MaxCameraPredictionNanos
             );
             double predictionVelocityScale =
                 MotionSmoother.predictionVelocityScale(
                     totalCameraAgeNanos,
                     CameraRenderLeadNanos,
-                    MaxCameraPredictionNanos,
-                    CameraPredictionDecayNanos
+                    LinearCameraPredictionNanos,
+                    MaxCameraPredictionNanos
                 );
-            boolean predictionActive = predictionSeconds > 0.0 ||
-                Math.abs(predictionVelocityScale) > 0.0001;
+            boolean predictionActive = predictionVelocityScale > 0.0001;
             double targetVelocityX = cameraVelocityX *
                 predictionVelocityScale;
             double targetVelocityY = cameraVelocityY *
@@ -964,7 +966,7 @@ final class EntityOutlineOverlayController {
                 );
             for (RenderTrack track : tracks.values()) {
                 animating |= track.advance(now);
-                drawTrack(
+                animating |= drawTrack(
                     canvas,
                     track,
                     cameraX,
@@ -974,13 +976,14 @@ final class EntityOutlineOverlayController {
                     cosYaw,
                     sinPitch,
                     cosPitch,
-                    focal
+                    focal,
+                    now
                 );
             }
             if (animating) postInvalidateOnAnimation();
         }
 
-        private void drawTrack(
+        private boolean drawTrack(
             Canvas canvas,
             RenderTrack track,
             double cameraX,
@@ -990,7 +993,8 @@ final class EntityOutlineOverlayController {
             double cosYaw,
             double sinPitch,
             double cosPitch,
-            double focal
+            double focal,
+            long now
         ) {
             double entityX = track.renderX.value();
             double entityY = track.renderY.value();
@@ -1007,7 +1011,10 @@ final class EntityOutlineOverlayController {
                 sinPitch,
                 cosPitch
             );
-            if (centerDepth <= NearPlane) return;
+            if (centerDepth <= NearPlane) {
+                track.screenBox.hide();
+                return false;
+            }
 
             double halfWidth = track.width * 0.5;
             double minimumX = Double.POSITIVE_INFINITY;
@@ -1055,7 +1062,10 @@ final class EntityOutlineOverlayController {
                     }
                 }
             }
-            if (projected < 4) return;
+            if (projected < 4) {
+                track.screenBox.hide();
+                return false;
+            }
 
             float left = (float) minimumX;
             float top = (float) minimumY;
@@ -1074,7 +1084,24 @@ final class EntityOutlineOverlayController {
                 bottom = center + minimumHeight * 0.5f;
             }
             if (right < 0 || bottom < 0 || left > getWidth() ||
-                top > getHeight()) return;
+                top > getHeight()) {
+                track.screenBox.hide();
+                return false;
+            }
+
+            boolean screenAnimating = track.screenBox.step(
+                left,
+                top,
+                right,
+                bottom,
+                now,
+                getWidth(),
+                getHeight()
+            );
+            left = (float) track.screenBox.left();
+            top = (float) track.screenBox.top();
+            right = (float) track.screenBox.right();
+            bottom = (float) track.screenBox.bottom();
 
             int color = track.player ? 0xff4fd5ff : 0xffff5b62;
             rectangle.set(left, top, right, bottom);
@@ -1126,6 +1153,7 @@ final class EntityOutlineOverlayController {
                 textBackgroundPaint
             );
             canvas.drawText(text, textX, baseline, textPaint);
+            return screenAnimating;
         }
 
         private static double depth(

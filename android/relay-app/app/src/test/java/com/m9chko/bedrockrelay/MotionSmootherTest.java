@@ -63,43 +63,133 @@ public final class MotionSmootherTest {
     }
 
     @Test
-    public void stalePredictionReturnsContinuouslyToAuthoritativeSample() {
-        long maximum = 120_000_000L;
-        long decay = 180_000_000L;
-        assertEquals(
-            0.12,
-            MotionSmoother.predictionSeconds(maximum, 0, maximum, decay),
-            1.0e-12
-        );
-        assertEquals(
-            1.0,
-            MotionSmoother.predictionVelocityScale(
-                maximum,
+    public void stalePredictionSlowsWithoutEverReversing() {
+        long linear = 65_000_000L;
+        long maximum = 130_000_000L;
+        double previous = -1.0;
+        for (long age = 0; age <= 2_000_000_000L; age += 1_000_000L) {
+            double horizon = MotionSmoother.predictionSeconds(
+                age,
                 0,
-                maximum,
-                decay
-            ),
-            1.0e-12
-        );
-        assertEquals(
-            0.0,
-            MotionSmoother.predictionSeconds(
-                maximum + decay,
+                linear,
+                maximum
+            );
+            double velocityScale = MotionSmoother.predictionVelocityScale(
+                age,
                 0,
-                maximum,
-                decay
-            ),
-            0.0
-        );
-        assertEquals(
-            0.0,
-            MotionSmoother.predictionVelocityScale(
-                maximum + decay,
-                0,
-                maximum,
-                decay
-            ),
-            0.0
-        );
+                linear,
+                maximum
+            );
+            assertTrue(horizon >= previous - 1.0e-12);
+            assertTrue(horizon <= 0.13 + 1.0e-12);
+            assertTrue(velocityScale >= 0.0);
+            assertTrue(velocityScale <= 1.0);
+            previous = horizon;
+        }
+        assertEquals(0.13, previous, 1.0e-10);
+        assertTrue(MotionSmoother.predictionVelocityScale(
+            2_000_000_000L,
+            0,
+            linear,
+            maximum
+        ) < 1.0e-10);
+    }
+
+    @Test
+    public void screenBoxSuppressesAlternatingProjectionJitter() {
+        MotionSmoother.ScreenBox box = new MotionSmoother.ScreenBox();
+        long now = 1_000_000_000L;
+        box.step(80.0, 80.0, 120.0, 180.0, now, 1080.0, 1920.0);
+        double previous = box.centerX();
+
+        for (int frame = 1; frame <= 240; ++frame) {
+            now += 16_666_667L;
+            double trend = 100.0 + frame * 2.0;
+            double jitter;
+            switch (frame & 3) {
+                case 0:
+                    jitter = 3.0;
+                    break;
+                case 2:
+                    jitter = -3.0;
+                    break;
+                default:
+                    jitter = 0.0;
+                    break;
+            }
+            box.step(
+                trend + jitter - 20.0,
+                80.0,
+                trend + jitter + 20.0,
+                180.0,
+                now,
+                1080.0,
+                1920.0
+            );
+            double current = box.centerX();
+            assertTrue(Double.isFinite(current));
+            assertTrue(current >= previous - 0.05);
+            assertTrue(current - previous < 8.0);
+            previous = current;
+        }
+        assertEquals(580.0, box.centerX(), 8.0);
+        assertEquals(40.0, box.right() - box.left(), 0.05);
+    }
+
+    @Test
+    public void screenBoxDoesNotSnapOnFastCameraTurn() {
+        MotionSmoother.ScreenBox box = new MotionSmoother.ScreenBox();
+        long now = 1_000_000_000L;
+        box.step(80.0, 80.0, 120.0, 180.0, now, 1080.0, 1920.0);
+
+        now += 16_666_667L;
+        box.step(880.0, 80.0, 920.0, 180.0, now, 1080.0, 1920.0);
+        assertTrue(box.centerX() > 100.0);
+        assertTrue(box.centerX() < 700.0);
+
+        for (int frame = 0; frame < 180; ++frame) {
+            now += 16_666_667L;
+            box.step(
+                880.0,
+                80.0,
+                920.0,
+                180.0,
+                now,
+                1080.0,
+                1920.0
+            );
+            assertTrue(Double.isFinite(box.centerX()));
+            assertTrue(box.centerX() < 940.0);
+        }
+        assertEquals(900.0, box.centerX(), 0.1);
+    }
+
+    @Test
+    public void stationaryScreenBoxRejectsSubpixelPacketFlicker() {
+        MotionSmoother.ScreenBox box = new MotionSmoother.ScreenBox();
+        long now = 1_000_000_000L;
+        box.step(80.0, 80.0, 120.0, 180.0, now, 1080.0, 1920.0);
+        double minimum = Double.POSITIVE_INFINITY;
+        double maximum = Double.NEGATIVE_INFINITY;
+
+        for (int frame = 1; frame <= 600; ++frame) {
+            now += 16_666_667L;
+            double jitter = (frame & 1) == 0 ? 3.0 : -3.0;
+            box.step(
+                80.0 + jitter,
+                80.0,
+                120.0 + jitter,
+                180.0,
+                now,
+                1080.0,
+                1920.0
+            );
+            if (frame > 120) {
+                minimum = Math.min(minimum, box.centerX());
+                maximum = Math.max(maximum, box.centerX());
+            }
+        }
+        assertTrue(maximum - minimum < 0.5);
+        assertEquals(100.0, box.centerX(), 0.5);
     }
 }
