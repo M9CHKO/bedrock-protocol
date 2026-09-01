@@ -188,6 +188,11 @@ public:
         return out;
     }
 
+    TrackedCameraPosition cameraSnapshot() const noexcept {
+        std::lock_guard lock(mutex_);
+        return camera_;
+    }
+
     void clear() noexcept {
         std::lock_guard lock(mutex_);
         clearSessionLocked();

@@ -21,7 +21,6 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -32,6 +31,8 @@ final class EntityOutlineOverlayController {
     private final WindowManager windowManager;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final AtomicReference<Frame> pendingFrame =
+        new AtomicReference<>();
+    private final AtomicReference<CameraSample> pendingCamera =
         new AtomicReference<>();
     private final AtomicBoolean deliveryPosted = new AtomicBoolean(false);
 
@@ -76,6 +77,13 @@ final class EntityOutlineOverlayController {
         postFrameDelivery();
     }
 
+    void offerCameraSnapshot(String json) throws Exception {
+        if (!wantsFrames()) return;
+        CameraSample camera = CameraSample.from(new JSONObject(json));
+        pendingCamera.set(camera);
+        postFrameDelivery();
+    }
+
     void hideImmediately() {
         sessionVisible = false;
         removeWindow();
@@ -85,11 +93,15 @@ final class EntityOutlineOverlayController {
         if (!deliveryPosted.compareAndSet(false, true)) return;
         mainHandler.post(() -> {
             Frame frame = pendingFrame.getAndSet(null);
-            if (outlineView != null && frame != null) {
-                outlineView.submit(frame);
+            CameraSample camera = pendingCamera.getAndSet(null);
+            if (outlineView != null) {
+                if (frame != null) outlineView.submit(frame);
+                if (camera != null) outlineView.submitCamera(camera);
             }
             deliveryPosted.set(false);
-            if (pendingFrame.get() != null) postFrameDelivery();
+            if (pendingFrame.get() != null || pendingCamera.get() != null) {
+                postFrameDelivery();
+            }
         });
     }
 
@@ -146,11 +158,14 @@ final class EntityOutlineOverlayController {
             outlineView = view;
             Frame frame = pendingFrame.get();
             if (frame != null) view.submit(frame);
+            CameraSample camera = pendingCamera.get();
+            if (camera != null) view.submitCamera(camera);
             DiagnosticsLog.append(
                 context,
                 "INFO",
                 "entities",
-                "Entity outline overlay opened; mode=2d_boxes"
+                "Entity outline overlay opened; mode=2d_boxes " +
+                    "smoothing=critical_damped cameraPollMs=12"
             );
         } catch (Throwable error) {
             outlineView = null;
@@ -167,6 +182,7 @@ final class EntityOutlineOverlayController {
         EntityOutlineView view = outlineView;
         outlineView = null;
         pendingFrame.set(null);
+        pendingCamera.set(null);
         if (view == null) return;
         try {
             windowManager.removeViewImmediate(view);
@@ -294,6 +310,7 @@ final class EntityOutlineOverlayController {
         final double width;
         final double height;
         final long updatedAtMs;
+        final long ageMs;
 
         EntitySample(
             String id,
@@ -304,7 +321,8 @@ final class EntityOutlineOverlayController {
             double z,
             double width,
             double height,
-            long updatedAtMs
+            long updatedAtMs,
+            long ageMs
         ) {
             this.id = id;
             this.label = label;
@@ -315,6 +333,7 @@ final class EntityOutlineOverlayController {
             this.width = width;
             this.height = height;
             this.updatedAtMs = updatedAtMs;
+            this.ageMs = ageMs;
         }
 
         static EntitySample from(JSONObject value) {
@@ -342,7 +361,8 @@ final class EntityOutlineOverlayController {
                 z,
                 Math.min(width, 16.0),
                 Math.min(height, 16.0),
-                value.optLong("updatedAtMs", 0)
+                value.optLong("updatedAtMs", 0),
+                Math.max(0, value.optLong("ageMs", 0))
             );
         }
     }
@@ -355,33 +375,53 @@ final class EntityOutlineOverlayController {
     }
 
     private static final class RenderTrack {
+        private static final long MaxPredictionNanos = 120_000_000L;
+        private static final long PredictionDecayNanos = 180_000_000L;
+        private static final long RenderLeadNanos = 18_000_000L;
+        private static final long MaximumFrameGapNanos = 250_000_000L;
+        private static final double VelocityResponseSeconds = 0.075;
+
         final String id;
         String label;
         boolean player;
-        double fromX;
-        double fromY;
-        double fromZ;
-        double toX;
-        double toY;
-        double toZ;
+        final MotionSmoother.Axis renderX = new MotionSmoother.Axis();
+        final MotionSmoother.Axis renderY = new MotionSmoother.Axis();
+        final MotionSmoother.Axis renderZ = new MotionSmoother.Axis();
+        double sampleX;
+        double sampleY;
+        double sampleZ;
+        double velocityX;
+        double velocityY;
+        double velocityZ;
         double width;
         double height;
-        long transitionStartedNanos;
         long seenGeneration;
         long nativeUpdatedAtMs;
+        long sampleReceivedNanos;
+        long sampleAgeNanos;
+        long lastFrameNanos;
+        String displayLabel = "";
+        String displayText = "";
+        int displayDistance = Integer.MIN_VALUE;
+        float displayTextWidth;
 
         RenderTrack(EntitySample sample, long now, long generation) {
             id = sample.id;
             label = sample.label;
             player = sample.player;
-            fromX = toX = sample.x;
-            fromY = toY = sample.y;
-            fromZ = toZ = sample.z;
+            sampleX = sample.x;
+            sampleY = sample.y;
+            sampleZ = sample.z;
+            renderX.reset(sample.x, 0.0);
+            renderY.reset(sample.y, 0.0);
+            renderZ.reset(sample.z, 0.0);
             width = sample.width;
             height = sample.height;
-            transitionStartedNanos = now;
             seenGeneration = generation;
             nativeUpdatedAtMs = sample.updatedAtMs;
+            sampleReceivedNanos = now;
+            sampleAgeNanos = Math.min(sample.ageMs, 500) * 1_000_000L;
+            lastFrameNanos = now;
         }
 
         void retarget(EntitySample sample, long now, long generation) {
@@ -390,27 +430,151 @@ final class EntityOutlineOverlayController {
             player = sample.player;
             width = sample.width;
             height = sample.height;
-            if (sample.updatedAtMs == nativeUpdatedAtMs &&
-                sample.x == toX && sample.y == toY && sample.z == toZ) {
+            if (nativeUpdatedAtMs > 0 && sample.updatedAtMs > 0 &&
+                sample.updatedAtMs < nativeUpdatedAtMs) {
                 return;
             }
+            if (sample.updatedAtMs == nativeUpdatedAtMs &&
+                sample.x == sampleX && sample.y == sampleY &&
+                sample.z == sampleZ) return;
 
-            double progress = progress(now, transitionStartedNanos);
-            fromX = mix(fromX, toX, progress);
-            fromY = mix(fromY, toY, progress);
-            fromZ = mix(fromZ, toZ, progress);
-            toX = sample.x;
-            toY = sample.y;
-            toZ = sample.z;
-            transitionStartedNanos = now;
+            double deltaX = sample.x - sampleX;
+            double deltaY = sample.y - sampleY;
+            double deltaZ = sample.z - sampleZ;
+            double elapsedSeconds = (sample.updatedAtMs -
+                nativeUpdatedAtMs) / 1000.0;
+            boolean teleport = deltaX * deltaX + deltaY * deltaY +
+                deltaZ * deltaZ > 64.0;
+            if (!teleport && elapsedSeconds >= 0.005 &&
+                elapsedSeconds <= 0.5) {
+                velocityX = MotionSmoother.filterVelocity(
+                    velocityX,
+                    MotionSmoother.clamp(
+                        deltaX / elapsedSeconds,
+                        -80.0,
+                        80.0
+                    ),
+                    elapsedSeconds,
+                    VelocityResponseSeconds
+                );
+                velocityY = MotionSmoother.filterVelocity(
+                    velocityY,
+                    MotionSmoother.clamp(
+                        deltaY / elapsedSeconds,
+                        -80.0,
+                        80.0
+                    ),
+                    elapsedSeconds,
+                    VelocityResponseSeconds
+                );
+                velocityZ = MotionSmoother.filterVelocity(
+                    velocityZ,
+                    MotionSmoother.clamp(
+                        deltaZ / elapsedSeconds,
+                        -80.0,
+                        80.0
+                    ),
+                    elapsedSeconds,
+                    VelocityResponseSeconds
+                );
+            } else if (teleport) {
+                velocityX = velocityY = velocityZ = 0.0;
+                renderX.reset(sample.x, 0.0);
+                renderY.reset(sample.y, 0.0);
+                renderZ.reset(sample.z, 0.0);
+            } else if (elapsedSeconds > 0.5) {
+                // Do not extrapolate a fresh packet with velocity measured
+                // before a long network pause.
+                velocityX = velocityY = velocityZ = 0.0;
+            }
+
+            sampleX = sample.x;
+            sampleY = sample.y;
+            sampleZ = sample.z;
             nativeUpdatedAtMs = sample.updatedAtMs;
+            sampleReceivedNanos = now;
+            sampleAgeNanos = Math.min(sample.ageMs, 500) * 1_000_000L;
+        }
+
+        boolean advance(long now) {
+            long elapsedSinceReceipt = Math.max(0, now - sampleReceivedNanos);
+            long totalAgeNanos = Math.min(
+                500_000_000L,
+                sampleAgeNanos + elapsedSinceReceipt
+            );
+            double predictionSeconds = MotionSmoother.predictionSeconds(
+                totalAgeNanos,
+                RenderLeadNanos,
+                MaxPredictionNanos,
+                PredictionDecayNanos
+            );
+            double predictionVelocityScale =
+                MotionSmoother.predictionVelocityScale(
+                    totalAgeNanos,
+                    RenderLeadNanos,
+                    MaxPredictionNanos,
+                    PredictionDecayNanos
+                );
+            boolean predictionActive = predictionSeconds > 0.0 ||
+                Math.abs(predictionVelocityScale) > 0.0001;
+            double targetVelocityX = velocityX * predictionVelocityScale;
+            double targetVelocityY = velocityY * predictionVelocityScale;
+            double targetVelocityZ = velocityZ * predictionVelocityScale;
+            double targetX = sampleX + velocityX * predictionSeconds;
+            double targetY = sampleY + velocityY * predictionSeconds;
+            double targetZ = sampleZ + velocityZ * predictionSeconds;
+
+            long frameGap = Math.max(0, now - lastFrameNanos);
+            if (lastFrameNanos == 0 || frameGap > MaximumFrameGapNanos) {
+                renderX.reset(targetX, targetVelocityX);
+                renderY.reset(targetY, targetVelocityY);
+                renderZ.reset(targetZ, targetVelocityZ);
+            } else {
+                double deltaSeconds = frameGap / 1_000_000_000.0;
+                double speed = Math.sqrt(
+                    velocityX * velocityX + velocityY * velocityY +
+                        velocityZ * velocityZ
+                );
+                double smoothTime = 0.095 -
+                    MotionSmoother.clamp(speed / 20.0, 0.0, 1.0) * 0.025;
+                renderX.step(
+                    targetX,
+                    targetVelocityX,
+                    smoothTime,
+                    deltaSeconds
+                );
+                renderY.step(
+                    targetY,
+                    targetVelocityY,
+                    smoothTime,
+                    deltaSeconds
+                );
+                renderZ.step(
+                    targetZ,
+                    targetVelocityZ,
+                    smoothTime,
+                    deltaSeconds
+                );
+            }
+            lastFrameNanos = now;
+
+            return (predictionActive &&
+                    (Math.abs(velocityX) > 0.002 ||
+                     Math.abs(velocityY) > 0.002 ||
+                     Math.abs(velocityZ) > 0.002)) ||
+                !renderX.isSettled(targetX, targetVelocityX, 0.0005, 0.005) ||
+                !renderY.isSettled(targetY, targetVelocityY, 0.0005, 0.005) ||
+                !renderZ.isSettled(targetZ, targetVelocityZ, 0.0005, 0.005);
         }
     }
 
     private static final class EntityOutlineView extends View {
-        private static final long TransitionNanos = 90_000_000L;
-        private static final long MaxCameraPredictionNanos = 90_000_000L;
-        private static final long RenderLeadNanos = 8_000_000L;
+        private static final long MaxCameraPredictionNanos = 120_000_000L;
+        private static final long CameraPredictionDecayNanos = 160_000_000L;
+        private static final long CameraRenderLeadNanos = 18_000_000L;
+        private static final long MaximumFrameGapNanos = 250_000_000L;
+        private static final double CameraPositionVelocityResponse = 0.045;
+        private static final double CameraAngleVelocityResponse = 0.028;
         private static final double NearPlane = 0.12;
 
         private final Map<String, RenderTrack> tracks = new HashMap<>();
@@ -424,11 +588,21 @@ final class EntityOutlineOverlayController {
         private final float density;
 
         private boolean cameraKnown;
-        private double cameraX;
-        private double cameraY;
-        private double cameraZ;
-        private double cameraPitch;
-        private double cameraYaw;
+        private final MotionSmoother.Axis renderedCameraX =
+            new MotionSmoother.Axis();
+        private final MotionSmoother.Axis renderedCameraY =
+            new MotionSmoother.Axis();
+        private final MotionSmoother.Axis renderedCameraZ =
+            new MotionSmoother.Axis();
+        private final MotionSmoother.Axis renderedCameraPitch =
+            new MotionSmoother.Axis();
+        private final MotionSmoother.Axis renderedCameraYaw =
+            new MotionSmoother.Axis();
+        private double cameraSampleX;
+        private double cameraSampleY;
+        private double cameraSampleZ;
+        private double cameraSamplePitch;
+        private double cameraSampleYaw;
         private double cameraVelocityX;
         private double cameraVelocityY;
         private double cameraVelocityZ;
@@ -437,6 +611,7 @@ final class EntityOutlineOverlayController {
         private long cameraUpdatedAtMs;
         private long cameraReceivedNanos;
         private long cameraSampleAgeNanos;
+        private long cameraLastFrameNanos;
         private long generation;
         private int fieldOfView = 70;
 
@@ -485,6 +660,11 @@ final class EntityOutlineOverlayController {
             postInvalidateOnAnimation();
         }
 
+        void submitCamera(CameraSample camera) {
+            updateCamera(camera, System.nanoTime());
+            postInvalidateOnAnimation();
+        }
+
         private void updateCamera(CameraSample sample, long now) {
             if (!sample.known) {
                 cameraKnown = false;
@@ -492,61 +672,120 @@ final class EntityOutlineOverlayController {
             }
             if (!cameraKnown) {
                 cameraKnown = true;
+                cameraSampleX = sample.x;
+                cameraSampleY = sample.y;
+                cameraSampleZ = sample.z;
+                cameraSamplePitch = sample.pitch;
+                cameraSampleYaw = sample.yaw;
                 cameraVelocityX = cameraVelocityY = cameraVelocityZ = 0;
                 cameraVelocityPitch = cameraVelocityYaw = 0;
+                renderedCameraX.reset(sample.x, 0.0);
+                renderedCameraY.reset(sample.y, 0.0);
+                renderedCameraZ.reset(sample.z, 0.0);
+                renderedCameraPitch.reset(sample.pitch, 0.0);
+                renderedCameraYaw.reset(sample.yaw, 0.0);
+                cameraLastFrameNanos = now;
             } else {
+                if (cameraUpdatedAtMs > 0 && sample.updatedAtMs > 0 &&
+                    sample.updatedAtMs < cameraUpdatedAtMs) return;
+
+                double unwrappedYaw = MotionSmoother.unwrapAngle(
+                    cameraSampleYaw,
+                    sample.yaw
+                );
                 boolean duplicate = sample.updatedAtMs == cameraUpdatedAtMs &&
-                    sample.x == cameraX && sample.y == cameraY &&
-                    sample.z == cameraZ && sample.pitch == cameraPitch &&
-                    sample.yaw == cameraYaw;
+                    sample.x == cameraSampleX && sample.y == cameraSampleY &&
+                    sample.z == cameraSampleZ &&
+                    sample.pitch == cameraSamplePitch &&
+                    unwrappedYaw == cameraSampleYaw;
                 if (duplicate) return;
 
                 double elapsedSeconds = (sample.updatedAtMs -
                     cameraUpdatedAtMs) / 1000.0;
+                double deltaX = sample.x - cameraSampleX;
+                double deltaY = sample.y - cameraSampleY;
+                double deltaZ = sample.z - cameraSampleZ;
+                boolean teleport = deltaX * deltaX + deltaY * deltaY +
+                    deltaZ * deltaZ > 64.0;
                 if (elapsedSeconds >= 0.005 && elapsedSeconds <= 0.25) {
-                    cameraVelocityX = clamp(
-                        (sample.x - cameraX) / elapsedSeconds,
-                        -100.0,
-                        100.0
+                    cameraVelocityX = filteredCameraVelocity(
+                        cameraVelocityX,
+                        deltaX,
+                        elapsedSeconds,
+                        100.0,
+                        CameraPositionVelocityResponse
                     );
-                    cameraVelocityY = clamp(
-                        (sample.y - cameraY) / elapsedSeconds,
-                        -100.0,
-                        100.0
+                    cameraVelocityY = filteredCameraVelocity(
+                        cameraVelocityY,
+                        deltaY,
+                        elapsedSeconds,
+                        100.0,
+                        CameraPositionVelocityResponse
                     );
-                    cameraVelocityZ = clamp(
-                        (sample.z - cameraZ) / elapsedSeconds,
-                        -100.0,
-                        100.0
+                    cameraVelocityZ = filteredCameraVelocity(
+                        cameraVelocityZ,
+                        deltaZ,
+                        elapsedSeconds,
+                        100.0,
+                        CameraPositionVelocityResponse
                     );
-                    cameraVelocityPitch = clamp(
-                        angleDifference(cameraPitch, sample.pitch) /
-                            elapsedSeconds,
-                        -2160.0,
-                        2160.0
+                    cameraVelocityPitch = filteredCameraVelocity(
+                        cameraVelocityPitch,
+                        sample.pitch - cameraSamplePitch,
+                        elapsedSeconds,
+                        2160.0,
+                        CameraAngleVelocityResponse
                     );
-                    cameraVelocityYaw = clamp(
-                        angleDifference(cameraYaw, sample.yaw) /
-                            elapsedSeconds,
-                        -2160.0,
-                        2160.0
+                    cameraVelocityYaw = filteredCameraVelocity(
+                        cameraVelocityYaw,
+                        unwrappedYaw - cameraSampleYaw,
+                        elapsedSeconds,
+                        2160.0,
+                        CameraAngleVelocityResponse
                     );
-                } else {
+                } else if (elapsedSeconds > 0.25) {
                     cameraVelocityX = cameraVelocityY = cameraVelocityZ = 0;
                     cameraVelocityPitch = cameraVelocityYaw = 0;
                 }
+                if (teleport) {
+                    cameraVelocityX = cameraVelocityY = cameraVelocityZ = 0;
+                    renderedCameraX.reset(sample.x, 0.0);
+                    renderedCameraY.reset(sample.y, 0.0);
+                    renderedCameraZ.reset(sample.z, 0.0);
+                }
+
+                cameraSampleX = sample.x;
+                cameraSampleY = sample.y;
+                cameraSampleZ = sample.z;
+                cameraSamplePitch = sample.pitch;
+                cameraSampleYaw = unwrappedYaw;
             }
 
-            cameraX = sample.x;
-            cameraY = sample.y;
-            cameraZ = sample.z;
-            cameraPitch = sample.pitch;
-            cameraYaw = sample.yaw;
             cameraUpdatedAtMs = sample.updatedAtMs;
             cameraReceivedNanos = now;
-            cameraSampleAgeNanos = Math.min(
-                MaxCameraPredictionNanos,
-                Math.min(sample.ageMs, 90) * 1_000_000L
+            cameraSampleAgeNanos = Math.min(sample.ageMs, 500) *
+                1_000_000L;
+        }
+
+        private static double filteredCameraVelocity(
+            double current,
+            double delta,
+            double elapsedSeconds,
+            double maximum,
+            double responseSeconds
+        ) {
+            double measured = Math.abs(delta) < 0.00001
+                ? 0.0
+                : MotionSmoother.clamp(
+                    delta / elapsedSeconds,
+                    -maximum,
+                    maximum
+                );
+            return MotionSmoother.filterVelocity(
+                current,
+                measured,
+                elapsedSeconds,
+                responseSeconds
             );
         }
 
@@ -556,27 +795,126 @@ final class EntityOutlineOverlayController {
             if (!cameraKnown || getWidth() <= 0 || getHeight() <= 0) return;
 
             long now = System.nanoTime();
-            long predictionNanos = Math.min(
-                MaxCameraPredictionNanos,
-                cameraSampleAgeNanos +
-                    Math.max(0, now - cameraReceivedNanos) +
-                    RenderLeadNanos
+            long elapsedSinceReceipt = Math.max(0, now - cameraReceivedNanos);
+            long totalCameraAgeNanos = Math.min(
+                500_000_000L,
+                cameraSampleAgeNanos + elapsedSinceReceipt
             );
-            double predictionSeconds = predictionNanos / 1_000_000_000.0;
-            double predictedCameraX = cameraX +
+            double predictionSeconds = MotionSmoother.predictionSeconds(
+                totalCameraAgeNanos,
+                CameraRenderLeadNanos,
+                MaxCameraPredictionNanos,
+                CameraPredictionDecayNanos
+            );
+            double predictionVelocityScale =
+                MotionSmoother.predictionVelocityScale(
+                    totalCameraAgeNanos,
+                    CameraRenderLeadNanos,
+                    MaxCameraPredictionNanos,
+                    CameraPredictionDecayNanos
+                );
+            boolean predictionActive = predictionSeconds > 0.0 ||
+                Math.abs(predictionVelocityScale) > 0.0001;
+            double targetVelocityX = cameraVelocityX *
+                predictionVelocityScale;
+            double targetVelocityY = cameraVelocityY *
+                predictionVelocityScale;
+            double targetVelocityZ = cameraVelocityZ *
+                predictionVelocityScale;
+            double targetVelocityPitch = cameraVelocityPitch *
+                predictionVelocityScale;
+            double targetVelocityYaw = cameraVelocityYaw *
+                predictionVelocityScale;
+            double targetCameraX = cameraSampleX +
                 cameraVelocityX * predictionSeconds;
-            double predictedCameraY = cameraY +
+            double targetCameraY = cameraSampleY +
                 cameraVelocityY * predictionSeconds;
-            double predictedCameraZ = cameraZ +
+            double targetCameraZ = cameraSampleZ +
                 cameraVelocityZ * predictionSeconds;
-            double pitch = Math.toRadians(clamp(
-                cameraPitch + cameraVelocityPitch * predictionSeconds,
+            double rawTargetPitch = cameraSamplePitch +
+                cameraVelocityPitch * predictionSeconds;
+            double targetCameraPitch = MotionSmoother.clamp(
+                rawTargetPitch,
+                -90.0,
+                90.0
+            );
+            if (targetCameraPitch != rawTargetPitch) targetVelocityPitch = 0.0;
+            double targetCameraYaw = cameraSampleYaw +
+                cameraVelocityYaw * predictionSeconds;
+
+            long frameGap = Math.max(0, now - cameraLastFrameNanos);
+            if (cameraLastFrameNanos == 0 ||
+                frameGap > MaximumFrameGapNanos) {
+                renderedCameraX.reset(targetCameraX, targetVelocityX);
+                renderedCameraY.reset(targetCameraY, targetVelocityY);
+                renderedCameraZ.reset(targetCameraZ, targetVelocityZ);
+                renderedCameraPitch.reset(
+                    targetCameraPitch,
+                    targetVelocityPitch
+                );
+                renderedCameraYaw.reset(targetCameraYaw, targetVelocityYaw);
+            } else {
+                double deltaSeconds = frameGap / 1_000_000_000.0;
+                double positionSpeed = Math.sqrt(
+                    cameraVelocityX * cameraVelocityX +
+                        cameraVelocityY * cameraVelocityY +
+                        cameraVelocityZ * cameraVelocityZ
+                );
+                double angleSpeed = Math.max(
+                    Math.abs(cameraVelocityPitch),
+                    Math.abs(cameraVelocityYaw)
+                );
+                double positionSmoothTime = 0.042 -
+                    MotionSmoother.clamp(
+                        positionSpeed / 30.0,
+                        0.0,
+                        1.0
+                    ) * 0.018;
+                double angleSmoothTime = 0.025 -
+                    MotionSmoother.clamp(angleSpeed / 720.0, 0.0, 1.0) *
+                        0.013;
+                renderedCameraX.step(
+                    targetCameraX,
+                    targetVelocityX,
+                    positionSmoothTime,
+                    deltaSeconds
+                );
+                renderedCameraY.step(
+                    targetCameraY,
+                    targetVelocityY,
+                    positionSmoothTime,
+                    deltaSeconds
+                );
+                renderedCameraZ.step(
+                    targetCameraZ,
+                    targetVelocityZ,
+                    positionSmoothTime,
+                    deltaSeconds
+                );
+                renderedCameraPitch.step(
+                    targetCameraPitch,
+                    targetVelocityPitch,
+                    angleSmoothTime,
+                    deltaSeconds
+                );
+                renderedCameraYaw.step(
+                    targetCameraYaw,
+                    targetVelocityYaw,
+                    angleSmoothTime,
+                    deltaSeconds
+                );
+            }
+            cameraLastFrameNanos = now;
+
+            double cameraX = renderedCameraX.value();
+            double cameraY = renderedCameraY.value();
+            double cameraZ = renderedCameraZ.value();
+            double pitch = Math.toRadians(MotionSmoother.clamp(
+                renderedCameraPitch.value(),
                 -90.0,
                 90.0
             ));
-            double yaw = Math.toRadians(
-                cameraYaw + cameraVelocityYaw * predictionSeconds
-            );
+            double yaw = Math.toRadians(renderedCameraYaw.value());
 
             double sinYaw = Math.sin(yaw);
             double cosYaw = Math.cos(yaw);
@@ -587,22 +925,51 @@ final class EntityOutlineOverlayController {
             double focal = (getHeight() * 0.5) /
                 Math.tan(Math.toRadians(fieldOfView * 0.5));
 
-            boolean animating = cameraSampleAgeNanos +
-                Math.max(0, now - cameraReceivedNanos) <
-                MaxCameraPredictionNanos;
-            for (RenderTrack track : tracks.values()) {
-                double entityProgress = progress(
-                    now,
-                    track.transitionStartedNanos
+            boolean cameraVelocityActive = predictionActive &&
+                (Math.abs(cameraVelocityX) > 0.001 ||
+                 Math.abs(cameraVelocityY) > 0.001 ||
+                 Math.abs(cameraVelocityZ) > 0.001 ||
+                 Math.abs(cameraVelocityPitch) > 0.01 ||
+                 Math.abs(cameraVelocityYaw) > 0.01);
+            boolean animating = cameraVelocityActive ||
+                !renderedCameraX.isSettled(
+                    targetCameraX,
+                    targetVelocityX,
+                    0.0001,
+                    0.002
+                ) ||
+                !renderedCameraY.isSettled(
+                    targetCameraY,
+                    targetVelocityY,
+                    0.0001,
+                    0.002
+                ) ||
+                !renderedCameraZ.isSettled(
+                    targetCameraZ,
+                    targetVelocityZ,
+                    0.0001,
+                    0.002
+                ) ||
+                !renderedCameraPitch.isSettled(
+                    targetCameraPitch,
+                    targetVelocityPitch,
+                    0.002,
+                    0.02
+                ) ||
+                !renderedCameraYaw.isSettled(
+                    targetCameraYaw,
+                    targetVelocityYaw,
+                    0.002,
+                    0.02
                 );
-                animating |= entityProgress < 1.0;
+            for (RenderTrack track : tracks.values()) {
+                animating |= track.advance(now);
                 drawTrack(
                     canvas,
                     track,
-                    entityProgress,
-                    predictedCameraX,
-                    predictedCameraY,
-                    predictedCameraZ,
+                    cameraX,
+                    cameraY,
+                    cameraZ,
                     sinYaw,
                     cosYaw,
                     sinPitch,
@@ -616,7 +983,6 @@ final class EntityOutlineOverlayController {
         private void drawTrack(
             Canvas canvas,
             RenderTrack track,
-            double progress,
             double cameraX,
             double cameraY,
             double cameraZ,
@@ -626,9 +992,9 @@ final class EntityOutlineOverlayController {
             double cosPitch,
             double focal
         ) {
-            double entityX = mix(track.fromX, track.toX, progress);
-            double entityY = mix(track.fromY, track.toY, progress);
-            double entityZ = mix(track.fromZ, track.toZ, progress);
+            double entityX = track.renderX.value();
+            double entityY = track.renderY.value();
+            double entityZ = track.renderZ.value();
             double centerDx = entityX - cameraX;
             double centerDy = entityY + track.height * 0.5 - cameraY;
             double centerDz = entityZ - cameraZ;
@@ -725,13 +1091,19 @@ final class EntityOutlineOverlayController {
                 (entityY - cameraY) * (entityY - cameraY) +
                 (entityZ - cameraZ) * (entityZ - cameraZ)
             );
-            String text = String.format(
-                Locale.getDefault(),
-                "%s  %.0f м",
-                track.label,
-                distance
-            );
-            float textWidth = textPaint.measureText(text);
+            int roundedDistance = (int) Math.round(distance);
+            if (!track.label.equals(track.displayLabel) ||
+                roundedDistance != track.displayDistance) {
+                track.displayLabel = track.label;
+                track.displayDistance = roundedDistance;
+                track.displayText = track.label + "  " +
+                    roundedDistance + " м";
+                track.displayTextWidth = textPaint.measureText(
+                    track.displayText
+                );
+            }
+            String text = track.displayText;
+            float textWidth = track.displayTextWidth;
             float textHeight = textPaint.getTextSize();
             float textX = Math.max(
                 density * 3f,
@@ -780,30 +1152,4 @@ final class EntityOutlineOverlayController {
         }
     }
 
-    private static double progress(long now, long started) {
-        if (started == 0) return 1.0;
-        return Math.max(
-            0.0,
-            Math.min(
-                1.0,
-                (double) (now - started) /
-                    EntityOutlineView.TransitionNanos
-            )
-        );
-    }
-
-    private static double mix(double from, double to, double progress) {
-        return from + (to - from) * progress;
-    }
-
-    private static double angleDifference(double from, double to) {
-        double difference = (to - from) % 360.0;
-        if (difference > 180.0) difference -= 360.0;
-        if (difference < -180.0) difference += 360.0;
-        return difference;
-    }
-
-    private static double clamp(double value, double minimum, double maximum) {
-        return Math.max(minimum, Math.min(maximum, value));
-    }
 }

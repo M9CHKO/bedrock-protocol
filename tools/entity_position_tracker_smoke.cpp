@@ -199,6 +199,17 @@ int main() {
         return 1;
     }
 
+    const auto cameraOnly = tracker.cameraSnapshot();
+    if (!cameraOnly.known || !near(cameraOnly.x, state.camera.x) ||
+        !near(cameraOnly.y, state.camera.y) ||
+        !near(cameraOnly.z, state.camera.z) ||
+        !near(cameraOnly.pitch, state.camera.pitch) ||
+        !near(cameraOnly.yaw, state.camera.yaw) ||
+        cameraOnly.updatedAtMs != state.camera.updatedAtMs) {
+        std::cerr << "camera-only snapshot did not match full snapshot\n";
+        return 1;
+    }
+
     if (tracker.observeCameraForward(0.0f, 0.0f, 0.0f)) {
         std::cerr << "zero camera forward vector was accepted\n";
         return 1;

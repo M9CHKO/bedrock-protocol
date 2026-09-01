@@ -27,6 +27,8 @@ public final class NativeBridge {
 
     public static native String snapshot();
 
+    public static native String entityCameraSnapshot();
+
     public static native String entityOverlaySnapshot();
 
     public static native String pollEvents();

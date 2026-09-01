@@ -58,6 +58,8 @@ public final class RelayService extends Service {
 
     private static final String CHANNEL_ID = "bedrock_relay";
     private static final int NOTIFICATION_ID = 19132;
+    private static final int OVERLAY_POLL_INTERVAL_MS = 12;
+    private static final int ENTITY_SNAPSHOT_EVERY_POLLS = 4;
 
     private final ExecutorService commandExecutor =
         Executors.newSingleThreadExecutor();
@@ -80,6 +82,7 @@ public final class RelayService extends Service {
     private volatile String lastSnapshotFingerprint = "";
     private volatile long lastPollingErrorAt;
     private volatile long lastEntityPollingErrorAt;
+    private int entityPollTick;
 
     @Override
     public void onCreate() {
@@ -286,9 +289,15 @@ public final class RelayService extends Service {
                 return;
             }
             try {
-                entityOverlayController.offerSnapshot(
-                    NativeBridge.entityOverlaySnapshot()
-                );
+                if ((entityPollTick++ % ENTITY_SNAPSHOT_EVERY_POLLS) == 0) {
+                    entityOverlayController.offerSnapshot(
+                        NativeBridge.entityOverlaySnapshot()
+                    );
+                } else {
+                    entityOverlayController.offerCameraSnapshot(
+                        NativeBridge.entityCameraSnapshot()
+                    );
+                }
             } catch (Throwable error) {
                 long now = System.currentTimeMillis();
                 if (now - lastEntityPollingErrorAt >= 10_000) {
@@ -301,7 +310,7 @@ public final class RelayService extends Service {
                     );
                 }
             }
-        }, 0, 50, TimeUnit.MILLISECONDS);
+        }, 0, OVERLAY_POLL_INTERVAL_MS, TimeUnit.MILLISECONDS);
     }
 
     private void handleEvent(JSONObject event) {

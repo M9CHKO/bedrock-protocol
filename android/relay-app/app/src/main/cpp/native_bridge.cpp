@@ -897,18 +897,51 @@ bedrock::JsRuntimeValue snapshotValue(
     return result;
 }
 
+bedrock::JsRuntimeValue entityOverlayCameraValue(
+    const bedrock::TrackedCameraPosition& camera,
+    uint64_t capturedSteadyAtMs
+) {
+    const auto cameraAgeMs = camera.updatedAtMs > 0 &&
+        capturedSteadyAtMs >= camera.updatedAtMs
+            ? capturedSteadyAtMs - camera.updatedAtMs
+            : 0;
+    return bedrock::JsRuntimeValue::object({
+        {"known", bedrock::JsRuntimeValue::boolean(camera.known)},
+        {"x", bedrock::JsRuntimeValue::number(camera.x)},
+        {"y", bedrock::JsRuntimeValue::number(camera.y)},
+        {"z", bedrock::JsRuntimeValue::number(camera.z)},
+        {"pitch", bedrock::JsRuntimeValue::number(camera.pitch)},
+        {"yaw", bedrock::JsRuntimeValue::number(camera.yaw)},
+        {"ageMs", bedrock::JsRuntimeValue::number(
+            static_cast<double>(cameraAgeMs)
+        )},
+        {"updatedAtMs", bedrock::JsRuntimeValue::number(
+            static_cast<double>(camera.updatedAtMs)
+        )}
+    });
+}
+
+bedrock::JsRuntimeValue entityCameraSnapshotValue(
+    const std::shared_ptr<RelayState>& state
+) {
+    const auto camera = state
+        ? state->entityPositions.cameraSnapshot()
+        : bedrock::TrackedCameraPosition {};
+    return entityOverlayCameraValue(camera, steadyMilliseconds());
+}
+
 bedrock::JsRuntimeValue entityOverlaySnapshotValue(
     const std::shared_ptr<RelayState>& state
 ) {
     const auto snapshot = state->entityPositions.snapshot(320.0f, 96);
     const auto capturedSteadyAtMs = steadyMilliseconds();
-    const auto cameraAgeMs = snapshot.camera.updatedAtMs > 0 &&
-        capturedSteadyAtMs >= snapshot.camera.updatedAtMs
-            ? capturedSteadyAtMs - snapshot.camera.updatedAtMs
-            : 0;
     std::vector<bedrock::JsRuntimeValue> entities;
     entities.reserve(snapshot.entities.size());
     for (const auto& entity : snapshot.entities) {
+        const auto entityAgeMs = entity.updatedAtMs > 0 &&
+            capturedSteadyAtMs >= entity.updatedAtMs
+                ? capturedSteadyAtMs - entity.updatedAtMs
+                : 0;
         entities.push_back(bedrock::JsRuntimeValue::object({
             {"id", bedrock::JsRuntimeValue::string(
                 std::to_string(entity.runtimeId)
@@ -921,6 +954,9 @@ bedrock::JsRuntimeValue entityOverlaySnapshotValue(
             {"z", bedrock::JsRuntimeValue::number(entity.z)},
             {"width", bedrock::JsRuntimeValue::number(entity.width)},
             {"height", bedrock::JsRuntimeValue::number(entity.height)},
+            {"ageMs", bedrock::JsRuntimeValue::number(
+                static_cast<double>(entityAgeMs)
+            )},
             {"updatedAtMs", bedrock::JsRuntimeValue::number(
                 static_cast<double>(entity.updatedAtMs)
             )}
@@ -931,24 +967,10 @@ bedrock::JsRuntimeValue entityOverlaySnapshotValue(
         {"capturedAtMs", bedrock::JsRuntimeValue::number(
             static_cast<double>(unixMilliseconds())
         )},
-        {"camera", bedrock::JsRuntimeValue::object({
-            {"known", bedrock::JsRuntimeValue::boolean(
-                snapshot.camera.known
-            )},
-            {"x", bedrock::JsRuntimeValue::number(snapshot.camera.x)},
-            {"y", bedrock::JsRuntimeValue::number(snapshot.camera.y)},
-            {"z", bedrock::JsRuntimeValue::number(snapshot.camera.z)},
-            {"pitch", bedrock::JsRuntimeValue::number(
-                snapshot.camera.pitch
-            )},
-            {"yaw", bedrock::JsRuntimeValue::number(snapshot.camera.yaw)},
-            {"ageMs", bedrock::JsRuntimeValue::number(
-                static_cast<double>(cameraAgeMs)
-            )},
-            {"updatedAtMs", bedrock::JsRuntimeValue::number(
-                static_cast<double>(snapshot.camera.updatedAtMs)
-            )}
-        })},
+        {"camera", entityOverlayCameraValue(
+            snapshot.camera,
+            capturedSteadyAtMs
+        )},
         {"entities", bedrock::JsRuntimeValue::array(std::move(entities))},
         {"totalTrackedEntities", bedrock::JsRuntimeValue::number(
             static_cast<double>(snapshot.totalTrackedEntities)
@@ -2085,6 +2107,22 @@ Java_com_m9chko_bedrockrelay_NativeBridge_snapshot(
         state = currentState;
     }
     return toJavaString(environment, jsonString(snapshotValue(state)));
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_m9chko_bedrockrelay_NativeBridge_entityCameraSnapshot(
+    JNIEnv* environment,
+    jclass
+) {
+    std::shared_ptr<RelayState> state;
+    {
+        std::lock_guard lock(controllerMutex);
+        state = currentState;
+    }
+    return toJavaString(
+        environment,
+        jsonString(entityCameraSnapshotValue(state))
+    );
 }
 
 extern "C" JNIEXPORT jstring JNICALL
