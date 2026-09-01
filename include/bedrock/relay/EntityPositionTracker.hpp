@@ -306,11 +306,12 @@ private:
         // Yaw becomes mathematically undefined when the camera points nearly
         // straight up/down. A few float bits in X/Z can otherwise turn a
         // microscopic touch into a 90-180 degree screen-space jump. The
-        // PlayerAuthInput body yaw was installed immediately before this
-        // vector, so use it at the pole and blend continuously back to the
-        // dedicated camera yaw outside the unstable cone.
-        constexpr float StableYawBlendStart = 0.035f;
-        constexpr float StableYawBlendEnd = 0.14f;
+        // Only fall back to PlayerAuthInput yaw extremely close to the pole,
+        // where the forward vector truly cannot encode yaw. The old 0.14
+        // threshold started replacing camera_orientation above about 82° and
+        // visibly displaced creator/flight cameras at otherwise stable views.
+        constexpr float StableYawBlendStart = 0.002f;
+        constexpr float StableYawBlendEnd = 0.02f;
         float yawWeight = std::clamp(
             (horizontalLength - StableYawBlendStart) /
                 (StableYawBlendEnd - StableYawBlendStart),

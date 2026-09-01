@@ -713,6 +713,7 @@ final class EntityOutlineOverlayController {
         private long cameraReceivedNanos;
         private long cameraSampleAgeNanos;
         private long cameraLastFrameNanos;
+        private double renderedFieldOfView = Double.NaN;
         private long generation;
         private int fieldOfView = 70;
         private boolean showPlayers = true;
@@ -744,6 +745,7 @@ final class EntityOutlineOverlayController {
 
         void setFieldOfView(int value) {
             fieldOfView = RelayService.clampEntityFov(value);
+            renderedFieldOfView = Double.NaN;
             postInvalidateOnAnimation();
         }
 
@@ -963,19 +965,37 @@ final class EntityOutlineOverlayController {
                 cameraVelocityEstimatorPitch.confidence(),
                 cameraVelocityEstimatorYaw.confidence()
             );
+            double positionSpeed = Math.sqrt(
+                cameraVelocityX * cameraVelocityX +
+                    cameraVelocityY * cameraVelocityY +
+                    cameraVelocityZ * cameraVelocityZ
+            );
+            double angleSpeed = Math.max(
+                Math.abs(cameraVelocityPitch),
+                Math.abs(cameraVelocityYaw)
+            );
+            double cameraMotionStrength =
+                ProjectionMath.cameraMotionStrength(
+                    positionSpeed,
+                    angleSpeed
+                );
+            double mediumMotionSoftness =
+                ProjectionMath.mediumMotionSoftness(cameraMotionStrength);
+            double predictionDamping = 1.0 -
+                mediumMotionSoftness * 0.22;
             long positionRenderLeadNanos = Math.round(
                 CameraRenderLeadNanos * MotionSmoother.clamp(
                     positionConfidence,
                     0.0,
                     1.0
-                )
+                ) * predictionDamping
             );
             long angleRenderLeadNanos = Math.round(
                 CameraRenderLeadNanos * MotionSmoother.clamp(
                     angleConfidence,
                     0.0,
                     1.0
-                )
+                ) * predictionDamping
             );
             double positionPredictionSeconds =
                 MotionSmoother.predictionSeconds(
@@ -984,12 +1004,14 @@ final class EntityOutlineOverlayController {
                 LinearCameraPredictionNanos,
                 MaxCameraPredictionNanos
             );
+            positionPredictionSeconds *= predictionDamping;
             double anglePredictionSeconds = MotionSmoother.predictionSeconds(
                 totalCameraAgeNanos,
                 angleRenderLeadNanos,
                 LinearCameraPredictionNanos,
                 MaxCameraPredictionNanos
             );
+            anglePredictionSeconds *= predictionDamping;
             double positionPredictionVelocityScale =
                 MotionSmoother.predictionVelocityScale(
                     totalCameraAgeNanos,
@@ -1033,6 +1055,10 @@ final class EntityOutlineOverlayController {
             if (targetCameraPitch != rawTargetPitch) targetVelocityPitch = 0.0;
             double targetCameraYaw = cameraSampleYaw +
                 cameraVelocityYaw * anglePredictionSeconds;
+            double targetFieldOfView = ProjectionMath.dynamicVerticalFov(
+                fieldOfView,
+                positionSpeed
+            );
 
             long frameGap = Math.max(0, now - cameraLastFrameNanos);
             if (cameraLastFrameNanos == 0 ||
@@ -1045,27 +1071,31 @@ final class EntityOutlineOverlayController {
                     targetVelocityPitch
                 );
                 renderedCameraYaw.reset(targetCameraYaw, targetVelocityYaw);
+                renderedFieldOfView = targetFieldOfView;
             } else {
                 double deltaSeconds = frameGap / 1_000_000_000.0;
-                double positionSpeed = Math.sqrt(
-                    cameraVelocityX * cameraVelocityX +
-                        cameraVelocityY * cameraVelocityY +
-                        cameraVelocityZ * cameraVelocityZ
-                );
-                double angleSpeed = Math.max(
-                    Math.abs(cameraVelocityPitch),
-                    Math.abs(cameraVelocityYaw)
-                );
                 double positionSmoothTime = 0.032 -
                     MotionSmoother.clamp(
                         positionSpeed / 30.0,
                         0.0,
                         1.0
                     ) * 0.014 +
+                    mediumMotionSoftness * 0.010 -
+                    ProjectionMath.smoothStep(
+                        0.72,
+                        1.0,
+                        cameraMotionStrength
+                    ) * 0.004 +
                     (1.0 - positionConfidence) * 0.012;
                 double angleSmoothTime = 0.016 -
                     MotionSmoother.clamp(angleSpeed / 720.0, 0.0, 1.0) *
                         0.008 +
+                    mediumMotionSoftness * 0.010 -
+                    ProjectionMath.smoothStep(
+                        0.72,
+                        1.0,
+                        cameraMotionStrength
+                    ) * 0.004 +
                     (1.0 - angleConfidence) * 0.010;
                 renderedCameraX.step(
                     targetCameraX,
@@ -1097,6 +1127,19 @@ final class EntityOutlineOverlayController {
                     angleSmoothTime,
                     deltaSeconds
                 );
+                if (!Double.isFinite(renderedFieldOfView)) {
+                    renderedFieldOfView = targetFieldOfView;
+                } else {
+                    double fovResponseSeconds =
+                        targetFieldOfView > renderedFieldOfView
+                            ? 0.12
+                            : 0.24;
+                    double fovAlpha = 1.0 - Math.exp(
+                        -deltaSeconds / fovResponseSeconds
+                    );
+                    renderedFieldOfView += fovAlpha *
+                        (targetFieldOfView - renderedFieldOfView);
+                }
             }
             cameraLastFrameNanos = now;
 
@@ -1114,10 +1157,12 @@ final class EntityOutlineOverlayController {
             double cosYaw = Math.cos(yaw);
             double sinPitch = Math.sin(pitch);
             double cosPitch = Math.cos(pitch);
-            // Minecraft's FOV setting is applied vertically. Using the view
-            // height keeps horizontal projection correct on wide phones.
-            double focal = (getHeight() * 0.5) /
-                Math.tan(Math.toRadians(fieldOfView * 0.5));
+            // The configured value is vertical. A softly animated movement
+            // boost approximates Bedrock's dynamic FOV without screen capture.
+            double focal = ProjectionMath.focalPixels(
+                getHeight(),
+                renderedFieldOfView
+            );
 
             boolean cameraVelocityActive = predictionActive &&
                 (Math.abs(cameraVelocityX) > 0.001 ||
@@ -1190,7 +1235,8 @@ final class EntityOutlineOverlayController {
                     cosPitch,
                     focal,
                     now,
-                    cameraProjectionActive
+                    cameraProjectionActive,
+                    cameraMotionStrength
                 );
             }
             if (animating) postInvalidateOnAnimation();
@@ -1208,7 +1254,8 @@ final class EntityOutlineOverlayController {
             double cosPitch,
             double focal,
             long now,
-            boolean cameraProjectionActive
+            boolean cameraProjectionActive,
+            double cameraMotionStrength
         ) {
             double entityX = track.renderX.value();
             double entityY = track.renderY.value();
@@ -1225,7 +1272,7 @@ final class EntityOutlineOverlayController {
                 track.screenBox.hide();
                 return false;
             }
-            double centerDepth = depth(
+            double centerDepth = ProjectionMath.depth(
                 centerDx,
                 centerDy,
                 centerDz,
@@ -1255,12 +1302,22 @@ final class EntityOutlineOverlayController {
                         // Bedrock yaw 0 faces +Z and positive yaw turns
                         // towards -X, so screen-right points along the
                         // negative of this horizontal basis.
-                        double viewX = -(dx * cosYaw + dz * sinYaw);
-                        double viewY =
-                            dx * (-sinYaw * sinPitch) +
-                            dy * cosPitch +
-                            dz * (cosYaw * sinPitch);
-                        double viewZ = depth(
+                        double viewX = ProjectionMath.viewX(
+                            dx,
+                            dz,
+                            sinYaw,
+                            cosYaw
+                        );
+                        double viewY = ProjectionMath.viewY(
+                            dx,
+                            dy,
+                            dz,
+                            sinYaw,
+                            cosYaw,
+                            sinPitch,
+                            cosPitch
+                        );
+                        double viewZ = ProjectionMath.depth(
                             dx,
                             dy,
                             dz,
@@ -1319,7 +1376,8 @@ final class EntityOutlineOverlayController {
                 now,
                 getWidth(),
                 getHeight(),
-                cameraProjectionActive
+                cameraProjectionActive,
+                cameraMotionStrength
             );
             left = (float) track.screenBox.left();
             top = (float) track.screenBox.top();
@@ -1396,20 +1454,6 @@ final class EntityOutlineOverlayController {
                 if (RectF.intersects(candidate, occupied)) return true;
             }
             return false;
-        }
-
-        private static double depth(
-            double dx,
-            double dy,
-            double dz,
-            double sinYaw,
-            double cosYaw,
-            double sinPitch,
-            double cosPitch
-        ) {
-            return dx * (-sinYaw * cosPitch) +
-                dy * (-sinPitch) +
-                dz * (cosYaw * cosPitch);
         }
 
         private static int withAlpha(int color, int alpha) {

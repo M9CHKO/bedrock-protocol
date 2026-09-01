@@ -2,6 +2,7 @@ package com.m9chko.bedrockrelay;
 
 import android.animation.ValueAnimator;
 import android.content.Context;
+import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.graphics.PixelFormat;
@@ -31,7 +32,7 @@ final class RelayOverlayController {
     private final WindowManager windowManager;
 
     private WindowManager.LayoutParams windowParams;
-    private LinearLayout windowRoot;
+    private volatile LinearLayout windowRoot;
     private TextView drawerTab;
     private TextView chunkStatus;
     private TextView pageTitle;
@@ -140,6 +141,10 @@ final class RelayOverlayController {
                 error
             );
         }
+    }
+
+    boolean isShowing() {
+        return windowRoot != null;
     }
 
     void hide() {
@@ -574,9 +579,48 @@ final class RelayOverlayController {
         info.setTextColor(0xffaab8c8);
         info.setPadding(dp(3), dp(8), dp(3), dp(8));
         root.addView(info);
+        OfficialTexturePack.Status textures =
+            new OfficialTexturePack(context).status();
+        TextView textureStatus = text(textures.description(), 9, true);
+        textureStatus.setTextColor(
+            textures.imported ? 0xff74df9c : 0xffffc76c
+        );
+        textureStatus.setPadding(dp(8), dp(8), dp(8), dp(8));
+        textureStatus.setBackground(statusBackground());
+        root.addView(
+            textureStatus,
+            margins(-1, -2, 0, dp(2), 0, dp(7))
+        );
+        TextView importTextures = text(
+            textures.imported
+                ? "ЗАМЕНИТЬ ОФИЦИАЛЬНЫЙ FULL ZIP"
+                : "ИМПОРТИРОВАТЬ ОФИЦИАЛЬНЫЙ FULL ZIP",
+            10,
+            true
+        );
+        importTextures.setGravity(Gravity.CENTER);
+        importTextures.setPadding(dp(9), dp(9), dp(9), dp(9));
+        importTextures.setBackground(actionBackground());
+        importTextures.setOnClickListener(view -> {
+            Intent intent = new Intent(context, MainActivity.class)
+                .setAction(MainActivity.ACTION_IMPORT_TEXTURE_PACK)
+                .addFlags(
+                    Intent.FLAG_ACTIVITY_NEW_TASK |
+                        Intent.FLAG_ACTIVITY_CLEAR_TOP |
+                        Intent.FLAG_ACTIVITY_SINGLE_TOP
+                );
+            context.startActivity(intent);
+        });
+        root.addView(
+            importTextures,
+            margins(-1, -2, 0, 0, 0, dp(7))
+        );
         TextView attribution = text(
-            "Силуэты: Game-icons.net — Lorc и Delapouite, CC BY 3.0; " +
-                "адаптированы и динамически окрашиваются.",
+            textures.imported
+                ? "Item PNG читаются из выбранного официального архива и " +
+                    "хранятся только во внутренней памяти приложения."
+                : "Запасные силуэты: Game-icons.net — Lorc и Delapouite, " +
+                    "CC BY 3.0.",
             9,
             false
         );

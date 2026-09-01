@@ -1,14 +1,19 @@
 package com.m9chko.bedrockrelay;
 
 import android.content.Context;
+import android.content.SharedPreferences;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.PixelFormat;
+import android.graphics.Rect;
 import android.graphics.RectF;
 import android.graphics.drawable.Drawable;
 import android.os.SystemClock;
 import android.provider.Settings;
+import android.util.LruCache;
 import android.view.Gravity;
 import android.view.View;
 import android.view.WindowManager;
@@ -16,12 +21,19 @@ import android.view.WindowManager;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.io.File;
+import java.util.HashSet;
 import java.util.Locale;
+import java.util.Set;
 
 /** Click-through top-right HUD for the local player's equipment. */
 final class EquipmentOverlayController {
     private final Context context;
     private final WindowManager windowManager;
+    private final OfficialTexturePack texturePack;
+    private final SharedPreferences texturePreferences;
+    private final SharedPreferences.OnSharedPreferenceChangeListener
+        texturePreferenceListener;
     private boolean sessionVisible;
     private boolean enabled = true;
     private int scalePercent = 100;
@@ -33,6 +45,19 @@ final class EquipmentOverlayController {
         this.context = context;
         this.windowManager = (WindowManager) context.getSystemService(
             Context.WINDOW_SERVICE
+        );
+        this.texturePack = new OfficialTexturePack(context);
+        this.texturePreferences = context.getSharedPreferences(
+            RelayService.PREFERENCES,
+            Context.MODE_PRIVATE
+        );
+        this.texturePreferenceListener = (preferences, key) -> {
+            if (!OfficialTexturePack.KEY_REVISION.equals(key)) return;
+            EquipmentView current = view;
+            if (current != null) current.post(current::reloadTextures);
+        };
+        texturePreferences.registerOnSharedPreferenceChangeListener(
+            texturePreferenceListener
         );
     }
 
@@ -75,6 +100,13 @@ final class EquipmentOverlayController {
         removeWindow();
     }
 
+    void destroy() {
+        hideImmediately();
+        texturePreferences.unregisterOnSharedPreferenceChangeListener(
+            texturePreferenceListener
+        );
+    }
+
     private void reconcile() {
         if (sessionVisible && enabled) addWindow();
         else removeWindow();
@@ -82,7 +114,11 @@ final class EquipmentOverlayController {
 
     private void addWindow() {
         if (view != null || !Settings.canDrawOverlays(context)) return;
-        EquipmentView added = new EquipmentView(context, scalePercent);
+        EquipmentView added = new EquipmentView(
+            context,
+            scalePercent,
+            texturePack
+        );
         WindowManager.LayoutParams params = new WindowManager.LayoutParams(
             added.preferredWidth(),
             added.preferredHeight(),
@@ -142,6 +178,10 @@ final class EquipmentOverlayController {
         final boolean present;
         final String name;
         final int damage;
+        final boolean durabilityKnown;
+        final int maximumDurability;
+        final int remainingDurability;
+        final int durabilityPercent;
         final boolean enchanted;
 
         EquipmentItem(
@@ -149,17 +189,41 @@ final class EquipmentOverlayController {
             boolean present,
             String name,
             int damage,
+            boolean damageKnown,
+            int maximumDurability,
+            int remainingDurability,
+            int durabilityPercent,
             boolean enchanted
         ) {
             this.slot = slot;
             this.present = present;
             this.name = name;
             this.damage = Math.max(0, damage);
+            this.maximumDurability = Math.max(0, maximumDurability);
+            this.remainingDurability = Math.max(
+                0,
+                Math.min(this.maximumDurability, remainingDurability)
+            );
+            this.durabilityPercent = Math.max(
+                0,
+                Math.min(100, durabilityPercent)
+            );
+            this.durabilityKnown = damageKnown && this.maximumDurability > 0;
             this.enchanted = enchanted;
         }
 
         static EquipmentItem empty(int slot) {
-            return new EquipmentItem(slot, false, "", 0, false);
+            return new EquipmentItem(
+                slot,
+                false,
+                "",
+                0,
+                false,
+                0,
+                0,
+                0,
+                false
+            );
         }
 
         static EquipmentItem from(int slot, JSONObject value) {
@@ -168,6 +232,10 @@ final class EquipmentOverlayController {
                 value.optBoolean("present", false),
                 value.optString("name", ""),
                 value.optInt("damage", 0),
+                value.optBoolean("damageKnown", false),
+                value.optInt("maximumDurability", 0),
+                value.optInt("remainingDurability", 0),
+                value.optInt("durabilityPercent", 0),
                 value.optBoolean("enchanted", false)
             );
         }
@@ -194,12 +262,33 @@ final class EquipmentOverlayController {
         private final Paint titlePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint barPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint bitmapPaint = new Paint();
+        private final Paint glintPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final RectF rectangle = new RectF();
+        private final RectF bitmapDestination = new RectF();
+        private final RectF glintDestination = new RectF();
+        private final Rect bitmapSource = new Rect();
         private final Drawable[] icons = new Drawable[5];
+        private final OfficialTexturePack texturePack;
+        private final Set<String> missingTextures = new HashSet<>();
+        private final LruCache<String, Bitmap> textureCache =
+            new LruCache<String, Bitmap>(6 * 1024 * 1024) {
+                @Override
+                protected int sizeOf(String key, Bitmap value) {
+                    return value.getAllocationByteCount();
+                }
+            };
+        private long textureRevision = Long.MIN_VALUE;
+        private Bitmap enchantmentGlint;
         private EquipmentItem[] items = new EquipmentItem[5];
 
-        EquipmentView(Context context, int scalePercent) {
+        EquipmentView(
+            Context context,
+            int scalePercent,
+            OfficialTexturePack texturePack
+        ) {
             super(context);
+            this.texturePack = texturePack;
             density = context.getResources().getDisplayMetrics().density;
             scale = scalePercent / 100f;
             width = px(198);
@@ -220,11 +309,17 @@ final class EquipmentOverlayController {
             textPaint.setColor(0xffb8c5d4);
             textPaint.setTextSize(px(8));
             barPaint.setStyle(Paint.Style.FILL);
+            bitmapPaint.setAntiAlias(false);
+            bitmapPaint.setFilterBitmap(false);
+            bitmapPaint.setDither(false);
+            glintPaint.setStyle(Paint.Style.STROKE);
+            glintPaint.setStrokeWidth(Math.max(1f, px(2)));
             for (int index = 0; index < icons.length; ++index) {
                 Drawable drawable = context.getDrawable(ICONS[index]);
                 icons[index] = drawable == null ? null : drawable.mutate();
                 items[index] = EquipmentItem.empty(index);
             }
+            reloadTextures();
         }
 
         int preferredWidth() { return width; }
@@ -235,9 +330,18 @@ final class EquipmentOverlayController {
             postInvalidateOnAnimation();
         }
 
+        void reloadTextures() {
+            textureRevision = texturePack.revision();
+            textureCache.evictAll();
+            missingTextures.clear();
+            enchantmentGlint = decode(texturePack.enchantmentGlintFile());
+            postInvalidateOnAnimation();
+        }
+
         @Override
         protected void onDraw(Canvas canvas) {
             super.onDraw(canvas);
+            if (textureRevision != texturePack.revision()) reloadTextures();
             rectangle.set(0, 0, getWidth(), getHeight());
             canvas.drawRoundRect(rectangle, px(13), px(13), backgroundPaint);
             rectangle.inset(px(0.7f), px(0.7f));
@@ -261,24 +365,52 @@ final class EquipmentOverlayController {
             barPaint.setColor(item.present ? 0xff202c3a : 0xff19212c);
             canvas.drawRoundRect(rectangle, px(6), px(6), barPaint);
 
-            Drawable icon = icons[item.slot];
-            if (icon != null) {
-                int color = item.present ? materialColor(item.name) : 0xff526071;
-                if (item.present && item.enchanted) {
-                    float phase = (SystemClock.uptimeMillis() % 1800L) / 1800f;
-                    float wave = 0.5f + 0.5f * (float) Math.sin(
-                        phase * Math.PI * 2.0 + item.slot * 0.8
-                    );
-                    color = blend(color, 0xffc26cff, 0.28f + wave * 0.34f);
-                }
-                icon.setTint(color);
-                icon.setBounds(
-                    Math.round(rectangle.left + px(4)),
-                    Math.round(rectangle.top + px(4)),
-                    Math.round(rectangle.right - px(4)),
-                    Math.round(rectangle.bottom - px(4))
+            bitmapDestination.set(
+                rectangle.left + px(2),
+                rectangle.top + px(2),
+                rectangle.right - px(2),
+                rectangle.bottom - px(2)
+            );
+            Bitmap official = item.present ? bitmapFor(item.name) : null;
+            if (official != null) {
+                bitmapSource.set(0, 0, official.getWidth(), official.getHeight());
+                bitmapPaint.setAlpha(255);
+                canvas.drawBitmap(
+                    official,
+                    bitmapSource,
+                    bitmapDestination,
+                    bitmapPaint
                 );
-                icon.draw(canvas);
+            } else {
+                Drawable icon = icons[item.slot];
+                if (icon != null) {
+                    int color = item.present
+                        ? materialColor(item.name)
+                        : 0xff526071;
+                    if (item.present && item.enchanted) {
+                        float phase = (SystemClock.uptimeMillis() % 1800L) /
+                            1800f;
+                        float wave = 0.5f + 0.5f * (float) Math.sin(
+                            phase * Math.PI * 2.0 + item.slot * 0.8
+                        );
+                        color = blend(
+                            color,
+                            0xffc26cff,
+                            0.28f + wave * 0.34f
+                        );
+                    }
+                    icon.setTint(color);
+                    icon.setBounds(
+                        Math.round(rectangle.left + px(4)),
+                        Math.round(rectangle.top + px(4)),
+                        Math.round(rectangle.right - px(4)),
+                        Math.round(rectangle.bottom - px(4))
+                    );
+                    icon.draw(canvas);
+                }
+            }
+            if (item.present && item.enchanted) {
+                drawEnchantmentGlint(canvas, bitmapDestination, item.slot);
             }
 
             float textX = px(38);
@@ -292,29 +424,108 @@ final class EquipmentOverlayController {
             canvas.drawText(itemName, textX, top + px(20), textPaint);
             textPaint.setColor(0xffb8c5d4);
 
-            int maximum = maximumDurability(item.name, item.slot);
             float barLeft = px(132);
             float barTop = top + px(6);
             float barWidth = px(58);
             rectangle.set(barLeft, barTop, barLeft + barWidth, barTop + px(5));
             barPaint.setColor(0xff344151);
             canvas.drawRoundRect(rectangle, px(3), px(3), barPaint);
-            if (item.present && maximum > 0) {
-                int remaining = Math.max(0, maximum - item.damage);
-                float ratio = Math.max(0f, Math.min(1f, remaining / (float) maximum));
+            if (item.present && item.durabilityKnown) {
+                float ratio = item.remainingDurability /
+                    (float) item.maximumDurability;
                 rectangle.right = rectangle.left + barWidth * ratio;
                 barPaint.setColor(durabilityColor(ratio));
                 canvas.drawRoundRect(rectangle, px(3), px(3), barPaint);
                 String value = String.format(
                     Locale.getDefault(),
                     "%d/%d",
-                    remaining,
-                    maximum
+                    item.remainingDurability,
+                    item.maximumDurability
                 );
                 canvas.drawText(value, barLeft, top + px(21), textPaint);
             } else {
                 canvas.drawText("—", barLeft, top + px(21), textPaint);
             }
+        }
+
+        private Bitmap bitmapFor(String registryName) {
+            String key = registryName == null ? "" : registryName;
+            Bitmap cached = textureCache.get(key);
+            if (cached != null) return cached;
+            if (missingTextures.contains(key)) return null;
+            Bitmap loaded = decode(texturePack.textureFile(key));
+            if (loaded == null) {
+                missingTextures.add(key);
+                return null;
+            }
+            textureCache.put(key, loaded);
+            return loaded;
+        }
+
+        private static Bitmap decode(File value) {
+            if (value == null || !value.isFile()) return null;
+            BitmapFactory.Options options = new BitmapFactory.Options();
+            options.inScaled = false;
+            options.inPreferredConfig = Bitmap.Config.ARGB_8888;
+            try {
+                return BitmapFactory.decodeFile(value.getAbsolutePath(), options);
+            } catch (Throwable ignored) {
+                return null;
+            }
+        }
+
+        private void drawEnchantmentGlint(
+            Canvas canvas,
+            RectF bounds,
+            int slot
+        ) {
+            int saved = canvas.save();
+            canvas.clipRect(bounds);
+            float phase = (SystemClock.uptimeMillis() % 2200L) / 2200f;
+            canvas.rotate(-28f, bounds.centerX(), bounds.centerY());
+            if (enchantmentGlint != null) {
+                bitmapSource.set(
+                    0,
+                    0,
+                    enchantmentGlint.getWidth(),
+                    enchantmentGlint.getHeight()
+                );
+                float tile = Math.max(bounds.width(), bounds.height()) * 2.35f;
+                float left = bounds.left - tile + phase * tile * 2f;
+                bitmapPaint.setAlpha(92);
+                for (int index = -1; index <= 1; ++index) {
+                    float x = left + index * tile;
+                    glintDestination.set(
+                        x,
+                        bounds.centerY() - tile * 0.5f,
+                        x + tile,
+                        bounds.centerY() + tile * 0.5f
+                    );
+                    canvas.drawBitmap(
+                        enchantmentGlint,
+                        bitmapSource,
+                        glintDestination,
+                        bitmapPaint
+                    );
+                }
+                bitmapPaint.setAlpha(255);
+            } else {
+                glintPaint.setColor(0x88cf76ff);
+                float spacing = px(8);
+                float offset = (phase * spacing * 2f + slot * px(2)) % spacing;
+                for (float x = bounds.left - bounds.height();
+                     x < bounds.right + bounds.height();
+                     x += spacing) {
+                    canvas.drawLine(
+                        x + offset,
+                        bounds.bottom + px(4),
+                        x + offset + bounds.height(),
+                        bounds.top - px(4),
+                        glintPaint
+                    );
+                }
+            }
+            canvas.restoreToCount(saved);
         }
 
         private int px(float value) {
@@ -346,57 +557,6 @@ final class EquipmentOverlayController {
             if (ratio > 0.55f) return 0xff68d98b;
             if (ratio > 0.25f) return 0xffffc857;
             return 0xffff6575;
-        }
-
-        private static int maximumDurability(String name, int slot) {
-            if (name == null || name.isEmpty()) return 0;
-            if (slot == 0) return handDurability(name);
-            int material;
-            if (name.contains("netherite")) material = 5;
-            else if (name.contains("diamond")) material = 4;
-            else if (name.contains("iron") || name.contains("chainmail")) {
-                material = 2;
-            } else if (name.contains("gold")) material = 3;
-            else if (name.contains("leather")) material = 1;
-            else if (name.contains("turtle") && slot == 1) return 275;
-            else return 0;
-            int[][] durability = {
-                {0, 0, 0, 0},
-                {55, 80, 75, 65},
-                {165, 240, 225, 195},
-                {77, 112, 105, 91},
-                {363, 528, 495, 429},
-                {407, 592, 555, 481}
-            };
-            return durability[material][slot - 1];
-        }
-
-        private static int handDurability(String name) {
-            if (name.contains("shield")) return 336;
-            if (name.contains("crossbow")) return 465;
-            if (name.endsWith(":bow") || name.equals("bow")) return 384;
-            if (name.contains("trident")) return 250;
-            if (name.contains("fishing_rod")) return 64;
-            if (name.contains("flint_and_steel")) return 64;
-            if (name.contains("shears")) return 238;
-            if (name.contains("elytra")) return 432;
-            if (name.contains("carrot_on_a_stick")) return 25;
-            if (name.contains("warped_fungus_on_a_stick")) return 100;
-            if (name.contains("brush")) return 64;
-            if (name.contains("mace")) return 500;
-            boolean materialTool = name.contains("sword") ||
-                name.contains("pickaxe") || name.contains("shovel") ||
-                name.contains("_axe") || name.contains("_hoe");
-            if (!materialTool) return 0;
-            int base;
-            if (name.contains("netherite")) base = 2031;
-            else if (name.contains("diamond")) base = 1561;
-            else if (name.contains("iron")) base = 250;
-            else if (name.contains("stone")) base = 131;
-            else if (name.contains("gold")) base = 32;
-            else if (name.contains("wooden")) base = 59;
-            else return 0;
-            return base;
         }
 
         private static int blend(int first, int second, float amount) {

@@ -2,6 +2,7 @@
 #include <bedrock/item/BedrockItem.hpp>
 #include <bedrock/protodef/ProtoDefEncoder.hpp>
 #include <bedrock/protodef/ProtoDefWriter.hpp>
+#include <bedrock/relay/ItemDurability.hpp>
 #include <bedrock/world/MinecraftDataAssets.hpp>
 
 #include <cstdint>
@@ -71,6 +72,65 @@ int main() {
         registry.enchantmentById(17) == nullptr ||
         registry.enchantmentById(17)->name != "unbreaking") {
         return fail("item/enchantment definition mismatch");
+    }
+
+    for (const auto& expected : bedrock::ItemDurabilityDefinitions) {
+        const auto* definition = registry.itemByName(expected.name);
+        if (definition == nullptr ||
+            definition->maxDurability != expected.maximum) {
+            return fail(
+                "overlay durability registry mismatch for " +
+                std::string(expected.name)
+            );
+        }
+    }
+    for (const std::string version : {"1.17.10", "1.19.10", "1.20.0"}) {
+        const auto profile = assets.loadBedrockItemRegistryByVersion(version);
+        for (const auto& expected : bedrock::ItemDurabilityDefinitions) {
+            const auto* definition = profile.itemByName(expected.name);
+            const auto registryMaximum = definition != nullptr &&
+                definition->maxDurability.has_value() &&
+                *definition->maxDurability > 1
+                    ? definition->maxDurability
+                    : std::nullopt;
+            if (bedrock::maximumItemDurability(version, expected.name) !=
+                registryMaximum) {
+                return fail(
+                    "versioned overlay durability mismatch for " + version +
+                    ":" + std::string(expected.name)
+                );
+            }
+        }
+    }
+    const auto durability = bedrock::calculateItemDurability(
+        "minecraft:diamond_sword",
+        390
+    );
+    const auto broken = bedrock::calculateItemDurability("mace", 900);
+    const auto oldCrossbow = bedrock::calculateItemDurability(
+        "1.18.30",
+        "minecraft:crossbow",
+        163
+    );
+    if (!durability.has_value() || durability->maximum != 1561 ||
+        durability->remaining != 1171 || durability->percent != 75 ||
+        !broken.has_value() || broken->damage != 500 ||
+        broken->remaining != 0 || broken->percent != 0 ||
+        !oldCrossbow.has_value() || oldCrossbow->maximum != 326 ||
+        oldCrossbow->remaining != 163 || oldCrossbow->percent != 50 ||
+        bedrock::maximumItemDurability("1.19.80", "brush").has_value() ||
+        bedrock::maximumItemDurability(
+            "1.20.71",
+            "wolf_armor"
+        ).has_value() ||
+        bedrock::maximumItemDurability("1.20.80", "wolf_armor") != 64 ||
+        bedrock::maximumItemDurability("1.20.80", "mace").has_value() ||
+        bedrock::calculateItemDurability("minecraft:apple", 0).has_value() ||
+        bedrock::calculateItemDurability(
+            "minecraft:diamond_sword",
+            std::nullopt
+        ).has_value()) {
+        return fail("overlay durability calculation mismatch");
     }
 
     registry.resetStackIds();

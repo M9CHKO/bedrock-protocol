@@ -256,6 +256,30 @@ int main() {
         return 1;
     }
 
+    std::vector<uint8_t> steepAuth;
+    writeFloat(steepAuth, 85.0f);
+    writeFloat(steepAuth, 37.0f);
+    writeFloat(steepAuth, 103.0f);
+    writeFloat(steepAuth, 71.0f);
+    writeFloat(steepAuth, -48.0f);
+    if (!tracker.observeServerboundWithCameraForward(
+            packet("player_auth_input", std::move(steepAuth)),
+            -0.0871557f,
+            -0.9961947f,
+            0.0f,
+            12'346,
+            true
+        )) {
+        std::cerr << "steep camera-forward update was rejected\n";
+        return 1;
+    }
+    state = tracker.snapshot();
+    if (!near(state.camera.pitch, 85.0f) ||
+        !near(state.camera.yaw, 90.0f)) {
+        std::cerr << "stable steep camera vector was replaced by body yaw\n";
+        return 1;
+    }
+
     std::vector<uint8_t> verticalAuth;
     writeFloat(verticalAuth, 89.9f);
     writeFloat(verticalAuth, 37.0f);
@@ -267,7 +291,7 @@ int main() {
             0.00001f,
             -1.0f,
             -0.00001f,
-            12'346,
+            12'347,
             true
         )) {
         std::cerr << "near-vertical camera-forward update was rejected\n";

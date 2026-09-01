@@ -3,6 +3,7 @@
 #include <bedrock/auth/XboxTokenManager.hpp>
 #include <bedrock/bedrock.hpp>
 #include <bedrock/relay/EntityPositionTracker.hpp>
+#include <bedrock/relay/ItemDurability.hpp>
 
 #include <android/log.h>
 #include <jni.h>
@@ -233,6 +234,31 @@ std::optional<int32_t> nbtInteger(
             if (const auto number = packetInteger(&payload->second)) {
                 return static_cast<int32_t>(*number);
             }
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<int32_t> itemNbtInteger(
+    const bedrock::RelayPacketEvent& decoded,
+    const std::string& prefix,
+    std::string_view name
+) noexcept {
+    // Match prismarine-protocol's decoded item shape first. Restricting the
+    // search to the item NBT root prevents an unrelated `metadata` or nested
+    // display tag from being mistaken for durability.
+    const std::array<std::string, 7> roots {
+        prefix + ".extra.nbt.nbt.value",
+        prefix + ".extra.nbt.value",
+        prefix + ".extra.nbt",
+        prefix + ".nbt.nbt.value",
+        prefix + ".nbt.value",
+        prefix + ".nbt",
+        prefix
+    };
+    for (const auto& root : roots) {
+        if (const auto value = nbtInteger(decoded.value(root), name)) {
+            return value;
         }
     }
     return std::nullopt;
@@ -593,6 +619,10 @@ struct RelayState {
         int64_t networkId = 0;
         std::string name;
         int32_t damage = 0;
+        bool damageKnown = false;
+        int32_t maximumDurability = 0;
+        int32_t remainingDurability = 0;
+        int32_t durabilityPercent = 0;
         bool enchanted = false;
     };
 
@@ -661,7 +691,31 @@ struct RelayState {
         bedrock::makeProtoDefVariableStore();
     std::mutex itemDecodeMutex;
 
+    static void refreshDurability(
+        EquipmentItem& item,
+        std::string_view version
+    ) noexcept {
+        item.maximumDurability = bedrock::maximumItemDurability(
+            version,
+            item.name
+        ).value_or(0);
+        item.remainingDurability = 0;
+        item.durabilityPercent = 0;
+        if (!item.damageKnown) return;
+        const auto durability = bedrock::calculateItemDurability(
+            version,
+            item.name,
+            item.damage
+        );
+        if (!durability.has_value()) return;
+        item.damage = durability->damage;
+        item.maximumDurability = durability->maximum;
+        item.remainingDurability = durability->remaining;
+        item.durabilityPercent = durability->percent;
+    }
+
     EquipmentItem decodedItem(
+        std::string_view version,
         const bedrock::RelayPacketEvent& decoded,
         const std::string& prefix
     ) {
@@ -669,15 +723,12 @@ struct RelayState {
         item.networkId = decoded.getInt(prefix + ".network_id", 0);
         item.present = item.networkId != 0;
         if (!item.present) return item;
-        const auto protocolDamage = decoded.getInt(
-            prefix + ".metadata",
-            -1
-        );
-        item.damage = std::max(0, static_cast<int32_t>(
-            protocolDamage >= 0
-                ? protocolDamage
-                : nbtInteger(decoded.value(prefix), "Damage").value_or(0)
-        ));
+        auto nbtDamage = itemNbtInteger(decoded, prefix, "Damage");
+        if (!nbtDamage.has_value()) {
+            nbtDamage = itemNbtInteger(decoded, prefix, "damage");
+        }
+        item.damageKnown = nbtDamage.has_value();
+        item.damage = std::max(0, nbtDamage.value_or(0));
         item.enchanted = packetValueHasContent(
             decoded.value(prefix + ".extra.nbt.nbt.value.ench")
         );
@@ -694,6 +745,7 @@ struct RelayState {
                 ? "minecraft:item_" + std::to_string(item.networkId)
                 : known->second;
         }
+        refreshDurability(item, version);
         return item;
     }
 
@@ -716,6 +768,16 @@ struct RelayState {
             for (auto& [runtimeId, name] : palette) {
                 itemNames.insert_or_assign(runtimeId, std::move(name));
             }
+            bool equipmentChanged = false;
+            for (auto& item : equipment) {
+                if (!item.present) continue;
+                const auto known = itemNames.find(item.networkId);
+                if (known == itemNames.end()) continue;
+                item.name = known->second;
+                refreshDurability(item, version);
+                equipmentChanged = true;
+            }
+            if (equipmentChanged) ++equipmentRevision;
         } catch (...) {
         }
     }
@@ -787,7 +849,7 @@ struct RelayState {
                 if (camera.runtimeId != 0 && runtimeId != camera.runtimeId) {
                     return;
                 }
-                auto hand = decodedItem(decoded, "item");
+                auto hand = decodedItem(version, decoded, "item");
                 std::lock_guard lock(mutex);
                 equipment[0] = std::move(hand);
                 ++equipmentRevision;
@@ -802,10 +864,10 @@ struct RelayState {
                     return;
                 }
                 std::array<EquipmentItem, 4> armor {
-                    decodedItem(decoded, "helmet"),
-                    decodedItem(decoded, "chestplate"),
-                    decodedItem(decoded, "leggings"),
-                    decodedItem(decoded, "boots")
+                    decodedItem(version, decoded, "helmet"),
+                    decodedItem(version, decoded, "chestplate"),
+                    decodedItem(version, decoded, "leggings"),
+                    decodedItem(version, decoded, "boots")
                 };
                 std::lock_guard lock(mutex);
                 for (std::size_t index = 0; index < armor.size(); ++index) {
@@ -825,6 +887,7 @@ struct RelayState {
                 for (std::size_t index = 0; index < armor.size(); ++index) {
                     armor[index] = index < items->arrayValue.size()
                         ? decodedItem(
+                            version,
                             decoded,
                             "input[" + std::to_string(index) + "]"
                         )
@@ -841,7 +904,7 @@ struct RelayState {
                 decoded.getString("window_id", "") == "armor") {
                 const auto slot = decoded.getUInt("slot", 99);
                 if (slot < 4) {
-                    auto armor = decodedItem(decoded, "item");
+                    auto armor = decodedItem(version, decoded, "item");
                     std::lock_guard lock(mutex);
                     equipment[static_cast<std::size_t>(slot) + 1] =
                         std::move(armor);
@@ -858,13 +921,16 @@ struct RelayState {
                 };
                 std::lock_guard lock(mutex);
                 for (std::size_t index = 0; index < DamageFields.size(); ++index) {
-                    if (decoded.has(DamageFields[index])) {
+                    if (decoded.has(DamageFields[index]) &&
+                        equipment[index + 1].present &&
+                        equipment[index + 1].damageKnown) {
                         equipment[index + 1].damage = std::max(
                             0,
                             equipment[index + 1].damage + static_cast<int32_t>(
                                 decoded.getInt(DamageFields[index], 0)
                             )
                         );
+                        refreshDurability(equipment[index + 1], version);
                     }
                 }
                 ++equipmentRevision;
@@ -1102,6 +1168,18 @@ bedrock::JsRuntimeValue snapshotValue(
             )},
             {"name", bedrock::JsRuntimeValue::string(item.name)},
             {"damage", bedrock::JsRuntimeValue::number(item.damage)},
+            {"damageKnown", bedrock::JsRuntimeValue::boolean(
+                item.damageKnown
+            )},
+            {"maximumDurability", bedrock::JsRuntimeValue::number(
+                item.maximumDurability
+            )},
+            {"remainingDurability", bedrock::JsRuntimeValue::number(
+                item.remainingDurability
+            )},
+            {"durabilityPercent", bedrock::JsRuntimeValue::number(
+                item.durabilityPercent
+            )},
             {"enchanted", bedrock::JsRuntimeValue::boolean(item.enchanted)}
         }));
     }

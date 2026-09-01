@@ -493,6 +493,22 @@ final class MotionSmoother {
         private static final double CameraSizeDerivativeCutoffHz = 0.9;
         private static final double CameraSizeMaximumCutoffHz = 24.0;
         private static final double CameraSizeRelativeSpeedGain = 34.0;
+        private static final double MediumCenterMinimumCutoffHz = 2.4;
+        private static final double MediumCenterDerivativeCutoffHz = 0.72;
+        private static final double MediumCenterMaximumCutoffHz = 20.0;
+        private static final double MediumCenterRelativeSpeedGain = 30.0;
+        private static final double MediumSizeMinimumCutoffHz = 1.8;
+        private static final double MediumSizeDerivativeCutoffHz = 0.65;
+        private static final double MediumSizeMaximumCutoffHz = 14.0;
+        private static final double MediumSizeRelativeSpeedGain = 20.0;
+        private static final double FastCenterMinimumCutoffHz = 4.2;
+        private static final double FastCenterDerivativeCutoffHz = 1.2;
+        private static final double FastCenterMaximumCutoffHz = 36.0;
+        private static final double FastCenterRelativeSpeedGain = 55.0;
+        private static final double FastSizeMinimumCutoffHz = 3.1;
+        private static final double FastSizeDerivativeCutoffHz = 1.0;
+        private static final double FastSizeMaximumCutoffHz = 26.0;
+        private static final double FastSizeRelativeSpeedGain = 38.0;
 
         private final AdaptivePair center = new AdaptivePair();
         private final AdaptivePair size = new AdaptivePair();
@@ -535,6 +551,30 @@ final class MotionSmoother {
             double viewportHeight,
             boolean cameraProjectionActive
         ) {
+            return step(
+                left,
+                top,
+                right,
+                bottom,
+                frameNanos,
+                viewportWidth,
+                viewportHeight,
+                cameraProjectionActive,
+                0.0
+            );
+        }
+
+        boolean step(
+            double left,
+            double top,
+            double right,
+            double bottom,
+            long frameNanos,
+            double viewportWidth,
+            double viewportHeight,
+            boolean cameraProjectionActive,
+            double cameraMotionStrength
+        ) {
             double targetCenterX = (left + right) * 0.5;
             double targetCenterY = (top + bottom) * 0.5;
             double targetWidth = Math.max(1.0, right - left);
@@ -566,30 +606,99 @@ final class MotionSmoother {
                 1.0,
                 Math.max(viewportWidth, viewportHeight)
             );
-            double centerMinimum = cameraProjectionActive
-                ? CameraCenterMinimumCutoffHz
-                : CenterMinimumCutoffHz;
-            double centerGain = cameraProjectionActive
-                ? CameraCenterRelativeSpeedGain
-                : CenterRelativeSpeedGain;
-            double centerDerivative = cameraProjectionActive
-                ? CameraCenterDerivativeCutoffHz
-                : CenterDerivativeCutoffHz;
-            double centerMaximum = cameraProjectionActive
-                ? CameraCenterMaximumCutoffHz
-                : CenterMaximumCutoffHz;
-            double sizeMinimum = cameraProjectionActive
-                ? CameraSizeMinimumCutoffHz
-                : SizeMinimumCutoffHz;
-            double sizeGain = cameraProjectionActive
-                ? CameraSizeRelativeSpeedGain
-                : SizeRelativeSpeedGain;
-            double sizeDerivative = cameraProjectionActive
-                ? CameraSizeDerivativeCutoffHz
-                : SizeDerivativeCutoffHz;
-            double sizeMaximum = cameraProjectionActive
-                ? CameraSizeMaximumCutoffHz
-                : SizeMaximumCutoffHz;
+            double centerMinimum = CenterMinimumCutoffHz;
+            double centerGain = CenterRelativeSpeedGain;
+            double centerDerivative = CenterDerivativeCutoffHz;
+            double centerMaximum = CenterMaximumCutoffHz;
+            double sizeMinimum = SizeMinimumCutoffHz;
+            double sizeGain = SizeRelativeSpeedGain;
+            double sizeDerivative = SizeDerivativeCutoffHz;
+            double sizeMaximum = SizeMaximumCutoffHz;
+            if (cameraProjectionActive) {
+                double motion = clamp(cameraMotionStrength, 0.0, 1.0);
+                double medium = 4.0 * motion * (1.0 - motion);
+                double fast = ProjectionMath.smoothStep(0.72, 1.0, motion);
+                centerMinimum = blend(
+                    CameraCenterMinimumCutoffHz,
+                    MediumCenterMinimumCutoffHz,
+                    medium
+                );
+                centerGain = blend(
+                    CameraCenterRelativeSpeedGain,
+                    MediumCenterRelativeSpeedGain,
+                    medium
+                );
+                centerDerivative = blend(
+                    CameraCenterDerivativeCutoffHz,
+                    MediumCenterDerivativeCutoffHz,
+                    medium
+                );
+                centerMaximum = blend(
+                    CameraCenterMaximumCutoffHz,
+                    MediumCenterMaximumCutoffHz,
+                    medium
+                );
+                sizeMinimum = blend(
+                    CameraSizeMinimumCutoffHz,
+                    MediumSizeMinimumCutoffHz,
+                    medium
+                );
+                sizeGain = blend(
+                    CameraSizeRelativeSpeedGain,
+                    MediumSizeRelativeSpeedGain,
+                    medium
+                );
+                sizeDerivative = blend(
+                    CameraSizeDerivativeCutoffHz,
+                    MediumSizeDerivativeCutoffHz,
+                    medium
+                );
+                sizeMaximum = blend(
+                    CameraSizeMaximumCutoffHz,
+                    MediumSizeMaximumCutoffHz,
+                    medium
+                );
+                centerMinimum = blend(
+                    centerMinimum,
+                    FastCenterMinimumCutoffHz,
+                    fast
+                );
+                centerGain = blend(
+                    centerGain,
+                    FastCenterRelativeSpeedGain,
+                    fast
+                );
+                centerDerivative = blend(
+                    centerDerivative,
+                    FastCenterDerivativeCutoffHz,
+                    fast
+                );
+                centerMaximum = blend(
+                    centerMaximum,
+                    FastCenterMaximumCutoffHz,
+                    fast
+                );
+                sizeMinimum = blend(
+                    sizeMinimum,
+                    FastSizeMinimumCutoffHz,
+                    fast
+                );
+                sizeGain = blend(
+                    sizeGain,
+                    FastSizeRelativeSpeedGain,
+                    fast
+                );
+                sizeDerivative = blend(
+                    sizeDerivative,
+                    FastSizeDerivativeCutoffHz,
+                    fast
+                );
+                sizeMaximum = blend(
+                    sizeMaximum,
+                    FastSizeMaximumCutoffHz,
+                    fast
+                );
+            }
             center.step(
                 targetCenterX,
                 targetCenterY,
@@ -638,6 +747,14 @@ final class MotionSmoother {
 
         double centerY() {
             return center.second();
+        }
+
+        private static double blend(
+            double first,
+            double second,
+            double amount
+        ) {
+            return first + (second - first) * clamp(amount, 0.0, 1.0);
         }
     }
 

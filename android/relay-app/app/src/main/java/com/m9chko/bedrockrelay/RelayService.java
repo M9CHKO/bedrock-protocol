@@ -16,6 +16,7 @@ import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.PowerManager;
+import android.os.SystemClock;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -102,6 +103,7 @@ public final class RelayService extends Service {
     private volatile boolean serviceStopping;
     private volatile boolean overlayShouldBeVisible;
     private volatile boolean overlaySessionReady;
+    private volatile long nextOverlayShowRetryAtMs;
     private volatile String notificationStatus = "Запуск UDP relay…";
     private volatile String lastSnapshotFingerprint = "";
     private volatile long lastPollingErrorAt;
@@ -204,7 +206,7 @@ public final class RelayService extends Service {
             chunkOverlayController.hideImmediately();
         }
         if (equipmentOverlayController != null) {
-            equipmentOverlayController.hideImmediately();
+            equipmentOverlayController.destroy();
         }
         DiagnosticsLog.append(this, "INFO", "service", "Service destroying");
         try {
@@ -452,13 +454,12 @@ public final class RelayService extends Service {
         boolean running = state.optBoolean("running", false);
         boolean upstreamReady = state.optBoolean("upstreamReady", false);
         int downstreamConnections = state.optInt("downstreamConnections", 0);
-        if (!running || !upstreamReady || downstreamConnections <= 0) {
-            overlaySessionReady = false;
-        }
-        setOverlayVisible(
-            overlaySessionReady && running && upstreamReady &&
-                downstreamConnections > 0
-        );
+        // The snapshot is authoritative and also repairs a missed/racing
+        // upstream_ready callback. A later healthy poll must be able to show
+        // the menu again after one transient incomplete snapshot.
+        overlaySessionReady = running && upstreamReady &&
+            downstreamConnections > 0;
+        setOverlayVisible(overlaySessionReady);
         updateOverlayChunkStatus(state);
         updateOverlayEquipment(state);
         if (!running) {
@@ -893,8 +894,18 @@ public final class RelayService extends Service {
     }
 
     private void setOverlayVisible(boolean visible) {
-        if (overlayShouldBeVisible == visible) return;
+        boolean changed = overlayShouldBeVisible != visible;
         overlayShouldBeVisible = visible;
+        long now = SystemClock.elapsedRealtime();
+        if (!changed) {
+            if (!visible) return;
+            RelayOverlayController controller = overlayController;
+            if (controller != null && controller.isShowing()) return;
+            // addView may fail during the activity/game transition. Retry at
+            // a bounded rate instead of permanently trusting the desired bit.
+            if (now < nextOverlayShowRetryAtMs) return;
+        }
+        nextOverlayShowRetryAtMs = visible ? now + 1_000L : 0L;
         mainHandler.post(() -> {
             if (overlayShouldBeVisible) {
                 if (entityOverlayController != null) {

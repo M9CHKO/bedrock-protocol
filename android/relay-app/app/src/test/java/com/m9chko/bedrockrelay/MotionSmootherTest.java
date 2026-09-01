@@ -274,6 +274,92 @@ public final class MotionSmootherTest {
     }
 
     @Test
+    public void mediumCameraMotionSoftensPacketCorrections() {
+        MotionSmoother.ScreenBox direct = new MotionSmoother.ScreenBox();
+        MotionSmoother.ScreenBox softened = new MotionSmoother.ScreenBox();
+        long now = 1_000_000_000L;
+        direct.step(
+            480.0,
+            400.0,
+            520.0,
+            500.0,
+            now,
+            1_080.0,
+            1_920.0,
+            true,
+            0.0
+        );
+        softened.step(
+            480.0,
+            400.0,
+            520.0,
+            500.0,
+            now,
+            1_080.0,
+            1_920.0,
+            true,
+            0.5
+        );
+        double directPrevious = direct.centerX();
+        double softenedPrevious = softened.centerX();
+        double directVelocity = 0.0;
+        double softenedVelocity = 0.0;
+        double directMaximumJerk = 0.0;
+        double softenedMaximumJerk = 0.0;
+        double target = 500.0;
+
+        for (int frame = 1; frame <= 240; ++frame) {
+            now += 8_333_333L;
+            int packetPhase = frame % 6;
+            double correction = ((frame / 6) & 1) == 0 ? -7.0 : 7.0;
+            correction *= 1.0 - packetPhase / 6.0;
+            target = 500.0 + frame * 1.5 + correction;
+            direct.step(
+                target - 20.0,
+                400.0,
+                target + 20.0,
+                500.0,
+                now,
+                1_080.0,
+                1_920.0,
+                true,
+                0.0
+            );
+            softened.step(
+                target - 20.0,
+                400.0,
+                target + 20.0,
+                500.0,
+                now,
+                1_080.0,
+                1_920.0,
+                true,
+                0.5
+            );
+            double nextDirectVelocity = direct.centerX() - directPrevious;
+            double nextSoftenedVelocity =
+                softened.centerX() - softenedPrevious;
+            if (frame > 30) {
+                directMaximumJerk = Math.max(
+                    directMaximumJerk,
+                    Math.abs(nextDirectVelocity - directVelocity)
+                );
+                softenedMaximumJerk = Math.max(
+                    softenedMaximumJerk,
+                    Math.abs(nextSoftenedVelocity - softenedVelocity)
+                );
+            }
+            directVelocity = nextDirectVelocity;
+            softenedVelocity = nextSoftenedVelocity;
+            directPrevious = direct.centerX();
+            softenedPrevious = softened.centerX();
+        }
+
+        assertTrue(softenedMaximumJerk < directMaximumJerk);
+        assertTrue(Math.abs(target - softened.centerX()) < 30.0);
+    }
+
+    @Test
     public void packetVelocityAccumulatesCoherentMicroTurnFromRest() {
         MotionSmoother.PacketVelocity velocity =
             new MotionSmoother.PacketVelocity();

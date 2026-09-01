@@ -8,6 +8,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.database.Cursor;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
@@ -18,6 +19,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
 import android.provider.Settings;
+import android.provider.OpenableColumns;
 import android.text.InputType;
 import android.view.Gravity;
 import android.view.View;
@@ -35,14 +37,25 @@ import android.widget.Toast;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.io.IOException;
+import java.io.InputStream;
 import java.util.ArrayList;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public final class MainActivity extends Activity {
+    public static final String ACTION_IMPORT_TEXTURE_PACK =
+        "com.m9chko.bedrockrelay.action.IMPORT_TEXTURE_PACK";
     private static final int NOTIFICATION_PERMISSION_REQUEST = 100;
     private static final int OVERLAY_PERMISSION_REQUEST = 101;
+    private static final int TEXTURE_PACK_REQUEST = 102;
     private static final String MINECRAFT_PACKAGE = "com.mojang.minecraftpe";
+    private static final String OFFICIAL_TEXTURE_RELEASES =
+        "https://github.com/Mojang/bedrock-samples/releases";
 
     private final Handler handler = new Handler(Looper.getMainLooper());
+    private final ExecutorService textureImportExecutor =
+        Executors.newSingleThreadExecutor();
     private final Runnable refreshTask = new Runnable() {
         @Override public void run() {
             refreshState();
@@ -51,6 +64,7 @@ public final class MainActivity extends Activity {
     };
 
     private SharedPreferences preferences;
+    private OfficialTexturePack texturePack;
     private EditText hostInput;
     private EditText portInput;
     private Spinner versionInput;
@@ -65,6 +79,10 @@ public final class MainActivity extends Activity {
     private LinearLayout logsPage;
     private TextView connectionTab;
     private TextView logsTab;
+    private TextView texturePackStatusText;
+    private Button texturePackImportButton;
+    private Button texturePackDeleteButton;
+    private boolean texturePackImportBusy;
     private long nextLogRefreshAt;
     private boolean pendingOverlayRelayStart;
     private boolean pendingOverlayMinecraftLaunch;
@@ -76,6 +94,7 @@ public final class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         preferences = getSharedPreferences(RelayService.PREFERENCES, MODE_PRIVATE);
+        texturePack = new OfficialTexturePack(this);
         if (savedInstanceState != null) {
             pendingOverlayRelayStart = savedInstanceState.getBoolean(
                 "pending_overlay_start",
@@ -98,6 +117,14 @@ public final class MainActivity extends Activity {
         }
         DiagnosticsLog.append(this, "INFO", "ui", "Main screen opened");
         setContentView(buildContent());
+        maybeOpenTexturePackPicker(getIntent());
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        maybeOpenTexturePackPicker(intent);
     }
 
     @Override
@@ -119,6 +146,7 @@ public final class MainActivity extends Activity {
         if (pendingOverlayRelayStart && Settings.canDrawOverlays(this)) {
             continuePendingOverlayStart();
         }
+        refreshTexturePackStatus();
         handler.removeCallbacks(refreshTask);
         handler.post(refreshTask);
     }
@@ -127,6 +155,12 @@ public final class MainActivity extends Activity {
     protected void onPause() {
         handler.removeCallbacks(refreshTask);
         super.onPause();
+    }
+
+    @Override
+    protected void onDestroy() {
+        textureImportExecutor.shutdownNow();
+        super.onDestroy();
     }
 
     private View buildContent() {
@@ -235,6 +269,55 @@ public final class MainActivity extends Activity {
         versionHint.setTextColor(0xff8291a3);
         serverCard.addView(versionHint);
         content.addView(serverCard, margins(-1, -2, 0, 0, 0, dp(10)));
+
+        LinearLayout texturesCard = card();
+        TextView texturesTitle = text("ТЕКСТУРЫ СНАРЯЖЕНИЯ", 12, true);
+        texturesTitle.setTextColor(0xffc79aff);
+        texturesCard.addView(
+            texturesTitle,
+            margins(-1, -2, 0, 0, 0, dp(7))
+        );
+        texturePackStatusText = text("", 10, false);
+        texturePackStatusText.setTextColor(0xff9dabbb);
+        texturesCard.addView(
+            texturePackStatusText,
+            margins(-1, -2, 0, 0, 0, dp(8))
+        );
+        texturePackImportButton = primaryButton(
+            "Импортировать официальный FULL ZIP"
+        );
+        texturePackImportButton.setOnClickListener(
+            view -> openTexturePackPicker()
+        );
+        texturesCard.addView(
+            texturePackImportButton,
+            margins(-1, dp(48), 0, 0, 0, dp(6))
+        );
+        Button releases = secondaryButton("Открыть релизы Mojang");
+        releases.setOnClickListener(view -> openOfficialTextureReleases());
+        texturesCard.addView(releases, margins(-1, dp(46), 0, 0, 0, dp(6)));
+        texturePackDeleteButton = secondaryButton("Удалить импортированные PNG");
+        texturePackDeleteButton.setTextColor(0xffff9aa5);
+        texturePackDeleteButton.setOnClickListener(view -> {
+            texturePack.clear();
+            refreshTexturePackStatus();
+            toast("Импортированные текстуры удалены");
+        });
+        texturesCard.addView(
+            texturePackDeleteButton,
+            margins(-1, dp(46), 0, 0, 0, dp(7))
+        );
+        TextView textureNote = text(
+            "Выберите официальный FULL-архив bedrock-samples один раз. " +
+                "Приложение сохранит только item PNG во внутренней памяти; " +
+                "они не добавляются в APK или Git.",
+            9,
+            false
+        );
+        textureNote.setTextColor(0xff78889b);
+        texturesCard.addView(textureNote);
+        content.addView(texturesCard, margins(-1, -2, 0, 0, 0, dp(10)));
+        refreshTexturePackStatus();
 
         TextView localAddress = text(
             "ЛОКАЛЬНЫЙ АДРЕС   127.0.0.1:19132   ⧉",
@@ -494,6 +577,154 @@ public final class MainActivity extends Activity {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode == OVERLAY_PERMISSION_REQUEST) {
             continuePendingOverlayStart();
+        } else if (requestCode == TEXTURE_PACK_REQUEST &&
+            resultCode == RESULT_OK && data != null && data.getData() != null) {
+            Uri source = data.getData();
+            try {
+                if ((data.getFlags() & Intent.FLAG_GRANT_READ_URI_PERMISSION) != 0) {
+                    getContentResolver().takePersistableUriPermission(
+                        source,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    );
+                }
+            } catch (Throwable ignored) {
+            }
+            importTexturePack(source, displayName(source));
+        }
+    }
+
+    private void maybeOpenTexturePackPicker(Intent intent) {
+        if (intent == null ||
+            !ACTION_IMPORT_TEXTURE_PACK.equals(intent.getAction())) {
+            return;
+        }
+        intent.setAction(null);
+        handler.post(this::openTexturePackPicker);
+    }
+
+    private void openTexturePackPicker() {
+        if (texturePackImportBusy) return;
+        Intent picker = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        picker.addCategory(Intent.CATEGORY_OPENABLE);
+        picker.setType("*/*");
+        picker.putExtra(Intent.EXTRA_MIME_TYPES, new String[] {
+            "application/zip",
+            "application/x-zip-compressed",
+            "application/octet-stream",
+            "application/mcpack"
+        });
+        picker.addFlags(
+            Intent.FLAG_GRANT_READ_URI_PERMISSION |
+                Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+        );
+        try {
+            startActivityForResult(picker, TEXTURE_PACK_REQUEST);
+        } catch (Throwable error) {
+            DiagnosticsLog.appendError(
+                this,
+                "textures",
+                "Could not open texture archive picker",
+                error
+            );
+            toast("Не удалось открыть выбор ZIP");
+        }
+    }
+
+    private void importTexturePack(Uri source, String sourceName) {
+        texturePackImportBusy = true;
+        refreshTexturePackStatus();
+        textureImportExecutor.execute(() -> {
+            try (InputStream input = getContentResolver().openInputStream(source)) {
+                OfficialTexturePack.ImportResult result =
+                    texturePack.importArchive(input, sourceName);
+                runOnUiThread(() -> {
+                    texturePackImportBusy = false;
+                    refreshTexturePackStatus();
+                    toast(
+                        "Импортировано текстур: " + result.textureCount +
+                            (result.enchantmentGlint ? " + glint" : "")
+                    );
+                });
+            } catch (Throwable error) {
+                DiagnosticsLog.appendError(
+                    this,
+                    "textures",
+                    "Official texture pack import failed",
+                    error
+                );
+                runOnUiThread(() -> {
+                    texturePackImportBusy = false;
+                    refreshTexturePackStatus();
+                    String message = error instanceof IOException
+                        ? error.getMessage()
+                        : "Не удалось импортировать архив";
+                    toast(message == null ? "Ошибка импорта" : message);
+                });
+            }
+        });
+    }
+
+    private void refreshTexturePackStatus() {
+        if (texturePackStatusText == null || texturePack == null) return;
+        OfficialTexturePack.Status status = texturePack.status();
+        texturePackStatusText.setText(
+            texturePackImportBusy
+                ? "Импорт и проверка PNG…"
+                : status.description()
+        );
+        texturePackStatusText.setTextColor(
+            texturePackImportBusy
+                ? 0xffffc76c
+                : status.imported ? 0xff74df9c : 0xff9dabbb
+        );
+        if (texturePackImportButton != null) {
+            texturePackImportButton.setEnabled(!texturePackImportBusy);
+            texturePackImportButton.setText(
+                texturePackImportBusy
+                    ? "Импортируем…"
+                    : status.imported
+                        ? "Заменить официальный FULL ZIP"
+                        : "Импортировать официальный FULL ZIP"
+            );
+        }
+        if (texturePackDeleteButton != null) {
+            texturePackDeleteButton.setVisibility(
+                status.imported && !texturePackImportBusy
+                    ? View.VISIBLE
+                    : View.GONE
+            );
+        }
+    }
+
+    private String displayName(Uri uri) {
+        try (Cursor cursor = getContentResolver().query(
+            uri,
+            new String[] { OpenableColumns.DISPLAY_NAME },
+            null,
+            null,
+            null
+        )) {
+            if (cursor != null && cursor.moveToFirst()) {
+                int column = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                if (column >= 0) {
+                    String value = cursor.getString(column);
+                    if (value != null && !value.trim().isEmpty()) return value;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        String fallback = uri.getLastPathSegment();
+        return fallback == null ? "bedrock-samples FULL" : fallback;
+    }
+
+    private void openOfficialTextureReleases() {
+        try {
+            startActivity(new Intent(
+                Intent.ACTION_VIEW,
+                Uri.parse(OFFICIAL_TEXTURE_RELEASES)
+            ));
+        } catch (Throwable error) {
+            toast("Не удалось открыть официальный релиз");
         }
     }
 
