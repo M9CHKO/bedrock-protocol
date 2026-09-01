@@ -16,6 +16,7 @@ import android.view.WindowManager;
 import android.view.animation.DecelerateInterpolator;
 import android.widget.Button;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.SeekBar;
 import android.widget.Switch;
 import android.widget.TextView;
@@ -32,10 +33,23 @@ final class RelayOverlayController {
     private WindowManager.LayoutParams windowParams;
     private LinearLayout windowRoot;
     private TextView drawerTab;
+    private TextView chunkStatus;
     private ValueAnimator drawerAnimator;
     private int drawerPanelWidth;
     private boolean drawerOpen;
     private boolean missingPermissionLogged;
+    private boolean statusRetentionEnabled;
+    private int statusConfiguredRadiusChunks = 24;
+    private long statusPublisherUpdates;
+    private long statusPublisherRewrites;
+    private int statusServerRadiusBlocks;
+    private int statusEffectiveRadiusBlocks;
+    private long statusRetainedChunks;
+    private long statusRetainedBytes;
+    private long statusMaximumBytes = 256L * 1024L * 1024L;
+    private long statusEvictedRadius;
+    private long statusEvictedMemory;
+    private long statusParseFailures;
 
     RelayOverlayController(
         Context context,
@@ -131,6 +145,7 @@ final class RelayOverlayController {
         }
         windowRoot = null;
         drawerTab = null;
+        chunkStatus = null;
         windowParams = null;
         if (root == null) return;
         try {
@@ -166,16 +181,73 @@ final class RelayOverlayController {
     }
 
     private View buildPanel() {
+        BoundedScrollView scroll = new BoundedScrollView(context);
+        scroll.setBackground(panelBackground(dp(18)));
+        scroll.setElevation(dp(10));
+        scroll.setClipToOutline(true);
+        scroll.setFillViewport(false);
+        scroll.setVerticalScrollBarEnabled(true);
+
         LinearLayout panel = new LinearLayout(context);
         panel.setOrientation(LinearLayout.VERTICAL);
         panel.setPadding(dp(14), dp(10), dp(14), dp(14));
-        panel.setBackground(panelBackground(dp(18)));
-        panel.setElevation(dp(10));
 
         TextView title = text("CPE Relay  •  подключено", 16, true);
         title.setTextColor(Color.WHITE);
         title.setPadding(dp(2), dp(6), dp(4), dp(10));
         panel.addView(title);
+
+        Switch entityOutlines = new Switch(context);
+        entityOutlines.setText("Обводка сущностей (2D)");
+        entityOutlines.setTextSize(15);
+        entityOutlines.setTextColor(Color.WHITE);
+        entityOutlines.setChecked(preferences.getBoolean(
+            RelayService.KEY_ENTITY_OUTLINES,
+            true
+        ));
+        panel.addView(entityOutlines, margins(-1, -2, 0, 2, 0, 0));
+
+        int initialEntityFov = RelayService.clampEntityFov(
+            preferences.getInt(RelayService.KEY_ENTITY_FOV, 70)
+        );
+        TextView entityFovLabel = text("", 12, true);
+        entityFovLabel.setTextColor(0xffdce6f5);
+        panel.addView(
+            entityFovLabel,
+            margins(-1, -2, dp(2), 0, dp(2), 0)
+        );
+        SeekBar entityFov = new SeekBar(context);
+        entityFov.setMin(RelayService.MIN_ENTITY_FOV);
+        entityFov.setMax(RelayService.MAX_ENTITY_FOV);
+        entityFov.setProgress(initialEntityFov);
+        panel.addView(entityFov, margins(-1, -2, 0, 0, 0, 0));
+        TextView entityHint = text(
+            "Рамки плавно следуют за игроками и мобами. Подстройте FOV " +
+                "под Minecraft; точнее всего вид от первого лица.",
+            11,
+            false
+        );
+        entityHint.setTextColor(0xffc4cad3);
+        panel.addView(
+            entityHint,
+            margins(-1, -2, dp(2), 0, dp(2), dp(8))
+        );
+
+        Runnable refreshEntityFov = () -> entityFovLabel.setText(
+            String.format(
+                Locale.getDefault(),
+                "FOV рамок: %d°",
+                entityFov.getProgress()
+            )
+        );
+        Runnable updateEntityControls = () -> {
+            boolean enabled = entityOutlines.isChecked();
+            entityFov.setEnabled(enabled);
+            entityFovLabel.setAlpha(enabled ? 1f : 0.55f);
+            entityHint.setAlpha(enabled ? 1f : 0.55f);
+        };
+        refreshEntityFov.run();
+        updateEntityControls.run();
 
         Switch detailedLogs = new Switch(context);
         detailedLogs.setText("Подробные логи");
@@ -207,6 +279,8 @@ final class RelayOverlayController {
         int initialRadius = RelayService.clampRetainedRadius(
             preferences.getInt(RelayService.KEY_RETAINED_RADIUS_CHUNKS, 24)
         );
+        statusRetentionEnabled = retention.isChecked();
+        statusConfiguredRadiusChunks = initialRadius;
         TextView radiusLabel = text("", 13, true);
         radiusLabel.setTextColor(0xffdce6f5);
         panel.addView(radiusLabel, margins(-1, -2, dp(2), 2, dp(2), 0));
@@ -231,11 +305,19 @@ final class RelayOverlayController {
         radiusRow.addView(plus, new LinearLayout.LayoutParams(dp(46), dp(42)));
         panel.addView(radiusRow);
 
+        chunkStatus = text("", 12, true);
+        chunkStatus.setPadding(dp(10), dp(8), dp(10), dp(8));
+        chunkStatus.setBackground(statusBackground());
+        panel.addView(
+            chunkStatus,
+            margins(-1, -2, dp(2), dp(4), dp(2), dp(8))
+        );
+        refreshChunkStatus();
+
         TextView chunksHint = text(
-            "Relay хранит полученные level_chunk в памяти текущей сессии и " +
-                "просит Minecraft не выгружать их в выбранном радиусе. Сервер " +
-                "не начнёт присылать новые дальше своего лимита. При выходе " +
-                "кэш очищается; защитный лимит памяти relay — 256 МБ.",
+            "Туман и дальность отрисовки Minecraft не показывают, выгружен " +
+                "ли чанк. Проверяйте кэш и переданный клиенту радиус по " +
+                "статусу выше. Новые чанки по-прежнему ограничены сервером.",
             12,
             false
         );
@@ -264,10 +346,44 @@ final class RelayOverlayController {
                 .apply();
             settingsChanged.run();
         });
+        entityOutlines.setOnCheckedChangeListener((button, checked) -> {
+            preferences.edit()
+                .putBoolean(RelayService.KEY_ENTITY_OUTLINES, checked)
+                .apply();
+            updateEntityControls.run();
+            settingsChanged.run();
+        });
+        entityFov.setOnSeekBarChangeListener(
+            new SeekBar.OnSeekBarChangeListener() {
+                @Override public void onProgressChanged(
+                    SeekBar seekBar,
+                    int progress,
+                    boolean fromUser
+                ) {
+                    refreshEntityFov.run();
+                }
+
+                @Override public void onStartTrackingTouch(SeekBar seekBar) {}
+
+                @Override public void onStopTrackingTouch(SeekBar seekBar) {
+                    preferences.edit()
+                        .putInt(
+                            RelayService.KEY_ENTITY_FOV,
+                            RelayService.clampEntityFov(seekBar.getProgress())
+                        )
+                        .apply();
+                    settingsChanged.run();
+                }
+            }
+        );
         retention.setOnCheckedChangeListener((button, checked) -> {
             preferences.edit()
                 .putBoolean(RelayService.KEY_CHUNK_RETENTION, checked)
                 .apply();
+            statusRetentionEnabled = checked;
+            statusConfiguredRadiusChunks = radius.getProgress();
+            if (!checked) clearLiveChunkStatus();
+            refreshChunkStatus();
             updateEnabled.run();
             settingsChanged.run();
         });
@@ -277,7 +393,9 @@ final class RelayOverlayController {
                 int progress,
                 boolean fromUser
             ) {
+                statusConfiguredRadiusChunks = progress;
                 refreshRadius.run();
+                refreshChunkStatus();
             }
 
             @Override public void onStartTrackingTouch(SeekBar seekBar) {}
@@ -300,7 +418,144 @@ final class RelayOverlayController {
             ));
             saveRadius(radius.getProgress());
         });
-        return panel;
+        scroll.addView(
+            panel,
+            new ScrollView.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        );
+        return scroll;
+    }
+
+    void updateChunkStatus(
+        boolean retentionEnabled,
+        int configuredRadiusChunks,
+        long publisherUpdates,
+        long publisherRewrites,
+        int serverRadiusBlocks,
+        int effectiveRadiusBlocks,
+        long retainedChunks,
+        long retainedBytes,
+        long maximumBytes,
+        long evictedRadius,
+        long evictedMemory,
+        long parseFailures
+    ) {
+        statusRetentionEnabled = retentionEnabled;
+        statusConfiguredRadiusChunks = configuredRadiusChunks;
+        statusPublisherUpdates = publisherUpdates;
+        statusPublisherRewrites = publisherRewrites;
+        statusServerRadiusBlocks = serverRadiusBlocks;
+        statusEffectiveRadiusBlocks = effectiveRadiusBlocks;
+        statusRetainedChunks = retainedChunks;
+        statusRetainedBytes = retainedBytes;
+        statusMaximumBytes = maximumBytes;
+        statusEvictedRadius = evictedRadius;
+        statusEvictedMemory = evictedMemory;
+        statusParseFailures = parseFailures;
+        refreshChunkStatus();
+    }
+
+    private void clearLiveChunkStatus() {
+        statusPublisherUpdates = 0;
+        statusPublisherRewrites = 0;
+        statusServerRadiusBlocks = 0;
+        statusEffectiveRadiusBlocks = 0;
+        statusRetainedChunks = 0;
+        statusRetainedBytes = 0;
+        statusEvictedRadius = 0;
+        statusEvictedMemory = 0;
+        statusParseFailures = 0;
+    }
+
+    private void refreshChunkStatus() {
+        if (chunkStatus == null) return;
+        if (!statusRetentionEnabled) {
+            chunkStatus.setText("Проверка чанков: удержание выключено");
+            chunkStatus.setTextColor(0xffc4cad3);
+            return;
+        }
+
+        String commandStatus;
+        int serverRadiusChunks = blocksToChunks(statusServerRadiusBlocks);
+        int effectiveRadiusChunks = blocksToChunks(
+            statusEffectiveRadiusBlocks
+        );
+        if (statusPublisherUpdates == 0 || effectiveRadiusChunks == 0) {
+            commandStatus = String.format(
+                Locale.getDefault(),
+                "Команда Minecraft: ожидается (цель %d чанков)",
+                statusConfiguredRadiusChunks
+            );
+        } else if (statusEffectiveRadiusBlocks > statusServerRadiusBlocks) {
+            commandStatus = String.format(
+                Locale.getDefault(),
+                "✓ Minecraft: сервер %d → relay %d чанков",
+                serverRadiusChunks,
+                effectiveRadiusChunks
+            );
+        } else {
+            commandStatus = String.format(
+                Locale.getDefault(),
+                "✓ Minecraft: сервер уже дал %d чанков",
+                effectiveRadiusChunks
+            );
+        }
+
+        String cacheStatus = String.format(
+            Locale.getDefault(),
+            "Кэш relay: %,d чанков • %s / %s",
+            statusRetainedChunks,
+            formatBytes(statusRetainedBytes),
+            formatBytes(statusMaximumBytes)
+        );
+        String counters = String.format(
+            Locale.getDefault(),
+            "Команд: %,d (изменено: %,d) • удалено: %,d",
+            statusPublisherUpdates,
+            statusPublisherRewrites,
+            statusEvictedRadius
+        );
+        if (statusEvictedMemory > 0) {
+            counters += String.format(
+                Locale.getDefault(),
+                " • память: %,d",
+                statusEvictedMemory
+            );
+        }
+        if (statusParseFailures > 0) {
+            counters += String.format(
+                Locale.getDefault(),
+                " • ошибок: %,d",
+                statusParseFailures
+            );
+        }
+
+        chunkStatus.setText(commandStatus + "\n" + cacheStatus + "\n" + counters);
+        boolean active = statusPublisherUpdates > 0 &&
+            statusRetainedChunks > 0 && statusParseFailures == 0;
+        chunkStatus.setTextColor(active ? 0xff9ee493 : 0xffffd27a);
+    }
+
+    private static int blocksToChunks(int blocks) {
+        if (blocks <= 0) return 0;
+        return (blocks + 15) / 16;
+    }
+
+    private static String formatBytes(long bytes) {
+        if (bytes < 1024L * 1024L) {
+            return String.format(
+                Locale.getDefault(),
+                "%.0f КБ",
+                bytes / 1024.0
+            );
+        }
+        return String.format(
+            Locale.getDefault(),
+            "%.1f МБ",
+            bytes / (1024.0 * 1024.0)
+        );
     }
 
     private void saveRadius(int radius) {
@@ -452,6 +707,14 @@ final class RelayOverlayController {
         return background;
     }
 
+    private GradientDrawable statusBackground() {
+        GradientDrawable background = new GradientDrawable();
+        background.setColor(0x66101720);
+        background.setCornerRadius(dp(10));
+        background.setStroke(dp(1), 0x665f789d);
+        return background;
+    }
+
     private Button smallButton(String label) {
         Button button = new Button(context);
         button.setText(label);
@@ -492,6 +755,26 @@ final class RelayOverlayController {
             dp(320),
             context.getResources().getDisplayMetrics().widthPixels - dp(60)
         );
+    }
+
+    private final class BoundedScrollView extends ScrollView {
+        BoundedScrollView(Context context) {
+            super(context);
+        }
+
+        @Override
+        protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
+            int maximumHeight = Math.max(
+                dp(120),
+                context.getResources().getDisplayMetrics().heightPixels -
+                    dp(20)
+            );
+            int boundedHeight = View.MeasureSpec.makeMeasureSpec(
+                maximumHeight,
+                View.MeasureSpec.AT_MOST
+            );
+            super.onMeasure(widthMeasureSpec, boundedHeight);
+        }
     }
 
     private int dp(float value) {

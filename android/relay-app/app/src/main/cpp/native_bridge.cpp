@@ -2,6 +2,7 @@
 #include <bedrock/auth/JsRuntimeValue.hpp>
 #include <bedrock/auth/XboxTokenManager.hpp>
 #include <bedrock/bedrock.hpp>
+#include <bedrock/relay/EntityPositionTracker.hpp>
 
 #include <android/log.h>
 #include <jni.h>
@@ -529,7 +530,9 @@ struct RelayState {
     std::atomic<bool> detailedLogging {true};
     std::atomic<bool> chunkRetentionEnabled {false};
     std::atomic<int> retainedRadiusChunks {24};
+    std::atomic<uint64_t> chunkPublisherPacketsObserved {0};
     std::atomic<uint64_t> chunkPublisherPacketsRewritten {0};
+    std::atomic<uint64_t> chunkPublisherDecodeFailures {0};
     std::atomic<uint32_t> lastServerPublisherRadiusBlocks {0};
     std::atomic<uint32_t> lastEffectivePublisherRadiusBlocks {0};
     std::atomic<uint64_t> retainedLevelChunkCount {0};
@@ -542,6 +545,7 @@ struct RelayState {
     std::atomic<uint64_t> retainedLevelChunksEvictedRadius {0};
     std::atomic<uint64_t> retainedLevelChunksEvictedMemory {0};
     std::atomic<uint64_t> retainedLevelChunkParseFailures {0};
+    bedrock::EntityPositionTracker entityPositions;
 
     void configureRuntime(
         bool detailed,
@@ -549,11 +553,29 @@ struct RelayState {
         int radiusChunks
     ) {
         detailedLogging.store(detailed, std::memory_order_relaxed);
-        chunkRetentionEnabled.store(retainChunks, std::memory_order_relaxed);
-        retainedRadiusChunks.store(
-            clampRetainedRadiusChunks(radiusChunks),
+        const bool wasRetaining = chunkRetentionEnabled.exchange(
+            retainChunks,
             std::memory_order_relaxed
         );
+        const int clampedRadius = clampRetainedRadiusChunks(radiusChunks);
+        const int previousRadius = retainedRadiusChunks.exchange(
+            clampedRadius,
+            std::memory_order_relaxed
+        );
+        if (retainChunks != wasRetaining ||
+            (retainChunks && clampedRadius != previousRadius)) {
+            chunkPublisherPacketsObserved.store(0, std::memory_order_relaxed);
+            chunkPublisherPacketsRewritten.store(0, std::memory_order_relaxed);
+            chunkPublisherDecodeFailures.store(0, std::memory_order_relaxed);
+            lastServerPublisherRadiusBlocks.store(
+                0,
+                std::memory_order_relaxed
+            );
+            lastEffectivePublisherRadiusBlocks.store(
+                0,
+                std::memory_order_relaxed
+            );
+        }
         if (!retainChunks) {
             retainedLevelChunkCount.store(0, std::memory_order_relaxed);
             retainedLevelChunkBytes.store(0, std::memory_order_relaxed);
@@ -755,9 +777,23 @@ bedrock::JsRuntimeValue snapshotValue(
         {"retainedRadiusChunks", bedrock::JsRuntimeValue::number(
             state->retainedRadiusChunks.load(std::memory_order_relaxed)
         )},
+        {"chunkPublisherPacketsObserved", bedrock::JsRuntimeValue::number(
+            static_cast<double>(
+                state->chunkPublisherPacketsObserved.load(
+                    std::memory_order_relaxed
+                )
+            )
+        )},
         {"chunkPublisherPacketsRewritten", bedrock::JsRuntimeValue::number(
             static_cast<double>(
                 state->chunkPublisherPacketsRewritten.load(
+                    std::memory_order_relaxed
+                )
+            )
+        )},
+        {"chunkPublisherDecodeFailures", bedrock::JsRuntimeValue::number(
+            static_cast<double>(
+                state->chunkPublisherDecodeFailures.load(
                     std::memory_order_relaxed
                 )
             )
@@ -847,6 +883,66 @@ bedrock::JsRuntimeValue snapshotValue(
         result.set("ok", bedrock::JsRuntimeValue::boolean(*ok));
     }
     return result;
+}
+
+bedrock::JsRuntimeValue entityOverlaySnapshotValue(
+    const std::shared_ptr<RelayState>& state
+) {
+    const auto snapshot = state->entityPositions.snapshot(320.0f, 96);
+    std::vector<bedrock::JsRuntimeValue> entities;
+    entities.reserve(snapshot.entities.size());
+    for (const auto& entity : snapshot.entities) {
+        entities.push_back(bedrock::JsRuntimeValue::object({
+            {"id", bedrock::JsRuntimeValue::string(
+                std::to_string(entity.runtimeId)
+            )},
+            {"type", bedrock::JsRuntimeValue::string(entity.type)},
+            {"label", bedrock::JsRuntimeValue::string(entity.label)},
+            {"player", bedrock::JsRuntimeValue::boolean(entity.player)},
+            {"x", bedrock::JsRuntimeValue::number(entity.x)},
+            {"y", bedrock::JsRuntimeValue::number(entity.y)},
+            {"z", bedrock::JsRuntimeValue::number(entity.z)},
+            {"width", bedrock::JsRuntimeValue::number(entity.width)},
+            {"height", bedrock::JsRuntimeValue::number(entity.height)},
+            {"updatedAtMs", bedrock::JsRuntimeValue::number(
+                static_cast<double>(entity.updatedAtMs)
+            )}
+        }));
+    }
+
+    return bedrock::JsRuntimeValue::object({
+        {"capturedAtMs", bedrock::JsRuntimeValue::number(
+            static_cast<double>(unixMilliseconds())
+        )},
+        {"camera", bedrock::JsRuntimeValue::object({
+            {"known", bedrock::JsRuntimeValue::boolean(
+                snapshot.camera.known
+            )},
+            {"x", bedrock::JsRuntimeValue::number(snapshot.camera.x)},
+            {"y", bedrock::JsRuntimeValue::number(snapshot.camera.y)},
+            {"z", bedrock::JsRuntimeValue::number(snapshot.camera.z)},
+            {"pitch", bedrock::JsRuntimeValue::number(
+                snapshot.camera.pitch
+            )},
+            {"yaw", bedrock::JsRuntimeValue::number(snapshot.camera.yaw)},
+            {"updatedAtMs", bedrock::JsRuntimeValue::number(
+                static_cast<double>(snapshot.camera.updatedAtMs)
+            )}
+        })},
+        {"entities", bedrock::JsRuntimeValue::array(std::move(entities))},
+        {"totalTrackedEntities", bedrock::JsRuntimeValue::number(
+            static_cast<double>(snapshot.totalTrackedEntities)
+        )},
+        {"recognizedPackets", bedrock::JsRuntimeValue::number(
+            static_cast<double>(snapshot.recognizedPackets)
+        )},
+        {"decodedPackets", bedrock::JsRuntimeValue::number(
+            static_cast<double>(snapshot.decodedPackets)
+        )},
+        {"parseFailures", bedrock::JsRuntimeValue::number(
+            static_cast<double>(snapshot.parseFailures)
+        )}
+    });
 }
 
 class RelayController {
@@ -1027,9 +1123,15 @@ public:
         });
 
         relay->onConnect([this, state](bedrock::RelayPlayer& player) {
+            state->entityPositions.clear();
             state->clientboundEquipmentPackets = 0;
             state->clientboundEquipmentTransportPackets = 0;
             state->clientboundEquipmentForwardedPackets = 0;
+            state->chunkPublisherPacketsObserved = 0;
+            state->chunkPublisherPacketsRewritten = 0;
+            state->chunkPublisherDecodeFailures = 0;
+            state->lastServerPublisherRadiusBlocks = 0;
+            state->lastEffectivePublisherRadiusBlocks = 0;
             state->retainedLevelChunkCount = 0;
             state->retainedLevelChunkBytes = 0;
             state->retainedLevelChunksStored = 0;
@@ -1077,6 +1179,7 @@ public:
         });
         relay->onDisconnect([this, state](bedrock::RelayPlayer& player) {
             cancelLoginWatchdog(player.connection.peer);
+            state->entityPositions.clear();
             state->push(
                 "disconnect",
                 "downstream_session=" + player.sessionId() +
@@ -1091,6 +1194,7 @@ public:
             state->flushFlight("downstream_disconnect");
         });
         relay->onError([state](const std::string& message) {
+            state->entityPositions.clear();
             {
                 std::lock_guard lock(state->mutex);
                 state->lastError = safeMessage(message);
@@ -1115,6 +1219,7 @@ public:
             state->flushFlight("relay_parse_error");
         });
         relay->live().onServerbound([state](bedrock::BedrockRelayPacketEvent& event) {
+            state->entityPositions.observeServerbound(event.packet);
             if (isFlightPacket(event.packet.name)) {
                 state->recordFlight(
                     "relay_seen",
@@ -1130,6 +1235,7 @@ public:
             );
         });
         relay->live().onClientbound([state](bedrock::BedrockRelayPacketEvent& event) {
+            state->entityPositions.observeClientbound(event.packet);
             if (event.packet.name == "network_chunk_publisher_update" &&
                 state->chunkRetentionEnabled.load(std::memory_order_relaxed)) {
                 const auto minimumRadiusBlocks = static_cast<uint32_t>(
@@ -1141,7 +1247,12 @@ public:
                     event.packet,
                     minimumRadiusBlocks
                 );
-                if (retention.recognized) {
+                if (retention.decoded) {
+                    const auto observed =
+                        state->chunkPublisherPacketsObserved.fetch_add(
+                            1,
+                            std::memory_order_relaxed
+                        ) + 1;
                     state->lastServerPublisherRadiusBlocks.store(
                         retention.originalRadiusBlocks,
                         std::memory_order_relaxed
@@ -1150,23 +1261,45 @@ public:
                         retention.effectiveRadiusBlocks,
                         std::memory_order_relaxed
                     );
-                }
-                if (retention.rewritten) {
-                    const auto rewritten =
-                        state->chunkPublisherPacketsRewritten.fetch_add(
+                    auto rewritten =
+                        state->chunkPublisherPacketsRewritten.load(
+                            std::memory_order_relaxed
+                        );
+                    if (retention.rewritten) {
+                        rewritten =
+                            state->chunkPublisherPacketsRewritten.fetch_add(
                             1,
                             std::memory_order_relaxed
                         ) + 1;
-                    if (rewritten <= 3 || rewritten % 128 == 0) {
+                    }
+                    if (observed <= 3 || observed % 128 == 0) {
                         state->push(
                             "chunk_retention",
                             "serverRadiusBlocks=" + std::to_string(
                                 retention.originalRadiusBlocks
                             ) + " effectiveRadiusBlocks=" + std::to_string(
                                 retention.effectiveRadiusBlocks
-                            ) + " rewrittenPackets=" +
+                            ) + " publisherUpdates=" +
+                                std::to_string(observed) +
+                                " rewrittenPackets=" +
                                 std::to_string(rewritten),
                             "DEBUG",
+                            "chunks"
+                        );
+                    }
+                } else if (retention.recognized) {
+                    const auto failures =
+                        state->chunkPublisherDecodeFailures.fetch_add(
+                            1,
+                            std::memory_order_relaxed
+                        ) + 1;
+                    if (failures <= 3 || failures % 128 == 0) {
+                        state->push(
+                            "chunk_retention_decode_failed",
+                            "Could not decode network_chunk_publisher_update; "
+                            "packet forwarded unchanged failures=" +
+                                std::to_string(failures),
+                            "WARN",
                             "chunks"
                         );
                     }
@@ -1445,6 +1578,7 @@ public:
     void stop() {
         if (stopped_.exchange(true)) return;
         stopLoginWatchdog();
+        state_->entityPositions.clear();
         std::unique_ptr<bedrock::Relay> relay;
         {
             std::lock_guard lock(relayMutex_);
@@ -1870,6 +2004,22 @@ Java_com_m9chko_bedrockrelay_NativeBridge_snapshot(
         state = currentState;
     }
     return toJavaString(environment, jsonString(snapshotValue(state)));
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_m9chko_bedrockrelay_NativeBridge_entityOverlaySnapshot(
+    JNIEnv* environment,
+    jclass
+) {
+    std::shared_ptr<RelayState> state;
+    {
+        std::lock_guard lock(controllerMutex);
+        state = currentState;
+    }
+    return toJavaString(
+        environment,
+        jsonString(entityOverlaySnapshotValue(state))
+    );
 }
 
 extern "C" JNIEXPORT jstring JNICALL

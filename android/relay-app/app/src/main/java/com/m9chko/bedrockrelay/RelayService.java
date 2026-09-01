@@ -40,9 +40,13 @@ public final class RelayService extends Service {
     public static final String KEY_CHUNK_RETENTION = "chunk_retention";
     public static final String KEY_RETAINED_RADIUS_CHUNKS =
         "retained_radius_chunks";
+    public static final String KEY_ENTITY_OUTLINES = "entity_outlines";
+    public static final String KEY_ENTITY_FOV = "entity_outline_fov";
 
     public static final int MIN_RETAINED_RADIUS_CHUNKS = 10;
     public static final int MAX_RETAINED_RADIUS_CHUNKS = 64;
+    public static final int MIN_ENTITY_FOV = 50;
+    public static final int MAX_ENTITY_FOV = 110;
 
     public static final String ACTION_START =
         "com.m9chko.bedrockrelay.action.START";
@@ -59,18 +63,23 @@ public final class RelayService extends Service {
         Executors.newSingleThreadExecutor();
     private final ScheduledExecutorService pollExecutor =
         Executors.newSingleThreadScheduledExecutor();
+    private final ScheduledExecutorService entityPollExecutor =
+        Executors.newSingleThreadScheduledExecutor();
     private final AtomicBoolean pollingStarted = new AtomicBoolean(false);
+    private final AtomicBoolean entityPollingStarted = new AtomicBoolean(false);
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
     private SharedPreferences preferences;
     private PowerManager.WakeLock wakeLock;
     private RelayOverlayController overlayController;
+    private EntityOutlineOverlayController entityOverlayController;
     private volatile boolean serviceStopping;
     private volatile boolean overlayShouldBeVisible;
     private volatile boolean overlaySessionReady;
     private volatile String notificationStatus = "Запуск UDP relay…";
     private volatile String lastSnapshotFingerprint = "";
     private volatile long lastPollingErrorAt;
+    private volatile long lastEntityPollingErrorAt;
 
     @Override
     public void onCreate() {
@@ -81,6 +90,7 @@ public final class RelayService extends Service {
             preferences,
             () -> applyRuntimeOptions(true)
         );
+        entityOverlayController = new EntityOutlineOverlayController(this);
         createNotificationChannel();
         DiagnosticsLog.append(
             this,
@@ -155,6 +165,9 @@ public final class RelayService extends Service {
         overlaySessionReady = false;
         overlayShouldBeVisible = false;
         if (overlayController != null) overlayController.hide();
+        if (entityOverlayController != null) {
+            entityOverlayController.hideImmediately();
+        }
         DiagnosticsLog.append(this, "INFO", "service", "Service destroying");
         try {
             NativeBridge.stopRelay();
@@ -169,6 +182,7 @@ public final class RelayService extends Service {
         preferences.edit().putBoolean(KEY_RELAY_ACTIVE, false).commit();
         releaseWakeLock();
         pollExecutor.shutdownNow();
+        entityPollExecutor.shutdownNow();
         commandExecutor.shutdownNow();
         super.onDestroy();
     }
@@ -261,6 +275,33 @@ public final class RelayService extends Service {
                 }
             }
         }, 0, 500, TimeUnit.MILLISECONDS);
+        startEntityPolling();
+    }
+
+    private void startEntityPolling() {
+        if (!entityPollingStarted.compareAndSet(false, true)) return;
+        entityPollExecutor.scheduleWithFixedDelay(() -> {
+            if (serviceStopping || entityOverlayController == null ||
+                !entityOverlayController.wantsFrames()) {
+                return;
+            }
+            try {
+                entityOverlayController.offerSnapshot(
+                    NativeBridge.entityOverlaySnapshot()
+                );
+            } catch (Throwable error) {
+                long now = System.currentTimeMillis();
+                if (now - lastEntityPollingErrorAt >= 10_000) {
+                    lastEntityPollingErrorAt = now;
+                    DiagnosticsLog.appendError(
+                        this,
+                        "entities",
+                        "Entity snapshot polling failed; overlay continues",
+                        error
+                    );
+                }
+            }
+        }, 0, 50, TimeUnit.MILLISECONDS);
     }
 
     private void handleEvent(JSONObject event) {
@@ -374,6 +415,7 @@ public final class RelayService extends Service {
             overlaySessionReady && running && upstreamReady &&
                 downstreamConnections > 0
         );
+        updateOverlayChunkStatus(state);
         if (!running) {
             return;
         }
@@ -392,7 +434,15 @@ public final class RelayService extends Service {
             " chunkRetention=" +
                 state.optBoolean("chunkRetentionEnabled", false) +
             " retainedRadiusChunks=" +
-                state.optInt("retainedRadiusChunks", 24);
+                state.optInt("retainedRadiusChunks", 24) +
+            " entityOutlines=" + preferences.getBoolean(
+                KEY_ENTITY_OUTLINES,
+                true
+            ) +
+            " entityFov=" + clampEntityFov(preferences.getInt(
+                KEY_ENTITY_FOV,
+                70
+            ));
         if (!fingerprint.equals(lastSnapshotFingerprint)) {
             lastSnapshotFingerprint = fingerprint;
             if (detailedLogsEnabled()) {
@@ -411,6 +461,72 @@ public final class RelayService extends Service {
             notificationStatus = "Relay готов: 127.0.0.1:19132";
         }
         refreshNotification();
+    }
+
+    private void updateOverlayChunkStatus(JSONObject state) {
+        if (overlayController == null) return;
+        final boolean retentionEnabled = state.optBoolean(
+            "chunkRetentionEnabled",
+            false
+        );
+        final int configuredRadiusChunks = state.optInt(
+            "retainedRadiusChunks",
+            24
+        );
+        final long publisherUpdates = state.optLong(
+            "chunkPublisherPacketsObserved",
+            0
+        );
+        final long publisherRewrites = state.optLong(
+            "chunkPublisherPacketsRewritten",
+            0
+        );
+        final int serverRadiusBlocks = state.optInt(
+            "lastServerPublisherRadiusBlocks",
+            0
+        );
+        final int effectiveRadiusBlocks = state.optInt(
+            "lastEffectivePublisherRadiusBlocks",
+            0
+        );
+        final long retainedChunks = state.optLong(
+            "retainedLevelChunkCount",
+            0
+        );
+        final long retainedBytes = state.optLong(
+            "retainedLevelChunkBytes",
+            0
+        );
+        final long maximumBytes = state.optLong(
+            "retainedLevelChunkMaximumBytes",
+            256L * 1024L * 1024L
+        );
+        final long evictedRadius = state.optLong(
+            "retainedLevelChunksEvictedRadius",
+            0
+        );
+        final long evictedMemory = state.optLong(
+            "retainedLevelChunksEvictedMemory",
+            0
+        );
+        final long parseFailures = state.optLong(
+            "retainedLevelChunkParseFailures",
+            0
+        ) + state.optLong("chunkPublisherDecodeFailures", 0);
+        mainHandler.post(() -> overlayController.updateChunkStatus(
+            retentionEnabled,
+            configuredRadiusChunks,
+            publisherUpdates,
+            publisherRewrites,
+            serverRadiusBlocks,
+            effectiveRadiusBlocks,
+            retainedChunks,
+            retainedBytes,
+            maximumBytes,
+            evictedRadius,
+            evictedMemory,
+            parseFailures
+        ));
     }
 
     private void stopRelayAndSelf() {
@@ -595,9 +711,23 @@ public final class RelayService extends Service {
             KEY_RETAINED_RADIUS_CHUNKS,
             24
         ));
+        boolean entityOutlines = preferences.getBoolean(
+            KEY_ENTITY_OUTLINES,
+            true
+        );
+        int entityFov = clampEntityFov(preferences.getInt(
+            KEY_ENTITY_FOV,
+            70
+        ));
         preferences.edit()
             .putInt(KEY_RETAINED_RADIUS_CHUNKS, radiusChunks)
+            .putInt(KEY_ENTITY_FOV, entityFov)
             .apply();
+        mainHandler.post(() -> {
+            if (entityOverlayController == null) return;
+            entityOverlayController.setHorizontalFov(entityFov);
+            entityOverlayController.setEnabled(entityOutlines);
+        });
         try {
             NativeBridge.configureRuntime(
                 detailedLogs,
@@ -611,7 +741,9 @@ public final class RelayService extends Service {
                     "settings",
                     "Runtime settings changed: detailedLogs=" + detailedLogs +
                         " chunkRetention=" + retainChunks +
-                        " retainedRadiusChunks=" + radiusChunks
+                        " retainedRadiusChunks=" + radiusChunks +
+                        " entityOutlines=" + entityOutlines +
+                        " entityFov=" + entityFov
                 );
             }
         } catch (Throwable error) {
@@ -628,11 +760,15 @@ public final class RelayService extends Service {
         if (overlayShouldBeVisible == visible) return;
         overlayShouldBeVisible = visible;
         mainHandler.post(() -> {
-            if (overlayController == null) return;
+            if (overlayController == null || entityOverlayController == null) {
+                return;
+            }
             if (overlayShouldBeVisible) {
+                entityOverlayController.setSessionVisible(true);
                 overlayController.show();
             } else {
                 overlayController.hide();
+                entityOverlayController.setSessionVisible(false);
             }
         });
     }
@@ -642,5 +778,9 @@ public final class RelayService extends Service {
             MIN_RETAINED_RADIUS_CHUNKS,
             Math.min(MAX_RETAINED_RADIUS_CHUNKS, radius)
         );
+    }
+
+    public static int clampEntityFov(int fov) {
+        return Math.max(MIN_ENTITY_FOV, Math.min(MAX_ENTITY_FOV, fov));
     }
 }
