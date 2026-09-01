@@ -237,6 +237,74 @@ bool checkNodeGcmGoldens(
     return true;
 }
 
+bool checkCipherCloneSemantics(
+    const std::vector<uint8_t>& key,
+    const std::vector<uint8_t>& iv
+) {
+    const auto makeChunk = [](std::size_t size, uint8_t seed) {
+        std::vector<uint8_t> chunk(size);
+        for (std::size_t i = 0; i < size; ++i) {
+            chunk[i] = static_cast<uint8_t>(seed + i * 37u);
+        }
+        return chunk;
+    };
+    const auto first = makeChunk(13, 0x11);
+    const auto probe = makeChunk(104, 0x42);
+    const auto tail = makeChunk(29, 0x87);
+
+    for (const uint32_t protocol : {UINT32_C(422), UINT32_C(827)}) {
+        auto encrypt = bedrock::BedrockEncryption::createCipherStream(
+            protocol,
+            key,
+            iv,
+            bedrock::BedrockCipherMode::Encrypt
+        );
+        (void) encrypt->process(first);
+        auto encryptClone = encrypt->clone();
+        const auto clonedProbe = encryptClone->process(probe);
+        const auto originalProbe = encrypt->process(probe);
+        const auto clonedTail = encryptClone->process(tail);
+        const auto originalTail = encrypt->process(tail);
+        if (clonedProbe != originalProbe || clonedTail != originalTail) {
+            std::cerr << "[LEGACY-ENCRYPTION-SMOKE] cipher encrypt clone "
+                         "did not preserve independent stream state\n";
+            return false;
+        }
+
+        auto sender = bedrock::BedrockEncryption::createCipherStream(
+            protocol,
+            key,
+            iv,
+            bedrock::BedrockCipherMode::Encrypt
+        );
+        const auto encryptedFirst = sender->process(first);
+        const auto encryptedProbe = sender->process(probe);
+        const auto encryptedTail = sender->process(tail);
+        auto decrypt = bedrock::BedrockEncryption::createCipherStream(
+            protocol,
+            key,
+            iv,
+            bedrock::BedrockCipherMode::Decrypt
+        );
+        if (decrypt->process(encryptedFirst) != first) {
+            std::cerr << "[LEGACY-ENCRYPTION-SMOKE] clone decrypt setup failed\n";
+            return false;
+        }
+        auto decryptClone = decrypt->clone();
+        const auto clonePlainProbe = decryptClone->process(encryptedProbe);
+        const auto originalPlainProbe = decrypt->process(encryptedProbe);
+        const auto clonePlainTail = decryptClone->process(encryptedTail);
+        const auto originalPlainTail = decrypt->process(encryptedTail);
+        if (clonePlainProbe != probe || originalPlainProbe != probe ||
+            clonePlainTail != tail || originalPlainTail != tail) {
+            std::cerr << "[LEGACY-ENCRYPTION-SMOKE] cipher decrypt clone "
+                         "did not preserve independent stream state\n";
+            return false;
+        }
+    }
+    return true;
+}
+
 bool checkChecksumEdgeSemantics(
     const std::vector<uint8_t>& key,
     const std::vector<uint8_t>& iv
@@ -462,6 +530,7 @@ int main() {
     ok = checkAlgorithmBoundary(key, iv) && ok;
     ok = checkNodeCfb8Goldens(key, iv) && ok;
     ok = checkNodeGcmGoldens(key, iv) && ok;
+    ok = checkCipherCloneSemantics(key, iv) && ok;
     ok = checkChecksumEdgeSemantics(key, iv) && ok;
     ok = checkStrictLegacyCompression() && ok;
     ok = checkLocalLegacyHandshake() && ok;

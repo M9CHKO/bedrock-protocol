@@ -113,8 +113,31 @@ BedrockAesGcmStream::~BedrockAesGcmStream() {
     }
 }
 
+BedrockAesGcmStream::BedrockAesGcmStream(
+    EVP_CIPHER_CTX* ctx,
+    Mode mode
+) noexcept : ctx_(ctx), mode_(mode) {}
+
 BedrockCipherAlgorithm BedrockAesGcmStream::algorithm() const noexcept {
     return BedrockCipherAlgorithm::Aes256GcmNoTag;
+}
+
+std::unique_ptr<BedrockCipherStream> BedrockAesGcmStream::clone() const {
+    if (!ctx_) {
+        throw BedrockEncryptionError("BedrockAesGcmStream context is null");
+    }
+
+    EVP_CIPHER_CTX* copied = EVP_CIPHER_CTX_new();
+    if (!copied) {
+        throw BedrockEncryptionError("EVP_CIPHER_CTX_new GCM clone failed");
+    }
+    if (EVP_CIPHER_CTX_copy(copied, ctx_) != 1) {
+        EVP_CIPHER_CTX_free(copied);
+        throw BedrockEncryptionError("EVP_CIPHER_CTX_copy GCM failed");
+    }
+    return std::unique_ptr<BedrockCipherStream>(
+        new BedrockAesGcmStream(copied, mode_)
+    );
 }
 
 std::vector<uint8_t> BedrockAesGcmStream::process(
@@ -215,8 +238,31 @@ BedrockAesCfb8Stream::~BedrockAesCfb8Stream() {
     }
 }
 
+BedrockAesCfb8Stream::BedrockAesCfb8Stream(
+    EVP_CIPHER_CTX* ctx,
+    Mode mode
+) noexcept : ctx_(ctx), mode_(mode) {}
+
 BedrockCipherAlgorithm BedrockAesCfb8Stream::algorithm() const noexcept {
     return BedrockCipherAlgorithm::Aes256Cfb8;
+}
+
+std::unique_ptr<BedrockCipherStream> BedrockAesCfb8Stream::clone() const {
+    if (!ctx_) {
+        throw BedrockEncryptionError("BedrockAesCfb8Stream context is null");
+    }
+
+    EVP_CIPHER_CTX* copied = EVP_CIPHER_CTX_new();
+    if (!copied) {
+        throw BedrockEncryptionError("EVP_CIPHER_CTX_new CFB8 clone failed");
+    }
+    if (EVP_CIPHER_CTX_copy(copied, ctx_) != 1) {
+        EVP_CIPHER_CTX_free(copied);
+        throw BedrockEncryptionError("EVP_CIPHER_CTX_copy CFB8 failed");
+    }
+    return std::unique_ptr<BedrockCipherStream>(
+        new BedrockAesCfb8Stream(copied, mode_)
+    );
 }
 
 std::vector<uint8_t> BedrockAesCfb8Stream::process(

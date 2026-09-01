@@ -46,6 +46,10 @@ public:
     BedrockCipherStream& operator=(const BedrockCipherStream&) = delete;
 
     virtual BedrockCipherAlgorithm algorithm() const noexcept = 0;
+    // OpenSSL cipher contexts are stateful. A deep clone lets callers test a
+    // ciphertext/counter hypothesis without irreversibly advancing the live
+    // stream when its keyed checksum does not validate.
+    virtual std::unique_ptr<BedrockCipherStream> clone() const = 0;
     virtual std::vector<uint8_t> process(
         const std::vector<uint8_t>& input
     ) = 0;
@@ -70,11 +74,14 @@ public:
     BedrockAesGcmStream& operator=(const BedrockAesGcmStream&) = delete;
 
     BedrockCipherAlgorithm algorithm() const noexcept override;
+    std::unique_ptr<BedrockCipherStream> clone() const override;
     std::vector<uint8_t> process(
         const std::vector<uint8_t>& input
     ) override;
 
 private:
+    BedrockAesGcmStream(EVP_CIPHER_CTX* ctx, Mode mode) noexcept;
+
     EVP_CIPHER_CTX* ctx_ = nullptr;
     Mode mode_;
 };
@@ -95,11 +102,14 @@ public:
     BedrockAesCfb8Stream& operator=(const BedrockAesCfb8Stream&) = delete;
 
     BedrockCipherAlgorithm algorithm() const noexcept override;
+    std::unique_ptr<BedrockCipherStream> clone() const override;
     std::vector<uint8_t> process(
         const std::vector<uint8_t>& input
     ) override;
 
 private:
+    BedrockAesCfb8Stream(EVP_CIPHER_CTX* ctx, Mode mode) noexcept;
+
     EVP_CIPHER_CTX* ctx_ = nullptr;
     Mode mode_;
 };

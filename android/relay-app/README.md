@@ -8,8 +8,19 @@ UDP-порту `19132` и подключает его к серверу, кот�
 
 ## Готовый APK
 
-- [CPE Relay 1.0.9 (arm64-v8a, optimized Release, debug-signed)](apk/CPE-Relay-v1.0.9-arm64-v8a-release-debug-signed.apk)
-- [SHA-256](apk/CPE-Relay-v1.0.9-arm64-v8a-release-debug-signed.apk.sha256)
+- [CPE Relay 1.0.10 (arm64-v8a, optimized Release, debug-signed)](apk/CPE-Relay-v1.0.10-arm64-v8a-release-debug-signed.apk)
+- [SHA-256](apk/CPE-Relay-v1.0.10-arm64-v8a-release-debug-signed.apk.sha256)
+
+Версия 1.0.10 исправляет оставшийся длительный `Checksum mismatch` на
+входящем потоке Minecraft. Проверка encrypted batch теперь выполняется на
+копии AES-контекста и меняет рабочее состояние только после правильной
+keyed-checksum. Если один batch потерян, повреждён или приходит устаревшим,
+relay может безопасно найти следующую подтверждённую позицию AES-GCM и
+продолжить сессию; отдельный тест воспроизводит наблюдавшийся 104-байтовый
+пакет и проверяет следующий пакет после восстановления. Защита не отключена:
+неподтверждённые данные не передаются, а после 8 batch / 64 КиБ без успешной
+проверки соединение по-прежнему закрывается. События `encryption_recovery`
+видны в основном журнале даже при отключённых подробных логах.
 
 Версия 1.0.9 исправляет второй вариант `Checksum mismatch`: при большой
 серии разделённых map-пакетов повтор входящего encrypted batch мог прийти уже

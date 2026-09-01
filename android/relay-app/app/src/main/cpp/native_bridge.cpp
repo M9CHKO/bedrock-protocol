@@ -866,8 +866,14 @@ public:
                 isLoginStagePacket(event.packetName);
             const bool publishError = event.kind ==
                 bedrock::BedrockServerTransportEventKind::Error;
+            const bool publishEncryptionRecovery =
+                event.kind == bedrock::BedrockServerTransportEventKind::Receive &&
+                event.message.starts_with(
+                    "downstream encryption recovery"
+                );
             std::string breadcrumb;
-            if (record || publishLoginStage || publishError) {
+            if (record || publishLoginStage || publishError ||
+                publishEncryptionRecovery) {
                 breadcrumb = transportBreadcrumb(event);
                 if (sampleIndex != 0) {
                     breadcrumb += " sample_index=" +
@@ -898,6 +904,15 @@ public:
                     "transport"
                 );
                 state->flushFlight("transport_error");
+            } else if (publishEncryptionRecovery) {
+                state->push(
+                    "encryption_recovery",
+                    breadcrumb,
+                    event.message.find("succeeded") != std::string::npos
+                        ? "INFO"
+                        : "WARN",
+                    "transport"
+                );
             }
         });
         relay->live().server().onLoggingIn([this, state](

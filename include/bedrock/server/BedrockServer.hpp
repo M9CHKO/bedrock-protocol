@@ -1848,6 +1848,11 @@ private:
             std::vector<uint8_t> bytes;
         };
 
+        struct PendingEncryptedBatch {
+            uint64_t fingerprint = 0;
+            std::vector<uint8_t> bytes;
+        };
+
         mutable std::mutex mutex;
         // Node runs queue admission, _tick, and write on one event loop.
         // Serialize those boundaries per Player while allowing sendQueued()
@@ -1873,9 +1878,154 @@ private:
         bool inboundEncryptionFailed = false;
         std::size_t recentEncryptedBatchBytes = 0;
         std::deque<RecentEncryptedBatch> recentEncryptedBatches;
+        std::size_t pendingEncryptedBatchBytes = 0;
+        std::deque<PendingEncryptedBatch> pendingEncryptedBatches;
         ProtoDefVariableStorePtr protoDefVariables = makeProtoDefVariableStore();
         std::vector<QueuedPacket> queuedPackets;
     };
+
+    struct GcmRecoveryCandidate {
+        std::unique_ptr<BedrockCipherStream> decryptStream;
+        BedrockChecksumVerification verification;
+        uint64_t receiveCounter = 0;
+        uint64_t skippedBatches = 0;
+        std::size_t skippedCipherBytes = 0;
+    };
+
+    static void rememberAcceptedEncryptedBatch(
+        SessionState& session,
+        const std::vector<uint8_t>& encrypted,
+        uint64_t fingerprint,
+        uint64_t receiveCounter
+    ) {
+        // RakNet can surface a previously accepted encrypted application
+        // batch well after newer ordered traffic when a peer is congested by
+        // large split packets. Keep enough exact ciphertext history to cover
+        // the transport retry horizon.
+        constexpr std::size_t maxRecentBatchCount = 4096;
+        constexpr std::size_t maxRecentBatchBytes = 8 * 1024 * 1024;
+        if (encrypted.size() > maxRecentBatchBytes) {
+            return;
+        }
+
+        while (!session.recentEncryptedBatches.empty() &&
+               (session.recentEncryptedBatches.size() >= maxRecentBatchCount ||
+                session.recentEncryptedBatchBytes + encrypted.size() >
+                    maxRecentBatchBytes)) {
+            session.recentEncryptedBatchBytes -=
+                session.recentEncryptedBatches.front().bytes.size();
+            session.recentEncryptedBatches.pop_front();
+        }
+        session.recentEncryptedBatchBytes += encrypted.size();
+        session.recentEncryptedBatches.push_back({
+            fingerprint,
+            receiveCounter,
+            encrypted
+        });
+    }
+
+    static void clearPendingEncryptedBatches(SessionState& session) {
+        session.pendingEncryptedBatchBytes = 0;
+        session.pendingEncryptedBatches.clear();
+    }
+
+    static std::optional<GcmRecoveryCandidate> probeGcmForwardRecovery(
+        const BedrockCipherStream& decryptStream,
+        const std::vector<uint8_t>& encrypted,
+        uint64_t receiveCounter,
+        const std::vector<uint8_t>& secretKeyBytes,
+        const std::deque<SessionState::RecentEncryptedBatch>& recentBatches
+    ) {
+        // Bedrock's modern tagless GCM stream uses CTR for the plaintext. Its
+        // keystream position depends on byte count, not ciphertext contents;
+        // the protocol never finalizes or checks the GCM authentication tag.
+        // A keyed Bedrock checksum therefore gives us a safe oracle for a
+        // bounded forward-only resynchronization after RakNet loses or
+        // corrupts one application batch. Dummy bytes advance only a cloned
+        // context, and no hypothesis is committed without a valid checksum.
+        constexpr std::size_t maxExhaustiveSkippedBytes = 4096;
+        constexpr std::size_t maxHintedSkippedBytes = 64 * 1024;
+        constexpr uint64_t maxSkippedBatches = 4;
+        constexpr std::size_t maxRecentLengthHints = 64;
+
+        if (encrypted.empty()) {
+            return std::nullopt;
+        }
+
+        std::unordered_set<std::size_t> attemptedByteCounts;
+        const auto probeBytes = [&](std::size_t skippedBytes)
+            -> std::optional<GcmRecoveryCandidate> {
+            if (skippedBytes == 0 ||
+                skippedBytes > maxHintedSkippedBytes ||
+                !attemptedByteCounts.insert(skippedBytes).second) {
+                return std::nullopt;
+            }
+
+            auto candidateStream = decryptStream.clone();
+            (void) candidateStream->process(
+                std::vector<uint8_t>(skippedBytes, 0)
+            );
+            const auto aesPlaintext = candidateStream->process(encrypted);
+
+            for (uint64_t skippedBatches = 1;
+                 skippedBatches <= maxSkippedBatches;
+                 ++skippedBatches) {
+                if (receiveCounter >
+                    UINT64_MAX - skippedBatches - UINT64_C(1)) {
+                    break;
+                }
+                uint64_t candidateCounter =
+                    receiveCounter + skippedBatches;
+                auto candidateVerification =
+                    BedrockEncryption::verifyAesPlaintext(
+                        aesPlaintext,
+                        candidateCounter,
+                        secretKeyBytes
+                    );
+                if (candidateVerification.matches()) {
+                    GcmRecoveryCandidate result;
+                    result.decryptStream = std::move(candidateStream);
+                    result.verification = std::move(candidateVerification);
+                    result.receiveCounter = candidateCounter;
+                    result.skippedBatches = skippedBatches;
+                    result.skippedCipherBytes = skippedBytes;
+                    return result;
+                }
+            }
+            return std::nullopt;
+        };
+
+        // Player movement batches tend to keep one stable wire length. Try
+        // that overwhelmingly common case before the bounded byte scan.
+        for (uint64_t count = 1; count <= maxSkippedBatches; ++count) {
+            if (encrypted.size() <= maxHintedSkippedBytes / count) {
+                if (auto candidate = probeBytes(
+                        encrypted.size() * static_cast<std::size_t>(count)
+                    )) {
+                    return candidate;
+                }
+            }
+        }
+
+        std::size_t recentHints = 0;
+        for (auto it = recentBatches.rbegin();
+             it != recentBatches.rend() &&
+                 recentHints < maxRecentLengthHints;
+             ++it, ++recentHints) {
+            if (auto candidate = probeBytes(it->bytes.size())) {
+                return candidate;
+            }
+        }
+
+        for (std::size_t skippedBytes = 1;
+             skippedBytes <= maxExhaustiveSkippedBytes;
+             ++skippedBytes) {
+            if (auto candidate = probeBytes(skippedBytes)) {
+                return candidate;
+            }
+        }
+        return std::nullopt;
+    }
 
     std::chrono::milliseconds outboundQueueInterval() const {
         // JavaScript's `value || 20` keeps zero on the default and Node's
@@ -2561,8 +2711,11 @@ private:
         bool encryptedSession = false;
         bool compressionReady = false;
         bool duplicateEncryptedBatch = false;
+        bool encryptionRecoveryPending = false;
         uint64_t encryptedReceiveCounter = 0;
         uint64_t duplicateOriginalReceiveCounter = 0;
+        std::string encryptionRecoveryEvent;
+        std::string encryptionRecoveryFailure;
         std::optional<BedrockChecksumVerification> verification;
         {
             std::lock_guard<std::mutex> lock(session->mutex);
@@ -2594,52 +2747,199 @@ private:
                         duplicate->receiveCounter;
                 }
                 if (!duplicateEncryptedBatch) {
-                    verification = BedrockEncryption::decryptAndVerify(
-                        *session->decryptStream,
-                        encryptedOnly,
-                        session->receiveCounter,
-                        session->encryptionKeys.secretKeyBytes
-                    );
-                    if (verification && verification->matches()) {
-                        // RakNet can surface a previously accepted encrypted
-                        // application batch well after newer ordered traffic
-                        // when a peer is congested by large split packets.
-                        // Keep enough exact ciphertext history to cover the
-                        // transport retry horizon.  Comparing the fingerprint
-                        // first keeps ordinary movement traffic cheap while
-                        // the byte comparison prevents hash collisions from
-                        // being treated as replays.
-                        constexpr std::size_t maxRecentBatchCount = 4096;
-                        constexpr std::size_t maxRecentBatchBytes =
-                            8 * 1024 * 1024;
-                        if (encryptedOnly.size() <= maxRecentBatchBytes) {
-                            while (!session->recentEncryptedBatches.empty() &&
-                                   (session->recentEncryptedBatches.size() >=
-                                        maxRecentBatchCount ||
-                                    session->recentEncryptedBatchBytes +
-                                            encryptedOnly.size() >
-                                        maxRecentBatchBytes)) {
-                                session->recentEncryptedBatchBytes -=
-                                    session->recentEncryptedBatches.front()
-                                        .bytes.size();
-                                session->recentEncryptedBatches.pop_front();
-                            }
-                            session->recentEncryptedBatchBytes +=
-                                encryptedOnly.size();
-                            session->recentEncryptedBatches.push_back(
-                                {
-                                    encryptedFingerprint,
-                                    encryptedReceiveCounter,
-                                    std::move(encryptedOnly)
-                                }
-                            );
+                    const auto pendingDuplicate = std::find_if(
+                        session->pendingEncryptedBatches.begin(),
+                        session->pendingEncryptedBatches.end(),
+                        [&](const auto& pending) {
+                            return pending.fingerprint == encryptedFingerprint &&
+                                pending.bytes == encryptedOnly;
                         }
-                    } else if (verification) {
-                        // The continuous cipher cannot safely consume any
-                        // later batch after a failed checksum. Suppress the
-                        // queued-packet error cascade while the delayed
-                        // disconnect is delivered.
-                        session->inboundEncryptionFailed = true;
+                    );
+                    const bool modernGcm = session->decryptStream->algorithm() ==
+                        BedrockCipherAlgorithm::Aes256GcmNoTag;
+
+                    if (modernGcm &&
+                        pendingDuplicate !=
+                            session->pendingEncryptedBatches.end()) {
+                        encryptionRecoveryPending = true;
+                        encryptionRecoveryEvent =
+                            "downstream encryption recovery duplicate ignored "
+                            "receive_counter=" +
+                            std::to_string(encryptedReceiveCounter) +
+                            " pending_batches=" +
+                            std::to_string(
+                                session->pendingEncryptedBatches.size()
+                            ) +
+                            " pending_bytes=" +
+                            std::to_string(
+                                session->pendingEncryptedBatchBytes
+                            );
+                    } else if (modernGcm && !encryptedOnly.empty()) {
+                        // Verify on a deep copy first. A bad checksum must not
+                        // consume the live EVP stream or receive counter.
+                        auto directStream = session->decryptStream->clone();
+                        uint64_t directCounter = session->receiveCounter;
+                        auto directVerification =
+                            BedrockEncryption::decryptAndVerify(
+                                *directStream,
+                                encryptedOnly,
+                                directCounter,
+                                session->encryptionKeys.secretKeyBytes
+                            );
+
+                        if (directVerification &&
+                            directVerification->matches()) {
+                            const auto ignoredBatches =
+                                session->pendingEncryptedBatches.size();
+                            const auto ignoredBytes =
+                                session->pendingEncryptedBatchBytes;
+                            session->decryptStream = std::move(directStream);
+                            session->receiveCounter = directCounter;
+                            verification = std::move(directVerification);
+                            rememberAcceptedEncryptedBatch(
+                                *session,
+                                encryptedOnly,
+                                encryptedFingerprint,
+                                encryptedReceiveCounter
+                            );
+                            clearPendingEncryptedBatches(*session);
+                            if (ignoredBatches != 0) {
+                                encryptionRecoveryEvent =
+                                    "downstream encryption recovery succeeded "
+                                    "mode=ignored_stale receive_counter=" +
+                                    std::to_string(encryptedReceiveCounter) +
+                                    " ignored_batches=" +
+                                    std::to_string(ignoredBatches) +
+                                    " ignored_bytes=" +
+                                    std::to_string(ignoredBytes);
+                            }
+                        } else if (directVerification) {
+                            verification = std::move(directVerification);
+                            auto recovered = probeGcmForwardRecovery(
+                                *session->decryptStream,
+                                encryptedOnly,
+                                session->receiveCounter,
+                                session->encryptionKeys.secretKeyBytes,
+                                session->recentEncryptedBatches
+                            );
+                            if (recovered.has_value()) {
+                                const auto ignoredBatches =
+                                    session->pendingEncryptedBatches.size();
+                                const auto ignoredBytes =
+                                    session->pendingEncryptedBatchBytes;
+                                const auto acceptedCounter =
+                                    encryptedReceiveCounter +
+                                    recovered->skippedBatches;
+                                session->decryptStream =
+                                    std::move(recovered->decryptStream);
+                                session->receiveCounter =
+                                    recovered->receiveCounter;
+                                verification =
+                                    std::move(recovered->verification);
+                                rememberAcceptedEncryptedBatch(
+                                    *session,
+                                    encryptedOnly,
+                                    encryptedFingerprint,
+                                    acceptedCounter
+                                );
+                                clearPendingEncryptedBatches(*session);
+                                encryptionRecoveryEvent =
+                                    "downstream encryption recovery succeeded "
+                                    "mode=forward_resync receive_counter=" +
+                                    std::to_string(encryptedReceiveCounter) +
+                                    " skipped_batches=" +
+                                    std::to_string(recovered->skippedBatches) +
+                                    " skipped_cipher_bytes=" +
+                                    std::to_string(
+                                        recovered->skippedCipherBytes
+                                    ) +
+                                    " ignored_batches=" +
+                                    std::to_string(ignoredBatches) +
+                                    " ignored_bytes=" +
+                                    std::to_string(ignoredBytes);
+                            } else {
+                                constexpr std::size_t maxPendingBatches = 8;
+                                constexpr std::size_t maxPendingBytes =
+                                    64 * 1024;
+                                const bool canWait =
+                                    session->pendingEncryptedBatches.size() <
+                                        maxPendingBatches &&
+                                    encryptedOnly.size() <=
+                                        maxPendingBytes -
+                                            std::min(
+                                                session->pendingEncryptedBatchBytes,
+                                                maxPendingBytes
+                                            );
+                                if (canWait) {
+                                    session->pendingEncryptedBatchBytes +=
+                                        encryptedOnly.size();
+                                    session->pendingEncryptedBatches.push_back({
+                                        encryptedFingerprint,
+                                        encryptedOnly
+                                    });
+                                    encryptionRecoveryPending = true;
+                                    encryptionRecoveryEvent =
+                                        "downstream encryption recovery pending "
+                                        "receive_counter=" +
+                                        std::to_string(encryptedReceiveCounter) +
+                                        " pending_batches=" +
+                                        std::to_string(
+                                            session->pendingEncryptedBatches.size()
+                                        ) +
+                                        " pending_bytes=" +
+                                        std::to_string(
+                                            session->pendingEncryptedBatchBytes
+                                        ) +
+                                        " history_batches=" +
+                                        std::to_string(
+                                            session->recentEncryptedBatches.size()
+                                        ) +
+                                        " history_bytes=" +
+                                        std::to_string(
+                                            session->recentEncryptedBatchBytes
+                                        );
+                                } else {
+                                    session->inboundEncryptionFailed = true;
+                                    encryptionRecoveryFailure =
+                                        "recovery_exhausted pending_batches=" +
+                                        std::to_string(
+                                            session->pendingEncryptedBatches.size()
+                                        ) +
+                                        " pending_bytes=" +
+                                        std::to_string(
+                                            session->pendingEncryptedBatchBytes
+                                        ) +
+                                        " history_batches=" +
+                                        std::to_string(
+                                            session->recentEncryptedBatches.size()
+                                        ) +
+                                        " history_bytes=" +
+                                        std::to_string(
+                                            session->recentEncryptedBatchBytes
+                                        );
+                                }
+                            }
+                        }
+                    } else {
+                        // Preserve the exact legacy CFB8/EventEmitter failure
+                        // semantics. CFB8 ciphertext feeds the next block and
+                        // cannot use GCM's forward-only byte resynchronization.
+                        verification = BedrockEncryption::decryptAndVerify(
+                            *session->decryptStream,
+                            encryptedOnly,
+                            session->receiveCounter,
+                            session->encryptionKeys.secretKeyBytes
+                        );
+                        if (verification && verification->matches()) {
+                            rememberAcceptedEncryptedBatch(
+                                *session,
+                                encryptedOnly,
+                                encryptedFingerprint,
+                                encryptedReceiveCounter
+                            );
+                        } else if (verification) {
+                            session->inboundEncryptionFailed = true;
+                        }
                     }
                 }
             }
@@ -2665,6 +2965,29 @@ private:
                 );
                 return;
             }
+            if (encryptionRecoveryPending) {
+                emitTransport(
+                    BedrockServerTransportEventKind::Receive,
+                    connection.peer,
+                    payload,
+                    payload.empty() ? 0 : payload.front(),
+                    0,
+                    {},
+                    encryptionRecoveryEvent
+                );
+                return;
+            }
+            if (!encryptionRecoveryEvent.empty()) {
+                emitTransport(
+                    BedrockServerTransportEventKind::Receive,
+                    connection.peer,
+                    payload,
+                    payload.empty() ? 0 : payload.front(),
+                    0,
+                    {},
+                    encryptionRecoveryEvent
+                );
+            }
             if (!verification) {
                 return;
             }
@@ -2679,7 +3002,10 @@ private:
                     {},
                     "downstream encryption " + message +
                         " receive_counter=" +
-                        std::to_string(encryptedReceiveCounter)
+                        std::to_string(encryptedReceiveCounter) +
+                        (encryptionRecoveryFailure.empty()
+                            ? std::string{}
+                            : " " + encryptionRecoveryFailure)
                 );
                 emitPlayerError(connection, message);
                 // A listener can synchronously close the player/server. Avoid
@@ -2991,6 +3317,7 @@ private:
             session->inboundEncryptionFailed = false;
             session->recentEncryptedBatchBytes = 0;
             session->recentEncryptedBatches.clear();
+            clearPendingEncryptedBatches(*session);
         }
 
         BedrockServerClientHandshakeEvent clientHandshakeEvent;

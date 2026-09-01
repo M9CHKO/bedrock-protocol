@@ -140,6 +140,7 @@ struct BedrockServerTestAccess {
         session->inboundEncryptionFailed = false;
         session->recentEncryptedBatchBytes = 0;
         session->recentEncryptedBatches.clear();
+        BedrockServer::clearPendingEncryptedBatches(*session);
         return true;
     }
 
@@ -623,6 +624,23 @@ std::vector<uint8_t> makeValidEncryptedPlayerWire(
     );
 }
 
+std::vector<uint8_t> makeSequentialEncryptedPlayerWire(
+    bedrock::BedrockCipherStream& encryptStream,
+    const std::vector<uint8_t>& key,
+    uint64_t counter,
+    const std::vector<uint8_t>& compressionPacket
+) {
+    auto encrypted = encryptStream.process(
+        bedrock::BedrockEncryption::makeAesPlaintext(
+            compressionPacket,
+            counter,
+            key
+        )
+    );
+    encrypted.insert(encrypted.begin(), 0xfe);
+    return encrypted;
+}
+
 bool checkPlayerEventSnapshots() {
     const std::vector<uint8_t> key(32, 0);
     const std::vector<uint8_t> iv(16, 0);
@@ -692,6 +710,234 @@ bool checkPlayerEventSnapshots() {
         bedrock::BedrockServerTestAccess::closePlayer(server, connection);
         if (order != std::vector<int>({1, 2, 3})) {
             std::cerr << "[SMOKE] Player close emitted more than once\n";
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool checkGcmChecksumRecovery() {
+    const std::vector<uint8_t> key(32, 0);
+    const std::vector<uint8_t> iv(16, 0);
+
+    {
+        bedrock::BedrockServer server({.version = "1.20.61", .offline = true});
+        const auto connection = bedrock::BedrockServerTestAccess::addEncryptedPlayer(
+            server, key, iv, 19207, 18
+        );
+        const auto codec = bedrock::VersionedMcpeCodec::forVersion("1.20.61");
+        const auto tick = codec.packetCodec().makePacketByName(
+            "tick_sync",
+            std::vector<uint8_t>(16, 0)
+        );
+        const auto compressionPacket = codec.encodeEncryptedCompressionPacket(
+            {tick},
+            7
+        );
+        auto sender = bedrock::BedrockEncryption::createCipherStream(
+            bedrock::protocolVersionFor("1.20.61"),
+            key,
+            iv,
+            bedrock::BedrockCipherMode::Encrypt
+        );
+        const auto prefixWire = makeSequentialEncryptedPlayerWire(
+            *sender, key, 0, compressionPacket
+        );
+        const auto missingWire = makeSequentialEncryptedPlayerWire(
+            *sender, key, 1, compressionPacket
+        );
+        const auto recoveredWire = makeSequentialEncryptedPlayerWire(
+            *sender, key, 2, compressionPacket
+        );
+        const auto followingWire = makeSequentialEncryptedPlayerWire(
+            *sender, key, 3, compressionPacket
+        );
+
+        int tickCalls = 0;
+        int recoveryCalls = 0;
+        std::string recoveryDetail;
+        server.onInbound([&](const bedrock::BedrockServerPacketEvent& event) {
+            if (event.packet.name == "tick_sync") {
+                ++tickCalls;
+            }
+        });
+        server.onTransport([&](
+            const bedrock::BedrockServerTransportEvent& event
+        ) {
+            if (event.message.starts_with(
+                    "downstream encryption recovery succeeded "
+                    "mode=forward_resync"
+                )) {
+                ++recoveryCalls;
+                recoveryDetail = event.message;
+            }
+        });
+
+        // Simulate one reliable application batch disappearing after the
+        // sender has already advanced its continuous GCM stream.
+        bedrock::BedrockServerTestAccess::handle(
+            server,
+            connection,
+            prefixWire
+        );
+        bedrock::BedrockServerTestAccess::handle(
+            server,
+            connection,
+            recoveredWire
+        );
+        bedrock::BedrockServerTestAccess::handle(
+            server,
+            connection,
+            followingWire
+        );
+
+        const auto expectedRecovery =
+            "downstream encryption recovery succeeded mode=forward_resync "
+            "receive_counter=1 skipped_batches=1 skipped_cipher_bytes=" +
+            std::to_string(missingWire.size() - 1) +
+            " ignored_batches=0 ignored_bytes=0";
+        if (recoveryCalls != 1 || recoveryDetail != expectedRecovery ||
+            tickCalls != 3 ||
+            bedrock::BedrockServerTestAccess::counters(server, connection) !=
+                std::pair<uint64_t, uint64_t>{0, 4} ||
+            bedrock::BedrockServerTestAccess::scheduledCloses(server) != 0) {
+            std::cerr << "[SMOKE] GCM forward checksum recovery failed\n";
+            return false;
+        }
+    }
+
+    {
+        bedrock::BedrockServer server({.version = "1.20.61", .offline = true});
+        const auto connection = bedrock::BedrockServerTestAccess::addEncryptedPlayer(
+            server, key, iv, 19208, 19
+        );
+        const auto codec = bedrock::VersionedMcpeCodec::forVersion("1.20.61");
+        const auto tick = codec.packetCodec().makePacketByName(
+            "tick_sync",
+            std::vector<uint8_t>(16, 0)
+        );
+        const auto compressionPacket = codec.encodeEncryptedCompressionPacket(
+            {tick},
+            7
+        );
+        auto sender = bedrock::BedrockEncryption::createCipherStream(
+            bedrock::protocolVersionFor("1.20.61"),
+            key,
+            iv,
+            bedrock::BedrockCipherMode::Encrypt
+        );
+        const auto firstWire = makeSequentialEncryptedPlayerWire(
+            *sender, key, 0, compressionPacket
+        );
+        const auto secondWire = makeSequentialEncryptedPlayerWire(
+            *sender, key, 1, compressionPacket
+        );
+        auto staleWire = firstWire;
+        staleWire[staleWire.size() / 2] ^= 0x5a;
+
+        int tickCalls = 0;
+        int pendingCalls = 0;
+        int pendingDuplicateCalls = 0;
+        int ignoredStaleCalls = 0;
+        server.onInbound([&](const bedrock::BedrockServerPacketEvent& event) {
+            if (event.packet.name == "tick_sync") {
+                ++tickCalls;
+            }
+        });
+        server.onTransport([&](
+            const bedrock::BedrockServerTransportEvent& event
+        ) {
+            if (event.message.starts_with(
+                    "downstream encryption recovery pending"
+                )) {
+                ++pendingCalls;
+            } else if (event.message.starts_with(
+                    "downstream encryption recovery duplicate ignored"
+                )) {
+                ++pendingDuplicateCalls;
+            } else if (event.message.find("mode=ignored_stale") !=
+                    std::string::npos) {
+                ++ignoredStaleCalls;
+            }
+        });
+
+        bedrock::BedrockServerTestAccess::handle(server, connection, staleWire);
+        bedrock::BedrockServerTestAccess::handle(server, connection, staleWire);
+        if (pendingCalls != 1 || pendingDuplicateCalls != 1 || tickCalls != 0 ||
+            bedrock::BedrockServerTestAccess::counters(server, connection) !=
+                std::pair<uint64_t, uint64_t>{0, 0}) {
+            std::cerr << "[SMOKE] failed GCM probe mutated live cipher state\n";
+            return false;
+        }
+
+        bedrock::BedrockServerTestAccess::handle(server, connection, firstWire);
+        bedrock::BedrockServerTestAccess::handle(server, connection, secondWire);
+        if (ignoredStaleCalls != 1 || tickCalls != 2 ||
+            bedrock::BedrockServerTestAccess::counters(server, connection) !=
+                std::pair<uint64_t, uint64_t>{0, 2} ||
+            bedrock::BedrockServerTestAccess::scheduledCloses(server) != 0) {
+            std::cerr << "[SMOKE] GCM stale-batch recovery did not resume stream\n";
+            return false;
+        }
+    }
+
+    {
+        bedrock::BedrockServer server({.version = "1.20.61", .offline = true});
+        const auto connection = bedrock::BedrockServerTestAccess::addEncryptedPlayer(
+            server, key, iv, 19209, 20
+        );
+        const auto codec = bedrock::VersionedMcpeCodec::forVersion("1.20.61");
+        const auto tick = codec.packetCodec().makePacketByName(
+            "tick_sync",
+            std::vector<uint8_t>(16, 0)
+        );
+        const auto compressionPacket = codec.encodeEncryptedCompressionPacket(
+            {tick},
+            7
+        );
+        auto sender = bedrock::BedrockEncryption::createCipherStream(
+            bedrock::protocolVersionFor("1.20.61"),
+            key,
+            iv,
+            bedrock::BedrockCipherMode::Encrypt
+        );
+        const auto validWire = makeSequentialEncryptedPlayerWire(
+            *sender, key, 0, compressionPacket
+        );
+
+        int errorCalls = 0;
+        std::string transportFailure;
+        connection.onError([&](const std::string&) {
+            ++errorCalls;
+        });
+        server.onTransport([&](
+            const bedrock::BedrockServerTransportEvent& event
+        ) {
+            if (event.kind == bedrock::BedrockServerTransportEventKind::Error &&
+                event.message.find("recovery_exhausted") != std::string::npos) {
+                transportFailure = event.message;
+            }
+        });
+
+        for (std::size_t i = 0; i < 9; ++i) {
+            auto invalidWire = validWire;
+            const auto offset = 1 + (i % (invalidWire.size() - 1));
+            invalidWire[offset] ^= static_cast<uint8_t>(0x31 + i);
+            bedrock::BedrockServerTestAccess::handle(
+                server,
+                connection,
+                invalidWire
+            );
+        }
+
+        if (errorCalls != 1 ||
+            transportFailure.find("recovery_exhausted pending_batches=8") ==
+                std::string::npos ||
+            bedrock::BedrockServerTestAccess::counters(server, connection) !=
+                std::pair<uint64_t, uint64_t>{1, 0} ||
+            bedrock::BedrockServerTestAccess::scheduledCloses(server) != 1) {
+            std::cerr << "[SMOKE] bounded GCM recovery did not fail closed\n";
             return false;
         }
     }
@@ -3755,6 +4001,7 @@ int main(int argc, char** argv) {
 
     if (argc == 2 && std::string(argv[1]) == "--player-errors-only") {
         if (!checkPlayerEventSnapshots() ||
+            !checkGcmChecksumRecovery() ||
             !checkEncryptedPlayerErrorBranches() ||
             !checkPlayerReadPacketBoundaries() ||
             !checkRakNetCallbackBoundary() ||
@@ -3775,6 +4022,7 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (!checkPlayerEventSnapshots() ||
+        !checkGcmChecksumRecovery() ||
         !checkEncryptedPlayerErrorBranches() ||
         !checkPlayerReadPacketBoundaries() ||
         !checkRakNetCallbackBoundary() ||
