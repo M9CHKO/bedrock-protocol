@@ -127,122 +127,97 @@ final class MotionSmoother {
     }
 
     /**
-     * Tracks a sampled value with continuous position, velocity and
-     * acceleration. Packet corrections change the requested jerk rather
-     * than the rendered position, so they cannot create a one-frame snap.
+     * Stable adaptive low-pass for a related pair of values. Both values use
+     * one response coefficient, so a projected centre follows one coherent
+     * 2D path and a rectangle's width/height cannot acquire separate inertia.
+     *
+     * The derivative only changes the cutoff. The rendered value is always a
+     * convex interpolation towards the current sample; it therefore cannot
+     * continue along an old trajectory or overshoot a stationary target.
      */
-    static final class JerkAxis {
+    static final class AdaptivePair {
         private boolean initialized;
-        private double value;
-        private double velocity;
-        private double acceleration;
-        private double lastSample;
-        private double sampleVelocity;
-        private double stationarySeconds;
+        private double first;
+        private double second;
+        private double lastSampleFirst;
+        private double lastSampleSecond;
+        private double derivativeFirst;
+        private double derivativeSecond;
 
-        void reset(double newValue, double newVelocity) {
+        void reset(double newFirst, double newSecond) {
             initialized = true;
-            value = newValue;
-            velocity = newVelocity;
-            acceleration = 0.0;
-            lastSample = newValue;
-            sampleVelocity = newVelocity;
-            stationarySeconds = 0.0;
+            first = newFirst;
+            second = newSecond;
+            lastSampleFirst = newFirst;
+            lastSampleSecond = newSecond;
+            derivativeFirst = 0.0;
+            derivativeSecond = 0.0;
         }
 
         void step(
-            double sample,
+            double sampleFirst,
+            double sampleSecond,
             double deltaSeconds,
-            double maximumVelocity,
-            double maximumAcceleration,
-            double sampleVelocityResponseSeconds,
-            double correctionSeconds,
-            double accelerationResponseSeconds,
-            double jerkResponseSeconds
+            double minimumCutoffHz,
+            double speedCutoffSlope,
+            double derivativeCutoffHz,
+            double maximumCutoffHz
         ) {
-            if (!initialized || !Double.isFinite(value) ||
-                !Double.isFinite(velocity) ||
-                !Double.isFinite(acceleration)) {
-                reset(sample, 0.0);
+            if (!initialized || !Double.isFinite(first) ||
+                !Double.isFinite(second) ||
+                !Double.isFinite(derivativeFirst) ||
+                !Double.isFinite(derivativeSecond)) {
+                reset(sampleFirst, sampleSecond);
                 return;
             }
-            if (!Double.isFinite(sample) || deltaSeconds <= 0.0) return;
+            if (!Double.isFinite(sampleFirst) ||
+                !Double.isFinite(sampleSecond) || deltaSeconds <= 0.0) {
+                return;
+            }
 
             double step = clamp(deltaSeconds, 0.0001, 0.05);
-            double sampleDelta = sample - lastSample;
-            stationarySeconds = Math.abs(sampleDelta) < 0.001
-                ? Math.min(1.0, stationarySeconds + step)
-                : 0.0;
-            double measuredVelocity = clamp(
-                sampleDelta / step,
-                -maximumVelocity,
-                maximumVelocity
-            );
-            lastSample = sample;
-            sampleVelocity = filterVelocity(
-                sampleVelocity,
-                measuredVelocity,
-                step,
-                sampleVelocityResponseSeconds
-            );
+            double rawDerivativeFirst =
+                (sampleFirst - lastSampleFirst) / step;
+            double rawDerivativeSecond =
+                (sampleSecond - lastSampleSecond) / step;
+            lastSampleFirst = sampleFirst;
+            lastSampleSecond = sampleSecond;
 
-            double desiredVelocity = sampleVelocity +
-                (sample - value) / Math.max(0.008, correctionSeconds);
-            desiredVelocity = clamp(
-                desiredVelocity,
-                -maximumVelocity,
-                maximumVelocity
+            double derivativeAlpha = lowPassAlpha(
+                derivativeCutoffHz,
+                step
             );
-            double desiredAcceleration = clamp(
-                (desiredVelocity - velocity) /
-                    Math.max(0.006, accelerationResponseSeconds),
-                -maximumAcceleration,
-                maximumAcceleration
+            derivativeFirst += derivativeAlpha *
+                (rawDerivativeFirst - derivativeFirst);
+            derivativeSecond += derivativeAlpha *
+                (rawDerivativeSecond - derivativeSecond);
+            double speed = Math.hypot(derivativeFirst, derivativeSecond);
+            double cutoff = clamp(
+                minimumCutoffHz + speedCutoffSlope * speed,
+                minimumCutoffHz,
+                maximumCutoffHz
             );
-            acceleration = filterVelocity(
-                acceleration,
-                desiredAcceleration,
-                step,
-                jerkResponseSeconds
-            );
-            velocity = clamp(
-                velocity + acceleration * step,
-                -maximumVelocity,
-                maximumVelocity
-            );
-            double nextValue = value + velocity * step;
-
-            // A stationary target may be crossed only because the remaining
-            // correction is below a pixel. Clamp that final crossing without
-            // affecting a real direction change of a moving camera.
-            if ((Math.abs(sampleVelocity) < 0.5 ||
-                 stationarySeconds >= 0.035) &&
-                (sample - value) * (sample - nextValue) < 0.0) {
-                value = sample;
-                velocity = 0.0;
-                acceleration = 0.0;
-                sampleVelocity = 0.0;
-            } else {
-                value = nextValue;
-            }
+            double alpha = lowPassAlpha(cutoff, step);
+            first += alpha * (sampleFirst - first);
+            second += alpha * (sampleSecond - second);
         }
 
-        double value() {
-            return value;
+        double first() {
+            return first;
         }
 
-        double velocity() {
-            return velocity;
+        double second() {
+            return second;
         }
 
-        double acceleration() {
-            return acceleration;
-        }
-
-        boolean isSettled(double target, double valueEpsilon) {
-            return initialized && Math.abs(value - target) <= valueEpsilon &&
-                Math.abs(velocity) <= 0.5 &&
-                Math.abs(acceleration) <= 8.0;
+        boolean isSettled(
+            double targetFirst,
+            double targetSecond,
+            double valueEpsilon
+        ) {
+            return initialized &&
+                Math.abs(first - targetFirst) <= valueEpsilon &&
+                Math.abs(second - targetSecond) <= valueEpsilon;
         }
     }
 
@@ -250,13 +225,18 @@ final class MotionSmoother {
     static final class ScreenBox {
         private static final long MaximumFrameGapNanos = 250_000_000L;
 
-        private final JerkAxis centerX = new JerkAxis();
-        private final JerkAxis centerY = new JerkAxis();
-        private final JerkAxis width = new JerkAxis();
-        private final JerkAxis height = new JerkAxis();
+        private static final double CenterMinimumCutoffHz = 1.2;
+        private static final double CenterDerivativeCutoffHz = 0.5;
+        private static final double CenterMaximumCutoffHz = 12.0;
+        private static final double CenterRelativeSpeedGain = 14.0;
+        private static final double SizeMinimumCutoffHz = 0.9;
+        private static final double SizeDerivativeCutoffHz = 0.5;
+        private static final double SizeMaximumCutoffHz = 8.0;
+        private static final double SizeRelativeSpeedGain = 9.0;
+
+        private final AdaptivePair center = new AdaptivePair();
+        private final AdaptivePair size = new AdaptivePair();
         private boolean initialized;
-        private double lastCenterX;
-        private double lastCenterY;
         private long lastFrameNanos;
 
         void hide() {
@@ -289,12 +269,8 @@ final class MotionSmoother {
             if (!initialized || lastFrameNanos == 0 ||
                 frameGap > MaximumFrameGapNanos) {
                 initialized = true;
-                lastCenterX = targetCenterX;
-                lastCenterY = targetCenterY;
-                centerX.reset(targetCenterX, 0.0);
-                centerY.reset(targetCenterY, 0.0);
-                width.reset(targetWidth, 0.0);
-                height.reset(targetHeight, 0.0);
+                center.reset(targetCenterX, targetCenterY);
+                size.reset(targetWidth, targetHeight);
                 lastFrameNanos = frameNanos;
                 return false;
             }
@@ -308,107 +284,64 @@ final class MotionSmoother {
                 1.0,
                 Math.max(viewportWidth, viewportHeight)
             );
-            double rawSpeed = Math.sqrt(
-                (targetCenterX - lastCenterX) *
-                    (targetCenterX - lastCenterX) +
-                (targetCenterY - lastCenterY) *
-                    (targetCenterY - lastCenterY)
-            ) / deltaSeconds;
-            lastCenterX = targetCenterX;
-            lastCenterY = targetCenterY;
-
-            // A moving camera needs little latency, while a nearly static
-            // projection benefits from stronger packet-noise rejection.
-            // All parameters vary continuously; there is deliberately no
-            // hard deadband or hysteresis boundary.
-            double motion = clamp(
-                rawSpeed / (viewportSpan * 0.8),
-                0.0,
-                1.0
-            );
-            double sampleVelocityResponse = 0.075 - motion * 0.035;
-            double correctionSeconds = 0.065 - motion * 0.025;
-            double accelerationResponse = 0.040 - motion * 0.015;
-            double jerkResponse = 0.045 - motion * 0.018;
-            double maximumPositionVelocity = viewportSpan * 20.0;
-            double maximumPositionAcceleration = viewportSpan * 180.0;
-            centerX.step(
+            center.step(
                 targetCenterX,
-                deltaSeconds,
-                maximumPositionVelocity,
-                maximumPositionAcceleration,
-                sampleVelocityResponse,
-                correctionSeconds,
-                accelerationResponse,
-                jerkResponse
-            );
-            centerY.step(
                 targetCenterY,
                 deltaSeconds,
-                maximumPositionVelocity,
-                maximumPositionAcceleration,
-                sampleVelocityResponse,
-                correctionSeconds,
-                accelerationResponse,
-                jerkResponse
+                CenterMinimumCutoffHz,
+                CenterRelativeSpeedGain / viewportSpan,
+                CenterDerivativeCutoffHz,
+                CenterMaximumCutoffHz
             );
-
-            double maximumSizeVelocity = viewportSpan * 8.0;
-            double maximumSizeAcceleration = viewportSpan * 60.0;
-            width.step(
+            size.step(
                 targetWidth,
-                deltaSeconds,
-                maximumSizeVelocity,
-                maximumSizeAcceleration,
-                0.110 - motion * 0.035,
-                0.100 - motion * 0.025,
-                0.055 - motion * 0.015,
-                0.065 - motion * 0.020
-            );
-            height.step(
                 targetHeight,
                 deltaSeconds,
-                maximumSizeVelocity,
-                maximumSizeAcceleration,
-                0.110 - motion * 0.035,
-                0.100 - motion * 0.025,
-                0.055 - motion * 0.015,
-                0.065 - motion * 0.020
+                SizeMinimumCutoffHz,
+                SizeRelativeSpeedGain / viewportSpan,
+                SizeDerivativeCutoffHz,
+                SizeMaximumCutoffHz
             );
-            if (width.value() <= 0.0 || height.value() <= 0.0) {
-                width.reset(targetWidth, 0.0);
-                height.reset(targetHeight, 0.0);
+            if (size.first() <= 0.0 || size.second() <= 0.0) {
+                size.reset(targetWidth, targetHeight);
             }
             lastFrameNanos = frameNanos;
-            return !centerX.isSettled(targetCenterX, 0.08) ||
-                !centerY.isSettled(targetCenterY, 0.08) ||
-                !width.isSettled(targetWidth, 0.08) ||
-                !height.isSettled(targetHeight, 0.08);
+            return !center.isSettled(targetCenterX, targetCenterY, 0.08) ||
+                !size.isSettled(targetWidth, targetHeight, 0.08);
         }
 
         double left() {
-            return centerX.value() - width.value() * 0.5;
+            return center.first() - size.first() * 0.5;
         }
 
         double top() {
-            return centerY.value() - height.value() * 0.5;
+            return center.second() - size.second() * 0.5;
         }
 
         double right() {
-            return centerX.value() + width.value() * 0.5;
+            return center.first() + size.first() * 0.5;
         }
 
         double bottom() {
-            return centerY.value() + height.value() * 0.5;
+            return center.second() + size.second() * 0.5;
         }
 
         double centerX() {
-            return centerX.value();
+            return center.first();
         }
 
         double centerY() {
-            return centerY.value();
+            return center.second();
         }
+    }
+
+    private static double lowPassAlpha(
+        double cutoffHz,
+        double deltaSeconds
+    ) {
+        double cutoff = Math.max(0.001, cutoffHz);
+        double step = Math.max(0.0, deltaSeconds);
+        return clamp(1.0 - Math.exp(-2.0 * Math.PI * cutoff * step), 0.0, 1.0);
     }
 
     static double angleDifference(double from, double to) {

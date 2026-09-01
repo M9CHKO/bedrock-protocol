@@ -146,6 +146,7 @@ public final class MotionSmootherTest {
         box.step(880.0, 80.0, 920.0, 180.0, now, 1080.0, 1920.0);
         assertTrue(box.centerX() > 100.0);
         assertTrue(box.centerX() < 700.0);
+        double previous = box.centerX();
 
         for (int frame = 0; frame < 180; ++frame) {
             now += 16_666_667L;
@@ -159,9 +160,36 @@ public final class MotionSmootherTest {
                 1920.0
             );
             assertTrue(Double.isFinite(box.centerX()));
-            assertTrue(box.centerX() < 940.0);
+            assertTrue(box.centerX() >= previous - 1.0e-9);
+            assertTrue(box.centerX() <= 900.0 + 1.0e-9);
+            previous = box.centerX();
         }
         assertEquals(900.0, box.centerX(), 0.1);
+    }
+
+    @Test
+    public void screenBoxCentreFollowsOneCoherentTwoDimensionalPath() {
+        MotionSmoother.ScreenBox box = new MotionSmoother.ScreenBox();
+        long now = 1_000_000_000L;
+        box.step(80.0, 50.0, 120.0, 150.0, now, 1080.0, 1920.0);
+
+        for (int frame = 0; frame < 20; ++frame) {
+            now += 8_333_333L;
+            box.step(
+                880.0,
+                450.0,
+                920.0,
+                550.0,
+                now,
+                1080.0,
+                1920.0
+            );
+            double horizontal = box.centerX() - 100.0;
+            double vertical = box.centerY() - 100.0;
+            assertEquals(horizontal, vertical * 2.0, 1.0e-8);
+            assertEquals(40.0, box.right() - box.left(), 1.0e-8);
+            assertEquals(100.0, box.bottom() - box.top(), 1.0e-8);
+        }
     }
 
     @Test
@@ -194,54 +222,91 @@ public final class MotionSmootherTest {
     }
 
     @Test
-    public void jerkAxisAbsorbsTwentyHertzCameraCorrectionsAt120Fps() {
-        MotionSmoother.JerkAxis axis = new MotionSmoother.JerkAxis();
-        axis.reset(100.0, 0.0);
-        double deltaSeconds = 1.0 / 120.0;
-        double previous = axis.value();
-        double previousAcceleration = axis.acceleration();
+    public void screenBoxAbsorbsTwentyHertzCameraCorrectionsAt120Fps() {
+        MotionSmoother.ScreenBox box = new MotionSmoother.ScreenBox();
+        long now = 1_000_000_000L;
+        box.step(80.0, 80.0, 120.0, 180.0, now, 1080.0, 1920.0);
+        double previous = box.centerX();
         double maximumFrameDistance = 0.0;
-        double maximumAccelerationChange = 0.0;
 
         for (int frame = 1; frame <= 720; ++frame) {
+            now += 8_333_333L;
             double continuousMotion = 100.0 + frame * 2.0;
             int packetPhase = frame % 6;
             double packetCorrection = ((frame / 6) & 1) == 0
                 ? -8.0
                 : 8.0;
             packetCorrection *= 1.0 - packetPhase / 6.0;
-            axis.step(
-                continuousMotion + packetCorrection,
-                deltaSeconds,
-                40_000.0,
-                360_000.0,
-                0.070,
-                0.060,
-                0.035,
-                0.040
+            double target = continuousMotion + packetCorrection;
+            box.step(
+                target - 20.0,
+                80.0,
+                target + 20.0,
+                180.0,
+                now,
+                1080.0,
+                1920.0
             );
 
-            double frameDistance = axis.value() - previous;
-            double accelerationChange = Math.abs(
-                axis.acceleration() - previousAcceleration
-            );
+            double frameDistance = box.centerX() - previous;
             if (frame > 120) {
                 assertTrue(frameDistance >= -0.01);
                 maximumFrameDistance = Math.max(
                     maximumFrameDistance,
                     frameDistance
                 );
-                maximumAccelerationChange = Math.max(
-                    maximumAccelerationChange,
-                    accelerationChange
-                );
             }
-            previous = axis.value();
-            previousAcceleration = axis.acceleration();
+            previous = box.centerX();
         }
 
-        assertTrue(maximumFrameDistance < 4.0);
-        assertTrue(maximumAccelerationChange < 2_100.0);
-        assertEquals(1_540.0, axis.value(), 8.0);
+        assertTrue(maximumFrameDistance < 4.5);
+        assertEquals(1_540.0, box.centerX(), 18.0);
+    }
+
+    @Test
+    public void screenBoxChangesDirectionOnceWithoutRinging() {
+        MotionSmoother.ScreenBox box = new MotionSmoother.ScreenBox();
+        long now = 1_000_000_000L;
+        box.step(80.0, 80.0, 120.0, 180.0, now, 1080.0, 1920.0);
+
+        double previous = box.centerX();
+        int direction = 0;
+        int directionChanges = 0;
+        for (int frame = 1; frame <= 360; ++frame) {
+            now += 8_333_333L;
+            double target;
+            if (frame <= 80) {
+                target = 100.0 + frame * 5.0;
+            } else if (frame <= 160) {
+                target = 500.0 - (frame - 80) * 5.0;
+            } else {
+                target = 100.0;
+            }
+            box.step(
+                target - 20.0,
+                80.0,
+                target + 20.0,
+                180.0,
+                now,
+                1080.0,
+                1920.0
+            );
+
+            double current = box.centerX();
+            double delta = current - previous;
+            int nextDirection = delta > 0.01 ? 1 : delta < -0.01 ? -1 : 0;
+            if (nextDirection != 0) {
+                if (direction != 0 && direction != nextDirection) {
+                    ++directionChanges;
+                }
+                direction = nextDirection;
+            }
+            assertTrue(current >= 100.0 - 1.0e-9);
+            assertTrue(current <= 500.0 + 1.0e-9);
+            previous = current;
+        }
+
+        assertEquals(1, directionChanges);
+        assertEquals(100.0, box.centerX(), 0.1);
     }
 }
