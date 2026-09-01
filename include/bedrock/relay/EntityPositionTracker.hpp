@@ -77,6 +77,38 @@ public:
         }
     }
 
+    // Decodes PlayerAuthInput and applies its dedicated camera-forward
+    // vector while holding one lock. This prevents readers from observing
+    // the packet's body rotation for a fraction of a frame before the true
+    // camera orientation is installed.
+    bool observeServerboundWithCameraForward(
+        const VersionedGamePacket& packet,
+        float forwardX,
+        float forwardY,
+        float forwardZ
+    ) noexcept {
+        if (packet.name != "player_auth_input") {
+            observeServerbound(packet);
+            return false;
+        }
+
+        std::lock_guard lock(mutex_);
+        ++recognizedPackets_;
+        try {
+            readPlayerAuthInputLocked(packet);
+            const bool applied = applyCameraForwardLocked(
+                forwardX,
+                forwardY,
+                forwardZ
+            );
+            ++decodedPackets_;
+            return applied;
+        } catch (...) {
+            ++parseFailures_;
+            return false;
+        }
+    }
+
     // PlayerAuthInput carries a dedicated camera forward vector on modern
     // Bedrock versions. It may differ from the player's body rotation (for
     // example while flying or when a camera preset is active), so prefer it
@@ -87,27 +119,7 @@ public:
         float forwardZ
     ) noexcept {
         std::lock_guard lock(mutex_);
-        if (!camera_.known || !std::isfinite(forwardX) ||
-            !std::isfinite(forwardY) || !std::isfinite(forwardZ)) {
-            return false;
-        }
-
-        const float length = std::sqrt(
-            forwardX * forwardX +
-            forwardY * forwardY +
-            forwardZ * forwardZ
-        );
-        if (!std::isfinite(length) || length < 0.0001f) return false;
-
-        const float normalizedX = forwardX / length;
-        const float normalizedY = std::clamp(forwardY / length, -1.0f, 1.0f);
-        const float normalizedZ = forwardZ / length;
-        constexpr float RadiansToDegrees = 57.29577951308232f;
-        camera_.pitch = std::asin(-normalizedY) * RadiansToDegrees;
-        camera_.yaw = std::atan2(-normalizedX, normalizedZ) *
-            RadiansToDegrees;
-        camera_.updatedAtMs = monotonicMilliseconds();
-        return true;
+        return applyCameraForwardLocked(forwardX, forwardY, forwardZ);
     }
 
     void observeClientbound(const VersionedGamePacket& packet) noexcept {
@@ -214,6 +226,34 @@ private:
     uint64_t recognizedPackets_ = 0;
     uint64_t decodedPackets_ = 0;
     uint64_t parseFailures_ = 0;
+
+    bool applyCameraForwardLocked(
+        float forwardX,
+        float forwardY,
+        float forwardZ
+    ) noexcept {
+        if (!camera_.known || !std::isfinite(forwardX) ||
+            !std::isfinite(forwardY) || !std::isfinite(forwardZ)) {
+            return false;
+        }
+
+        const float length = std::sqrt(
+            forwardX * forwardX +
+            forwardY * forwardY +
+            forwardZ * forwardZ
+        );
+        if (!std::isfinite(length) || length < 0.0001f) return false;
+
+        const float normalizedX = forwardX / length;
+        const float normalizedY = std::clamp(forwardY / length, -1.0f, 1.0f);
+        const float normalizedZ = forwardZ / length;
+        constexpr float RadiansToDegrees = 57.29577951308232f;
+        camera_.pitch = std::asin(-normalizedY) * RadiansToDegrees;
+        camera_.yaw = std::atan2(-normalizedX, normalizedZ) *
+            RadiansToDegrees;
+        camera_.updatedAtMs = monotonicMilliseconds();
+        return true;
+    }
 
     static bool isRecognizedClientbound(std::string_view name) noexcept {
         return name == "start_game" || name == "change_dimension" ||

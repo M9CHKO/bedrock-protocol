@@ -199,6 +199,34 @@ int main() {
         return 1;
     }
 
+    const auto recognizedBeforeAtomic = state.recognizedPackets;
+    const auto decodedBeforeAtomic = state.decodedPackets;
+    std::vector<uint8_t> atomicAuth;
+    writeFloat(atomicAuth, 45.0f);
+    writeFloat(atomicAuth, -45.0f);
+    writeFloat(atomicAuth, 103.0f);
+    writeFloat(atomicAuth, 71.0f);
+    writeFloat(atomicAuth, -48.0f);
+    if (!tracker.observeServerboundWithCameraForward(
+            packet("player_auth_input", std::move(atomicAuth)),
+            0.0f,
+            0.0f,
+            1.0f
+        )) {
+        std::cerr << "atomic camera-forward update was rejected\n";
+        return 1;
+    }
+    state = tracker.snapshot();
+    if (!near(state.camera.x, 103.0f) || !near(state.camera.y, 71.0f) ||
+        !near(state.camera.z, -48.0f) ||
+        !near(state.camera.pitch, 0.0f) ||
+        !near(state.camera.yaw, 0.0f) ||
+        state.recognizedPackets != recognizedBeforeAtomic + 1 ||
+        state.decodedPackets != decodedBeforeAtomic + 1) {
+        std::cerr << "atomic camera sample was not published as one packet\n";
+        return 1;
+    }
+
     const auto cameraOnly = tracker.cameraSnapshot();
     if (!cameraOnly.known || !near(cameraOnly.x, state.camera.x) ||
         !near(cameraOnly.y, state.camera.y) ||

@@ -166,8 +166,8 @@ final class EntityOutlineOverlayController {
                 "INFO",
                 "entities",
                 "Entity outline overlay opened; mode=2d_boxes " +
-                    "smoothing=world+screen_no_overshoot " +
-                    "predictor=monotonic cameraPollMs=12"
+                    "smoothing=world+screen_jerk_limited " +
+                    "predictor=monotonic cameraSample=atomic cameraPollMs=12"
             );
         } catch (Throwable error) {
             outlineView = null;
@@ -576,8 +576,8 @@ final class EntityOutlineOverlayController {
         private static final long MaxCameraPredictionNanos = 95_000_000L;
         private static final long CameraRenderLeadNanos = 18_000_000L;
         private static final long MaximumFrameGapNanos = 250_000_000L;
-        private static final double CameraPositionVelocityResponse = 0.045;
-        private static final double CameraAngleVelocityResponse = 0.028;
+        private static final double CameraPositionVelocityResponse = 0.065;
+        private static final double CameraAngleVelocityResponse = 0.050;
         private static final double NearPlane = 0.12;
 
         private final Map<String, RenderTrack> tracks = new HashMap<>();
@@ -716,6 +716,7 @@ final class EntityOutlineOverlayController {
                         deltaX,
                         elapsedSeconds,
                         100.0,
+                        800.0,
                         CameraPositionVelocityResponse
                     );
                     cameraVelocityY = filteredCameraVelocity(
@@ -723,6 +724,7 @@ final class EntityOutlineOverlayController {
                         deltaY,
                         elapsedSeconds,
                         100.0,
+                        800.0,
                         CameraPositionVelocityResponse
                     );
                     cameraVelocityZ = filteredCameraVelocity(
@@ -730,6 +732,7 @@ final class EntityOutlineOverlayController {
                         deltaZ,
                         elapsedSeconds,
                         100.0,
+                        800.0,
                         CameraPositionVelocityResponse
                     );
                     cameraVelocityPitch = filteredCameraVelocity(
@@ -737,6 +740,7 @@ final class EntityOutlineOverlayController {
                         sample.pitch - cameraSamplePitch,
                         elapsedSeconds,
                         2160.0,
+                        36_000.0,
                         CameraAngleVelocityResponse
                     );
                     cameraVelocityYaw = filteredCameraVelocity(
@@ -744,6 +748,7 @@ final class EntityOutlineOverlayController {
                         unwrappedYaw - cameraSampleYaw,
                         elapsedSeconds,
                         2160.0,
+                        36_000.0,
                         CameraAngleVelocityResponse
                     );
                 } else if (elapsedSeconds > 0.25) {
@@ -775,6 +780,7 @@ final class EntityOutlineOverlayController {
             double delta,
             double elapsedSeconds,
             double maximum,
+            double maximumAcceleration,
             double responseSeconds
         ) {
             double measured = Math.abs(delta) < 0.00001
@@ -784,6 +790,17 @@ final class EntityOutlineOverlayController {
                     -maximum,
                     maximum
                 );
+            if (Double.isFinite(current)) {
+                double maximumChange = Math.max(
+                    0.0,
+                    maximumAcceleration * elapsedSeconds
+                );
+                measured = MotionSmoother.clamp(
+                    measured,
+                    current - maximumChange,
+                    current + maximumChange
+                );
+            }
             return MotionSmoother.filterVelocity(
                 current,
                 measured,

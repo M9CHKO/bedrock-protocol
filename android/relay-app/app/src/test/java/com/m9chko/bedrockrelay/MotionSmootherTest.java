@@ -192,4 +192,56 @@ public final class MotionSmootherTest {
         assertTrue(maximum - minimum < 0.5);
         assertEquals(100.0, box.centerX(), 0.5);
     }
+
+    @Test
+    public void jerkAxisAbsorbsTwentyHertzCameraCorrectionsAt120Fps() {
+        MotionSmoother.JerkAxis axis = new MotionSmoother.JerkAxis();
+        axis.reset(100.0, 0.0);
+        double deltaSeconds = 1.0 / 120.0;
+        double previous = axis.value();
+        double previousAcceleration = axis.acceleration();
+        double maximumFrameDistance = 0.0;
+        double maximumAccelerationChange = 0.0;
+
+        for (int frame = 1; frame <= 720; ++frame) {
+            double continuousMotion = 100.0 + frame * 2.0;
+            int packetPhase = frame % 6;
+            double packetCorrection = ((frame / 6) & 1) == 0
+                ? -8.0
+                : 8.0;
+            packetCorrection *= 1.0 - packetPhase / 6.0;
+            axis.step(
+                continuousMotion + packetCorrection,
+                deltaSeconds,
+                40_000.0,
+                360_000.0,
+                0.070,
+                0.060,
+                0.035,
+                0.040
+            );
+
+            double frameDistance = axis.value() - previous;
+            double accelerationChange = Math.abs(
+                axis.acceleration() - previousAcceleration
+            );
+            if (frame > 120) {
+                assertTrue(frameDistance >= -0.01);
+                maximumFrameDistance = Math.max(
+                    maximumFrameDistance,
+                    frameDistance
+                );
+                maximumAccelerationChange = Math.max(
+                    maximumAccelerationChange,
+                    accelerationChange
+                );
+            }
+            previous = axis.value();
+            previousAcceleration = axis.acceleration();
+        }
+
+        assertTrue(maximumFrameDistance < 4.0);
+        assertTrue(maximumAccelerationChange < 2_100.0);
+        assertEquals(1_540.0, axis.value(), 8.0);
+    }
 }

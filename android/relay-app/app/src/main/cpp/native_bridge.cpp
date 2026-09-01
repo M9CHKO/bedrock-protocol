@@ -1275,7 +1275,7 @@ public:
         relay->live().onServerbound([state, version](
             bedrock::BedrockRelayPacketEvent& event
         ) {
-            state->entityPositions.observeServerbound(event.packet);
+            bool positionObserved = false;
             if (event.packet.name == "player_auth_input") {
                 try {
                     bedrock::RelayPacketEvent decoded(version, event);
@@ -1295,16 +1295,22 @@ public:
                     );
                     if (std::isfinite(forwardX) &&
                         std::isfinite(forwardY) &&
-                        std::isfinite(forwardZ) &&
-                        state->entityPositions.observeCameraForward(
-                            static_cast<float>(forwardX),
-                            static_cast<float>(forwardY),
-                            static_cast<float>(forwardZ)
-                        )) {
-                        state->cameraOrientationUpdates.fetch_add(
-                            1,
-                            std::memory_order_relaxed
-                        );
+                        std::isfinite(forwardZ)) {
+                        const bool orientationApplied =
+                            state->entityPositions
+                                .observeServerboundWithCameraForward(
+                                    event.packet,
+                                    static_cast<float>(forwardX),
+                                    static_cast<float>(forwardY),
+                                    static_cast<float>(forwardZ)
+                                );
+                        positionObserved = true;
+                        if (orientationApplied) {
+                            state->cameraOrientationUpdates.fetch_add(
+                                1,
+                                std::memory_order_relaxed
+                            );
+                        }
                     }
                 } catch (const std::exception& error) {
                     const auto failures =
@@ -1322,6 +1328,9 @@ public:
                         );
                     }
                 }
+            }
+            if (!positionObserved) {
+                state->entityPositions.observeServerbound(event.packet);
             }
             if (isFlightPacket(event.packet.name)) {
                 state->recordFlight(
