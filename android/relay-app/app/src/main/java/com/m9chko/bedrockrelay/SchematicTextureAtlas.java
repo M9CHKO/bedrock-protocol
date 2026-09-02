@@ -5,6 +5,8 @@ import android.graphics.BitmapFactory;
 import android.graphics.Color;
 
 import android.content.Context;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.SystemClock;
 
 import java.io.File;
@@ -13,6 +15,8 @@ import java.util.HashSet;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * Small original pixel-art texture set embedded as code. No Mojang artwork is
@@ -20,14 +24,28 @@ import java.util.Set;
  */
 final class SchematicTextureAtlas {
     private static final int SIDE = 16;
-    private final Map<String, Bitmap> textures = new HashMap<>();
+    private final Map<String, Bitmap> fallbackTextures = new HashMap<>();
+    private final Map<String, Bitmap> officialTextures = new HashMap<>();
     private final Set<String> missingOfficial = new HashSet<>();
+    private final Set<String> pendingOfficial = new HashSet<>();
     private final OfficialTexturePack officialPack;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final ExecutorService decoder = Executors.newSingleThreadExecutor(
+        runnable -> {
+            Thread thread = new Thread(runnable, "schematic-textures");
+            thread.setDaemon(true);
+            return thread;
+        }
+    );
+    private final Runnable invalidation;
     private long loadedRevision = Long.MIN_VALUE;
     private long nextRevisionCheckAtMs;
+    private long generation;
+    private boolean closed;
 
-    SchematicTextureAtlas(Context context) {
+    SchematicTextureAtlas(Context context, Runnable invalidation) {
         officialPack = new OfficialTexturePack(context);
+        this.invalidation = invalidation;
     }
 
     Bitmap textureFor(String blockState) {
@@ -40,37 +58,92 @@ final class SchematicTextureAtlas {
             nextRevisionCheckAtMs = now + 1_000L;
             long revision = officialPack.revision();
             if (revision != loadedRevision) {
-                clear();
+                clearTextures();
                 loadedRevision = revision;
             }
         }
         String blockName = TexturePackPaths.normalizedBlockName(blockState);
         String officialKey = "official:" + blockName + ":" + face;
-        Bitmap existing = textures.get(officialKey);
+        Bitmap existing = officialTextures.get(officialKey);
         if (existing != null) return existing;
-        if (!missingOfficial.contains(officialKey)) {
-            File officialFile = officialPack.blockTextureFile(blockState, face);
-            Bitmap official = decodeOfficial(officialFile);
-            if (official != null) {
-                textures.put(officialKey, official);
-                return official;
-            }
-            missingOfficial.add(officialKey);
+        if (!closed && !missingOfficial.contains(officialKey) &&
+            pendingOfficial.add(officialKey)) {
+            scheduleOfficialTexture(
+                officialKey,
+                blockState,
+                face,
+                generation
+            );
         }
         String key = textureKey(blockState);
-        existing = textures.get(key);
+        existing = fallbackTextures.get(key);
         if (existing != null) return existing;
         Bitmap created = createTexture(key);
-        textures.put(key, created);
+        fallbackTextures.put(key, created);
         return created;
     }
 
-    void clear() {
-        for (Bitmap bitmap : textures.values()) {
+    int officialTextureCount() {
+        return officialTextures.size();
+    }
+
+    int pendingTextureCount() {
+        return pendingOfficial.size();
+    }
+
+    void close() {
+        closed = true;
+        ++generation;
+        decoder.shutdownNow();
+        clearTextures();
+    }
+
+    private void scheduleOfficialTexture(
+        String key,
+        String blockState,
+        String face,
+        long requestedGeneration
+    ) {
+        decoder.execute(() -> {
+            Bitmap decoded = null;
+            try {
+                File source = officialPack.blockTextureFile(blockState, face);
+                decoded = decodeOfficial(source);
+            } catch (Throwable ignored) {
+            }
+            Bitmap result = decoded;
+            mainHandler.post(() -> {
+                if (closed || generation != requestedGeneration) {
+                    if (result != null && !result.isRecycled()) result.recycle();
+                    return;
+                }
+                pendingOfficial.remove(key);
+                if (result == null) {
+                    missingOfficial.add(key);
+                    return;
+                }
+                Bitmap previous = officialTextures.put(key, result);
+                if (previous != null && previous != result &&
+                    !previous.isRecycled()) {
+                    previous.recycle();
+                }
+                if (invalidation != null) invalidation.run();
+            });
+        });
+    }
+
+    private void clearTextures() {
+        ++generation;
+        for (Bitmap bitmap : fallbackTextures.values()) {
             if (bitmap != null && !bitmap.isRecycled()) bitmap.recycle();
         }
-        textures.clear();
+        for (Bitmap bitmap : officialTextures.values()) {
+            if (bitmap != null && !bitmap.isRecycled()) bitmap.recycle();
+        }
+        fallbackTextures.clear();
+        officialTextures.clear();
         missingOfficial.clear();
+        pendingOfficial.clear();
     }
 
     static String textureKey(String state) {

@@ -12,7 +12,8 @@ public final class NativeBridge {
         String destinationHost,
         int destinationPort,
         String version,
-        String authCacheDirectory
+        String authCacheDirectory,
+        String minecraftDataDirectory
     );
 
     public static native String supportedVersions();
@@ -28,7 +29,8 @@ public final class NativeBridge {
     public static native void configureGameplayFeatures(
         boolean autoArmorEnabled,
         boolean autoTotemEnabled,
-        boolean miniMapEnabled
+        boolean miniMapEnabled,
+        boolean schematicEnabled
     );
 
     public static native String snapshot();
@@ -39,6 +41,9 @@ public final class NativeBridge {
         long afterRevision,
         int radiusChunks
     );
+
+    /** Exact top of the highest collision shape, or NaN when unavailable. */
+    public static native float worldSurfaceY(int worldX, int worldZ);
 
     public static native String entityCameraSnapshot();
 

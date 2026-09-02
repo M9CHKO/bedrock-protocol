@@ -49,6 +49,10 @@ struct BedrockLiveRelayOptions {
     // palette/order issues. This never changes packet forwarding or parsing
     // policy and does not print content keys or CDN URLs.
     bool itemResourceDiagnostics = false;
+    // Upper bound for exact retained level_chunk packet bytes per downstream
+    // session. Frontends may lower this on memory-constrained devices.
+    std::size_t levelChunkRetentionMaximumBytes =
+        DefaultLevelChunkRetentionMaximumBytes;
     // Relay#forceSingle rejects a second transport while any accepted
     // downstream Player session is still present.
     bool forceSingle = false;

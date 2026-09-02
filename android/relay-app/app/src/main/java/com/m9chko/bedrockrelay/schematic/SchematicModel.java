@@ -18,6 +18,7 @@ public final class SchematicModel {
     private final List<String> palette;
     private final int[] blocks;
     private final int[] boundaryBlocks;
+    private final boolean[] airPalette;
     private final int nonAirBlocks;
 
     SchematicModel(
@@ -58,6 +59,7 @@ public final class SchematicModel {
         for (int index = 0; index < air.length; ++index) {
             air[index] = isAirState(this.palette.get(index));
         }
+        airPalette = air;
         for (int index = 0; index < this.blocks.length; ++index) {
             int paletteIndex = this.blocks[index];
             if (paletteIndex < 0 || paletteIndex >= this.palette.size()) {
@@ -134,6 +136,17 @@ public final class SchematicModel {
 
     public String paletteState(int index) {
         return palette.get(index);
+    }
+
+    /** Outside the model is air; used to omit fully covered render faces. */
+    public boolean isAirAt(int x, int y, int z) {
+        if (x < 0 || x >= sizeX || y < 0 || y >= sizeY ||
+            z < 0 || z >= sizeZ) {
+            return true;
+        }
+        int paletteIndex = blocks[(y * sizeZ + z) * sizeX + x];
+        return paletteIndex < 0 || paletteIndex >= airPalette.length ||
+            airPalette[paletteIndex];
     }
 
     public int paletteSize() {

@@ -1131,10 +1131,21 @@ final class RelayOverlayController {
 
         root.addView(sectionHeader("ПОЗИЦИЯ В МИРЕ"));
         int anchorX = preferences.getInt(RelayService.KEY_SCHEMATIC_ANCHOR_X, 0);
-        int anchorY = preferences.getInt(RelayService.KEY_SCHEMATIC_ANCHOR_Y, 0);
+        float anchorY = preferences.getFloat(
+            RelayService.KEY_SCHEMATIC_ANCHOR_Y_EXACT,
+            preferences.getInt(RelayService.KEY_SCHEMATIC_ANCHOR_Y, 0)
+        );
         int anchorZ = preferences.getInt(RelayService.KEY_SCHEMATIC_ANCHOR_Z, 0);
+        boolean schematicPlaced = preferences.getBoolean(
+            RelayService.KEY_SCHEMATIC_PLACED,
+            false
+        );
         TextView coordinates = text(
-            "Якорь: X " + anchorX + "  Y " + anchorY + "  Z " + anchorZ,
+            schematicPlaced
+                ? "Фиксированный якорь: X " + anchorX + "  Y " +
+                    formatSchematicY(anchorY) +
+                    "  Z " + anchorZ
+                : "Схема не размещена — нажмите кнопку ниже",
             10,
             true
         );
@@ -1142,8 +1153,13 @@ final class RelayOverlayController {
         coordinates.setPadding(dp(4), dp(3), dp(4), dp(5));
         root.addView(coordinates);
         root.addView(schematicAction("ПОСТАВИТЬ ПЕРЕД ИГРОКОМ", () -> {
+            long request = preferences.getLong(
+                RelayService.KEY_SCHEMATIC_PLACE_REQUEST,
+                0L
+            ) + 1L;
             preferences.edit()
                 .putBoolean(RelayService.KEY_SCHEMATIC_PLACED, false)
+                .putLong(RelayService.KEY_SCHEMATIC_PLACE_REQUEST, request)
                 .apply();
             settingsChanged.run();
         }), margins(-1, -2, 0, 0, 0, dp(6)));
@@ -1152,9 +1168,9 @@ final class RelayOverlayController {
         root.addView(schematicMoveRow("Z −", 0, 0, -1, "Z +", 0, 0, 1));
 
         TextView note = text(
-            "Это отдельный кликабельность-неперехватывающий слой. Он скрывается " +
-                "в инвентаре, сундуке, шалкере и чате. Координаты камеры и мира " +
-                "берутся только из пакетов relay.",
+            "После размещения якорь остаётся неподвижным в координатах мира и " +
+                "меняется только кнопками X/Y/Z, поворота и зеркала. Слой " +
+                "скрывается в инвентаре, сундуке, шалкере и чате.",
             9,
             false
         );
@@ -1196,6 +1212,23 @@ final class RelayOverlayController {
     }
 
     private void adjustSchematicAnchor(int dx, int dy, int dz) {
+        if (!preferences.getBoolean(
+                RelayService.KEY_SCHEMATIC_PLACED,
+                false
+            )) {
+            DiagnosticsLog.append(
+                context,
+                "INFO",
+                "schematics",
+                "Anchor move ignored until the schematic is explicitly placed"
+            );
+            showPage("schematics");
+            return;
+        }
+        float anchorY = preferences.getFloat(
+            RelayService.KEY_SCHEMATIC_ANCHOR_Y_EXACT,
+            preferences.getInt(RelayService.KEY_SCHEMATIC_ANCHOR_Y, 0)
+        ) + dy;
         preferences.edit()
             .putInt(
                 RelayService.KEY_SCHEMATIC_ANCHOR_X,
@@ -1203,16 +1236,25 @@ final class RelayOverlayController {
             )
             .putInt(
                 RelayService.KEY_SCHEMATIC_ANCHOR_Y,
-                preferences.getInt(RelayService.KEY_SCHEMATIC_ANCHOR_Y, 0) + dy
+                (int) Math.floor(anchorY)
             )
+            .putFloat(RelayService.KEY_SCHEMATIC_ANCHOR_Y_EXACT, anchorY)
             .putInt(
                 RelayService.KEY_SCHEMATIC_ANCHOR_Z,
                 preferences.getInt(RelayService.KEY_SCHEMATIC_ANCHOR_Z, 0) + dz
             )
-            .putBoolean(RelayService.KEY_SCHEMATIC_PLACED, true)
             .apply();
         settingsChanged.run();
         showPage("schematics");
+    }
+
+    private static String formatSchematicY(float value) {
+        if (Math.abs(value - Math.round(value)) < 0.0001f) {
+            return Integer.toString(Math.round(value));
+        }
+        return String.format(Locale.getDefault(), "%.3f", value)
+            .replaceAll("0+$", "")
+            .replaceAll("[.,]$", "");
     }
 
     private void notifySchematicReload() {

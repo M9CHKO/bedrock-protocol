@@ -93,8 +93,14 @@ public final class RelayService extends Service {
     public static final String KEY_SCHEMATIC_MIRROR = "schematic_mirror";
     public static final String KEY_SCHEMATIC_LAYER = "schematic_layer";
     public static final String KEY_SCHEMATIC_PLACED = "schematic_placed";
+    public static final String KEY_SCHEMATIC_PLACE_REQUEST =
+        "schematic_place_request";
+    public static final String KEY_SCHEMATIC_PLACE_REQUEST_HANDLED =
+        "schematic_place_request_handled";
     public static final String KEY_SCHEMATIC_ANCHOR_X = "schematic_anchor_x";
     public static final String KEY_SCHEMATIC_ANCHOR_Y = "schematic_anchor_y";
+    public static final String KEY_SCHEMATIC_ANCHOR_Y_EXACT =
+        "schematic_anchor_y_exact";
     public static final String KEY_SCHEMATIC_ANCHOR_Z = "schematic_anchor_z";
 
     public static final int DEFAULT_PLAYER_COLOR = 0xff4fd5ff;
@@ -365,12 +371,29 @@ public final class RelayService extends Service {
             return;
         }
 
+        String minecraftDataDirectory = "";
+        try {
+            minecraftDataDirectory = MinecraftDataAssets.prepareNativeDirectory(
+                this,
+                version
+            );
+        } catch (Throwable error) {
+            DiagnosticsLog.appendError(
+                this,
+                "world",
+                "Packaged minecraft-data could not be prepared; " +
+                    "semantic map colors and collision placement may degrade",
+                error
+            );
+        }
+
         try {
             JSONObject result = new JSONObject(NativeBridge.startRelay(
                 host,
                 port,
                 version,
-                cache.getAbsolutePath()
+                cache.getAbsolutePath(),
+                minecraftDataDirectory
             ));
             if (!result.optBoolean("ok", false)) {
                 reportError(result.optString("error", "Не удалось запустить relay"));
@@ -1255,7 +1278,8 @@ public final class RelayService extends Service {
             NativeBridge.configureGameplayFeatures(
                 autoArmor,
                 autoTotem,
-                miniMap
+                miniMap,
+                schematicEnabled
             );
             if (logChange) {
                 DiagnosticsLog.append(

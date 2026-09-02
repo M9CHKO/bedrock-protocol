@@ -2866,6 +2866,8 @@ struct RelayOptions {
     // default and independent from packet parse-error policy.
     bool itemResourceDiagnostics = false;
     bool enableChunkCaching = false;
+    std::size_t levelChunkRetentionMaximumBytes =
+        DefaultLevelChunkRetentionMaximumBytes;
     bool forceSingle = false;
     // With forceSingle, let a new downstream replace a stale existing
     // session instead of rejecting the new transport.
@@ -4364,6 +4366,8 @@ private:
         out.realms = options.destination.realms;
 
         out.enableChunkCaching = options.enableChunkCaching;
+        out.levelChunkRetentionMaximumBytes =
+            options.levelChunkRetentionMaximumBytes;
         out.logging = options.logging;
         out.itemResourceDiagnostics = options.itemResourceDiagnostics;
         out.forceSingle = options.forceSingle;

@@ -53,6 +53,7 @@ final class OfficialTexturePack {
     private final Context context;
     private final SharedPreferences preferences;
     private final File filesDirectory;
+    private final BlockNameTranslator blockNameTranslator;
     private long loadedBlockIndexRevision = Long.MIN_VALUE;
     private Map<String, String> loadedBlockIndex = Collections.emptyMap();
 
@@ -63,6 +64,7 @@ final class OfficialTexturePack {
             Context.MODE_PRIVATE
         );
         this.filesDirectory = this.context.getFilesDir();
+        this.blockNameTranslator = new BlockNameTranslator(this.context);
         recoverInterruptedSwap();
     }
 
@@ -241,18 +243,25 @@ final class OfficialTexturePack {
         File current = directory(DIRECTORY);
         File blocks = new File(current, BLOCKS_DIRECTORY);
         if (!blocks.isDirectory()) return null;
-        String blockName = TexturePackPaths.normalizedBlockName(registryName);
-        if (blockName.isEmpty()) return null;
         Map<String, String> index = blockIndex();
-        String mapped = index.get(blockName + "#" + face);
-        if (mapped == null) mapped = index.get(blockName);
-        File mappedFile = safeBlockFile(blocks, mapped);
-        if (mappedFile != null && mappedFile.isFile()) return mappedFile;
-        for (String candidate : TexturePackPaths.blockFileCandidates(registryName)) {
-            File direct = new File(blocks, candidate);
-            if (direct.isFile()) return direct;
-            File nested = findByName(blocks, candidate, 0);
-            if (nested != null) return nested;
+        List<String> blockNames = blockNameTranslator.bedrockCandidates(
+            registryName
+        );
+        for (String blockName : blockNames) {
+            String mapped = index.get(blockName + "#" + face);
+            if (mapped == null) mapped = index.get(blockName);
+            File mappedFile = safeBlockFile(blocks, mapped);
+            if (mappedFile != null && mappedFile.isFile()) return mappedFile;
+        }
+        for (String blockName : blockNames) {
+            for (String candidate : TexturePackPaths.blockFileCandidates(
+                blockName
+            )) {
+                File direct = new File(blocks, candidate);
+                if (direct.isFile()) return direct;
+                File nested = findByName(blocks, candidate, 0);
+                if (nested != null) return nested;
+            }
         }
         return null;
     }

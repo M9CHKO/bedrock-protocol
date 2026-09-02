@@ -2,6 +2,7 @@ package com.m9chko.bedrockrelay.schematic;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 import org.junit.Test;
@@ -108,6 +109,9 @@ public final class SchematicImporterTest {
         );
         assertEquals(27, model.nonAirBlocks());
         assertEquals(26, model.boundaryBlockCount());
+        assertFalse(model.isAirAt(1, 1, 1));
+        assertTrue(model.isAirAt(-1, 1, 1));
+        assertTrue(model.isAirAt(3, 1, 1));
     }
 
     private static void putPacked(

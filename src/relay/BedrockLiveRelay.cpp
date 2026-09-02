@@ -525,6 +525,9 @@ enum class RelayUpstreamPhase {
 };
 
 struct BedrockLiveRelay::Session {
+    explicit Session(std::size_t retainedChunkMaximumBytes)
+        : retainedLevelChunks(retainedChunkMaximumBytes) {}
+
     mutable std::mutex mutex;
     std::string id;
     BedrockServerConnection downstream;
@@ -623,7 +626,9 @@ ServerListenResult BedrockLiveRelay::listen() {
                 }
             }
             if (!rejected) {
-                session = std::make_shared<Session>();
+                session = std::make_shared<Session>(
+                    options_.levelChunkRetentionMaximumBytes
+                );
                 session->id = id;
                 session->downstream = connection;
                 session->upstreamOptions = baseUpstreamOptions_;
@@ -948,7 +953,7 @@ LevelChunkRetentionStats BedrockLiveRelay::levelChunkRetentionStats() const noex
     out.enabled = levelChunkRetentionEnabled_;
     out.configuredRadiusChunks = retainedLevelChunkRadius_;
     out.effectiveRadiusChunks = retainedLevelChunkRadius_;
-    out.maximumBytes = DefaultLevelChunkRetentionMaximumBytes;
+    out.maximumBytes = options_.levelChunkRetentionMaximumBytes;
     return out;
 }
 

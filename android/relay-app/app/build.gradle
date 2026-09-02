@@ -2,6 +2,71 @@ plugins {
     id "com.android.application"
 }
 
+import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
+
+def minecraftDataVersion = "1.21.100"
+def minecraftDataSource = file(
+    "${rootProject.projectDir}/../../data/minecraft-data/bedrock/${minecraftDataVersion}"
+)
+def generatedMinecraftAssets = file(
+    "${layout.buildDirectory.get().asFile}/generated/minecraftDataAssets"
+)
+
+tasks.register("generateMinecraftDataAssets") {
+    def blocks = new File(minecraftDataSource, "blocks.json")
+    def states = new File(minecraftDataSource, "blockStates.json")
+    def collisions = new File(minecraftDataSource, "blockCollisionShapes.json")
+    def javaToBedrock = new File(minecraftDataSource, "blocksJ2B.json")
+    inputs.files(blocks, states, collisions, javaToBedrock)
+    outputs.dir(generatedMinecraftAssets)
+
+    doLast {
+        def destination = new File(
+            generatedMinecraftAssets,
+            "minecraft-data/${minecraftDataVersion}"
+        )
+        project.delete(generatedMinecraftAssets)
+        destination.mkdirs()
+        [blocks, states, collisions].each { source ->
+            project.copy {
+                from source
+                into destination
+            }
+        }
+
+        // blocksJ2B contains millions of state combinations. Textures only
+        // need registry names, so generate a compact one-to-many base-name
+        // index for the Java schematic -> Bedrock resource-pack bridge.
+        def aliases = new TreeMap<String, LinkedHashSet<String>>()
+        def mapping = new JsonSlurper().parse(javaToBedrock)
+        mapping.each { javaState, bedrockState ->
+            def javaName = javaState.toString()
+            def bedrockName = bedrockState.toString()
+            int javaProperties = javaName.indexOf('[')
+            int bedrockProperties = bedrockName.indexOf('[')
+            if (javaProperties >= 0) javaName = javaName.substring(0, javaProperties)
+            if (bedrockProperties >= 0) {
+                bedrockName = bedrockName.substring(0, bedrockProperties)
+            }
+            if (javaName.startsWith("minecraft:")) {
+                javaName = javaName.substring("minecraft:".length())
+            }
+            if (bedrockName.startsWith("minecraft:")) {
+                bedrockName = bedrockName.substring("minecraft:".length())
+            }
+            aliases.computeIfAbsent(javaName) { new LinkedHashSet<String>() }
+                .add(bedrockName)
+        }
+        def serializable = new TreeMap<String, List<String>>()
+        aliases.each { name, values -> serializable.put(name, new ArrayList<>(values)) }
+        new File(destination, "block-name-j2b.json").setText(
+            JsonOutput.toJson(serializable),
+            "UTF-8"
+        )
+    }
+}
+
 android {
     namespace "com.m9chko.bedrockrelay"
     compileSdk 36
@@ -11,8 +76,8 @@ android {
         applicationId "com.m9chko.bedrockrelay"
         minSdk 26
         targetSdk 36
-        versionCode 28
-        versionName "1.2.1"
+        versionCode 29
+        versionName "1.2.2"
 
         ndk {
             abiFilters "arm64-v8a"
@@ -62,6 +127,14 @@ android {
             useLegacyPackaging true
         }
     }
+
+    sourceSets {
+        main.assets.srcDir generatedMinecraftAssets
+    }
+}
+
+tasks.named("preBuild").configure {
+    dependsOn tasks.named("generateMinecraftDataAssets")
 }
 
 dependencies {

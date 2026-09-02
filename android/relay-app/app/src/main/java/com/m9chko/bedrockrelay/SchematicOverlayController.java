@@ -12,6 +12,7 @@ import android.graphics.PixelFormat;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.provider.Settings;
 import android.view.Gravity;
 import android.view.View;
@@ -21,12 +22,15 @@ import com.m9chko.bedrockrelay.schematic.SchematicModel;
 
 import org.json.JSONObject;
 
+import java.util.Arrays;
+import java.util.Comparator;
 import java.util.Locale;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 /** Click-through 3D ghost blocks anchored to packet-derived world coordinates. */
 final class SchematicOverlayController {
+    private static final long SURFACE_WAIT_MILLIS = 1_800L;
     private final Context context;
     private final SharedPreferences preferences;
     private final WindowManager windowManager;
@@ -47,6 +51,13 @@ final class SchematicOverlayController {
     private volatile SchematicModel model;
     private volatile EntityOutlineOverlayController.CameraSample latestCamera =
         EntityOutlineOverlayController.CameraSample.unknown();
+    private boolean placementPending;
+    private boolean placementTargetCaptured;
+    private long placementRequest;
+    private long placementDeadlineMs;
+    private int placementX;
+    private int placementZ;
+    private double placementFallbackY;
     private boolean missingPermissionLogged;
     private SchematicView view;
 
@@ -88,6 +99,7 @@ final class SchematicOverlayController {
         rotationQuarterTurns = Math.floorMod(rotation, 4);
         this.mirrored = mirrored;
         selectedLayer = layer;
+        refreshPlacementRequest();
         SchematicView current = view;
         if (current != null) {
             current.configure(
@@ -100,7 +112,7 @@ final class SchematicOverlayController {
             );
             current.setAnchor(
                 preferences.getInt(RelayService.KEY_SCHEMATIC_ANCHOR_X, 0),
-                preferences.getInt(RelayService.KEY_SCHEMATIC_ANCHOR_Y, 0),
+                savedAnchorY(),
                 preferences.getInt(RelayService.KEY_SCHEMATIC_ANCHOR_Z, 0)
             );
         }
@@ -119,7 +131,11 @@ final class SchematicOverlayController {
     }
 
     boolean wantsFrames() {
-        return sessionVisible && enabled && !uiBlocked && model != null;
+        return sessionVisible && enabled && !uiBlocked && model != null &&
+            (placementPending || preferences.getBoolean(
+                RelayService.KEY_SCHEMATIC_PLACED,
+                false
+            ));
     }
 
     void offerCameraSnapshot(String json) throws Exception {
@@ -133,23 +149,25 @@ final class SchematicOverlayController {
         if (!wantsFrames() || camera == null) return;
         latestCamera = camera;
         pendingCamera.set(camera);
-        if (!preferences.getBoolean(RelayService.KEY_SCHEMATIC_PLACED, false) &&
-            camera.known) {
-            placeNearCamera(camera);
-        }
+        if (placementPending && camera.known) tryPlaceNearCamera(camera);
         postDelivery();
     }
 
     boolean placeNearCamera() {
+        beginPlacement(
+            preferences.getLong(
+                RelayService.KEY_SCHEMATIC_PLACE_REQUEST,
+                0L
+            )
+        );
         EntityOutlineOverlayController.CameraSample camera = latestCamera;
         if (camera == null || !camera.known) return false;
-        placeNearCamera(camera);
-        return true;
+        return tryPlaceNearCamera(camera);
     }
 
     void shiftAnchor(int dx, int dy, int dz) {
         int x = preferences.getInt(RelayService.KEY_SCHEMATIC_ANCHOR_X, 0);
-        int y = preferences.getInt(RelayService.KEY_SCHEMATIC_ANCHOR_Y, 0);
+        double y = savedAnchorY();
         int z = preferences.getInt(RelayService.KEY_SCHEMATIC_ANCHOR_Z, 0);
         saveAnchor(x + dx, y + dy, z + dz);
     }
@@ -159,25 +177,94 @@ final class SchematicOverlayController {
         removeWindow();
     }
 
-    private void placeNearCamera(
-        EntityOutlineOverlayController.CameraSample camera
-    ) {
-        double yaw = Math.toRadians(camera.yaw);
-        int x = (int) Math.floor(camera.x - Math.sin(yaw) * 5.0);
-        int y = (int) Math.floor(camera.y) - 1;
-        int z = (int) Math.floor(camera.z + Math.cos(yaw) * 5.0);
-        saveAnchor(x, y, z);
+    private void refreshPlacementRequest() {
+        long requested = preferences.getLong(
+            RelayService.KEY_SCHEMATIC_PLACE_REQUEST,
+            0L
+        );
+        long handled = preferences.getLong(
+            RelayService.KEY_SCHEMATIC_PLACE_REQUEST_HANDLED,
+            0L
+        );
+        if (requested != 0L && requested != handled &&
+            (!placementPending || placementRequest != requested)) {
+            beginPlacement(requested);
+        }
     }
 
-    private void saveAnchor(int x, int y, int z) {
-        preferences.edit()
+    private void beginPlacement(long request) {
+        placementPending = true;
+        placementTargetCaptured = false;
+        placementRequest = request;
+        placementDeadlineMs = 0L;
+        reconcileWindow();
+    }
+
+    private boolean tryPlaceNearCamera(
+        EntityOutlineOverlayController.CameraSample camera
+    ) {
+        if (!placementTargetCaptured) {
+            double yaw = Math.toRadians(camera.yaw);
+            placementX = (int) Math.floor(
+                camera.x - Math.sin(yaw) * 5.0
+            );
+            placementZ = (int) Math.floor(
+                camera.z + Math.cos(yaw) * 5.0
+            );
+            // Packet camera Y is eye level. This fallback puts the first
+            // schematic layer at the player's feet if the target chunk has
+            // not reached the terrain decoder yet.
+            placementFallbackY = (int) Math.floor(camera.y - 1.62);
+            placementDeadlineMs = SystemClock.uptimeMillis() +
+                SURFACE_WAIT_MILLIS;
+            placementTargetCaptured = true;
+        }
+
+        float surfaceY = NativeBridge.worldSurfaceY(placementX, placementZ);
+        boolean collisionKnown = Float.isFinite(surfaceY);
+        if (!collisionKnown &&
+            SystemClock.uptimeMillis() < placementDeadlineMs) {
+            return false;
+        }
+        double anchorY = collisionKnown ? surfaceY : placementFallbackY;
+        saveAnchor(placementX, anchorY, placementZ);
+        DiagnosticsLog.append(
+            context,
+            "INFO",
+            "schematics",
+            "Schematic anchor fixed at X=" + placementX +
+                " Y=" + anchorY + " Z=" + placementZ +
+                " ground=" + (collisionKnown ? "block_collision" : "camera_fallback")
+        );
+        return true;
+    }
+
+    private double savedAnchorY() {
+        return preferences.getFloat(
+            RelayService.KEY_SCHEMATIC_ANCHOR_Y_EXACT,
+            preferences.getInt(RelayService.KEY_SCHEMATIC_ANCHOR_Y, 0)
+        );
+    }
+
+    private void saveAnchor(int x, double y, int z) {
+        SharedPreferences.Editor editor = preferences.edit()
             .putInt(RelayService.KEY_SCHEMATIC_ANCHOR_X, x)
-            .putInt(RelayService.KEY_SCHEMATIC_ANCHOR_Y, y)
+            .putInt(RelayService.KEY_SCHEMATIC_ANCHOR_Y, (int) Math.floor(y))
+            .putFloat(RelayService.KEY_SCHEMATIC_ANCHOR_Y_EXACT, (float) y)
             .putInt(RelayService.KEY_SCHEMATIC_ANCHOR_Z, z)
-            .putBoolean(RelayService.KEY_SCHEMATIC_PLACED, true)
-            .apply();
+            .putBoolean(RelayService.KEY_SCHEMATIC_PLACED, true);
+        if (placementRequest != 0L) {
+            editor.putLong(
+                RelayService.KEY_SCHEMATIC_PLACE_REQUEST_HANDLED,
+                placementRequest
+            );
+        }
+        editor.apply();
+        placementPending = false;
+        placementTargetCaptured = false;
         SchematicView current = view;
         if (current != null) current.setAnchor(x, y, z);
+        reconcileWindow();
     }
 
     private void postDelivery() {
@@ -193,7 +280,11 @@ final class SchematicOverlayController {
     }
 
     private void reconcileWindow() {
-        if (sessionVisible && enabled && !uiBlocked && model != null) {
+        if (sessionVisible && enabled && !uiBlocked && model != null &&
+            preferences.getBoolean(
+                RelayService.KEY_SCHEMATIC_PLACED,
+                false
+            )) {
             addWindow();
         } else {
             removeWindow();
@@ -227,7 +318,7 @@ final class SchematicOverlayController {
         );
         added.setAnchor(
             preferences.getInt(RelayService.KEY_SCHEMATIC_ANCHOR_X, 0),
-            preferences.getInt(RelayService.KEY_SCHEMATIC_ANCHOR_Y, 0),
+            savedAnchorY(),
             preferences.getInt(RelayService.KEY_SCHEMATIC_ANCHOR_Z, 0)
         );
         added.setSystemUiVisibility(
@@ -297,8 +388,11 @@ final class SchematicOverlayController {
 
     private static final class SchematicView extends View {
         private static final double NEAR_PLANE = 0.10;
-        private static final int MAX_RENDERED_CUBES = 2_400;
-        private static final int MAX_TEXTURED_CUBES = 900;
+        private static final int MAX_RENDERED_CUBES = 1_800;
+        private static final int MAX_TEXTURED_CUBES = 1_200;
+        private static final long FRAME_INTERVAL_MILLIS = 16L;
+        private static final Comparator<ProjectedCube> FAR_TO_NEAR =
+            (left, right) -> Double.compare(right.depth, left.depth);
         private static final int[][] EDGES = {
             {0, 1}, {1, 3}, {3, 2}, {2, 0},
             {4, 5}, {5, 7}, {7, 6}, {6, 4},
@@ -310,6 +404,12 @@ final class SchematicOverlayController {
         private static final int[] X_MAX_FACE = {5, 7, 3, 1};
         private static final int[] Z_MIN_FACE = {4, 5, 1, 0};
         private static final int[] Z_MAX_FACE = {6, 7, 3, 2};
+        private static final int FACE_TOP = 1;
+        private static final int FACE_BOTTOM = 1 << 1;
+        private static final int FACE_X_MIN = 1 << 2;
+        private static final int FACE_X_MAX = 1 << 3;
+        private static final int FACE_Z_MIN = 1 << 4;
+        private static final int FACE_Z_MAX = 1 << 5;
 
         private final PacketCameraTracker camera = new PacketCameraTracker();
         private final Paint fillPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -323,6 +423,8 @@ final class SchematicOverlayController {
         private final float[] targetQuad = new float[8];
         private final double[] screenX = new double[8];
         private final double[] screenY = new double[8];
+        private final ProjectedCube[] renderQueue =
+            new ProjectedCube[MAX_RENDERED_CUBES];
         private final SchematicTextureAtlas textureAtlas;
         private final float density;
         private SchematicModel model;
@@ -333,13 +435,18 @@ final class SchematicOverlayController {
         private boolean mirrored;
         private int selectedLayer = -1;
         private int anchorX;
-        private int anchorY;
+        private double anchorY;
         private int anchorZ;
         private double projectedSpan;
+        private long lastFrameRequestAtMs;
+        private boolean delayedFramePosted;
 
         SchematicView(Context context) {
             super(context);
-            textureAtlas = new SchematicTextureAtlas(context);
+            textureAtlas = new SchematicTextureAtlas(
+                context,
+                () -> requestFrame(false)
+            );
             density = context.getResources().getDisplayMetrics().density;
             setBackgroundColor(Color.TRANSPARENT);
             setWillNotDraw(false);
@@ -353,11 +460,14 @@ final class SchematicOverlayController {
             statusPaint.setTextSize(Math.max(11f, density * 9.5f));
             statusPaint.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
             statusBackground.setColor(0x99111720);
+            for (int index = 0; index < renderQueue.length; ++index) {
+                renderQueue[index] = new ProjectedCube();
+            }
         }
 
         void setModel(SchematicModel value) {
             model = value;
-            postInvalidateOnAnimation();
+            requestFrame(true);
         }
 
         void configure(
@@ -374,19 +484,19 @@ final class SchematicOverlayController {
             this.rotation = Math.floorMod(rotation, 4);
             this.mirrored = mirrored;
             selectedLayer = layer;
-            postInvalidateOnAnimation();
+            requestFrame(true);
         }
 
-        void setAnchor(int x, int y, int z) {
+        void setAnchor(int x, double y, int z) {
             anchorX = x;
             anchorY = y;
             anchorZ = z;
-            postInvalidateOnAnimation();
+            requestFrame(true);
         }
 
         void submitCamera(EntityOutlineOverlayController.CameraSample value) {
             camera.update(value);
-            postInvalidateOnAnimation();
+            requestFrame(false);
         }
 
         @Override
@@ -417,7 +527,7 @@ final class SchematicOverlayController {
             int boundaryCount = current.boundaryBlockCount();
             int stride = Math.max(1, (boundaryCount + MAX_RENDERED_CUBES - 1) /
                 MAX_RENDERED_CUBES);
-            int rendered = 0;
+            int queued = 0;
             for (int listIndex = 0; listIndex < boundaryCount;
                 listIndex += stride) {
                 int blockIndex = current.boundaryBlockIndexAt(listIndex);
@@ -433,44 +543,82 @@ final class SchematicOverlayController {
                 double dz = centerZ - cameraState.z;
                 if (dx * dx + dy * dy + dz * dz >
                     (double) maximumDistance * maximumDistance) continue;
-                if (!projectCube(
-                    localX,
-                    localY,
-                    localZ,
-                    cameraState,
+                double depth = ProjectionMath.depth(
+                    dx,
+                    dy,
+                    dz,
                     sinYaw,
                     cosYaw,
                     sinPitch,
-                    cosPitch,
-                    focal
-                )) continue;
-                int paletteIndex = current.paletteIndexAtLinear(blockIndex);
+                    cosPitch
+                );
+                if (depth <= NEAR_PLANE) continue;
+                int exposedFaces = exposedFaces(
+                    current,
+                    localX,
+                    localY,
+                    localZ
+                );
+                renderQueue[queued++].set(
+                    blockIndex,
+                    localX,
+                    localY,
+                    localZ,
+                    centerX,
+                    centerY,
+                    centerZ,
+                    depth,
+                    exposedFaces
+                );
+                if (queued >= MAX_RENDERED_CUBES) break;
+            }
+            Arrays.sort(renderQueue, 0, queued, FAR_TO_NEAR);
+            int rendered = 0;
+            int firstTextured = Math.max(0, queued - MAX_TEXTURED_CUBES);
+            for (int queueIndex = 0; queueIndex < queued; ++queueIndex) {
+                ProjectedCube cube = renderQueue[queueIndex];
+                if (!projectCube(
+                        cube.localX,
+                        cube.localY,
+                        cube.localZ,
+                        cameraState,
+                        sinYaw,
+                        cosYaw,
+                        sinPitch,
+                        cosPitch,
+                        focal
+                    )) {
+                    continue;
+                }
+                int paletteIndex = current.paletteIndexAtLinear(
+                    cube.blockIndex
+                );
                 String state = current.paletteState(paletteIndex);
                 int color = blockColor(state);
-                boolean textureVisible = rendered < MAX_TEXTURED_CUBES &&
-                    projectedSpan >= 4.0;
+                boolean textureVisible = queueIndex >= firstTextured &&
+                    projectedSpan >= 1.5;
                 drawCube(
                     canvas,
                     textureVisible
                         ? textureAtlas.textureFor(
                             state,
-                            cameraState.y >= centerY ? "top" : "bottom"
+                            cameraState.y >= cube.centerY ? "top" : "bottom"
                         )
                         : null,
                     textureVisible
                         ? textureAtlas.textureFor(state, "side")
                         : null,
                     color,
-                    centerX,
-                    centerY,
-                    centerZ,
+                    cube.centerX,
+                    cube.centerY,
+                    cube.centerZ,
+                    cube.exposedFaces,
                     cameraState
                 );
                 ++rendered;
-                if (rendered >= MAX_RENDERED_CUBES) break;
             }
             drawStatus(canvas, current, rendered, stride > 1);
-            if (cameraState.animating) postInvalidateOnAnimation();
+            if (cameraState.animating) requestFrame(false);
         }
 
         private boolean projectCube(
@@ -531,39 +679,46 @@ final class SchematicOverlayController {
             double centerX,
             double centerY,
             double centerZ,
+            int exposedFaces,
             PacketCameraTracker.State cameraState
         ) {
-            int fillAlpha = Math.round(255f * opacityPercent / 100f * 0.25f);
-            int textureAlpha = Math.round(255f * opacityPercent / 100f * 0.88f);
-            int edgeAlpha = Math.min(235, fillAlpha + 110);
+            int fillAlpha = Math.round(25f + 55f * opacityPercent / 100f);
+            int textureAlpha = Math.round(
+                185f + 70f * opacityPercent / 100f
+            );
+            int edgeAlpha = Math.round(55f + 95f * opacityPercent / 100f);
             fillPaint.setColor((color & 0x00ffffff) | (fillAlpha << 24));
             texturePaint.setAlpha(Math.max(24, Math.min(255, textureAlpha)));
             edgePaint.setColor((color & 0x00ffffff) | (edgeAlpha << 24));
             if (cameraState.y >= centerY) {
-                drawTexturedFace(canvas, horizontalTexture, TOP_FACE);
-            } else {
+                if ((exposedFaces & FACE_TOP) != 0) {
+                    drawTexturedFace(canvas, horizontalTexture, TOP_FACE);
+                }
+            } else if ((exposedFaces & FACE_BOTTOM) != 0) {
                 drawTexturedFace(canvas, horizontalTexture, BOTTOM_FACE);
             }
-            if (normalFacingCamera(
+            if ((exposedFaces & FACE_X_MIN) != 0 && normalFacingCamera(
                 -1.0, 0.0, centerX, centerZ, cameraState
             )) drawTexturedFace(canvas, sideTexture, X_MIN_FACE);
-            if (normalFacingCamera(
+            if ((exposedFaces & FACE_X_MAX) != 0 && normalFacingCamera(
                 1.0, 0.0, centerX, centerZ, cameraState
             )) drawTexturedFace(canvas, sideTexture, X_MAX_FACE);
-            if (normalFacingCamera(
+            if ((exposedFaces & FACE_Z_MIN) != 0 && normalFacingCamera(
                 0.0, -1.0, centerX, centerZ, cameraState
             )) drawTexturedFace(canvas, sideTexture, Z_MIN_FACE);
-            if (normalFacingCamera(
+            if ((exposedFaces & FACE_Z_MAX) != 0 && normalFacingCamera(
                 0.0, 1.0, centerX, centerZ, cameraState
             )) drawTexturedFace(canvas, sideTexture, Z_MAX_FACE);
-            for (int[] edge : EDGES) {
-                canvas.drawLine(
-                    (float) screenX[edge[0]],
-                    (float) screenY[edge[0]],
-                    (float) screenX[edge[1]],
-                    (float) screenY[edge[1]],
-                    edgePaint
-                );
+            if (projectedSpan >= 5.0) {
+                for (int[] edge : EDGES) {
+                    canvas.drawLine(
+                        (float) screenX[edge[0]],
+                        (float) screenY[edge[0]],
+                        (float) screenX[edge[1]],
+                        (float) screenY[edge[1]],
+                        edgePaint
+                    );
+                }
             }
         }
 
@@ -638,10 +793,85 @@ final class SchematicOverlayController {
                 worldNormalZ * (cameraState.z - centerZ) > 0.0;
         }
 
+        private int exposedFaces(
+            SchematicModel current,
+            int x,
+            int y,
+            int z
+        ) {
+            int faces = 0;
+            if (selectedLayer >= 0 || current.isAirAt(x, y + 1, z)) {
+                faces |= FACE_TOP;
+            }
+            if (selectedLayer >= 0 || current.isAirAt(x, y - 1, z)) {
+                faces |= FACE_BOTTOM;
+            }
+            if (current.isAirAt(x - 1, y, z)) faces |= FACE_X_MIN;
+            if (current.isAirAt(x + 1, y, z)) faces |= FACE_X_MAX;
+            if (current.isAirAt(x, y, z - 1)) faces |= FACE_Z_MIN;
+            if (current.isAirAt(x, y, z + 1)) faces |= FACE_Z_MAX;
+            return faces;
+        }
+
+        private static final class ProjectedCube {
+            int blockIndex;
+            int localX;
+            int localY;
+            int localZ;
+            double centerX;
+            double centerY;
+            double centerZ;
+            double depth;
+            int exposedFaces;
+
+            void set(
+                int blockIndex,
+                int localX,
+                int localY,
+                int localZ,
+                double centerX,
+                double centerY,
+                double centerZ,
+                double depth,
+                int exposedFaces
+            ) {
+                this.blockIndex = blockIndex;
+                this.localX = localX;
+                this.localY = localY;
+                this.localZ = localZ;
+                this.centerX = centerX;
+                this.centerY = centerY;
+                this.centerZ = centerZ;
+                this.depth = depth;
+                this.exposedFaces = exposedFaces;
+            }
+        }
+
         @Override
         protected void onDetachedFromWindow() {
-            textureAtlas.clear();
+            textureAtlas.close();
             super.onDetachedFromWindow();
+        }
+
+        private void requestFrame(boolean immediate) {
+            long now = SystemClock.uptimeMillis();
+            if (immediate || now - lastFrameRequestAtMs >=
+                FRAME_INTERVAL_MILLIS) {
+                lastFrameRequestAtMs = now;
+                postInvalidateOnAnimation();
+                return;
+            }
+            if (delayedFramePosted) return;
+            delayedFramePosted = true;
+            long delay = Math.max(
+                1L,
+                FRAME_INTERVAL_MILLIS - (now - lastFrameRequestAtMs)
+            );
+            postDelayed(() -> {
+                delayedFramePosted = false;
+                lastFrameRequestAtMs = SystemClock.uptimeMillis();
+                postInvalidateOnAnimation();
+            }, delay);
         }
 
         private void drawStatus(
@@ -652,10 +882,14 @@ final class SchematicOverlayController {
         ) {
             String text = String.format(
                 Locale.getDefault(),
-                "СХЕМА • %s • %,d%s",
+                "СХЕМА • %s • %,d%s • Mojang %d%s",
                 selectedLayer >= 0 ? "слой Y=" + selectedLayer : "все слои",
                 rendered,
-                limited ? " видимых (лимит)" : " видимых"
+                limited ? " видимых (лимит)" : " видимых",
+                textureAtlas.officialTextureCount(),
+                textureAtlas.pendingTextureCount() > 0
+                    ? " (загрузка " + textureAtlas.pendingTextureCount() + ")"
+                    : ""
             );
             float padding = density * 7f;
             float width = statusPaint.measureText(text) + padding * 2f;

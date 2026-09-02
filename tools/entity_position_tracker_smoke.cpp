@@ -120,7 +120,8 @@ int main() {
     state = tracker.snapshot();
     if (state.entities.size() != 2 || !state.entities[1].item ||
         state.entities[1].runtimeId != 78 ||
-        state.entities[1].label != "minecraft:diamond") {
+        state.entities[1].label != "minecraft:diamond" ||
+        !near(state.entities[1].y, 63.875f)) {
         std::cerr << "decoded dropped item was not tracked separately\n";
         return 1;
     }

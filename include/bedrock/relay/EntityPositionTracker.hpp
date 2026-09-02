@@ -185,10 +185,13 @@ public:
             entity.label = label.empty() ? "Предмет" : std::move(label);
             entity.item = true;
             entity.x = x;
-            entity.y = y;
             entity.z = z;
             entity.width = 0.25f;
             entity.height = 0.25f;
+            // AddItemEntity and MoveEntity report the dropped item's centre.
+            // The overlay projects records as base-to-top AABBs, so retaining
+            // the centre as the base shifts the box upward by half its height.
+            entity.y = y - entity.height * 0.5f;
             entity.updatedAtMs = monotonicMilliseconds();
             entities_[runtimeId] = std::move(entity);
             if (uniqueId != 0) uniqueToRuntime_[uniqueId] = runtimeId;
@@ -680,7 +683,9 @@ private:
         const auto found = entities_.find(runtimeId);
         if (found == entities_.end()) return;
         found->second.x = x;
-        found->second.y = y;
+        found->second.y = found->second.item
+            ? y - found->second.height * 0.5f
+            : y;
         found->second.z = z;
         found->second.updatedAtMs = monotonicMilliseconds();
     }
@@ -695,7 +700,12 @@ private:
         float y = found == entities_.end() ? 0.0f : found->second.y;
         float z = found == entities_.end() ? 0.0f : found->second.z;
         if ((flags & 0x01u) != 0) x = cursor.readF32LE();
-        if ((flags & 0x02u) != 0) y = cursor.readF32LE();
+        if ((flags & 0x02u) != 0) {
+            y = cursor.readF32LE();
+            if (found != entities_.end() && found->second.item) {
+                y -= found->second.height * 0.5f;
+            }
+        }
         if ((flags & 0x04u) != 0) z = cursor.readF32LE();
         if (found == entities_.end()) return;
         requirePosition(x, y, z);

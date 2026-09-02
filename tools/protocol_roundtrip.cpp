@@ -3297,6 +3297,8 @@ bool checkRelayOptionsGolden() {
             liveOptions.upstream.chunkRadius != 10 ||
             liveOptions.upstream.batchingIntervalMs != 20 ||
             liveOptions.logging || liveOptions.enableChunkCaching ||
+            liveOptions.levelChunkRetentionMaximumBytes !=
+                bedrock::DefaultLevelChunkRetentionMaximumBytes ||
             liveOptions.forceSingle ||
             relayOptions.logging || relayOptions.enableChunkCaching ||
             relayOptions.forceSingle || relayOptions.omitParseErrors ||
@@ -3322,6 +3324,7 @@ bool checkRelayOptionsGolden() {
         options.batchingInterval = 37;
         options.logging = true;
         options.enableChunkCaching = true;
+        options.levelChunkRetentionMaximumBytes = 12u * 1024u * 1024u;
         options.forceSingle = true;
         options.omitParseErrors = true;
         options.useRaknetWorker = false;
@@ -3348,6 +3351,8 @@ bool checkRelayOptionsGolden() {
             !liveOptions.upstream.forceRefresh ||
             liveOptions.upstream.password != "configured-password" ||
             !liveOptions.logging || !liveOptions.enableChunkCaching ||
+            liveOptions.levelChunkRetentionMaximumBytes !=
+                12u * 1024u * 1024u ||
             !liveOptions.forceSingle ||
             !relay.options().omitParseErrors ||
             liveOptions.upstream.authTitle !=

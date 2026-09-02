@@ -4,6 +4,7 @@
 #include <bedrock/bedrock.hpp>
 #include <bedrock/relay/EntityPositionTracker.hpp>
 #include <bedrock/relay/ItemDurability.hpp>
+#include <bedrock/world/BedrockBlockRegistry.hpp>
 
 #include <android/log.h>
 #include <jni.h>
@@ -43,6 +44,9 @@ namespace {
 constexpr char LogTag[] = "CpeRelayNative";
 constexpr int MinimumRetainedRadiusChunks = 10;
 constexpr int MaximumRetainedRadiusChunks = 64;
+constexpr int MaximumClientPublisherRadiusChunks = 32;
+constexpr std::size_t AndroidLevelChunkRetentionMaximumBytes =
+    96u * 1024u * 1024u;
 
 std::atomic<bool> configuredDetailedLogging {true};
 std::atomic<bool> configuredChunkRetention {false};
@@ -50,6 +54,7 @@ std::atomic<int> configuredRetainedRadiusChunks {24};
 std::atomic<bool> configuredAutoArmor {false};
 std::atomic<bool> configuredAutoTotem {false};
 std::atomic<bool> configuredMiniMap {false};
+std::atomic<bool> configuredSchematic {false};
 
 int clampRetainedRadiusChunks(int radius) {
     return std::max(
@@ -706,13 +711,26 @@ struct RelayState {
     struct MiniMapTile {
         MiniMapKey key;
         std::array<int32_t, 256> pixels {};
+        std::array<int16_t, 256> surfaceHeights {};
+        std::array<float, 256> groundHeights {};
         uint64_t revision = 0;
+    };
+
+    struct MiniMapAppearance {
+        bool air = false;
+        bool solid = false;
+        float collisionTop = 1.0f;
+        int32_t color = 0xff777777;
     };
 
     struct MiniMapChunkJob {
         std::string version;
         std::vector<uint8_t> payload;
         uint64_t generation = 0;
+        int32_t dimension = 0;
+        int32_t x = 0;
+        int32_t z = 0;
+        int64_t cameraDistanceSquared = 0;
     };
 
     mutable std::mutex mutex;
@@ -753,6 +771,7 @@ struct RelayState {
     std::atomic<bool> autoArmorEnabled {false};
     std::atomic<bool> autoTotemEnabled {false};
     std::atomic<bool> miniMapEnabled {false};
+    std::atomic<bool> schematicEnabled {false};
     std::atomic<int> retainedRadiusChunks {24};
     std::atomic<uint64_t> chunkPublisherPacketsObserved {0};
     std::atomic<uint64_t> chunkPublisherPacketsRewritten {0};
@@ -762,7 +781,7 @@ struct RelayState {
     std::atomic<uint64_t> retainedLevelChunkCount {0};
     std::atomic<uint64_t> retainedLevelChunkBytes {0};
     std::atomic<uint64_t> retainedLevelChunkMaximumBytes {
-        bedrock::DefaultLevelChunkRetentionMaximumBytes
+        AndroidLevelChunkRetentionMaximumBytes
     };
     std::atomic<uint64_t> retainedLevelChunksStored {0};
     std::atomic<uint64_t> retainedLevelChunksReplaced {0};
@@ -809,6 +828,10 @@ struct RelayState {
     bool miniMapStopping = false;
     uint64_t miniMapGeneration = 1;
     uint64_t miniMapRevision = 0;
+    mutable std::mutex blockRegistryMutex;
+    std::optional<bedrock::BedrockBlockRegistry> blockRegistry;
+    std::unordered_map<int32_t, MiniMapAppearance> miniMapAppearances;
+    bool blockRuntimeIdsAreHashes = true;
 
     RelayState() {
         miniMapWorker = std::thread([this]() { miniMapWorkerLoop(); });
@@ -831,48 +854,288 @@ struct RelayState {
         return result;
     }
 
-    static int32_t miniMapSurfaceColor(
-        int32_t stateId,
-        uint32_t biomeId,
-        int32_t height,
-        int32_t dimension
-    ) noexcept {
-        if (stateId == 0) return 0x00000000;
-        static constexpr std::array<std::array<int, 3>, 10> Overworld {{
-            {{89, 139, 76}}, {{107, 151, 81}}, {{126, 111, 79}},
-            {{104, 119, 128}}, {{184, 170, 119}}, {{67, 111, 88}},
-            {{118, 139, 72}}, {{144, 121, 92}}, {{91, 132, 142}},
-            {{174, 181, 187}}
-        }};
-        static constexpr std::array<std::array<int, 3>, 6> Nether {{
-            {{118, 48, 40}}, {{91, 39, 37}}, {{129, 75, 43}},
-            {{72, 59, 55}}, {{123, 91, 53}}, {{83, 44, 66}}
-        }};
-        static constexpr std::array<std::array<int, 3>, 5> End {{
-            {{204, 207, 139}}, {{179, 181, 124}}, {{116, 101, 132}},
-            {{93, 85, 108}}, {{218, 216, 157}}
-        }};
+    static constexpr int16_t UnknownSurfaceHeight =
+        std::numeric_limits<int16_t>::min();
 
-        uint32_t mixed = static_cast<uint32_t>(stateId) * 0x9e3779b1u;
-        mixed ^= biomeId * 0x85ebca6bu;
-        std::array<int, 3> base {};
-        if (dimension == 1) {
-            base = End[mixed % End.size()];
-        } else if (dimension == -1) {
-            base = Nether[mixed % Nether.size()];
-        } else {
-            base = Overworld[mixed % Overworld.size()];
+    static bool blockNameContains(
+        std::string_view name,
+        std::string_view part
+    ) noexcept {
+        return name.find(part) != std::string_view::npos;
+    }
+
+    static bool blockNameHasToken(
+        std::string_view name,
+        std::string_view token
+    ) noexcept {
+        std::size_t offset = 0;
+        while (offset <= name.size()) {
+            const auto found = name.find(token, offset);
+            if (found == std::string_view::npos) return false;
+            const auto end = found + token.size();
+            if ((found == 0 || name[found - 1] == '_') &&
+                (end == name.size() || name[end] == '_')) {
+                return true;
+            }
+            offset = found + 1;
         }
-        const int shade = std::clamp((height - 64) / 3, -30, 34);
-        const int red = std::clamp(base[0] + shade, 18, 245);
-        const int green = std::clamp(base[1] + shade, 18, 245);
-        const int blue = std::clamp(base[2] + shade, 18, 245);
+        return false;
+    }
+
+    static int32_t mapRgb(int red, int green, int blue) noexcept {
         return static_cast<int32_t>(
             0xff000000u |
-            (static_cast<uint32_t>(red) << 16u) |
-            (static_cast<uint32_t>(green) << 8u) |
-            static_cast<uint32_t>(blue)
+            (static_cast<uint32_t>(std::clamp(red, 0, 255)) << 16u) |
+            (static_cast<uint32_t>(std::clamp(green, 0, 255)) << 8u) |
+            static_cast<uint32_t>(std::clamp(blue, 0, 255))
         );
+    }
+
+    static int32_t namedBlockColor(
+        std::string_view name,
+        int32_t dimension
+    ) noexcept {
+        struct DyeColor {
+            std::string_view name;
+            int red;
+            int green;
+            int blue;
+        };
+        static constexpr std::array<DyeColor, 16> Dyes {{
+            {"light_blue", 85, 169, 214}, {"light_gray", 169, 170, 165},
+            {"magenta", 184, 75, 183}, {"orange", 232, 137, 45},
+            {"yellow", 231, 207, 59}, {"lime", 116, 186, 54},
+            {"pink", 216, 137, 167}, {"gray", 85, 90, 94},
+            {"cyan", 49, 138, 145}, {"purple", 127, 69, 162},
+            {"blue", 63, 85, 163}, {"brown", 112, 70, 45},
+            {"green", 82, 107, 47}, {"red", 168, 61, 61},
+            {"black", 38, 39, 42}, {"white", 231, 231, 223}
+        }};
+        const bool dyedMaterial = blockNameContains(name, "wool") ||
+            blockNameContains(name, "concrete") ||
+            blockNameContains(name, "terracotta") ||
+            blockNameContains(name, "stained_glass") ||
+            blockNameContains(name, "glazed") ||
+            blockNameContains(name, "carpet") ||
+            blockNameContains(name, "candle") ||
+            blockNameContains(name, "shulker_box");
+        if (dyedMaterial) {
+            for (const auto& dye : Dyes) {
+                if (blockNameHasToken(name, dye.name)) {
+                    return mapRgb(dye.red, dye.green, dye.blue);
+                }
+            }
+        }
+
+        if (blockNameContains(name, "water") ||
+            blockNameContains(name, "bubble_column")) return mapRgb(49, 105, 196);
+        if (blockNameContains(name, "lava")) return mapRgb(238, 83, 25);
+        if (blockNameContains(name, "magma")) return mapRgb(151, 61, 34);
+        if (blockNameContains(name, "snow") || name == "powder_snow") {
+            return mapRgb(238, 244, 247);
+        }
+        if (blockNameContains(name, "ice")) return mapRgb(125, 184, 235);
+        if (blockNameContains(name, "grass_block") ||
+            blockNameContains(name, "moss") || name == "grass") {
+            return mapRgb(91, 151, 70);
+        }
+        if (blockNameContains(name, "leaves") ||
+            blockNameContains(name, "vine") ||
+            blockNameContains(name, "azalea")) return mapRgb(55, 116, 54);
+        if (blockNameContains(name, "kelp") ||
+            blockNameContains(name, "seagrass")) return mapRgb(43, 111, 84);
+        if (blockNameContains(name, "dirt") ||
+            blockNameContains(name, "podzol") ||
+            blockNameContains(name, "farmland")) return mapRgb(123, 83, 54);
+        if (blockNameContains(name, "mud")) return mapRgb(78, 69, 71);
+        if (blockNameContains(name, "mycelium")) return mapRgb(111, 89, 106);
+        if (blockNameContains(name, "sand") ||
+            blockNameContains(name, "end_stone")) return mapRgb(215, 199, 135);
+        if (blockNameContains(name, "gravel")) return mapRgb(126, 120, 116);
+        if (blockNameContains(name, "clay")) return mapRgb(152, 161, 178);
+        // Ores and metal blocks must win before their deepslate/stone host.
+        if (blockNameContains(name, "diamond")) return mapRgb(67, 199, 198);
+        if (blockNameContains(name, "emerald")) return mapRgb(48, 182, 91);
+        if (blockNameContains(name, "lapis")) return mapRgb(52, 81, 151);
+        if (blockNameContains(name, "redstone")) return mapRgb(180, 43, 46);
+        if (blockNameContains(name, "gold")) return mapRgb(222, 177, 45);
+        if (blockNameContains(name, "iron")) return mapRgb(190, 181, 164);
+        if (blockNameContains(name, "coal")) return mapRgb(48, 49, 50);
+        if (blockNameContains(name, "oxidized_copper")) return mapRgb(61, 148, 124);
+        if (blockNameContains(name, "weathered_copper")) return mapRgb(83, 145, 111);
+        if (blockNameContains(name, "exposed_copper")) return mapRgb(171, 121, 83);
+        if (blockNameContains(name, "copper")) return mapRgb(190, 105, 75);
+        if (blockNameContains(name, "deepslate") ||
+            blockNameContains(name, "blackstone")) return mapRgb(55, 59, 68);
+        if (blockNameContains(name, "basalt")) return mapRgb(73, 72, 76);
+        if (blockNameContains(name, "tuff")) return mapRgb(99, 109, 100);
+        if (blockNameContains(name, "calcite") ||
+            blockNameContains(name, "quartz")) return mapRgb(220, 215, 204);
+        if (blockNameContains(name, "granite")) return mapRgb(151, 103, 82);
+        if (blockNameContains(name, "diorite")) return mapRgb(188, 187, 183);
+        if (blockNameContains(name, "andesite")) return mapRgb(116, 119, 120);
+        if (blockNameContains(name, "stone") ||
+            blockNameContains(name, "cobble")) return mapRgb(119, 123, 126);
+        if (blockNameContains(name, "netherrack")) return mapRgb(105, 45, 47);
+        if (blockNameContains(name, "nether_brick")) return mapRgb(55, 29, 36);
+        if (blockNameContains(name, "soul_sand") ||
+            blockNameContains(name, "soul_soil")) return mapRgb(82, 63, 51);
+        if (blockNameContains(name, "warped")) return mapRgb(41, 116, 112);
+        if (blockNameContains(name, "crimson")) return mapRgb(125, 51, 72);
+        if (blockNameContains(name, "prismarine")) return mapRgb(83, 151, 136);
+        if (blockNameContains(name, "purpur")) return mapRgb(164, 113, 166);
+        if (blockNameContains(name, "brick")) return mapRgb(151, 77, 65);
+        if (blockNameContains(name, "glass")) return mapRgb(157, 210, 216);
+        if (blockNameContains(name, "slime")) return mapRgb(109, 190, 87);
+        if (blockNameContains(name, "honey")) return mapRgb(222, 151, 45);
+        if (blockNameContains(name, "hay")) return mapRgb(194, 168, 45);
+        if (blockNameContains(name, "melon")) return mapRgb(109, 151, 47);
+        if (blockNameContains(name, "pumpkin")) return mapRgb(196, 111, 35);
+        if (blockNameContains(name, "flower") ||
+            blockNameContains(name, "tulip") ||
+            blockNameContains(name, "orchid") ||
+            blockNameContains(name, "dandelion")) return mapRgb(183, 111, 123);
+
+        if (blockNameContains(name, "planks") ||
+            blockNameContains(name, "log") ||
+            blockNameContains(name, "wood") ||
+            blockNameContains(name, "stem") ||
+            blockNameContains(name, "hyphae") ||
+            blockNameContains(name, "bookshelf") ||
+            blockNameContains(name, "chest") ||
+            blockNameContains(name, "barrel")) {
+            if (blockNameContains(name, "spruce") ||
+                blockNameContains(name, "dark_oak")) return mapRgb(83, 58, 38);
+            if (blockNameContains(name, "birch") ||
+                blockNameContains(name, "bamboo")) return mapRgb(196, 174, 109);
+            if (blockNameContains(name, "acacia")) return mapRgb(165, 89, 51);
+            if (blockNameContains(name, "mangrove")) return mapRgb(113, 55, 48);
+            if (blockNameContains(name, "cherry")) return mapRgb(210, 151, 151);
+            return mapRgb(151, 108, 64);
+        }
+
+        uint32_t hash = 2166136261u;
+        for (const auto byte : name) {
+            hash ^= static_cast<uint8_t>(byte);
+            hash *= 16777619u;
+        }
+        const int dimensionBias = dimension == 1 ? -18 : (dimension == 2 ? 14 : 0);
+        return mapRgb(
+            72 + static_cast<int>(hash & 0x5f) + dimensionBias,
+            72 + static_cast<int>((hash >> 8u) & 0x5f),
+            72 + static_cast<int>((hash >> 16u) & 0x5f)
+        );
+    }
+
+    static int32_t shadeMapColor(
+        int32_t color,
+        int shade,
+        uint32_t biomeId
+    ) noexcept {
+        const auto raw = static_cast<uint32_t>(color);
+        const int biomeShade = static_cast<int>(biomeId % 7u) - 3;
+        const int amount = std::clamp(shade + biomeShade, -52, 48);
+        return mapRgb(
+            static_cast<int>((raw >> 16u) & 0xffu) + amount,
+            static_cast<int>((raw >> 8u) & 0xffu) + amount,
+            static_cast<int>(raw & 0xffu) + amount
+        );
+    }
+
+    MiniMapAppearance miniMapAppearanceLocked(
+        int32_t runtimeId,
+        int32_t dimension
+    ) {
+        const auto cached = miniMapAppearances.find(runtimeId);
+        if (cached != miniMapAppearances.end()) return cached->second;
+        MiniMapAppearance appearance;
+        if (blockRegistry.has_value()) {
+            const auto* block = blockRegistry->blockByRuntimeId(runtimeId);
+            const auto* state = blockRegistry->stateByRuntimeId(runtimeId);
+            if (block != nullptr) {
+                appearance.air = block->name == "air" ||
+                    block->name == "cave_air" || block->name == "void_air";
+                if (!appearance.air && state != nullptr) {
+                    float collisionTop = -std::numeric_limits<float>::infinity();
+                    for (const auto& shape : state->shapes) {
+                        if (shape[3] <= 0.0 || shape[4] <= 0.0 ||
+                            shape[5] <= 0.0) {
+                            continue;
+                        }
+                        const auto top = static_cast<float>(
+                            shape[1] + shape[4] * 0.5
+                        );
+                        if (std::isfinite(top)) {
+                            collisionTop = std::max(collisionTop, top);
+                        }
+                    }
+                    if (std::isfinite(collisionTop)) {
+                        appearance.solid = true;
+                        appearance.collisionTop = collisionTop;
+                    }
+                }
+                if (!appearance.air && !appearance.solid &&
+                    block->boundingBox != "empty" &&
+                    (state == nullptr || state->missingStateShape)) {
+                    appearance.solid = true;
+                    appearance.collisionTop = 1.0f;
+                }
+                appearance.color = namedBlockColor(block->name, dimension);
+            } else {
+                appearance.air = runtimeId == 0;
+                appearance.solid = !appearance.air;
+                appearance.color = namedBlockColor(
+                    "unknown_" + std::to_string(runtimeId),
+                    dimension
+                );
+            }
+        } else {
+            appearance.air = runtimeId == 0;
+            appearance.solid = !appearance.air;
+            appearance.color = namedBlockColor(
+                "runtime_" + std::to_string(runtimeId),
+                dimension
+            );
+        }
+        miniMapAppearances.emplace(runtimeId, appearance);
+        return appearance;
+    }
+
+    void loadBlockRegistry(const std::filesystem::path& directory) {
+        if (directory.empty()) return;
+        auto loaded = bedrock::BedrockBlockRegistryLoader::loadMinecraftData(
+            directory / "blocks.json",
+            directory / "blockStates.json",
+            directory / "blockCollisionShapes.json",
+            true
+        );
+        loaded.loadRuntimeIds(true);
+        const auto blockCount = loaded.blockCount();
+        const auto stateCount = loaded.stateCount();
+        {
+            std::lock_guard lock(blockRegistryMutex);
+            blockRegistry = std::move(loaded);
+            miniMapAppearances.clear();
+            blockRuntimeIdsAreHashes = true;
+        }
+        push(
+            "block_registry",
+            "Loaded minecraft-data blocks=" + std::to_string(blockCount) +
+                " states=" + std::to_string(stateCount) +
+                " version=" + version,
+            "INFO",
+            "world"
+        );
+    }
+
+    void configureBlockRuntimeIds(bool hashed) {
+        std::lock_guard lock(blockRegistryMutex);
+        if (!blockRegistry.has_value() || blockRuntimeIdsAreHashes == hashed) {
+            return;
+        }
+        blockRegistry->loadRuntimeIds(hashed);
+        blockRuntimeIdsAreHashes = hashed;
+        miniMapAppearances.clear();
     }
 
     void resetMiniMapWorld(int32_t dimension) noexcept {
@@ -884,6 +1147,10 @@ struct RelayState {
             miniMapJobs.clear();
             miniMapTiles.clear();
         }
+        {
+            std::lock_guard lock(blockRegistryMutex);
+            miniMapAppearances.clear();
+        }
         miniMapCondition.notify_all();
     }
 
@@ -891,19 +1158,75 @@ struct RelayState {
         const std::string& version,
         const bedrock::VersionedGamePacket& packet
     ) noexcept {
-        if (!miniMapEnabled.load(std::memory_order_relaxed) ||
+        if ((!miniMapEnabled.load(std::memory_order_relaxed) &&
+             !schematicEnabled.load(std::memory_order_relaxed)) ||
             packet.name != "level_chunk") {
             return;
         }
         try {
-            std::lock_guard lock(miniMapMutex);
-            if (miniMapStopping) return;
-            while (miniMapJobs.size() >= 32) miniMapJobs.pop_front();
-            miniMapJobs.push_back(MiniMapChunkJob {
+            bedrock::VersionedPayloadCursor cursor(packet.payload);
+            const int32_t chunkX = cursor.readVarInt();
+            const int32_t chunkZ = cursor.readVarInt();
+            const int32_t dimension = cursor.readVarInt();
+            const auto camera = entityPositions.cameraSnapshot();
+            int64_t distanceSquared = 0;
+            if (camera.known) {
+                const int32_t cameraChunkX = static_cast<int32_t>(
+                    std::floor(camera.x / 16.0f)
+                );
+                const int32_t cameraChunkZ = static_cast<int32_t>(
+                    std::floor(camera.z / 16.0f)
+                );
+                const int64_t dx = static_cast<int64_t>(chunkX) -
+                    cameraChunkX;
+                const int64_t dz = static_cast<int64_t>(chunkZ) -
+                    cameraChunkZ;
+                distanceSquared = dx * dx + dz * dz;
+                if (dimension != miniMapDimension.load(
+                        std::memory_order_relaxed
+                    )) {
+                    distanceSquared += 1'000'000;
+                }
+            }
+            MiniMapChunkJob incoming {
                 version,
                 packet.payload,
-                miniMapGeneration
-            });
+                0,
+                dimension,
+                chunkX,
+                chunkZ,
+                distanceSquared
+            };
+            std::lock_guard lock(miniMapMutex);
+            if (miniMapStopping) return;
+            incoming.generation = miniMapGeneration;
+            for (auto& queued : miniMapJobs) {
+                if (queued.dimension == dimension && queued.x == chunkX &&
+                    queued.z == chunkZ) {
+                    queued = std::move(incoming);
+                    miniMapCondition.notify_one();
+                    return;
+                }
+            }
+            constexpr std::size_t MaximumQueuedChunks = 96;
+            if (miniMapJobs.size() < MaximumQueuedChunks) {
+                miniMapJobs.push_back(std::move(incoming));
+            } else {
+                auto farthest = std::max_element(
+                    miniMapJobs.begin(),
+                    miniMapJobs.end(),
+                    [](const auto& left, const auto& right) {
+                        return left.cameraDistanceSquared <
+                            right.cameraDistanceSquared;
+                    }
+                );
+                if (farthest == miniMapJobs.end() ||
+                    incoming.cameraDistanceSquared >=
+                        farthest->cameraDistanceSquared) {
+                    return;
+                }
+                *farthest = std::move(incoming);
+            }
             miniMapCondition.notify_one();
         } catch (...) {
         }
@@ -918,8 +1241,16 @@ struct RelayState {
                     return miniMapStopping || !miniMapJobs.empty();
                 });
                 if (miniMapStopping) return;
-                job = std::move(miniMapJobs.front());
-                miniMapJobs.pop_front();
+                const auto nearest = std::min_element(
+                    miniMapJobs.begin(),
+                    miniMapJobs.end(),
+                    [](const auto& left, const auto& right) {
+                        return left.cameraDistanceSquared <
+                            right.cameraDistanceSquared;
+                    }
+                );
+                job = std::move(*nearest);
+                miniMapJobs.erase(nearest);
             }
 
             try {
@@ -939,44 +1270,116 @@ struct RelayState {
                 );
                 MiniMapTile tile;
                 tile.key = MiniMapKey {packet.dimension, packet.x, packet.z};
-                for (int32_t z = 0; z < 16; ++z) {
-                    for (int32_t x = 0; x < 16; ++x) {
-                        int32_t surfaceState = 0;
-                        int32_t surfaceY = column.minY();
-                        for (int32_t sectionY = column.maxCY() - 1;
-                             sectionY >= column.minCY() && surfaceState == 0;
-                             --sectionY) {
-                            const auto* section = column.getSectionAtIndex(sectionY);
-                            if (section == nullptr) continue;
-                            for (int32_t localY = 15; localY >= 0; --localY) {
-                                const auto stateId = section->getBlockStateId(
-                                    static_cast<uint8_t>(x),
-                                    static_cast<uint8_t>(localY),
-                                    static_cast<uint8_t>(z)
-                                );
-                                if (stateId == 0) continue;
-                                surfaceState = stateId;
-                                surfaceY = sectionY * 16 + localY;
-                                break;
+                tile.surfaceHeights.fill(UnknownSurfaceHeight);
+                tile.groundHeights.fill(
+                    std::numeric_limits<float>::quiet_NaN()
+                );
+                std::array<int32_t, 256> baseColors {};
+                std::array<uint32_t, 256> biomes {};
+                {
+                    // StartGame may switch between numeric and hashed runtime
+                    // IDs. Keep the registry mode stable for the whole tile.
+                    std::lock_guard registryLock(blockRegistryMutex);
+                    for (int32_t z = 0; z < 16; ++z) {
+                        for (int32_t x = 0; x < 16; ++x) {
+                            const auto offset = static_cast<std::size_t>(
+                                z * 16 + x
+                            );
+                            bool surfaceFound = false;
+                            bool groundFound = false;
+                            int32_t surfaceY = column.minY();
+                            for (int32_t sectionY = column.maxCY() - 1;
+                                 sectionY >= column.minCY() &&
+                                    (!surfaceFound || !groundFound);
+                                 --sectionY) {
+                                const auto* section =
+                                    column.getSectionAtIndex(sectionY);
+                                if (section == nullptr) continue;
+                                for (int32_t localY = 15;
+                                     localY >= 0 &&
+                                        (!surfaceFound || !groundFound);
+                                     --localY) {
+                                    const auto runtimeId =
+                                        section->getBlockStateId(
+                                            static_cast<uint8_t>(x),
+                                            static_cast<uint8_t>(localY),
+                                            static_cast<uint8_t>(z)
+                                        );
+                                    const auto appearance =
+                                        miniMapAppearanceLocked(
+                                            runtimeId,
+                                            packet.dimension
+                                        );
+                                    if (appearance.air) continue;
+                                    const int32_t blockY =
+                                        sectionY * 16 + localY;
+                                    if (!surfaceFound) {
+                                        surfaceFound = true;
+                                        surfaceY = blockY;
+                                        tile.surfaceHeights[offset] =
+                                            static_cast<int16_t>(blockY);
+                                        baseColors[offset] = appearance.color;
+                                    }
+                                    if (!groundFound && appearance.solid) {
+                                        groundFound = true;
+                                        tile.groundHeights[offset] =
+                                            static_cast<float>(blockY) +
+                                                appearance.collisionTop;
+                                    }
+                                }
+                            }
+                            if (!surfaceFound) continue;
+                            try {
+                                biomes[offset] = column.getBiomeId({
+                                    x,
+                                    surfaceY,
+                                    z,
+                                    std::nullopt
+                                });
+                            } catch (...) {
                             }
                         }
-                        uint32_t biome = 0;
-                        try {
-                            biome = column.getBiomeId({
-                                x,
-                                surfaceY,
-                                z,
-                                std::nullopt
-                            });
-                        } catch (...) {
+                    }
+                }
+
+                auto heightAt = [&tile](int x, int z, int fallback) {
+                    x = std::clamp(x, 0, 15);
+                    z = std::clamp(z, 0, 15);
+                    const auto value = tile.surfaceHeights[
+                        static_cast<std::size_t>(z * 16 + x)
+                    ];
+                    return value == UnknownSurfaceHeight
+                        ? fallback
+                        : static_cast<int>(value);
+                };
+                for (int32_t z = 0; z < 16; ++z) {
+                    for (int32_t x = 0; x < 16; ++x) {
+                        const auto offset = static_cast<std::size_t>(
+                            z * 16 + x
+                        );
+                        const int height = tile.surfaceHeights[offset];
+                        if (height == UnknownSurfaceHeight) {
+                            tile.pixels[offset] = 0x00000000;
+                            continue;
                         }
-                        tile.pixels[static_cast<std::size_t>(z * 16 + x)] =
-                            miniMapSurfaceColor(
-                                surfaceState,
-                                biome,
-                                surfaceY,
-                                packet.dimension
-                            );
+                        const int west = heightAt(x - 1, z, height);
+                        const int east = heightAt(x + 1, z, height);
+                        const int north = heightAt(x, z - 1, height);
+                        const int south = heightAt(x, z + 1, height);
+                        int shade = std::clamp(
+                            (west + north - east - south) * 5 +
+                                (height - 64) / 20,
+                            -42,
+                            38
+                        );
+                        int contour = height % 8;
+                        if (contour < 0) contour += 8;
+                        if (contour == 0) shade -= 6;
+                        tile.pixels[offset] = shadeMapColor(
+                            baseColors[offset],
+                            shade,
+                            biomes[offset]
+                        );
                     }
                 }
 
@@ -1069,6 +1472,36 @@ struct RelayState {
             }
             return result;
         }
+    }
+
+    float worldSurfaceY(int32_t worldX, int32_t worldZ) const noexcept {
+        auto chunkCoordinate = [](int32_t value) {
+            int32_t chunk = value / 16;
+            if (value < 0 && value % 16 != 0) --chunk;
+            return chunk;
+        };
+        const int32_t chunkX = chunkCoordinate(worldX);
+        const int32_t chunkZ = chunkCoordinate(worldZ);
+        const int32_t localX = worldX - chunkX * 16;
+        const int32_t localZ = worldZ - chunkZ * 16;
+        const int32_t dimension = miniMapDimension.load(
+            std::memory_order_relaxed
+        );
+        std::lock_guard lock(miniMapMutex);
+        const auto found = miniMapTiles.find(MiniMapKey {
+            dimension,
+            chunkX,
+            chunkZ
+        });
+        if (found == miniMapTiles.end()) {
+            return std::numeric_limits<float>::quiet_NaN();
+        }
+        const auto height = found->second.groundHeights[
+            static_cast<std::size_t>(localZ * 16 + localX)
+        ];
+        return std::isfinite(height)
+            ? height
+            : std::numeric_limits<float>::quiet_NaN();
     }
 
     static void refreshDurability(
@@ -1453,6 +1886,15 @@ struct RelayState {
         }
         if (!serverbound && name == "start_game") {
             minecraftUiBlocked.store(false, std::memory_order_relaxed);
+            try {
+                std::lock_guard decodeLock(itemDecodeMutex);
+                bedrock::RelayPacketEvent decoded(version, event);
+                configureBlockRuntimeIds(decoded.getBool(
+                    "block_network_ids_are_hashes",
+                    true
+                ));
+            } catch (...) {
+            }
             resetMiniMapWorld(0);
             std::lock_guard lock(mutex);
             equipment = {};
@@ -1865,11 +2307,13 @@ struct RelayState {
     void configureGameplayFeatures(
         bool armor,
         bool totem,
-        bool miniMap
+        bool miniMap,
+        bool schematic
     ) {
         autoArmorEnabled.store(armor, std::memory_order_relaxed);
         autoTotemEnabled.store(totem, std::memory_order_relaxed);
         miniMapEnabled.store(miniMap, std::memory_order_relaxed);
+        schematicEnabled.store(schematic, std::memory_order_relaxed);
         if (!armor && !totem) {
             std::lock_guard lock(mutex);
             pendingAutomationRequestId = 0;
@@ -2006,11 +2450,15 @@ struct RelayState {
         });
     }
 
-    void flushFlight(std::string reason) {
+    void flushFlight(
+        std::string reason,
+        std::size_t maximumRecords = 768
+    ) {
         if (!detailedLogging.load(std::memory_order_relaxed)) return;
         std::vector<FlightRecord> snapshot;
         uint64_t firstSequence = 0;
         uint64_t lastSequence = 0;
+        std::size_t omittedRecords = 0;
         {
             std::lock_guard lock(mutex);
             if (flight.empty() ||
@@ -2025,7 +2473,17 @@ struct RelayState {
             if (firstUnflushed == flight.end()) {
                 return;
             }
-            snapshot.assign(firstUnflushed, flight.end());
+            const auto availableRecords = static_cast<std::size_t>(
+                flight.end() - firstUnflushed
+            );
+            const auto selectedRecords = std::min(
+                availableRecords,
+                std::max<std::size_t>(1, maximumRecords)
+            );
+            omittedRecords = availableRecords - selectedRecords;
+            const auto firstSelected = firstUnflushed +
+                static_cast<std::ptrdiff_t>(omittedRecords);
+            snapshot.assign(firstSelected, flight.end());
             firstSequence = snapshot.front().sequence;
             lastSequence = snapshot.back().sequence;
             lastFlushedFlightSequence = flightSequence;
@@ -2036,7 +2494,8 @@ struct RelayState {
             "reason=" + reason + " records=" +
                 std::to_string(snapshot.size()) + " sequence=" +
                 std::to_string(firstSequence) + ".." +
-                std::to_string(lastSequence),
+                std::to_string(lastSequence) + " omittedOlder=" +
+                std::to_string(omittedRecords),
             "WARN",
             "flight"
         );
@@ -2461,6 +2920,8 @@ public:
         // when a server uses a newer optional packet field.
         options.parseErrorPolicy = bedrock::RelayParseErrorPolicy::ForwardRaw;
         options.enableChunkCaching = false;
+        options.levelChunkRetentionMaximumBytes =
+            AndroidLevelChunkRetentionMaximumBytes;
         options.destination.host = destinationHost;
         options.destination.port = destinationPort;
         options.destination.offline = false;
@@ -2492,6 +2953,10 @@ public:
                 std::to_string(destinationPort) +
                 " version=" + version +
                 " forceSingle=true replaceExisting=true" +
+                " retainedChunkLimitMiB=" + std::to_string(
+                    AndroidLevelChunkRetentionMaximumBytes /
+                        (1024u * 1024u)
+                ) +
                 " nativeBuild=" + std::string(NativeBuildType) +
                 " compilerOptimized=" +
                 (NativeCompilerOptimized ? "true" : "false"),
@@ -2671,8 +3136,10 @@ public:
             state->clearGameplayTelemetry();
             state->push(
                 "disconnect",
-                "downstream_session=" + player.sessionId() +
+                "origin=downstream_transport_close downstream_session=" +
+                    player.sessionId() +
                     "; matching upstream was notified and closed; "
+                    "relay remains running and listening; "
                     "clientbound_equipment_packets=" +
                     std::to_string(
                         state->clientboundEquipmentPackets.load()
@@ -2680,7 +3147,10 @@ public:
                 "INFO",
                 "lifecycle"
             );
-            state->flushFlight("downstream_disconnect");
+            // A normal Minecraft-side close is not a relay fault. Preserve a
+            // compact tail without forcing the UI to format hundreds of
+            // high-volume packet breadcrumbs at the moment of disconnect.
+            state->flushFlight("downstream_disconnect", 96);
         });
         relay->onError([state](const std::string& message) {
             state->entityPositions.clear();
@@ -2838,10 +3308,19 @@ public:
             }
             if (event.packet.name == "network_chunk_publisher_update" &&
                 state->chunkRetentionEnabled.load(std::memory_order_relaxed)) {
-                const auto minimumRadiusBlocks = static_cast<uint32_t>(
+                const auto requestedRadiusChunks =
                     state->retainedRadiusChunks.load(
                         std::memory_order_relaxed
-                    ) * 16
+                    );
+                // Keep the full requested cache inside the relay, but do not
+                // make Minecraft render/download a 1024-block publisher
+                // radius on memory-constrained Android devices.
+                const auto clientRadiusChunks = std::min(
+                    requestedRadiusChunks,
+                    MaximumClientPublisherRadiusChunks
+                );
+                const auto minimumRadiusBlocks = static_cast<uint32_t>(
+                    clientRadiusChunks * 16
                 );
                 const auto retention = bedrock::retainPublishedChunks(
                     event.packet,
@@ -2877,7 +3356,11 @@ public:
                             "chunk_retention",
                             "serverRadiusBlocks=" + std::to_string(
                                 retention.originalRadiusBlocks
-                            ) + " effectiveRadiusBlocks=" + std::to_string(
+                            ) + " requestedCacheRadiusChunks=" +
+                                std::to_string(requestedRadiusChunks) +
+                                " clientRadiusLimitChunks=" +
+                                std::to_string(clientRadiusChunks) +
+                                " effectiveRadiusBlocks=" + std::to_string(
                                 retention.effectiveRadiusBlocks
                             ) + " publisherUpdates=" +
                                 std::to_string(observed) +
@@ -3464,7 +3947,8 @@ Java_com_m9chko_bedrockrelay_NativeBridge_startRelay(
     jstring destinationHostValue,
     jint destinationPortValue,
     jstring versionValue,
-    jstring cacheDirectoryValue
+    jstring cacheDirectoryValue,
+    jstring minecraftDataDirectoryValue
 ) {
     auto state = std::make_shared<RelayState>();
     state->configureRuntime(
@@ -3475,7 +3959,8 @@ Java_com_m9chko_bedrockrelay_NativeBridge_startRelay(
     state->configureGameplayFeatures(
         configuredAutoArmor.load(std::memory_order_relaxed),
         configuredAutoTotem.load(std::memory_order_relaxed),
-        configuredMiniMap.load(std::memory_order_relaxed)
+        configuredMiniMap.load(std::memory_order_relaxed),
+        configuredSchematic.load(std::memory_order_relaxed)
     );
     try {
         initializeJavaBridge(environment, bridgeClass);
@@ -3486,6 +3971,10 @@ Java_com_m9chko_bedrockrelay_NativeBridge_startRelay(
         const auto cacheDirectory = fromJavaString(
             environment,
             cacheDirectoryValue
+        );
+        const auto minecraftDataDirectory = fromJavaString(
+            environment,
+            minecraftDataDirectoryValue
         );
         const auto version = fromJavaString(environment, versionValue);
         if (destinationHost.empty()) {
@@ -3508,6 +3997,28 @@ Java_com_m9chko_bedrockrelay_NativeBridge_startRelay(
         state->version = version;
         state->relayStartedAt = unixMilliseconds();
         state->running = true;
+        if (!minecraftDataDirectory.empty()) {
+            try {
+                state->loadBlockRegistry(
+                    std::filesystem::path(minecraftDataDirectory)
+                );
+            } catch (const std::exception& error) {
+                state->push(
+                    "block_registry_failed",
+                    "Could not load packaged minecraft-data: " +
+                        safeMessage(error.what()),
+                    "WARN",
+                    "world"
+                );
+            }
+        } else {
+            state->push(
+                "block_registry_unavailable",
+                "No packaged minecraft-data directory for version=" + version,
+                "WARN",
+                "world"
+            );
+        }
 
         std::shared_ptr<RelayController> previous;
         {
@@ -3637,21 +4148,26 @@ Java_com_m9chko_bedrockrelay_NativeBridge_configureGameplayFeatures(
     jclass,
     jboolean autoArmorEnabled,
     jboolean autoTotemEnabled,
-    jboolean miniMapEnabled
+    jboolean miniMapEnabled,
+    jboolean schematicEnabled
 ) {
     const bool armor = autoArmorEnabled == JNI_TRUE;
     const bool totem = autoTotemEnabled == JNI_TRUE;
     const bool miniMap = miniMapEnabled == JNI_TRUE;
+    const bool schematic = schematicEnabled == JNI_TRUE;
     configuredAutoArmor.store(armor, std::memory_order_relaxed);
     configuredAutoTotem.store(totem, std::memory_order_relaxed);
     configuredMiniMap.store(miniMap, std::memory_order_relaxed);
+    configuredSchematic.store(schematic, std::memory_order_relaxed);
 
     std::shared_ptr<RelayState> state;
     {
         std::lock_guard lock(controllerMutex);
         state = currentState;
     }
-    if (state) state->configureGameplayFeatures(armor, totem, miniMap);
+    if (state) {
+        state->configureGameplayFeatures(armor, totem, miniMap, schematic);
+    }
 }
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -3710,6 +4226,23 @@ Java_com_m9chko_bedrockrelay_NativeBridge_miniMapSnapshot(
         reinterpret_cast<const jint*>(values.data())
     );
     return result;
+}
+
+extern "C" JNIEXPORT jfloat JNICALL
+Java_com_m9chko_bedrockrelay_NativeBridge_worldSurfaceY(
+    JNIEnv*,
+    jclass,
+    jint worldX,
+    jint worldZ
+) {
+    std::shared_ptr<RelayState> state;
+    {
+        std::lock_guard lock(controllerMutex);
+        state = currentState;
+    }
+    return state
+        ? static_cast<jfloat>(state->worldSurfaceY(worldX, worldZ))
+        : std::numeric_limits<jfloat>::quiet_NaN();
 }
 
 extern "C" JNIEXPORT jstring JNICALL

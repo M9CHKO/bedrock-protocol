@@ -314,7 +314,9 @@ final class MiniMapOverlayController {
             super(context);
             density = context.getResources().getDisplayMetrics().density;
             scale = scalePercent / 100f;
-            size = px(172);
+            // Keep the map compact enough for a phone HUD; the scale slider
+            // can still enlarge it when the user wants a navigation view.
+            size = px(124);
             setBackgroundColor(Color.TRANSPARENT);
             setWillNotDraw(false);
             background.setColor(0xe20d141d);
@@ -349,6 +351,7 @@ final class MiniMapOverlayController {
             canvas.drawRoundRect(bounds, radius, radius, border);
             drawPlayerMarker(canvas, bounds.centerX(), bounds.centerY());
             canvas.drawText("N", bounds.centerX() - px(3), bounds.top + px(12), label);
+            drawHeight(canvas, bounds);
         }
 
         private void drawTerrain(Canvas canvas, RectF area) {
@@ -402,6 +405,25 @@ final class MiniMapOverlayController {
             arrow.close();
             canvas.drawPath(arrow, marker);
             canvas.restoreToCount(saved);
+        }
+
+        private void drawHeight(Canvas canvas, RectF area) {
+            boolean known;
+            int blockY;
+            synchronized (modelLock) {
+                known = cameraKnown;
+                blockY = (int) Math.floor(cameraY - 1.62f);
+            }
+            if (!known) return;
+            label.setColor(0xffe8f1fa);
+            label.setShadowLayer(px(1.5f), 0f, px(1f), 0xe0000000);
+            canvas.drawText(
+                "Y " + blockY,
+                area.left + px(8),
+                area.bottom - px(7),
+                label
+            );
+            label.clearShadowLayer();
         }
 
         private int px(float value) {
