@@ -82,11 +82,28 @@ int main() {
         "rewritten packet does not contain the configured radius"
     );
 
-    auto noOpPacket = makePublisherPacket(320);
-    const auto noOpBytes = noOpPacket.fullPacket;
-    const auto noOp = bedrock::retainPublishedChunks(noOpPacket, 160);
-    ok &= check(!noOp.rewritten, "helper reduced the server radius");
-    ok &= check(noOpPacket.fullPacket == noOpBytes, "no-op packet bytes changed");
+    auto forwardedPacket = makePublisherPacket(320);
+    const auto forwardedPayload = forwardedPacket.payload;
+    const auto forwardedBytes = forwardedPacket.fullPacket;
+    auto inspectedPacket = forwardedPacket;
+    const auto inspection = bedrock::retainPublishedChunks(inspectedPacket, 0);
+    ok &= check(inspection.decoded, "read-only inspection did not decode packet");
+    ok &= check(!inspection.rewritten, "read-only inspection rewrote its copy");
+    ok &= check(
+        inspection.originalRadiusBlocks == 320 &&
+            inspection.effectiveRadiusBlocks == 320,
+        "read-only inspection reported the wrong radius"
+    );
+    ok &= check(
+        forwardedPacket.payload == forwardedPayload &&
+            forwardedPacket.fullPacket == forwardedBytes,
+        "read-only inspection changed the packet selected for forwarding"
+    );
+    ok &= check(
+        inspectedPacket.payload == forwardedPayload &&
+            inspectedPacket.fullPacket == forwardedBytes,
+        "minimum zero changed the inspected packet copy"
+    );
 
     auto malformed = makePublisherPacket(160);
     malformed.payload = {0x80};

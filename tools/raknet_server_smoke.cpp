@@ -285,6 +285,39 @@ struct BedrockServerTestAccess {
         return {};
     }
 
+    static bool rakNetDisconnectExceptionStillCloses() {
+        RakNetServer server;
+        const RakNetServerPeer peer {"127.0.0.1", 19132, 2, 1400};
+        {
+            std::lock_guard<std::mutex> lock(server.peersMutex_);
+            server.peers_.emplace("127.0.0.1:19132", peer);
+        }
+        int closeCalls = 0;
+        server.onRawPacket([](
+            const RakNetServerPeer&,
+            const std::vector<uint8_t>&
+        ) {
+            throw std::runtime_error("disconnect raw callback boom");
+        });
+        server.onCloseConnection([&](const RakNetServerPeer&) {
+            ++closeCalls;
+        });
+
+        bool originalFailurePreserved = false;
+        try {
+            // ID_CONNECTION_LOST. RakPeer normally generates it locally; call
+            // the native boundary directly to keep this regression test fast.
+            server.handleNativePacket(peer, {0x16});
+        } catch (const std::runtime_error& error) {
+            originalFailurePreserved =
+                std::string(error.what()) == "disconnect raw callback boom";
+        } catch (...) {
+        }
+        std::lock_guard<std::mutex> lock(server.peersMutex_);
+        return originalFailurePreserved && closeCalls == 1 &&
+            server.peers_.empty();
+    }
+
     static bool rakNetInternalMessageIsFiltered() {
         RakNetServer server;
         const RakNetServerPeer peer {"127.0.0.1", 19132, 1, 1400};
@@ -318,6 +351,13 @@ struct BedrockServerTestAccess {
             return false;
         }
         return rawCalls == 1 && encapsulatedCalls == 0;
+    }
+
+    static void shutdownRakNetAfterWorkerError(
+        RakNetServer& server,
+        const char* detail
+    ) {
+        server.shutdownAfterWorkerError(detail);
     }
 };
 
@@ -1547,6 +1587,11 @@ bool checkRakNetCallbackBoundary() {
         std::cerr << "[SMOKE] RakNet internal/application boundary regressed\n";
         return false;
     }
+    if (!bedrock::BedrockServerTestAccess::
+            rakNetDisconnectExceptionStillCloses()) {
+        std::cerr << "[SMOKE] disconnect callback exception leaked peer state\n";
+        return false;
+    }
     return true;
 }
 
@@ -2147,6 +2192,280 @@ bool establishConnectedSession(
         return false;
     }
     return true;
+}
+
+bool checkRakNetWorkerExceptionBoundary() {
+    bedrock::RakNetServer server({
+        .host = "127.0.0.1",
+        .port = 0,
+        .maxPlayers = 1,
+        .protocolVersion = RAKNET_PROTOCOL
+    });
+    std::atomic<bool> opened {false};
+    std::atomic<int> workerErrors {0};
+    std::atomic<int> closed {0};
+    std::mutex errorMutex;
+    std::string workerError;
+    server.onOpenConnection([&](const bedrock::RakNetServerPeer&) {
+        opened = true;
+    });
+    server.onWorkerError([&](
+        const bedrock::RakNetServerPeer&,
+        const std::string& message
+    ) {
+        ++workerErrors;
+        std::lock_guard<std::mutex> lock(errorMutex);
+        workerError = message;
+    });
+    server.onCloseConnection([&](const bedrock::RakNetServerPeer&) {
+        ++closed;
+    });
+    server.onEncapsulated([](
+        const bedrock::RakNetServerPeer&,
+        const std::vector<uint8_t>&
+    ) {
+        throw std::runtime_error("server live callback boom");
+    });
+    server.listen();
+
+    sockaddr_in target {};
+    target.sin_family = AF_INET;
+    target.sin_port = htons(server.boundPort());
+    inet_pton(AF_INET, "127.0.0.1", &target.sin_addr);
+    const int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0 || !establishConnectedSession(
+            sock,
+            target,
+            server.boundPort()
+        )) {
+        if (sock >= 0) close(sock);
+        server.close();
+        std::cerr << "[SMOKE] worker-boundary connection failed\n";
+        return false;
+    }
+    for (int attempt = 0; attempt < 100 && !opened.load(); ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    const std::vector<uint8_t> payload {0xfe, 0x01, 0x02, 0x03};
+    if (!opened.load() || !sendPacket(
+            sock,
+            target,
+            buildReliableDatagram(payload, 2, 2, 2)
+        )) {
+        close(sock);
+        server.close();
+        std::cerr << "[SMOKE] worker-boundary payload setup failed\n";
+        return false;
+    }
+
+    for (int attempt = 0;
+         attempt < 100 && (workerErrors.load() == 0 || closed.load() == 0);
+         ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    std::string capturedError;
+    {
+        std::lock_guard<std::mutex> lock(errorMutex);
+        capturedError = workerError;
+    }
+    const bool ok = workerErrors.load() == 1 && closed.load() == 1 &&
+        capturedError == "server live callback boom" && server.listening();
+    close(sock);
+    server.close();
+    if (!ok) {
+        std::cerr << "[SMOKE] server worker exception was not contained: errors="
+                  << workerErrors.load() << " close=" << closed.load()
+                  << " listening=" << server.listening()
+                  << " detail=" << capturedError << "\n";
+    }
+    return ok;
+}
+
+bool checkRakNetPreOpenWorkerException() {
+    bedrock::RakNetServer server({
+        .host = "127.0.0.1",
+        .port = 0,
+        .maxPlayers = 1,
+        .protocolVersion = RAKNET_PROTOCOL
+    });
+    std::atomic<int> opened {0};
+    std::atomic<int> workerErrors {0};
+    std::atomic<int> closed {0};
+    server.onOpenConnection([&](const bedrock::RakNetServerPeer&) {
+        ++opened;
+    });
+    server.onCloseConnection([&](const bedrock::RakNetServerPeer&) {
+        ++closed;
+    });
+    server.onWorkerError([&](
+        const bedrock::RakNetServerPeer&,
+        const std::string&
+    ) {
+        ++workerErrors;
+    });
+    server.onRawPacket([](
+        const bedrock::RakNetServerPeer&,
+        const std::vector<uint8_t>&
+    ) {
+        // ID_NEW_INCOMING_CONNECTION reaches raw observers before peers_
+        // insertion. The worker boundary must force-close its native GUID.
+        throw std::runtime_error("pre-open raw callback boom");
+    });
+    server.listen();
+
+    sockaddr_in target {};
+    target.sin_family = AF_INET;
+    target.sin_port = htons(server.boundPort());
+    inet_pton(AF_INET, "127.0.0.1", &target.sin_addr);
+    const int rejectedSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (rejectedSock < 0) {
+        server.close();
+        return false;
+    }
+    // The close can race the final ACK, so only the worker error is required
+    // from this first handshake.
+    (void) establishConnectedSession(
+        rejectedSock,
+        target,
+        server.boundPort()
+    );
+    for (int attempt = 0; attempt < 100 && workerErrors.load() == 0; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    close(rejectedSock);
+    server.onRawPacket({});
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    // maxPlayers=1 makes the second successful connection proof that the
+    // failed pre-open transport no longer occupies a native RakNet slot.
+    const int acceptedSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    const bool accepted = acceptedSock >= 0 && establishConnectedSession(
+        acceptedSock,
+        target,
+        server.boundPort()
+    );
+    for (int attempt = 0; attempt < 100 && opened.load() == 0; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    const bool ok = workerErrors.load() == 1 && opened.load() == 1 &&
+        closed.load() == 0 && accepted && server.listening();
+    if (acceptedSock >= 0) close(acceptedSock);
+    server.close();
+    if (!ok) {
+        std::cerr << "[SMOKE] pre-open worker exception leaked native peer: errors="
+                  << workerErrors.load() << " open=" << opened.load()
+                  << " close=" << closed.load() << " accepted=" << accepted
+                  << "\n";
+    }
+    return ok;
+}
+
+bool checkRakNetFatalWorkerCleanup() {
+    bedrock::RakNetServer server({
+        .host = "127.0.0.1",
+        .port = 0,
+        .maxPlayers = 1,
+        .protocolVersion = RAKNET_PROTOCOL
+    });
+    std::atomic<bool> opened {false};
+    std::atomic<int> workerErrors {0};
+    std::atomic<int> closed {0};
+    std::mutex errorMutex;
+    std::string workerError;
+    server.onOpenConnection([&](const bedrock::RakNetServerPeer&) {
+        opened = true;
+    });
+    server.onWorkerError([&](
+        const bedrock::RakNetServerPeer&,
+        const std::string& message
+    ) {
+        ++workerErrors;
+        std::lock_guard<std::mutex> lock(errorMutex);
+        workerError = message;
+    });
+    server.onCloseConnection([&](const bedrock::RakNetServerPeer&) {
+        ++closed;
+    });
+    server.onEncapsulated([&](
+        const bedrock::RakNetServerPeer&,
+        const std::vector<uint8_t>&
+    ) {
+        // Exercise the last-resort cleanup from the worker itself. This is a
+        // friend-only injection for a condition that is otherwise limited to
+        // native/internal failures outside the per-callback boundary.
+        bedrock::BedrockServerTestAccess::shutdownRakNetAfterWorkerError(
+            server,
+            "server worker fatal boom"
+        );
+    });
+    server.listen();
+    const uint16_t port = server.boundPort();
+
+    sockaddr_in target {};
+    target.sin_family = AF_INET;
+    target.sin_port = htons(port);
+    inet_pton(AF_INET, "127.0.0.1", &target.sin_addr);
+    const int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0 || !establishConnectedSession(sock, target, port)) {
+        if (sock >= 0) close(sock);
+        server.close();
+        std::cerr << "[SMOKE] fatal worker cleanup connection failed\n";
+        return false;
+    }
+    for (int attempt = 0; attempt < 100 && !opened.load(); ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    const std::vector<uint8_t> payload {0xfe, 0x04, 0x05, 0x06};
+    if (!opened.load() || !sendPacket(
+            sock,
+            target,
+            buildReliableDatagram(payload, 2, 2, 2)
+        )) {
+        close(sock);
+        server.close();
+        std::cerr << "[SMOKE] fatal worker cleanup payload setup failed\n";
+        return false;
+    }
+    close(sock);
+
+    for (int attempt = 0;
+         attempt < 100 && (server.listening() || closed.load() == 0);
+         ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    std::string capturedError;
+    {
+        std::lock_guard<std::mutex> lock(errorMutex);
+        capturedError = workerError;
+    }
+
+    bool portReleased = false;
+    try {
+        bedrock::RakNetServer replacement({
+            .host = "127.0.0.1",
+            .port = port,
+            .maxPlayers = 1,
+            .protocolVersion = RAKNET_PROTOCOL
+        });
+        replacement.listen();
+        portReleased = replacement.listening();
+        replacement.close();
+    } catch (...) {
+        portReleased = false;
+    }
+
+    const bool ok = workerErrors.load() == 1 && closed.load() == 1 &&
+        capturedError == "server worker fatal boom" &&
+        !server.listening() && portReleased;
+    server.close();
+    if (!ok) {
+        std::cerr << "[SMOKE] fatal worker cleanup was incomplete: errors="
+                  << workerErrors.load() << " close=" << closed.load()
+                  << " listening=" << server.listening()
+                  << " portReleased=" << portReleased
+                  << " detail=" << capturedError << "\n";
+    }
+    return ok;
 }
 
 bool checkReliableSendBackpressure() {
@@ -4080,6 +4399,9 @@ int main(int argc, char** argv) {
             !checkEncryptedPlayerErrorBranches() ||
             !checkPlayerReadPacketBoundaries() ||
             !checkRakNetCallbackBoundary() ||
+            !checkRakNetWorkerExceptionBoundary() ||
+            !checkRakNetPreOpenWorkerException() ||
+            !checkRakNetFatalWorkerCleanup() ||
             !checkTransportFailureDiagnostics() ||
             !checkEncryptedReceiveVsDelayedClose() ||
             !checkDestroyWhileReceiving()) {
@@ -4101,6 +4423,9 @@ int main(int argc, char** argv) {
         !checkEncryptedPlayerErrorBranches() ||
         !checkPlayerReadPacketBoundaries() ||
         !checkRakNetCallbackBoundary() ||
+        !checkRakNetWorkerExceptionBoundary() ||
+        !checkRakNetPreOpenWorkerException() ||
+        !checkRakNetFatalWorkerCleanup() ||
         !checkTransportFailureDiagnostics() ||
         !checkEncryptedReceiveVsDelayedClose() ||
         !checkDestroyWhileReceiving()) {

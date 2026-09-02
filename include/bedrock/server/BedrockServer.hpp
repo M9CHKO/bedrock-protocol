@@ -31,6 +31,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <exception>
 #include <filesystem>
 #include <functional>
 #include <initializer_list>
@@ -222,6 +223,9 @@ struct BedrockServerOptions {
     // connection.js starts one outbound queue timer per Player and uses
     // `options.batchingInterval || 20` as its period.
     int batchingInterval = 20;
+    // Reliable-delivery inactivity timeout after RakNet connects. Appended to
+    // preserve positional aggregate initialization of the original fields.
+    int raknetTimeoutMs = 30'000;
 };
 
 // C++ lifecycle switches are intentionally separate from the ordinary
@@ -924,6 +928,20 @@ public:
                 );
             }
         });
+        raknet_.onWorkerError([this](
+            const RakNetServerPeer& peer,
+            const std::string& message
+        ) {
+            emitTransport(
+                BedrockServerTransportEventKind::Error,
+                peer,
+                {},
+                0,
+                0,
+                {},
+                "RakNet server worker callback failure: " + message
+            );
+        });
         raknet_.onCloseConnection([this](const RakNetServerPeer& peer) {
             emitTransport(
                 BedrockServerTransportEventKind::Close,
@@ -1567,6 +1585,7 @@ private:
         raknet.host = options.host;
         raknet.port = options.port;
         raknet.maxPlayers = options.maxPlayers;
+        raknet.timeoutMs = options.raknetTimeoutMs;
         // node_modules/bedrock-protocol/src/rak.js switches at 1.19.30
         // (Minecraft protocol 554), not at 1.20.0.
         raknet.protocolVersion = protocolVersionForMinecraft(options.version) >= 554 ? 11 : 10;
@@ -3170,10 +3189,17 @@ private:
             std::lock_guard<std::mutex> lock(playerLifecycleMutex_);
             shouldEmitPlayerClose = closedPlayers_.insert(playerKey(connection)).second;
         }
+        std::exception_ptr closeHandlerFailure;
         if (shouldEmitPlayerClose) {
             // Incoming native close invokes Player.close before Server
             // deletes the client and decrements clientCount.
-            emitPlayerClose(connection);
+            try {
+                emitPlayerClose(connection);
+            } catch (...) {
+                // Complete transport/session cleanup before allowing the live
+                // callback exception to reach RakNet's worker boundary.
+                closeHandlerFailure = std::current_exception();
+            }
             clearPlayerListeners(connection);
         }
         {
@@ -3194,6 +3220,9 @@ private:
         }
         if (erased) {
             --clientCount_;
+        }
+        if (closeHandlerFailure) {
+            std::rethrow_exception(closeHandlerFailure);
         }
     }
 

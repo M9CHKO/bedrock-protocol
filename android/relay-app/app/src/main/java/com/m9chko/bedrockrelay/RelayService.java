@@ -146,6 +146,8 @@ public final class RelayService extends Service {
         Executors.newSingleThreadScheduledExecutor();
     private final AtomicBoolean pollingStarted = new AtomicBoolean(false);
     private final AtomicBoolean entityPollingStarted = new AtomicBoolean(false);
+    private final AtomicBoolean schematicSnapshotInFlight =
+        new AtomicBoolean(false);
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
     private SharedPreferences preferences;
@@ -168,6 +170,7 @@ public final class RelayService extends Service {
     private volatile String lastSnapshotFingerprint = "";
     private volatile long lastPollingErrorAt;
     private volatile long lastEntityPollingErrorAt;
+    private volatile long lastSchematicSnapshotErrorAt;
     private int entityPollTick;
     private int uiPollTick;
 
@@ -465,8 +468,51 @@ public final class RelayService extends Service {
                         NativeBridge.minecraftUiBlocked() || isImeVisible()
                     );
                 }
-                if ((pollTick % 8) == 0 && miniMapOverlayController != null &&
-                    miniMapOverlayController.wantsFrames()) {
+                boolean outlineFrames = entityOverlayController != null &&
+                    entityOverlayController.wantsFrames();
+                boolean threatFrames = threatOverlayController != null &&
+                    threatOverlayController.wantsFrames();
+                boolean schematicFrames = schematicOverlayController != null &&
+                    schematicOverlayController.wantsFrames();
+                boolean miniMapFrames = miniMapOverlayController != null &&
+                    miniMapOverlayController.wantsFrames();
+                if (!outlineFrames && !threatFrames && !schematicFrames &&
+                    !miniMapFrames) return;
+
+                // Deliver the latency-sensitive packet camera first. Minimap
+                // copies and schematic/world matching must never hold up this
+                // path and reintroduce visible projection jitter.
+                if (outlineFrames || threatFrames || schematicFrames) {
+                    boolean entityFrames = outlineFrames || threatFrames;
+                    if (entityFrames &&
+                        ((entityPollTick++ % ENTITY_SNAPSHOT_EVERY_POLLS) == 0 ||
+                            !outlineFrames)) {
+                        EntityOutlineOverlayController.Frame frame =
+                            EntityOutlineOverlayController.Frame.parse(
+                                NativeBridge.entityOverlaySnapshot()
+                            );
+                        if (outlineFrames) {
+                            entityOverlayController.offerFrame(frame);
+                        }
+                        if (threatFrames) {
+                            threatOverlayController.offerFrame(frame);
+                        }
+                        if (schematicFrames) {
+                            schematicOverlayController.offerCamera(frame.camera);
+                        }
+                    } else {
+                        String cameraJson = NativeBridge.entityCameraSnapshot();
+                        if (outlineFrames) {
+                            entityOverlayController.offerCameraSnapshot(cameraJson);
+                        }
+                        if (schematicFrames) {
+                            schematicOverlayController.offerCameraSnapshot(
+                                cameraJson
+                            );
+                        }
+                    }
+                }
+                if (miniMapFrames && (pollTick & 7) == 0) {
                     miniMapOverlayController.offerSnapshot(
                         NativeBridge.miniMapSnapshot(
                             miniMapOverlayController.requestedRevision(),
@@ -474,39 +520,8 @@ public final class RelayService extends Service {
                         )
                     );
                 }
-                boolean outlineFrames = entityOverlayController != null &&
-                    entityOverlayController.wantsFrames();
-                boolean threatFrames = threatOverlayController != null &&
-                    threatOverlayController.wantsFrames();
-                boolean schematicFrames = schematicOverlayController != null &&
-                    schematicOverlayController.wantsFrames();
-                if (!outlineFrames && !threatFrames && !schematicFrames) return;
-
-                boolean entityFrames = outlineFrames || threatFrames;
-                if (entityFrames &&
-                    ((entityPollTick++ % ENTITY_SNAPSHOT_EVERY_POLLS) == 0 ||
-                        !outlineFrames)) {
-                    EntityOutlineOverlayController.Frame frame =
-                        EntityOutlineOverlayController.Frame.parse(
-                            NativeBridge.entityOverlaySnapshot()
-                        );
-                    if (outlineFrames) {
-                        entityOverlayController.offerFrame(frame);
-                    }
-                    if (threatFrames) {
-                        threatOverlayController.offerFrame(frame);
-                    }
-                    if (schematicFrames) {
-                        schematicOverlayController.offerCamera(frame.camera);
-                    }
-                } else {
-                    String cameraJson = NativeBridge.entityCameraSnapshot();
-                    if (outlineFrames) {
-                        entityOverlayController.offerCameraSnapshot(cameraJson);
-                    }
-                    if (schematicFrames) {
-                        schematicOverlayController.offerCameraSnapshot(cameraJson);
-                    }
+                if (schematicFrames && (pollTick & 7) == 0) {
+                    scheduleSchematicWorldSnapshot(schematicOverlayController);
                 }
             } catch (Throwable error) {
                 long now = System.currentTimeMillis();
@@ -521,6 +536,38 @@ public final class RelayService extends Service {
                 }
             }
         }, 0, OVERLAY_POLL_INTERVAL_MS, TimeUnit.MILLISECONDS);
+    }
+
+    private void scheduleSchematicWorldSnapshot(
+        SchematicOverlayController controller
+    ) {
+        if (!schematicSnapshotInFlight.compareAndSet(false, true)) return;
+        try {
+            schematicExecutor.execute(() -> {
+                try {
+                    if (!serviceStopping && schematicOverlayController == controller &&
+                        controller.wantsFrames()) {
+                        controller.pollWorldSnapshot();
+                    }
+                } catch (Throwable error) {
+                    long now = System.currentTimeMillis();
+                    if (now - lastSchematicSnapshotErrorAt >= 10_000) {
+                        lastSchematicSnapshotErrorAt = now;
+                        DiagnosticsLog.appendError(
+                            this,
+                            "schematics",
+                            "Schematic world matching failed; overlay continues",
+                            error
+                        );
+                    }
+                } finally {
+                    schematicSnapshotInFlight.set(false);
+                }
+            });
+        } catch (Throwable error) {
+            schematicSnapshotInFlight.set(false);
+            if (!serviceStopping) throw error;
+        }
     }
 
     private void reloadSchematicModel() {
@@ -1270,6 +1317,9 @@ public final class RelayService extends Service {
             }
         });
         try {
+            boolean schematicWorldTracking = schematicEnabled ||
+                (schematicOverlayController != null &&
+                    schematicOverlayController.model() != null);
             NativeBridge.configureRuntime(
                 detailedLogs,
                 retainChunks,
@@ -1279,7 +1329,7 @@ public final class RelayService extends Service {
                 autoArmor,
                 autoTotem,
                 miniMap,
-                schematicEnabled
+                schematicWorldTracking
             );
             if (logChange) {
                 DiagnosticsLog.append(

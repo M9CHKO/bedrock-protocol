@@ -387,6 +387,7 @@ bool BedrockNetworkClient::connect() {
     rakOptions.port = options_.port;
     rakOptions.mtu = options_.mtu;
     rakOptions.timeoutMs = options_.connectTimeoutMs;
+    rakOptions.reliabilityTimeoutMs = options_.raknetTimeoutMs;
     rakOptions.protocolVersion = session_.definition().protocolVersion() >= 589 ? 11 : 10;
 
     auto raknet = std::make_shared<RakNetClient>(rakOptions);
@@ -2337,14 +2338,22 @@ bool BedrockNetworkClient::startQueue(
     }
     const auto provider = callbackLifetimeProviderSnapshot();
     try {
-        queueThread_ = std::thread([this, provider]() {
+        queueThread_ = std::thread([this, provider]() noexcept {
             // A queue-thread callback (heartbeat/send seam/user listener) may
             // destroy the last facade owner. Keep State -> network alive until
-            // queueLoop has observed stopQueue_ and returned from every `this`
-            // access, mirroring the RakNet worker's transport-wide lease.
-            auto threadLease = provider ? provider() : std::shared_ptr<void>();
-            if (provider && !threadLease) return;
-            queueLoop();
+            // failure handling and every final `this` access have completed,
+            // mirroring the RakNet worker's transport-wide lease.
+            std::shared_ptr<void> threadLease;
+            try {
+                threadLease = provider
+                    ? provider()
+                    : std::shared_ptr<void>();
+                if (!provider || threadLease) queueLoop();
+            } catch (const std::exception& error) {
+                failQueueWorker(error.what());
+            } catch (...) {
+                failQueueWorker("unknown native exception");
+            }
         });
     } catch (...) {
         // Do not leave a logically running queue with no worker if native
@@ -2516,6 +2525,126 @@ void BedrockNetworkClient::queueLoop() {
         queuePumpInFlight_ = false;
         queueCv_.notify_all();
     }
+}
+
+void BedrockNetworkClient::failQueueWorker(const char* detail) noexcept {
+    std::string reason;
+    try {
+        reason = "Network queue worker failure";
+        if (detail != nullptr && *detail != '\0') {
+            reason += ": ";
+            reason += detail;
+        }
+    } catch (...) {
+        reason.clear();
+    }
+
+    // Publish a terminal queue state before callbacks. This releases a public
+    // close waiting in pauseQueuePump() and makes a concurrent stop/join wait
+    // only for this no-throw boundary to return.
+    try {
+        std::lock_guard<std::mutex> lock(queueMutex_);
+        stopQueue_ = true;
+        queuePumpRequested_ = false;
+        queuePumpEnabled_ = false;
+        queuePumpInFlight_ = false;
+        queuePumpResumeDue_.reset();
+        queuedPackets_.clear();
+        chunkRadiusDue_.reset();
+        keepAliveDue_.reset();
+    } catch (...) {
+    }
+    queueCv_.notify_all();
+
+    // Never wait behind another close owner from this worker: that owner may
+    // already hold queueLifecycleMutex_ while joining us. In that race its
+    // close event/transport cleanup wins and this thread must simply unwind.
+    bool ownsClose = false;
+    try {
+        std::lock_guard<std::mutex> lock(closingMutex_);
+        if (!closing_.load()) {
+            closing_.store(true);
+            closingThreadId_ = std::this_thread::get_id();
+            closingDepth_ = 1;
+            closingCommitted_ = false;
+            ownsClose = true;
+        }
+    } catch (...) {
+    }
+    if (!ownsClose) return;
+
+    // Error is observational, but an absent or throwing ErrorEvent listener
+    // must not skip the close and native teardown below.
+    try {
+        emitError(reason);
+    } catch (...) {
+    }
+
+    // Emit close exactly once while status and transport still reflect the
+    // failed live session. A throwing listener aborts the remaining snapshot,
+    // as EventEmitter does, but cannot abort cleanup at this thread boundary.
+    try {
+        if (status() != BedrockNetworkClientStatus::Disconnected) {
+            std::vector<ErrorHandler> handlers;
+            {
+                std::lock_guard<std::mutex> lock(eventHandlersMutex_);
+                handlers = closeHandlers_;
+            }
+            for (auto& handler : handlers) handler(reason);
+        }
+    } catch (...) {
+    }
+
+    rakNetStopRequested_.store(true);
+    std::shared_ptr<RakNetClient> transport;
+    try {
+        std::lock_guard<std::mutex> lock(sendMutex_);
+        transport = std::move(raknet_);
+    } catch (...) {
+    }
+    if (transport) {
+        try {
+            transport->close(reason);
+        } catch (...) {
+            try {
+                transport->requestStop();
+            } catch (...) {
+            }
+        }
+    }
+
+    try {
+        clearEventHandlers();
+    } catch (...) {
+    }
+    try {
+        std::lock_guard<std::mutex> lock(mutex_);
+        status_ = BedrockNetworkClientStatus::Disconnected;
+    } catch (...) {
+    }
+    closed_.store(true);
+    try {
+        std::lock_guard<std::mutex> lock(connectLifecycleMutex_);
+        if (connectLifecyclePhase_ != ConnectLifecyclePhase::Connecting) {
+            connectLifecyclePhase_ = ConnectLifecyclePhase::Idle;
+        }
+    } catch (...) {
+    }
+
+    // Commit and release the close latch only after transport/state teardown.
+    // Waiting transport-origin callbacks see committed=true and return; later
+    // public close calls acquire a fresh idempotent frame.
+    try {
+        std::lock_guard<std::mutex> lock(closingMutex_);
+        closingDepth_ = 0;
+        closingThreadId_ = std::thread::id{};
+        closingCommitted_ = true;
+        closing_.store(false);
+    } catch (...) {
+    }
+    closingCv_.notify_all();
+    connectLifecycleCv_.notify_all();
+    closedCv_.notify_all();
 }
 
 void BedrockNetworkClient::resetLifecycle() {

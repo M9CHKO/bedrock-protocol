@@ -250,6 +250,9 @@ struct BedrockNetworkClientOptions {
     std::optional<bool> useNativeRaknet;
     std::string compressionAlgorithm = "deflate";
     uint16_t compressionThreshold = 512;
+    // RakNet's post-connect reliable-delivery timeout. Appended for aggregate
+    // source compatibility; connectTimeoutMs remains the handshake budget.
+    int raknetTimeoutMs = 30'000;
 };
 
 struct BedrockNetworkClientPacketEvent {
@@ -587,6 +590,7 @@ private:
     void stopQueueIfRunning();
     void stopQueueLocked(bool preserveRollbackDeadline = false);
     void queueLoop();
+    void failQueueWorker(const char* detail) noexcept;
     void resetLifecycle();
     void sendLocalPlayerInitialized(uint64_t runtimeEntityId);
     void sendPackets(const std::vector<VersionedGamePacket>& packets);

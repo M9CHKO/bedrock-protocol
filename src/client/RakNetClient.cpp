@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <exception>
 #include <functional>
 #include <optional>
 #include <utility>
@@ -132,7 +133,11 @@ RakNetClient& RakNetClient::operator=(RakNetClient&& other) {
     running_.store(false);
     connected_.store(false);
     connectAccepted_.store(other.connectAccepted_.load());
+    connectedCallbackPending_.store(
+        other.connectedCallbackPending_.load()
+    );
     other.connectAccepted_.store(false);
+    other.connectedCallbackPending_.store(false);
     closeRequested_.store(other.closeRequested_.load());
     {
         std::scoped_lock lock(errorMutex_, other.errorMutex_);
@@ -152,7 +157,11 @@ RakNetClient& RakNetClient::operator=(RakNetClient&& other) {
 }
 
 bool RakNetClient::connect() {
-    if (running_.load()) return true;
+    if (running_.load()) {
+        return connectAccepted_.load() &&
+            !connectedCallbackPending_.load() && connected_.load() &&
+            !closeRequested_.load();
+    }
     if (!beginConnectActivity()) return running_.load();
     auto connectActivity = std::unique_ptr<void, std::function<void(void*)>>(
         this,
@@ -160,6 +169,7 @@ bool RakNetClient::connect() {
     );
     if (closeRequested_.load()) return false;
     connectAccepted_.store(false);
+    connectedCallbackPending_.store(false);
 
     RakNet::SystemAddress target;
     const std::string host = options_.host == "::1"
@@ -192,7 +202,10 @@ bool RakNetClient::connect() {
     if (startup != RakNet::RAKNET_STARTED) {
         setError(std::string("RakNet startup failed: ") +
             startupError(startup));
-        RakNet::RakPeerInterface::DestroyInstance(peer);
+        try {
+            RakNet::RakPeerInterface::DestroyInstance(peer);
+        } catch (...) {
+        }
         return false;
     }
 
@@ -240,7 +253,9 @@ bool RakNetClient::connect() {
             0,
             attempts,
             interval,
-            static_cast<RakNet::TimeMS>(std::max(options_.timeoutMs, 1))
+            static_cast<RakNet::TimeMS>(
+                std::max(options_.reliabilityTimeoutMs, 1)
+            )
         );
     }
     if (result != RakNet::CONNECTION_ATTEMPT_STARTED) {
@@ -262,23 +277,30 @@ bool RakNetClient::connect() {
         } else {
             workerActive_ = true;
             try {
-                thread_ = std::thread([this]() {
-                    {
-                        std::lock_guard<std::mutex> lock(threadMutex_);
-                        workerThreadId_ = std::this_thread::get_id();
-                    }
-                    threadCv_.notify_all();
-
+                thread_ = std::thread([this]() noexcept {
+                    // Keep the owner lease alive through final bookkeeping.
+                    // Releasing the last owner before endWorkerActivity()
+                    // would make that final access to this a use-after-free.
                     std::shared_ptr<void> threadLease;
-                    const auto provider = callbackLifetimeProviderSnapshot();
-                    if (provider) threadLease = provider();
-                    auto workerActivity =
-                        std::unique_ptr<void, std::function<void(void*)>>(
-                            this,
-                            [this](void*) { endWorkerActivity(); }
-                        );
-                    if (provider && !threadLease) return;
-                    runLoop();
+                    try {
+                        {
+                            std::lock_guard<std::mutex> lock(threadMutex_);
+                            workerThreadId_ = std::this_thread::get_id();
+                        }
+                        threadCv_.notify_all();
+
+                        const auto provider = callbackLifetimeProviderSnapshot();
+                        if (provider) threadLease = provider();
+                        if (!provider || threadLease) runLoop();
+                    } catch (const std::exception& error) {
+                        failWorkerCallback(error.what());
+                    } catch (...) {
+                        failWorkerCallback("unknown native exception");
+                    }
+                    // Keep worker bookkeeping and native teardown outside the
+                    // guarded callback body, but still inside the noexcept
+                    // thread entry so every return path reconciles state.
+                    endWorkerActivity();
                 });
             } catch (...) {
                 workerActive_ = false;
@@ -312,6 +334,7 @@ bool RakNetClient::connect() {
             lock,
             std::chrono::milliseconds(std::max(options_.timeoutMs, 1) + 250),
             [this]() {
+                if (connectedCallbackPending_.load()) return false;
                 return connectAccepted_.load() || closeRequested_.load() ||
                     !running_.load();
             }
@@ -464,26 +487,34 @@ void RakNetClient::handleNativePacket(const std::vector<uint8_t>& packet) {
     if (id == ID_CONNECTION_REQUEST_ACCEPTED) {
         bool expected = false;
         if (!connected_.compare_exchange_strong(expected, true)) return;
-        connectAccepted_.store(true);
+        connectedCallbackPending_.store(true);
         {
             std::lock_guard<std::mutex> lock(nativeMutex_);
             if (native_ && native_->peer) {
                 mtu_.store(native_->peer->GetMTUSize(native_->target));
             }
         }
-        threadCv_.notify_all();
         const auto handler = connectedHandlerSnapshot();
         if (handler) handler();
+        // Publish handshake success only after the callback completed. A
+        // callback may intentionally close the accepted session and still
+        // constitutes a successful handshake; a throwing callback never
+        // reaches this store and is converted into worker failure instead.
+        connectAccepted_.store(true);
+        connectedCallbackPending_.store(false);
+        threadCv_.notify_all();
         return;
     }
 
     if (id == ID_ALREADY_CONNECTED) {
         bool expected = false;
         if (connected_.compare_exchange_strong(expected, true)) {
-            connectAccepted_.store(true);
-            threadCv_.notify_all();
+            connectedCallbackPending_.store(true);
             const auto handler = connectedHandlerSnapshot();
             if (handler) handler();
+            connectAccepted_.store(true);
+            connectedCallbackPending_.store(false);
+            threadCv_.notify_all();
         }
         return;
     }
@@ -557,7 +588,10 @@ void RakNetClient::destroyPeer() noexcept {
             if (peer->IsActive()) peer->Shutdown(0);
         } catch (...) {
         }
-        RakNet::RakPeerInterface::DestroyInstance(peer);
+        try {
+            RakNet::RakPeerInterface::DestroyInstance(peer);
+        } catch (...) {
+        }
     }
 }
 
@@ -571,6 +605,40 @@ void RakNetClient::endWorkerActivity() noexcept {
         workerThreadId_ = std::thread::id{};
     }
     threadCv_.notify_all();
+}
+
+void RakNetClient::failWorkerCallback(const char* detail) noexcept {
+    const bool hadSession = connected_.load();
+    connectAccepted_.store(false);
+    connectedCallbackPending_.store(false);
+    std::string reason;
+    try {
+        reason = "RakNet worker callback failure";
+        if (detail != nullptr && *detail != '\0') {
+            reason += ": ";
+            reason += detail;
+        }
+    } catch (...) {
+        // Shutting down the native worker is still mandatory even when the
+        // diagnostic string itself cannot be allocated.
+        reason.clear();
+    }
+    try {
+        setError(reason);
+    } catch (...) {
+    }
+    requestStop();
+    threadCv_.notify_all();
+
+    if (!hadSession) return;
+    try {
+        const auto handler = closeHandlerSnapshot();
+        if (handler) handler(reason);
+    } catch (...) {
+        // A failing observer cannot be allowed to escape std::thread's entry
+        // function. The native connection is already stopped and error() keeps
+        // the original worker failure for diagnostics.
+    }
 }
 
 void RakNetClient::setError(std::string error) {

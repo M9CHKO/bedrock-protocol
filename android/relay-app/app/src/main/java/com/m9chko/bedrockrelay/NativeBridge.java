@@ -42,6 +42,16 @@ public final class NativeBridge {
         int radiusChunks
     );
 
+    /**
+     * World blocks for XYZ triples. Snapshot v2 contains one
+     * [presence, base-name hash, state-signature hash] record per coordinate;
+     * the native header carries its revision.
+     */
+    public static native int[] schematicBlockSnapshot(
+        long afterRevision,
+        int[] worldCoordinates
+    );
+
     /** Exact top of the highest collision shape, or NaN when unavailable. */
     public static native float worldSurfaceY(int worldX, int worldZ);
 

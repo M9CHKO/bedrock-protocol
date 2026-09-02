@@ -145,6 +145,14 @@ final class PacketCameraTracker {
     }
 
     State frame(long nowNanos, int configuredFov) {
+        return frame(nowNanos, configuredFov, true);
+    }
+
+    State frame(
+        long nowNanos,
+        int configuredFov,
+        boolean dynamicFov
+    ) {
         if (!known) return null;
         long receiptAge = Math.max(0, nowNanos - receivedNanos);
         long totalAge = Math.min(
@@ -232,10 +240,9 @@ final class PacketCameraTracker {
         double targetVelocityZ = speedZ * linearVelocityScale;
         double targetVelocityPitch = speedPitch * angleVelocityScale;
         double targetVelocityYaw = speedYaw * angleVelocityScale;
-        double targetFov = ProjectionMath.dynamicVerticalFov(
-            configuredFov,
-            linearSpeed
-        );
+        double targetFov = dynamicFov
+            ? ProjectionMath.dynamicVerticalFov(configuredFov, linearSpeed)
+            : MotionSmoother.clamp(configuredFov, 1.0, 179.0);
 
         long frameGap = Math.max(0, nowNanos - lastFrameNanos);
         if (lastFrameNanos == 0 || frameGap > MAXIMUM_FRAME_GAP_NANOS) {
@@ -267,7 +274,9 @@ final class PacketCameraTracker {
                 delta
             );
             renderYaw.step(targetYaw, targetVelocityYaw, angleSmooth, delta);
-            if (!Double.isFinite(renderedFov)) {
+            if (!dynamicFov) {
+                renderedFov = targetFov;
+            } else if (!Double.isFinite(renderedFov)) {
                 renderedFov = targetFov;
             } else {
                 double response = targetFov > renderedFov ? 0.12 : 0.24;

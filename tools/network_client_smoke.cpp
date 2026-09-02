@@ -64,8 +64,42 @@ struct BedrockNetworkClientTestAccess {
     }
 
     static bool queueRunning(BedrockNetworkClient& client) {
-        std::lock_guard<std::mutex> lock(client.queueLifecycleMutex_);
+        std::lock_guard<std::mutex> lock(client.queueMutex_);
         return !client.stopQueue_;
+    }
+
+    static bool queueThreadJoinable(BedrockNetworkClient& client) {
+        std::lock_guard<std::mutex> lock(client.queueLifecycleMutex_);
+        return client.queueThread_.joinable();
+    }
+
+    static bool startQueue(BedrockNetworkClient& client) {
+        return client.startQueue();
+    }
+
+    static void armQueueFailure(
+        BedrockNetworkClient& client,
+        std::function<void(const std::vector<uint8_t>&)> sender
+    ) {
+        client.closed_.store(false);
+        client.closing_.store(false);
+        client.rakNetStopRequested_.store(false);
+        {
+            std::lock_guard<std::mutex> lock(client.mutex_);
+            client.status_ = BedrockNetworkClientStatus::Initialized;
+        }
+        std::lock_guard<std::mutex> lock(client.sendMutex_);
+        client.reliableSendOverride_ = std::move(sender);
+        client.raknet_ = std::make_shared<RakNetClient>();
+    }
+
+    static bool hasTransport(BedrockNetworkClient& client) {
+        std::lock_guard<std::mutex> lock(client.sendMutex_);
+        return static_cast<bool>(client.raknet_);
+    }
+
+    static bool stopRequested(const BedrockNetworkClient& client) {
+        return client.rakNetStopRequested_.load();
     }
 
     static void applySubChunk(
@@ -1710,9 +1744,120 @@ bool checkEncryptedErrorSurface() {
     return true;
 }
 
+bool checkQueueWorkerExceptionBoundary() {
+    const auto runCase = [](bool throwingCloseListener) {
+        bedrock::BedrockNetworkClient client({
+            .host = "127.0.0.1",
+            .port = 9,
+            .username = "QueueFailure",
+            .version = "1.20.40",
+            .offline = true,
+            .batchingIntervalMs = 5,
+            .trackWorld = false
+        });
+        bedrock::BedrockNetworkClientTestAccess::armQueueFailure(
+            client,
+            [](const std::vector<uint8_t>&) {
+                throw std::runtime_error("queue send boom");
+            }
+        );
+
+        std::atomic<int> errors {0};
+        std::atomic<int> closes {0};
+        std::mutex reasonMutex;
+        std::string errorReason;
+        std::string closeReason;
+        client.onError([&](const std::string& reason) {
+            {
+                std::lock_guard<std::mutex> lock(reasonMutex);
+                errorReason = reason;
+            }
+            ++errors;
+        });
+        client.onClose([&](const std::string& reason) {
+            {
+                std::lock_guard<std::mutex> lock(reasonMutex);
+                closeReason = reason;
+            }
+            ++closes;
+            if (throwingCloseListener) {
+                throw std::runtime_error("queue close listener boom");
+            }
+        });
+
+        if (!bedrock::BedrockNetworkClientTestAccess::startQueue(client)) {
+            return false;
+        }
+        client.queue(
+            "client_cache_status",
+            bedrock::ProtoDefValue::object({
+                {"enabled", bedrock::ProtoDefValue::boolean(false)}
+            })
+        );
+        for (int attempt = 0;
+             attempt < 200 &&
+                 client.status() !=
+                     bedrock::BedrockNetworkClientStatus::Disconnected;
+             ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+
+        std::string capturedError;
+        std::string capturedClose;
+        {
+            std::lock_guard<std::mutex> lock(reasonMutex);
+            capturedError = errorReason;
+            capturedClose = closeReason;
+        }
+        const std::string expected =
+            "Network queue worker failure: queue send boom";
+        const bool contained = errors.load() == 1 && closes.load() == 1 &&
+            capturedError == expected && capturedClose == expected &&
+            client.status() ==
+                bedrock::BedrockNetworkClientStatus::Disconnected &&
+            !bedrock::BedrockNetworkClientTestAccess::queueRunning(client) &&
+            !bedrock::BedrockNetworkClientTestAccess::hasTransport(client) &&
+            bedrock::BedrockNetworkClientTestAccess::stopRequested(client);
+
+        // Reap a completed-but-joinable queue thread from an external thread;
+        // the failure path itself must never attempt a self-join.
+        client.close("queue failure cleanup");
+        const bool reaped =
+            !bedrock::BedrockNetworkClientTestAccess::queueThreadJoinable(client);
+        if (!contained || !reaped) {
+            std::cerr << "[NETWORK-CLIENT-SMOKE] queue boundary mismatch: throwClose="
+                      << throwingCloseListener << " errors=" << errors.load()
+                      << " closes=" << closes.load() << " error="
+                      << capturedError << " close=" << capturedClose
+                      << " running="
+                      << bedrock::BedrockNetworkClientTestAccess::queueRunning(
+                             client
+                         )
+                      << " transport="
+                      << bedrock::BedrockNetworkClientTestAccess::hasTransport(
+                             client
+                         )
+                      << " joinable="
+                      << bedrock::BedrockNetworkClientTestAccess::
+                             queueThreadJoinable(client)
+                      << "\n";
+        }
+        return contained && reaped;
+    };
+
+    const bool ok = runCase(false) && runCase(true);
+    if (ok) {
+        std::cout << "[NETWORK-CLIENT-SMOKE] queue worker boundary ok\n";
+    }
+    return ok;
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--queue-worker-only") {
+        return checkQueueWorkerExceptionBoundary() ? 0 : 1;
+    }
     bool ok = true;
     ok = checkSubChunkWorldTracking() && ok;
     ok = checkDisconnectGolden(
@@ -1746,5 +1891,6 @@ int main() {
     ok = checkManualClientInitialization() && ok;
     ok = checkHighLevelKickDecoding() && ok;
     ok = checkEncryptedErrorSurface() && ok;
+    ok = checkQueueWorkerExceptionBoundary() && ok;
     return ok ? 0 : 1;
 }

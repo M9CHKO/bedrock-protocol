@@ -2882,6 +2882,10 @@ struct RelayOptions {
     // ForwardRaw keeps the original VersionedGamePacket byte-for-byte and
     // deliberately skips field handlers for that packet.
     std::optional<RelayParseErrorPolicy> parseErrorPolicy;
+    // Appended extension fields preserve existing positional aggregate
+    // initialization while allowing frontends to tune each transport side.
+    int downstreamRaknetTimeoutMs = 30'000;
+    int upstreamRaknetTimeoutMs = 30'000;
 
     // A single root offline value is the common case and applies to both
     // sides. destination.offline exists only as an explicit upstream override.
@@ -4334,6 +4338,7 @@ private:
         out.server.maxPlayers = options.maxPlayers;
         out.server.offline = options.offline;
         out.server.raknetBackend = options.raknetBackend;
+        out.server.raknetTimeoutMs = options.downstreamRaknetTimeoutMs;
         out.server.compressionAlgorithm = options.compressionAlgorithm;
         out.server.compressionLevel = options.compressionLevel;
         out.server.compressionThreshold = options.compressionThreshold;
@@ -4357,6 +4362,7 @@ private:
             options.advanced.httpClientFactory;
         out.upstream.profilesFolder = options.profilesFolder;
         out.upstream.raknetBackend = options.raknetBackend;
+        out.upstream.raknetTimeoutMs = options.upstreamRaknetTimeoutMs;
         out.upstream.useRaknetWorkers = options.useRaknetWorker;
         out.upstream.batchingIntervalMs = options.batchingInterval;
         out.upstream.compressionLevel = options.compressionLevel;

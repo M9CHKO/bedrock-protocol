@@ -21,7 +21,12 @@ struct RakNetClientOptions {
     int mtu = 1400;
     int protocolVersion = 11;
     uint64_t clientGuid = 0;
+    // Wall-clock budget for the initial RakNet connection handshake.
     int timeoutMs = 3000;
+    // Active-session reliable-delivery timeout. This must stay independent
+    // from timeoutMs: mobile clients can require a long inactivity window
+    // without making a failed initial connection equally slow.
+    int reliabilityTimeoutMs = 30'000;
 };
 
 class RakNetClient {
@@ -100,6 +105,7 @@ private:
     std::atomic<bool> running_ {false};
     std::atomic<bool> connected_ {false};
     std::atomic<bool> connectAccepted_ {false};
+    std::atomic<bool> connectedCallbackPending_ {false};
     std::atomic<bool> closeRequested_ {false};
     std::thread thread_;
 
@@ -129,6 +135,7 @@ private:
     void shutdownPeer(unsigned int blockDuration) noexcept;
     void destroyPeer() noexcept;
     void endWorkerActivity() noexcept;
+    void failWorkerCallback(const char* detail) noexcept;
     void setError(std::string error);
     CallbackLifetimeProvider callbackLifetimeProviderSnapshot() const;
     ConnectedHandler connectedHandlerSnapshot() const;

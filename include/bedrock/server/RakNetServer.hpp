@@ -20,6 +20,7 @@ struct RakNetServerOptions {
     int protocolVersion = 11;
     uint64_t serverGuid = 0;
     std::string advertisement;
+    int timeoutMs = 30'000;
 };
 
 struct RakNetServerPeer {
@@ -80,6 +81,10 @@ public:
     using EncapsulatedHandler = std::function<void(
         const RakNetServerPeer&,
         const std::vector<uint8_t>&
+    )>;
+    using WorkerErrorHandler = std::function<void(
+        const RakNetServerPeer&,
+        const std::string&
     )>;
     using AdvertisementProvider = std::function<std::string()>;
 
@@ -147,6 +152,13 @@ public:
         encapsulatedHandler_ = std::move(handler);
     }
 
+    // Reports an exception contained on the RakNet worker. A populated peer
+    // identifies the affected connection; an empty peer is server-scoped.
+    void onWorkerError(WorkerErrorHandler handler) {
+        std::lock_guard<std::mutex> lock(callbackMutex_);
+        workerErrorHandler_ = std::move(handler);
+    }
+
     RakNetServerSendResult sendReliable(
         const RakNetServerPeer& peer,
         const std::vector<uint8_t>& payload,
@@ -183,6 +195,7 @@ private:
     CloseConnectionHandler closeConnectionHandler_;
     RawPacketHandler rawPacketHandler_;
     EncapsulatedHandler encapsulatedHandler_;
+    WorkerErrorHandler workerErrorHandler_;
     AdvertisementProvider advertisementProvider_;
 
     std::mutex lifecycleMutex_;
@@ -196,7 +209,7 @@ private:
 
     void runLoop();
     bool processLifecycleDeadlines();
-    void closePeerNow(const RakNetServerPeer& peer, bool silent);
+    bool closePeerNow(const RakNetServerPeer& peer, bool silent);
     void finishShutdown();
     void joinWorkerIfExternal();
     void destroyPeer() noexcept;
@@ -204,11 +217,21 @@ private:
         const RakNetServerPeer& peer,
         const std::vector<uint8_t>& packet
     );
+    void reportWorkerError(
+        const RakNetServerPeer& peer,
+        const char* detail
+    ) noexcept;
+    void shutdownAfterWorkerError(const char* detail) noexcept;
+    void failPeerAfterWorkerError(
+        const RakNetServerPeer& peer,
+        const char* detail
+    ) noexcept;
     static std::string peerKey(const RakNetServerPeer& peer);
     OpenConnectionHandler openConnectionHandlerSnapshot() const;
     CloseConnectionHandler closeConnectionHandlerSnapshot() const;
     RawPacketHandler rawPacketHandlerSnapshot() const;
     EncapsulatedHandler encapsulatedHandlerSnapshot() const;
+    WorkerErrorHandler workerErrorHandlerSnapshot() const;
     AdvertisementProvider advertisementProviderSnapshot() const;
 };
 

@@ -3293,7 +3293,9 @@ bool checkRelayOptionsGolden() {
             liveOptions.server.compressionLevel != 7 ||
             liveOptions.server.compressionThreshold != 512 ||
             liveOptions.server.batchingInterval != 20 ||
+            relayOptions.upstreamRaknetTimeoutMs != 30'000 ||
             liveOptions.upstream.offline ||
+            liveOptions.upstream.raknetTimeoutMs != 30'000 ||
             liveOptions.upstream.chunkRadius != 10 ||
             liveOptions.upstream.batchingIntervalMs != 20 ||
             liveOptions.logging || liveOptions.enableChunkCaching ||
@@ -3322,6 +3324,7 @@ bool checkRelayOptionsGolden() {
         options.offline = true;
         options.motd = bedrock::ServerMotd("Relay facade", "Relay world");
         options.batchingInterval = 37;
+        options.upstreamRaknetTimeoutMs = 123'456;
         options.logging = true;
         options.enableChunkCaching = true;
         options.levelChunkRetentionMaximumBytes = 12u * 1024u * 1024u;
@@ -3343,6 +3346,7 @@ bool checkRelayOptionsGolden() {
             !liveOptions.useDownstreamDisplayNameForUpstreamUsername ||
             liveOptions.server.batchingInterval != 37 ||
             liveOptions.upstream.batchingIntervalMs != 37 ||
+            liveOptions.upstream.raknetTimeoutMs != 123'456 ||
             liveOptions.server.motd.at("motd") != "Relay facade" ||
             liveOptions.server.motd.at("levelName") != "Relay world" ||
             liveOptions.upstream.username != "ConfiguredRelayIdentity" ||

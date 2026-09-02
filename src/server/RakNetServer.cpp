@@ -7,6 +7,7 @@
 #include <RakSleep.h>
 
 #include <algorithm>
+#include <exception>
 #include <optional>
 #include <stdexcept>
 #include <utility>
@@ -88,7 +89,10 @@ void RakNetServer::listen() {
     const int maximumConnections = options_.maxPlayers > 0
         ? options_.maxPlayers
         : 3;
-    peer->SetTimeoutTime(30000, RakNet::UNASSIGNED_SYSTEM_ADDRESS);
+    peer->SetTimeoutTime(
+        static_cast<RakNet::TimeMS>(std::max(options_.timeoutMs, 1'000)),
+        RakNet::UNASSIGNED_SYSTEM_ADDRESS
+    );
     peer->SetMaximumIncomingConnections(
         static_cast<unsigned short>(maximumConnections)
     );
@@ -145,7 +149,15 @@ void RakNetServer::listen() {
 
     running_.store(true);
     try {
-        thread_ = std::thread([this]() { runLoop(); });
+        thread_ = std::thread([this]() {
+            try {
+                runLoop();
+            } catch (const std::exception& error) {
+                shutdownAfterWorkerError(error.what());
+            } catch (...) {
+                shutdownAfterWorkerError("unknown native exception");
+            }
+        });
     } catch (...) {
         running_.store(false);
         peer->Shutdown(0);
@@ -353,7 +365,16 @@ void RakNetServer::runLoop() {
                     native_->peer->DeallocatePacket(nativePacket);
                 }
             }
-            handleNativePacket(packetPeer, packet);
+            try {
+                handleNativePacket(packetPeer, packet);
+            } catch (const std::exception& error) {
+                failPeerAfterWorkerError(packetPeer, error.what());
+            } catch (...) {
+                failPeerAfterWorkerError(
+                    packetPeer,
+                    "unknown native exception"
+                );
+            }
         }
         if (!receivedAny) RakSleep(5);
     }
@@ -399,16 +420,38 @@ bool RakNetServer::processLifecycleDeadlines() {
         if (lhs.deadline != rhs.deadline) return lhs.deadline < rhs.deadline;
         return lhs.order < rhs.order;
     });
-    for (const auto& item : due) closePeerNow(item.peer, item.silent);
+    for (const auto& item : due) {
+        try {
+            closePeerNow(item.peer, item.silent);
+        } catch (const std::exception& error) {
+            // closePeerNow removes the peer before invoking its observer. A
+            // failing close observer must not tear down unrelated sessions.
+            reportWorkerError(item.peer, error.what());
+        } catch (...) {
+            reportWorkerError(
+                item.peer,
+                "scheduled peer close raised an unknown exception"
+            );
+        }
+    }
 
     if (advertisementDue) {
-        const auto provider = advertisementProviderSnapshot();
-        if (provider) setAdvertisement(provider());
+        try {
+            const auto provider = advertisementProviderSnapshot();
+            if (provider) setAdvertisement(provider());
+        } catch (const std::exception& error) {
+            reportWorkerError({}, error.what());
+        } catch (...) {
+            reportWorkerError(
+                {},
+                "advertisement provider raised an unknown exception"
+            );
+        }
     }
     return running_.load();
 }
 
-void RakNetServer::closePeerNow(
+bool RakNetServer::closePeerNow(
     const RakNetServerPeer& peer,
     bool silent
 ) {
@@ -418,7 +461,7 @@ void RakNetServer::closePeerNow(
         const auto found = peers_.find(peerKey(peer));
         if (found == peers_.end() ||
             found->second.clientGuid != peer.clientGuid) {
-            return;
+            return false;
         }
         closedPeer = found->second;
         peers_.erase(found);
@@ -440,6 +483,7 @@ void RakNetServer::closePeerNow(
     // that may already be gone or congested before tearing down the session.
     const auto handler = closeConnectionHandlerSnapshot();
     if (closedPeer && handler) handler(*closedPeer);
+    return true;
 }
 
 void RakNetServer::finishShutdown() {
@@ -475,7 +519,10 @@ void RakNetServer::destroyPeer() noexcept {
         if (peer->IsActive()) peer->Shutdown(0);
     } catch (...) {
     }
-    RakNet::RakPeerInterface::DestroyInstance(peer);
+    try {
+        RakNet::RakPeerInterface::DestroyInstance(peer);
+    } catch (...) {
+    }
 }
 
 void RakNetServer::handleNativePacket(
@@ -517,10 +564,31 @@ void RakNetServer::handleNativePacket(
             }
         }
         if (closedPeer) {
-            const auto rawHandler = rawPacketHandlerSnapshot();
-            if (rawHandler) rawHandler(packetPeer, packet);
-            const auto handler = closeConnectionHandlerSnapshot();
-            if (handler) handler(*closedPeer);
+            std::exception_ptr rawFailure;
+            try {
+                const auto rawHandler = rawPacketHandlerSnapshot();
+                if (rawHandler) rawHandler(packetPeer, packet);
+            } catch (...) {
+                rawFailure = std::current_exception();
+            }
+
+            // The peer is deliberately removed before observers run. Always
+            // reconcile the logical close even when the preceding raw observer
+            // fails; failPeerAfterWorkerError cannot rediscover an erased peer.
+            try {
+                const auto handler = closeConnectionHandlerSnapshot();
+                if (handler) handler(*closedPeer);
+            } catch (const std::exception& closeError) {
+                if (!rawFailure) throw;
+                reportWorkerError(*closedPeer, closeError.what());
+            } catch (...) {
+                if (!rawFailure) throw;
+                reportWorkerError(
+                    *closedPeer,
+                    "disconnect close observer raised an unknown exception"
+                );
+            }
+            if (rawFailure) std::rethrow_exception(rawFailure);
         }
         return;
     }
@@ -539,6 +607,106 @@ void RakNetServer::handleNativePacket(
     if (id < ID_USER_PACKET_ENUM) return;
     const auto handler = encapsulatedHandlerSnapshot();
     if (handler) handler(packetPeer, packet);
+}
+
+void RakNetServer::reportWorkerError(
+    const RakNetServerPeer& peer,
+    const char* detail
+) noexcept {
+    try {
+        const auto handler = workerErrorHandlerSnapshot();
+        if (handler) {
+            handler(
+                peer,
+                detail == nullptr || *detail == '\0'
+                    ? "unknown native exception"
+                    : detail
+            );
+        }
+    } catch (...) {
+        // Failure reporting is observational and must not cross the same
+        // worker boundary that it is protecting.
+    }
+}
+
+void RakNetServer::shutdownAfterWorkerError(const char* detail) noexcept {
+    // This is the last-resort boundary around the polling thread. Do not rely
+    // on closeAfter() to do the cleanup: running_ is already false here, so a
+    // later closeAfter() only joins the worker and would otherwise leave the
+    // native socket and logical peer table alive until destruction.
+    running_.store(false);
+    reportWorkerError({}, detail);
+
+    try {
+        std::lock_guard<std::mutex> lock(lifecycleMutex_);
+        scheduledPeerCloses_.clear();
+        shutdownScheduled_ = false;
+        advertisementUpdatesEnabled_ = false;
+    } catch (...) {
+        reportWorkerError({}, "worker shutdown could not clear lifecycle state");
+    }
+
+    std::unordered_map<std::string, RakNetServerPeer> closedPeers;
+    try {
+        std::lock_guard<std::mutex> lock(peersMutex_);
+        closedPeers.swap(peers_);
+    } catch (...) {
+        reportWorkerError({}, "worker shutdown could not detach peer state");
+    }
+
+    // The polling thread is distinct from RakNet's internal threads, so it is
+    // safe to stop and destroy the native peer here. Never try to join our own
+    // std::thread from this path; an external close/destructor will join it.
+    destroyPeer();
+
+    CloseConnectionHandler closeHandler;
+    try {
+        closeHandler = closeConnectionHandlerSnapshot();
+    } catch (...) {
+        reportWorkerError({}, "worker shutdown could not snapshot close handler");
+    }
+    if (!closeHandler) return;
+    for (const auto& entry : closedPeers) {
+        try {
+            closeHandler(entry.second);
+        } catch (const std::exception& error) {
+            reportWorkerError(entry.second, error.what());
+        } catch (...) {
+            reportWorkerError(
+                entry.second,
+                "peer reconciliation raised an unknown exception"
+            );
+        }
+    }
+}
+
+void RakNetServer::failPeerAfterWorkerError(
+    const RakNetServerPeer& peer,
+    const char* detail
+) noexcept {
+    reportWorkerError(peer, detail);
+    try {
+        // A callback exception invalidates the ordering assumptions of this
+        // RakNet session. Close only that peer and keep the listener alive.
+        if (!closePeerNow(peer, true)) {
+            // A callback on ID_NEW_INCOMING_CONNECTION can fail before the
+            // peer is inserted into peers_. It is still a live native RakNet
+            // connection and must not be left occupying a server slot.
+            std::lock_guard<std::mutex> lock(nativeMutex_);
+            if (native_ && native_->peer) {
+                native_->peer->CloseConnection(
+                    RakNet::RakNetGUID(peer.clientGuid),
+                    false,
+                    0,
+                    LOW_PRIORITY
+                );
+            }
+        }
+    } catch (const std::exception& closeError) {
+        reportWorkerError(peer, closeError.what());
+    } catch (...) {
+        reportWorkerError(peer, "peer cleanup raised an unknown exception");
+    }
 }
 
 std::string RakNetServer::peerKey(const RakNetServerPeer& peer) {
@@ -567,6 +735,12 @@ RakNetServer::EncapsulatedHandler
 RakNetServer::encapsulatedHandlerSnapshot() const {
     std::lock_guard<std::mutex> lock(callbackMutex_);
     return encapsulatedHandler_;
+}
+
+RakNetServer::WorkerErrorHandler
+RakNetServer::workerErrorHandlerSnapshot() const {
+    std::lock_guard<std::mutex> lock(callbackMutex_);
+    return workerErrorHandler_;
 }
 
 RakNetServer::AdvertisementProvider
