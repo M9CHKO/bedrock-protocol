@@ -269,7 +269,7 @@ The C++ relay core includes these behaviors from the JavaScript relay:
 | Choose chunk cache value | `enableChunkCaching = false` / `true` |
 | Queue `level_chunk` before `start_game` | `queueClientboundLevelChunksUntilStartGame = true` |
 | Skip duplicate `play_status login_success` | `skipClientboundLoginSuccess = true` |
-| Skip upstream resource-pack handshake packets in live relay | `skipClientboundResourcePacks = true` |
+| Forward the destination server's resource-pack exchange | `skipClientboundResourcePacks = false` (default) |
 | Forward per-session skin and arbitrary login `clientData` | `forwardDownstreamClientData = true` |
 | Queue backend packets before downstream join | `markDownstreamJoined()` / `flushDownQueue()` |
 | Queue downstream packets before upstream join | `markUpstreamJoined()` / `flushUpQueue()` |
@@ -281,11 +281,21 @@ The C++ relay core includes these behaviors from the JavaScript relay:
 | Drop only a packet that cannot be parsed | `parseErrorPolicy = RelayParseErrorPolicy::Drop` |
 | Forward the original packet bytes after a parse error | `parseErrorPolicy = RelayParseErrorPolicy::ForwardRaw` |
 
-High-level Relay strictly parses a packet before exposing structured fields to
-handlers. Transport forwarding remains independent: `ForwardRaw` reports the
-error through `onParseError`, skips structured handlers, and forwards the
-original `VersionedGamePacket` without decoding or re-encoding it. `Drop`
-discards only that packet, while `Disconnect` tears down the matching
+The destination server, rather than the local listener, drives required
+resource-pack negotiation. `resource_packs_info`, `resource_pack_stack`,
+`resource_pack_data_info`, `resource_pack_chunk_data`,
+`resource_pack_client_response`, and `resource_pack_chunk_request` are
+forwarded with their original bytes when no global or player packet handler is
+registered for that direction. This preserves large chunks and future optional
+fields that the selected Minecraft client understands even if the local schema
+does not. Registering a handler explicitly opts that direction into normal
+structured decoding and mutation.
+
+Other high-level Relay packets are strictly parsed before structured fields are
+exposed to handlers. Transport forwarding remains independent: `ForwardRaw`
+reports the error through `onParseError`, skips structured handlers, and
+forwards the original `VersionedGamePacket` without decoding or re-encoding it.
+`Drop` discards only that packet, while `Disconnect` tears down the matching
 downstream and upstream session immediately. For source compatibility,
 omitting `parseErrorPolicy` maps `omitParseErrors = false` to `Disconnect` and
 `omitParseErrors = true` to `Drop`.

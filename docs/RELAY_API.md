@@ -162,18 +162,49 @@ The high-level options are forwarded to the live runtime: `logging = true`
 enables session and packet tracing, while `enableChunkCaching` selects the
 forced `client_cache_status` value sent to each upstream server.
 
-Clientbound packets are strictly decoded before any high-level handler runs.
-A malformed backend packet is always canceled and never reaches the downstream
-client. With the default `omitParseErrors = false`, only that packet's
-downstream session is disconnected; with `omitParseErrors = true`, the packet
-is dropped and the session remains usable. Serverbound decode errors propagate
-to the caller, matching the JavaScript `RelayPlayer.readPacket` path.
+Packets consumed by a high-level handler are strictly decoded before that
+handler runs. With the default `omitParseErrors = false`, a decode failure
+disconnects only the matching downstream session; with
+`omitParseErrors = true`, the packet is dropped and the session remains usable.
+Serverbound decode errors propagate to the caller, matching the JavaScript
+`RelayPlayer.readPacket` path. Transparent resource-pack transport is the
+exception described below: without a registered structured consumer, it keeps
+its original bytes and does not depend on a complete local schema.
 
 Each downstream login's signed `clientData` JSON is forwarded to its matching
 upstream login. Custom skin, animation, device/platform, and unknown extension
 fields are retained. The upstream login builder still replaces the destination
 `ServerAddress` and applies the normal runtime and protocol-version
 normalization.
+
+## Required Server Resource Packs
+
+The destination server drives the resource-pack exchange all the way to the
+real Minecraft client. The local relay server does not claim that every pack is
+already installed and the upstream client does not auto-accept packs on
+Minecraft's behalf.
+
+When no global or player packet handler is registered for the corresponding
+direction, Relay forwards these packets without structured decoding or
+re-encoding:
+
+- `resource_packs_info`
+- `resource_pack_stack`
+- `resource_pack_data_info`
+- `resource_pack_chunk_data`
+- `resource_pack_client_response`
+- `resource_pack_chunk_request`
+
+This raw transport path preserves server-specific optional fields, the exact
+pack identifiers, and large fragmented pack chunks. Minecraft can therefore
+show its normal consent/download screen, request each chunk, validate the pack,
+and send its final response to the server. Registering a packet handler for
+that direction intentionally switches the packet back to strict structured
+decoding so an application can inspect or modify it.
+
+Diagnostics should record only packet names, sizes, and non-secret hashes.
+Do not log `content_key`, signed CDN query parameters, JWT data, or pack payload
+bytes.
 
 ## Packet Events
 
