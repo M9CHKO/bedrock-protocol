@@ -4,15 +4,15 @@ plugins {
 
 android {
     namespace "com.m9chko.bedrockrelay"
-    compileSdk 35
+    compileSdk 36
     ndkVersion "27.2.12479018"
 
     defaultConfig {
         applicationId "com.m9chko.bedrockrelay"
         minSdk 26
-        targetSdk 35
-        versionCode 24
-        versionName "1.1.1"
+        targetSdk 36
+        versionCode 28
+        versionName "1.2.1"
 
         ndk {
             abiFilters "arm64-v8a"

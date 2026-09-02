@@ -18,10 +18,13 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -37,6 +40,7 @@ final class EntityOutlineOverlayController {
     private final AtomicBoolean deliveryPosted = new AtomicBoolean(false);
 
     private volatile boolean sessionVisible;
+    private volatile boolean uiBlocked;
     private volatile boolean enabled = true;
     private volatile int fieldOfView = 70;
     private volatile boolean showPlayers = true;
@@ -45,6 +49,8 @@ final class EntityOutlineOverlayController {
     private volatile int playerColor = 0xff4fd5ff;
     private volatile int mobColor = 0xffff5b62;
     private volatile int itemColor = 0xffffcf4a;
+    private volatile int threatColor = 0xffff3b30;
+    private volatile Set<String> threatEntityIds = Collections.emptySet();
     private volatile float outlineThickness = 1.7f;
     private volatile int maximumDistance = 128;
     private boolean missingPermissionLogged;
@@ -59,6 +65,12 @@ final class EntityOutlineOverlayController {
 
     void setSessionVisible(boolean visible) {
         sessionVisible = visible;
+        reconcileWindow();
+    }
+
+    void setUiBlocked(boolean blocked) {
+        if (uiBlocked == blocked) return;
+        uiBlocked = blocked;
         reconcileWindow();
     }
 
@@ -111,12 +123,27 @@ final class EntityOutlineOverlayController {
     }
 
     boolean wantsFrames() {
-        return sessionVisible && enabled;
+        return sessionVisible && enabled && !uiBlocked;
+    }
+
+    void setThreatHighlights(Set<String> entityIds, int color) {
+        threatEntityIds = entityIds == null || entityIds.isEmpty()
+            ? Collections.emptySet()
+            : Collections.unmodifiableSet(new HashSet<>(entityIds));
+        threatColor = color | 0xff000000;
+        EntityOutlineView view = outlineView;
+        if (view != null) {
+            view.setThreatHighlights(threatEntityIds, threatColor);
+        }
     }
 
     void offerSnapshot(String json) throws Exception {
         if (!wantsFrames()) return;
-        Frame frame = Frame.parse(json);
+        offerFrame(Frame.parse(json));
+    }
+
+    void offerFrame(Frame frame) {
+        if (!wantsFrames() || frame == null) return;
         pendingFrame.set(frame);
         postFrameDelivery();
     }
@@ -150,7 +177,7 @@ final class EntityOutlineOverlayController {
     }
 
     private void reconcileWindow() {
-        if (sessionVisible && enabled) {
+        if (sessionVisible && enabled && !uiBlocked) {
             addWindow();
         } else {
             removeWindow();
@@ -185,6 +212,7 @@ final class EntityOutlineOverlayController {
             outlineThickness,
             maximumDistance
         );
+        view.setThreatHighlights(threatEntityIds, threatColor);
         view.setSystemUiVisibility(
             View.SYSTEM_UI_FLAG_LAYOUT_STABLE |
                 View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN |
@@ -203,6 +231,11 @@ final class EntityOutlineOverlayController {
             PixelFormat.TRANSLUCENT
         );
         params.gravity = Gravity.TOP | Gravity.START;
+        // Entity boxes and schematics are two independent full-screen,
+        // click-through projection windows. Android combines their window
+        // opacity for obscured-touch checks: 1 - (1-.54)^2 = .7884, which
+        // remains below the 0.8 limit even while both modules are enabled.
+        params.alpha = 0.54f;
         if (Build.VERSION.SDK_INT >= 28) {
             params.layoutInDisplayCutoutMode =
                 WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
@@ -302,7 +335,7 @@ final class EntityOutlineOverlayController {
         }
     }
 
-    private static final class CameraSample {
+    static final class CameraSample {
         final boolean known;
         final boolean inputTickKnown;
         final long inputTick;
@@ -376,8 +409,9 @@ final class EntityOutlineOverlayController {
         }
     }
 
-    private static final class EntitySample {
+    static final class EntitySample {
         final String id;
+        final String type;
         final String label;
         final boolean player;
         final boolean item;
@@ -391,6 +425,7 @@ final class EntityOutlineOverlayController {
 
         EntitySample(
             String id,
+            String type,
             String label,
             boolean player,
             boolean item,
@@ -403,6 +438,7 @@ final class EntityOutlineOverlayController {
             long ageMs
         ) {
             this.id = id;
+            this.type = type;
             this.label = label;
             this.player = player;
             this.item = item;
@@ -433,6 +469,7 @@ final class EntityOutlineOverlayController {
             }
             return new EntitySample(
                 id,
+                value.optString("type", label),
                 label,
                 value.optBoolean("player", false),
                 value.optBoolean("item", false),
@@ -455,9 +492,6 @@ final class EntityOutlineOverlayController {
     }
 
     private static final class RenderTrack {
-        private static final long LinearPredictionNanos = 65_000_000L;
-        private static final long MaxPredictionNanos = 130_000_000L;
-        private static final long RenderLeadNanos = 18_000_000L;
         private static final long MaximumFrameGapNanos = 250_000_000L;
 
         final String id;
@@ -585,31 +619,17 @@ final class EntityOutlineOverlayController {
         }
 
         boolean advance(long now) {
-            long elapsedSinceReceipt = Math.max(0, now - sampleReceivedNanos);
-            long totalAgeNanos = Math.min(
-                10_000_000_000L,
-                sampleAgeNanos + elapsedSinceReceipt
-            );
-            double predictionSeconds = MotionSmoother.predictionSeconds(
-                totalAgeNanos,
-                RenderLeadNanos,
-                LinearPredictionNanos,
-                MaxPredictionNanos
-            );
-            double predictionVelocityScale =
-                MotionSmoother.predictionVelocityScale(
-                    totalAgeNanos,
-                    RenderLeadNanos,
-                    LinearPredictionNanos,
-                    MaxPredictionNanos
-                );
-            boolean predictionActive = predictionVelocityScale > 0.0001;
-            double targetVelocityX = velocityX * predictionVelocityScale;
-            double targetVelocityY = velocityY * predictionVelocityScale;
-            double targetVelocityZ = velocityZ * predictionVelocityScale;
-            double targetX = sampleX + velocityX * predictionSeconds;
-            double targetY = sampleY + velocityY * predictionSeconds;
-            double targetZ = sampleZ + velocityZ * predictionSeconds;
+            // Bedrock already interpolates remote entities behind the newest
+            // network sample. Extrapolating that sample made our box lead the
+            // mob and then correct backwards. Follow the newest authoritative
+            // position monotonically instead; the critically damped axes fill
+            // the gaps between 20 Hz entity packets without overshoot.
+            double targetVelocityX = 0.0;
+            double targetVelocityY = 0.0;
+            double targetVelocityZ = 0.0;
+            double targetX = sampleX;
+            double targetY = sampleY;
+            double targetZ = sampleZ;
 
             long frameGap = Math.max(0, now - lastFrameNanos);
             if (lastFrameNanos == 0 || frameGap > MaximumFrameGapNanos) {
@@ -622,8 +642,8 @@ final class EntityOutlineOverlayController {
                     velocityX * velocityX + velocityY * velocityY +
                         velocityZ * velocityZ
                 );
-                double smoothTime = 0.095 -
-                    MotionSmoother.clamp(speed / 20.0, 0.0, 1.0) * 0.025;
+                double smoothTime = 0.070 -
+                    MotionSmoother.clamp(speed / 20.0, 0.0, 1.0) * 0.018;
                 renderX.step(
                     targetX,
                     targetVelocityX,
@@ -645,20 +665,21 @@ final class EntityOutlineOverlayController {
             }
             lastFrameNanos = now;
 
-            return (predictionActive &&
-                    (Math.abs(velocityX) > 0.002 ||
-                     Math.abs(velocityY) > 0.002 ||
-                     Math.abs(velocityZ) > 0.002)) ||
-                !renderX.isSettled(targetX, targetVelocityX, 0.0005, 0.005) ||
+            return !renderX.isSettled(
+                    targetX,
+                    targetVelocityX,
+                    0.0005,
+                    0.005
+                ) ||
                 !renderY.isSettled(targetY, targetVelocityY, 0.0005, 0.005) ||
                 !renderZ.isSettled(targetZ, targetVelocityZ, 0.0005, 0.005);
         }
     }
 
     private static final class EntityOutlineView extends View {
-        private static final long LinearCameraPredictionNanos = 55_000_000L;
-        private static final long MaxCameraPredictionNanos = 85_000_000L;
-        private static final long CameraRenderLeadNanos = 8_000_000L;
+        private static final long LinearCameraPredictionNanos = 32_000_000L;
+        private static final long MaxCameraPredictionNanos = 48_000_000L;
+        private static final long CameraRenderLeadNanos = 2_000_000L;
         private static final long MaximumFrameGapNanos = 250_000_000L;
         private static final double NearPlane = 0.12;
 
@@ -722,6 +743,8 @@ final class EntityOutlineOverlayController {
         private int playerColor = 0xff4fd5ff;
         private int mobColor = 0xffff5b62;
         private int itemColor = 0xffffcf4a;
+        private int threatColor = 0xffff3b30;
+        private Set<String> threatEntityIds = Collections.emptySet();
         private float outlineThickness = 1.7f;
         private int maximumDistance = 128;
 
@@ -775,6 +798,14 @@ final class EntityOutlineOverlayController {
                 density * 2.5f,
                 density * (outlineThickness + 2.6f)
             ));
+            postInvalidateOnAnimation();
+        }
+
+        void setThreatHighlights(Set<String> entityIds, int color) {
+            threatEntityIds = entityIds == null
+                ? Collections.emptySet()
+                : entityIds;
+            threatColor = color | 0xff000000;
             postInvalidateOnAnimation();
         }
 
@@ -1039,12 +1070,29 @@ final class EntityOutlineOverlayController {
                 anglePredictionVelocityScale;
             double targetVelocityYaw = cameraVelocityYaw *
                 anglePredictionVelocityScale;
-            double targetCameraX = cameraSampleX +
-                cameraVelocityX * positionPredictionSeconds;
-            double targetCameraY = cameraSampleY +
-                cameraVelocityY * positionPredictionSeconds;
-            double targetCameraZ = cameraSampleZ +
-                cameraVelocityZ * positionPredictionSeconds;
+            double targetCameraX = cameraSampleX + cameraVelocityX *
+                boundedPredictionSeconds(
+                    positionPredictionSeconds,
+                    positionSpeed,
+                    0.85
+                );
+            double targetCameraY = cameraSampleY + cameraVelocityY *
+                boundedPredictionSeconds(
+                    positionPredictionSeconds,
+                    positionSpeed,
+                    0.85
+                );
+            double targetCameraZ = cameraSampleZ + cameraVelocityZ *
+                boundedPredictionSeconds(
+                    positionPredictionSeconds,
+                    positionSpeed,
+                    0.85
+                );
+            anglePredictionSeconds = boundedPredictionSeconds(
+                anglePredictionSeconds,
+                angleSpeed,
+                3.25
+            );
             double rawTargetPitch = cameraSamplePitch +
                 cameraVelocityPitch * anglePredictionSeconds;
             double targetCameraPitch = MotionSmoother.clamp(
@@ -1342,7 +1390,7 @@ final class EntityOutlineOverlayController {
                     }
                 }
             }
-            if (projected != 8) {
+            if (projected == 0) {
                 track.screenBox.hide();
                 return false;
             }
@@ -1355,15 +1403,32 @@ final class EntityOutlineOverlayController {
             float projectedHeight = bottom - top;
             float minimumWidth = density * (track.item ? 1.5f : 2.5f);
             float minimumHeight = density * (track.item ? 3.5f : 7f);
-            if (projectedWidth < minimumWidth ||
-                projectedHeight < minimumHeight ||
-                projectedWidth > getWidth() * 2f ||
-                projectedHeight > getHeight() * 2f) {
-                track.screenBox.hide();
-                return false;
+            float centerX = (left + right) * 0.5f;
+            float centerY = (top + bottom) * 0.5f;
+            if (projectedWidth < minimumWidth) {
+                left = centerX - minimumWidth * 0.5f;
+                right = centerX + minimumWidth * 0.5f;
+            }
+            if (projectedHeight < minimumHeight) {
+                top = centerY - minimumHeight * 0.5f;
+                bottom = centerY + minimumHeight * 0.5f;
             }
             if (right < 0 || bottom < 0 || left > getWidth() ||
                 top > getHeight()) {
+                track.screenBox.hide();
+                return false;
+            }
+
+            // Keep a partially visible entity drawable when one or more box
+            // corners cross the camera plane or a display edge. Previously
+            // one rejected corner hid the whole outline at particular camera
+            // angles. Clipping also prevents near entities from producing an
+            // enormous unstable rectangle.
+            left = Math.max(0f, Math.min(getWidth(), left));
+            top = Math.max(0f, Math.min(getHeight(), top));
+            right = Math.max(0f, Math.min(getWidth(), right));
+            bottom = Math.max(0f, Math.min(getHeight(), bottom));
+            if (right - left < 1f || bottom - top < 1f) {
                 track.screenBox.hide();
                 return false;
             }
@@ -1384,9 +1449,12 @@ final class EntityOutlineOverlayController {
             right = (float) track.screenBox.right();
             bottom = (float) track.screenBox.bottom();
 
-            int color = track.player
-                ? playerColor
-                : track.item ? itemColor : mobColor;
+            int color = !track.player && !track.item &&
+                    threatEntityIds.contains(track.id)
+                ? threatColor
+                : track.player
+                    ? playerColor
+                    : track.item ? itemColor : mobColor;
             rectangle.set(left, top, right, bottom);
             fillPaint.setColor(withAlpha(color, 24));
             glowPaint.setColor(withAlpha(color, 78));
@@ -1454,6 +1522,18 @@ final class EntityOutlineOverlayController {
                 if (RectF.intersects(candidate, occupied)) return true;
             }
             return false;
+        }
+
+        private static double boundedPredictionSeconds(
+            double requestedSeconds,
+            double speedPerSecond,
+            double maximumDisplacement
+        ) {
+            if (!(speedPerSecond > 0.000001)) return 0.0;
+            return Math.min(
+                Math.max(0.0, requestedSeconds),
+                maximumDisplacement / speedPerSecond
+            );
         }
 
         private static int withAlpha(int color, int alpha) {

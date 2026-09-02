@@ -22,6 +22,10 @@ import android.widget.SeekBar;
 import android.widget.Switch;
 import android.widget.TextView;
 
+import com.m9chko.bedrockrelay.schematic.SchematicRepository;
+import com.m9chko.bedrockrelay.schematic.SchematicSourceFolder;
+
+import java.util.List;
 import java.util.Locale;
 
 /** Session-scoped Toolbox-style controls displayed over Minecraft. */
@@ -35,6 +39,8 @@ final class RelayOverlayController {
     private volatile LinearLayout windowRoot;
     private TextView drawerTab;
     private TextView chunkStatus;
+    private TextView miniMapStatus;
+    private TextView automationStatus;
     private TextView pageTitle;
     private TextView backButton;
     private LinearLayout pageContent;
@@ -56,6 +62,15 @@ final class RelayOverlayController {
     private long statusEvictedRadius;
     private long statusEvictedMemory;
     private long statusParseFailures;
+    private long statusMiniMapDecoded;
+    private long statusMiniMapFailures;
+    private String statusAutomationText = "Ожидание инвентаря";
+    private boolean statusInventoryReady;
+    private boolean statusAutomationPending;
+    private long statusAutomationAccepted;
+    private long statusAutomationRejected;
+    private String schematicImportStatus = "";
+    private boolean schematicImportError;
 
     RelayOverlayController(
         Context context,
@@ -68,6 +83,14 @@ final class RelayOverlayController {
         this.windowManager = (WindowManager) context.getSystemService(
             Context.WINDOW_SERVICE
         );
+    }
+
+    void updateSchematicImportStatus(String value, boolean error) {
+        schematicImportStatus = value == null ? "" : value;
+        schematicImportError = error;
+        if ("schematics".equals(currentPage) && pageContent != null) {
+            showPage("schematics");
+        }
     }
 
     void show() {
@@ -156,6 +179,8 @@ final class RelayOverlayController {
         windowRoot = null;
         drawerTab = null;
         chunkStatus = null;
+        miniMapStatus = null;
+        automationStatus = null;
         pageTitle = null;
         backButton = null;
         pageContent = null;
@@ -254,6 +279,8 @@ final class RelayOverlayController {
         currentPage = page;
         pageContent.removeAllViews();
         chunkStatus = null;
+        miniMapStatus = null;
+        automationStatus = null;
         logText = null;
         backButton.setVisibility("home".equals(page) ? View.INVISIBLE : View.VISIBLE);
         switch (page) {
@@ -268,6 +295,22 @@ final class RelayOverlayController {
             case "equipment":
                 pageTitle.setText("СНАРЯЖЕНИЕ");
                 buildEquipmentPage(pageContent);
+                break;
+            case "minimap":
+                pageTitle.setText("МИНИ-КАРТА");
+                buildMiniMapPage(pageContent);
+                break;
+            case "automation":
+                pageTitle.setText("АВТОМАТИЗАЦИЯ");
+                buildAutomationPage(pageContent);
+                break;
+            case "threats":
+                pageTitle.setText("АНАЛИЗ УГРОЗ");
+                buildThreatsPage(pageContent);
+                break;
+            case "schematics":
+                pageTitle.setText("СХЕМЫ");
+                buildSchematicsPage(pageContent);
                 break;
             case "logs":
                 pageTitle.setText("ЖУРНАЛ");
@@ -290,10 +333,27 @@ final class RelayOverlayController {
         subtitle.setTextColor(0xffaab8c8);
         subtitle.setPadding(dp(2), 0, dp(2), dp(8));
         root.addView(subtitle);
+        root.addView(sectionHeader("ВИЗУАЛИЗАЦИЯ"));
         root.addView(menuCard(
             "◎  ОБВОДКА",
             "Игроки, мобы, предметы • цвета • толщина",
             "outline"
+        ));
+        root.addView(menuCard(
+            "⚠  АНАЛИЗ УГРОЗ",
+            "Враждебные мобы • оценка урона • свой порог",
+            "threats"
+        ));
+        root.addView(menuCard(
+            "♢  СНАРЯЖЕНИЕ",
+            "Обе руки • броня • прочность • зачарования",
+            "equipment"
+        ));
+        root.addView(sectionHeader("КАРТА И МИР"));
+        root.addView(menuCard(
+            "⌖  МИНИ-КАРТА",
+            "Карта поверхности из пакетов чанков",
+            "minimap"
         ));
         root.addView(menuCard(
             "▦  ЧАНКИ",
@@ -301,10 +361,17 @@ final class RelayOverlayController {
             "chunks"
         ));
         root.addView(menuCard(
-            "♢  СНАРЯЖЕНИЕ",
-            "Прочность брони и перелив зачарований",
-            "equipment"
+            "⌂  СХЕМЫ",
+            "3D-проекция построек • слои • поворот • импорт NBT",
+            "schematics"
         ));
+        root.addView(sectionHeader("АВТОМАТИЗАЦИЯ"));
+        root.addView(menuCard(
+            "⇄  АВТО-ЭКИПИРОВКА",
+            "Тотем в левую руку и лучшая броня",
+            "automation"
+        ));
+        root.addView(sectionHeader("ДИАГНОСТИКА"));
         root.addView(menuCard(
             "≡  ЖУРНАЛ",
             "Запись полностью отключается одним переключателем",
@@ -319,6 +386,13 @@ final class RelayOverlayController {
         note.setTextColor(0xff8391a2);
         note.setPadding(dp(3), dp(7), dp(3), 0);
         root.addView(note);
+    }
+
+    private View sectionHeader(String value) {
+        TextView header = text("└─ " + value, 9, true);
+        header.setTextColor(0xff6f91bd);
+        header.setPadding(dp(4), dp(5), dp(3), dp(5));
+        return header;
     }
 
     private View menuCard(String title, String subtitle, String page) {
@@ -457,6 +531,10 @@ final class RelayOverlayController {
     }
 
     private View colorPicker(String key, int defaultColor) {
+        return colorPicker(key, defaultColor, "outline");
+    }
+
+    private View colorPicker(String key, int defaultColor, String returnPage) {
         int selected = preferences.getInt(key, defaultColor) | 0xff000000;
         int[] colors = {
             0xff4fd5ff, 0xff5df0a2, 0xffffcf4a, 0xffff8a4c,
@@ -472,7 +550,7 @@ final class RelayOverlayController {
             swatch.setOnClickListener(view -> {
                 preferences.edit().putInt(key, color).apply();
                 settingsChanged.run();
-                showPage("outline");
+                showPage(returnPage);
             });
             row.addView(swatch, margins(dp(28), dp(28), dp(2), 0, dp(3), 0));
         }
@@ -570,9 +648,10 @@ final class RelayOverlayController {
             )
         ));
         TextView info = text(
-            "HUD показывает предмет в руке, четыре слота брони и остаток " +
+            "HUD показывает правую и левую руки, четыре слота брони и остаток " +
                 "прочности. Зачарованные вещи получают плавный фиолетовый " +
-                "перелив. Данные приходят только из пакетов текущего игрока.",
+                "перелив. Окно можно перетаскивать и оно автоматически " +
+                "скрывается в инвентаре, сундуке, шалкере и чате.",
             10,
             false
         );
@@ -617,8 +696,8 @@ final class RelayOverlayController {
         );
         TextView attribution = text(
             textures.imported
-                ? "Item PNG читаются из выбранного официального архива и " +
-                    "хранятся только во внутренней памяти приложения."
+                ? "Item PNG используются в HUD, block PNG — в визуализации " +
+                    "схем. Они хранятся только во внутренней памяти приложения."
                 : "Запасные силуэты: Game-icons.net — Lorc и Delapouite, " +
                     "CC BY 3.0.",
             9,
@@ -626,6 +705,628 @@ final class RelayOverlayController {
         );
         attribution.setTextColor(0xff78889b);
         root.addView(attribution);
+    }
+
+    private void buildMiniMapPage(LinearLayout root) {
+        root.addView(toggle(
+            "Показывать мини-карту",
+            RelayService.KEY_MINIMAP,
+            true
+        ));
+        root.addView(toggle(
+            "Круглая форма",
+            RelayService.KEY_MINIMAP_ROUND,
+            true
+        ));
+        int radius = RelayService.clampMiniMapRadius(preferences.getInt(
+            RelayService.KEY_MINIMAP_RADIUS,
+            4
+        ));
+        TextView radiusLabel = settingLabel(
+            "Радиус карты: " + radius + " чанка"
+        );
+        root.addView(radiusLabel);
+        SeekBar radiusSlider = slider(
+            RelayService.MIN_MINIMAP_RADIUS_CHUNKS,
+            RelayService.MAX_MINIMAP_RADIUS_CHUNKS,
+            radius
+        );
+        root.addView(radiusSlider);
+        radiusSlider.setOnSeekBarChangeListener(seekListener(
+            progress -> radiusLabel.setText(
+                "Радиус карты: " + progress + " чанков"
+            ),
+            progress -> saveInt(
+                RelayService.KEY_MINIMAP_RADIUS,
+                RelayService.clampMiniMapRadius(progress)
+            )
+        ));
+        int scale = RelayService.clampOverlayScale(preferences.getInt(
+            RelayService.KEY_MINIMAP_SCALE,
+            90
+        ));
+        TextView scaleLabel = settingLabel("Размер карты: " + scale + "%");
+        root.addView(scaleLabel);
+        SeekBar scaleSlider = slider(70, 150, scale);
+        root.addView(scaleSlider);
+        scaleSlider.setOnSeekBarChangeListener(seekListener(
+            progress -> scaleLabel.setText("Размер карты: " + progress + "%"),
+            progress -> saveInt(
+                RelayService.KEY_MINIMAP_SCALE,
+                RelayService.clampOverlayScale(progress)
+            )
+        ));
+        miniMapStatus = text("", 10, true);
+        miniMapStatus.setPadding(dp(10), dp(8), dp(10), dp(8));
+        miniMapStatus.setBackground(statusBackground());
+        root.addView(miniMapStatus, margins(-1, -2, 0, dp(5), 0, dp(7)));
+        refreshMiniMapStatus();
+        TextView note = text(
+            "Мини-карта строится из LevelChunk без захвата экрана. Её можно " +
+                "перетаскивать; при открытом интерфейсе Minecraft она скрывается.",
+            10,
+            false
+        );
+        note.setTextColor(0xff98a7b8);
+        root.addView(note);
+    }
+
+    private void buildSchematicsPage(LinearLayout root) {
+        SchematicRepository repository = new SchematicRepository(context);
+        SchematicSourceFolder sourceFolder = new SchematicSourceFolder(context);
+        SchematicSourceFolder.ScanResult folder = sourceFolder.scan();
+        List<SchematicRepository.Entry> entries = repository.list();
+        SchematicRepository.Entry active = null;
+        for (SchematicRepository.Entry entry : entries) {
+            if (entry.active) {
+                active = entry;
+                break;
+            }
+        }
+        final SchematicRepository.Entry activeEntry = active;
+
+        root.addView(toggle(
+            "Показывать 3D-схему в мире",
+            RelayService.KEY_SCHEMATIC_ENABLED,
+            false
+        ));
+
+        TextView status = text(
+            active == null
+                ? "Активная схема не выбрана"
+                : active.sourceName + "\n" + active.format + " • " +
+                    active.sizeX + "×" + active.sizeY + "×" + active.sizeZ +
+                    " • " + String.format(
+                        Locale.getDefault(),
+                        "%,d блоков",
+                        active.nonAirBlocks
+                    ),
+            10,
+            true
+        );
+        status.setTextColor(active == null ? 0xffffc76c : 0xff82e6b1);
+        status.setPadding(dp(10), dp(9), dp(10), dp(9));
+        status.setBackground(statusBackground());
+        root.addView(status, margins(-1, -2, 0, dp(4), 0, dp(7)));
+
+        root.addView(sectionHeader("ФАЙЛЫ НА ТЕЛЕФОНЕ"));
+        TextView folderStatus = text(
+            folder.configured
+                ? "Папка: " + folder.folderName + "\n" +
+                    (folder.errorMessage.isEmpty()
+                        ? folder.entries.size() + " совместимых файлов"
+                        : folder.errorMessage)
+                : "Выберите папку один раз. После этого схемы можно " +
+                    "импортировать здесь, не закрывая Minecraft и сервер.",
+            9,
+            true
+        );
+        folderStatus.setTextColor(
+            !folder.errorMessage.isEmpty()
+                ? 0xffff8e99
+                : folder.configured ? 0xff82e6b1 : 0xffffc76c
+        );
+        folderStatus.setPadding(dp(10), dp(8), dp(10), dp(8));
+        folderStatus.setBackground(statusBackground());
+        root.addView(folderStatus, margins(-1, -2, 0, dp(2), 0, dp(6)));
+
+        root.addView(schematicAction(
+            folder.configured ? "СМЕНИТЬ ПАПКУ СХЕМ" : "ВЫБРАТЬ ПАПКУ СХЕМ",
+            () -> {
+                Intent intent = new Intent(context, MainActivity.class)
+                    .setAction(MainActivity.ACTION_CHOOSE_SCHEMATIC_FOLDER)
+                    .addFlags(
+                        Intent.FLAG_ACTIVITY_NEW_TASK |
+                            Intent.FLAG_ACTIVITY_CLEAR_TOP |
+                            Intent.FLAG_ACTIVITY_SINGLE_TOP
+                    );
+                context.startActivity(intent);
+            }
+        ), margins(-1, -2, 0, 0, 0, dp(6)));
+
+        if (!schematicImportStatus.isEmpty()) {
+            TextView importStatus = text(schematicImportStatus, 9, true);
+            importStatus.setTextColor(
+                schematicImportError ? 0xffff8e99 : 0xff68ddff
+            );
+            importStatus.setPadding(dp(9), dp(7), dp(9), dp(7));
+            importStatus.setBackground(statusBackground());
+            root.addView(importStatus, margins(-1, -2, 0, 0, 0, dp(6)));
+        }
+
+        int sourceShown = 0;
+        for (SchematicSourceFolder.SourceEntry entry : folder.entries) {
+            if (sourceShown >= 24) break;
+            ++sourceShown;
+            LinearLayout fileCard = new LinearLayout(context);
+            fileCard.setOrientation(LinearLayout.VERTICAL);
+            fileCard.setPadding(dp(10), dp(7), dp(10), dp(7));
+            fileCard.setBackground(cardBackground(false));
+            TextView fileName = text(entry.name, 10, true);
+            fileName.setTextColor(0xffe7eef8);
+            fileCard.addView(fileName);
+            TextView fileDetail = text(
+                entry.relativePath + " • " + formatBytes(entry.sizeBytes),
+                8,
+                false
+            );
+            fileDetail.setTextColor(0xff8495a8);
+            fileDetail.setPadding(0, dp(2), 0, dp(5));
+            fileCard.addView(fileDetail);
+            TextView use = schematicAction("ИМПОРТИРОВАТЬ В МИР", () -> {
+                schematicImportStatus = "Импортируем " + entry.name + "…";
+                schematicImportError = false;
+                showPage("schematics");
+                try {
+                    context.startService(new Intent(context, RelayService.class)
+                        .setAction(RelayService.ACTION_IMPORT_SCHEMATIC_DOCUMENT)
+                        .putExtra(
+                            RelayService.EXTRA_SCHEMATIC_URI,
+                            entry.uri.toString()
+                        )
+                        .putExtra(RelayService.EXTRA_SCHEMATIC_NAME, entry.name));
+                } catch (Throwable error) {
+                    updateSchematicImportStatus(
+                        "Не удалось запустить импорт",
+                        true
+                    );
+                    DiagnosticsLog.appendError(
+                        context,
+                        "schematics",
+                        "Could not start in-game schematic import",
+                        error
+                    );
+                }
+            });
+            fileCard.addView(use, new LinearLayout.LayoutParams(-1, dp(34)));
+            root.addView(fileCard, margins(-1, -2, 0, 0, 0, dp(5)));
+        }
+
+        if (folder.entries.size() > sourceShown) {
+            TextView more = text(
+                "Показаны первые 24 файла из " + folder.entries.size(),
+                8,
+                false
+            );
+            more.setTextColor(0xff8797aa);
+            root.addView(more, margins(-1, -2, 0, 0, 0, dp(5)));
+        }
+
+        TextView importButton = schematicAction(
+            "ВЫБРАТЬ ОДИН ФАЙЛ (ЗАПАСНОЙ СПОСОБ)",
+            () -> {
+                Intent intent = new Intent(context, MainActivity.class)
+                    .setAction(MainActivity.ACTION_IMPORT_SCHEMATIC)
+                    .addFlags(
+                        Intent.FLAG_ACTIVITY_NEW_TASK |
+                            Intent.FLAG_ACTIVITY_CLEAR_TOP |
+                            Intent.FLAG_ACTIVITY_SINGLE_TOP
+                    );
+                context.startActivity(intent);
+            }
+        );
+        root.addView(importButton, margins(-1, -2, 0, 0, 0, dp(8)));
+
+        if (!entries.isEmpty()) {
+            root.addView(sectionHeader("БИБЛИОТЕКА"));
+            int shown = 0;
+            for (SchematicRepository.Entry entry : entries) {
+                if (++shown > 16) break;
+                LinearLayout card = new LinearLayout(context);
+                card.setOrientation(LinearLayout.VERTICAL);
+                card.setPadding(dp(10), dp(8), dp(10), dp(8));
+                card.setBackground(cardBackground(entry.active));
+                TextView name = text(
+                    (entry.active ? "●  " : "○  ") + entry.sourceName,
+                    11,
+                    true
+                );
+                name.setTextColor(entry.active ? 0xff68ddff : 0xffe5edf8);
+                card.addView(name);
+                TextView detail = text(
+                    entry.format + " • " + entry.sizeX + "×" + entry.sizeY +
+                        "×" + entry.sizeZ,
+                    9,
+                    false
+                );
+                detail.setTextColor(0xff91a2b6);
+                detail.setPadding(0, dp(2), 0, dp(5));
+                card.addView(detail);
+                LinearLayout actions = new LinearLayout(context);
+                actions.setOrientation(LinearLayout.HORIZONTAL);
+                if (!entry.active) {
+                    TextView select = schematicAction("ВЫБРАТЬ", () -> {
+                        if (repository.activate(entry.id)) {
+                            preferences.edit()
+                                .putBoolean(
+                                    RelayService.KEY_SCHEMATIC_PLACED,
+                                    false
+                                )
+                                .apply();
+                            notifySchematicReload();
+                            showPage("schematics");
+                        }
+                    });
+                    actions.addView(select, new LinearLayout.LayoutParams(
+                        0,
+                        dp(34),
+                        1f
+                    ));
+                }
+                TextView remove = schematicAction("УДАЛИТЬ", () -> {
+                    boolean wasActive = entry.active;
+                    if (repository.delete(entry.id)) {
+                        if (wasActive) {
+                            List<SchematicRepository.Entry> remaining =
+                                repository.list();
+                            if (!remaining.isEmpty()) {
+                                repository.activate(remaining.get(0).id);
+                                preferences.edit()
+                                    .putBoolean(
+                                        RelayService.KEY_SCHEMATIC_PLACED,
+                                        false
+                                    )
+                                    .apply();
+                            }
+                            notifySchematicReload();
+                        }
+                        showPage("schematics");
+                    }
+                });
+                actions.addView(remove, new LinearLayout.LayoutParams(
+                    0,
+                    dp(34),
+                    1f
+                ));
+                card.addView(actions);
+                root.addView(card, margins(-1, -2, 0, 0, 0, dp(6)));
+            }
+        }
+
+        if (active == null) {
+            TextView formats = text(
+                "Поддерживаются .mcstructure, .nbt, .litematic, .schem и " +
+                    ".schematic. GZip и обычный NBT определяются автоматически.",
+                10,
+                false
+            );
+            formats.setTextColor(0xff9cabbc);
+            root.addView(formats);
+            return;
+        }
+
+        root.addView(sectionHeader("ОТОБРАЖЕНИЕ"));
+        int opacity = RelayService.clampSchematicOpacity(preferences.getInt(
+            RelayService.KEY_SCHEMATIC_OPACITY,
+            42
+        ));
+        TextView opacityLabel = settingLabel("Прозрачность блоков: " +
+            opacity + "%");
+        root.addView(opacityLabel);
+        SeekBar opacitySlider = slider(10, 85, opacity);
+        root.addView(opacitySlider);
+        opacitySlider.setOnSeekBarChangeListener(seekListener(
+            value -> opacityLabel.setText("Прозрачность блоков: " + value + "%"),
+            value -> saveInt(
+                RelayService.KEY_SCHEMATIC_OPACITY,
+                RelayService.clampSchematicOpacity(value)
+            )
+        ));
+
+        int distance = RelayService.clampSchematicDistance(preferences.getInt(
+            RelayService.KEY_SCHEMATIC_DISTANCE,
+            96
+        ));
+        TextView distanceLabel = settingLabel("Дальность схемы: " + distance +
+            " м");
+        root.addView(distanceLabel);
+        SeekBar distanceSlider = slider(16, 192, distance);
+        root.addView(distanceSlider);
+        distanceSlider.setOnSeekBarChangeListener(seekListener(
+            value -> distanceLabel.setText("Дальность схемы: " + value + " м"),
+            value -> saveInt(
+                RelayService.KEY_SCHEMATIC_DISTANCE,
+                RelayService.clampSchematicDistance(value)
+            )
+        ));
+
+        int rotation = Math.floorMod(preferences.getInt(
+            RelayService.KEY_SCHEMATIC_ROTATION,
+            0
+        ), 4);
+        root.addView(schematicAction(
+            "ПОВОРОТ: " + (rotation * 90) + "°  ↻",
+            () -> {
+                preferences.edit().putInt(
+                    RelayService.KEY_SCHEMATIC_ROTATION,
+                    (rotation + 1) & 3
+                ).apply();
+                settingsChanged.run();
+                showPage("schematics");
+            }
+        ), margins(-1, -2, 0, dp(5), 0, dp(6)));
+        boolean mirrored = preferences.getBoolean(
+            RelayService.KEY_SCHEMATIC_MIRROR,
+            false
+        );
+        root.addView(schematicAction(
+            mirrored ? "ОТРАЖЕНИЕ: ВКЛЮЧЕНО" : "ОТРАЖЕНИЕ: ВЫКЛЮЧЕНО",
+            () -> {
+                preferences.edit().putBoolean(
+                    RelayService.KEY_SCHEMATIC_MIRROR,
+                    !mirrored
+                ).apply();
+                settingsChanged.run();
+                showPage("schematics");
+            }
+        ), margins(-1, -2, 0, 0, 0, dp(6)));
+
+        int selectedLayer = preferences.getInt(
+            RelayService.KEY_SCHEMATIC_LAYER,
+            -1
+        );
+        if (selectedLayer >= activeEntry.sizeY) {
+            selectedLayer = activeEntry.sizeY - 1;
+        }
+        final int layer = selectedLayer;
+        LinearLayout layerRow = new LinearLayout(context);
+        layerRow.setOrientation(LinearLayout.HORIZONTAL);
+        TextView previousLayer = schematicAction("−", () -> {
+            int next = layer < 0
+                ? Math.max(0, activeEntry.sizeY - 1)
+                : layer - 1;
+            preferences.edit().putInt(
+                RelayService.KEY_SCHEMATIC_LAYER,
+                Math.max(-1, next)
+            ).apply();
+            settingsChanged.run();
+            showPage("schematics");
+        });
+        TextView layerMode = schematicAction(
+            layer < 0 ? "ВСЕ СЛОИ" : "СЛОЙ Y=" + layer,
+            () -> {
+                preferences.edit().putInt(
+                    RelayService.KEY_SCHEMATIC_LAYER,
+                    layer < 0 ? 0 : -1
+                ).apply();
+                settingsChanged.run();
+                showPage("schematics");
+            }
+        );
+        TextView nextLayer = schematicAction("+", () -> {
+            int next = layer < 0
+                ? 0
+                : Math.min(activeEntry.sizeY - 1, layer + 1);
+            preferences.edit().putInt(
+                RelayService.KEY_SCHEMATIC_LAYER,
+                next
+            ).apply();
+            settingsChanged.run();
+            showPage("schematics");
+        });
+        layerRow.addView(previousLayer, new LinearLayout.LayoutParams(dp(42), dp(36)));
+        layerRow.addView(layerMode, new LinearLayout.LayoutParams(0, dp(36), 1f));
+        layerRow.addView(nextLayer, new LinearLayout.LayoutParams(dp(42), dp(36)));
+        root.addView(layerRow, margins(-1, -2, 0, 0, 0, dp(8)));
+
+        root.addView(sectionHeader("ПОЗИЦИЯ В МИРЕ"));
+        int anchorX = preferences.getInt(RelayService.KEY_SCHEMATIC_ANCHOR_X, 0);
+        int anchorY = preferences.getInt(RelayService.KEY_SCHEMATIC_ANCHOR_Y, 0);
+        int anchorZ = preferences.getInt(RelayService.KEY_SCHEMATIC_ANCHOR_Z, 0);
+        TextView coordinates = text(
+            "Якорь: X " + anchorX + "  Y " + anchorY + "  Z " + anchorZ,
+            10,
+            true
+        );
+        coordinates.setTextColor(0xffa9d9ff);
+        coordinates.setPadding(dp(4), dp(3), dp(4), dp(5));
+        root.addView(coordinates);
+        root.addView(schematicAction("ПОСТАВИТЬ ПЕРЕД ИГРОКОМ", () -> {
+            preferences.edit()
+                .putBoolean(RelayService.KEY_SCHEMATIC_PLACED, false)
+                .apply();
+            settingsChanged.run();
+        }), margins(-1, -2, 0, 0, 0, dp(6)));
+        root.addView(schematicMoveRow("X −", -1, 0, 0, "X +", 1, 0, 0));
+        root.addView(schematicMoveRow("Y −", 0, -1, 0, "Y +", 0, 1, 0));
+        root.addView(schematicMoveRow("Z −", 0, 0, -1, "Z +", 0, 0, 1));
+
+        TextView note = text(
+            "Это отдельный кликабельность-неперехватывающий слой. Он скрывается " +
+                "в инвентаре, сундуке, шалкере и чате. Координаты камеры и мира " +
+                "берутся только из пакетов relay.",
+            9,
+            false
+        );
+        note.setTextColor(0xff8291a3);
+        note.setPadding(dp(3), dp(8), dp(3), 0);
+        root.addView(note);
+    }
+
+    private View schematicMoveRow(
+        String firstLabel,
+        int firstX,
+        int firstY,
+        int firstZ,
+        String secondLabel,
+        int secondX,
+        int secondY,
+        int secondZ
+    ) {
+        LinearLayout row = new LinearLayout(context);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        TextView first = schematicAction(firstLabel, () ->
+            adjustSchematicAnchor(firstX, firstY, firstZ));
+        TextView second = schematicAction(secondLabel, () ->
+            adjustSchematicAnchor(secondX, secondY, secondZ));
+        row.addView(first, new LinearLayout.LayoutParams(0, dp(35), 1f));
+        row.addView(second, new LinearLayout.LayoutParams(0, dp(35), 1f));
+        row.setPadding(0, 0, 0, dp(4));
+        return row;
+    }
+
+    private TextView schematicAction(String label, Runnable action) {
+        TextView button = text(label, 10, true);
+        button.setGravity(Gravity.CENTER);
+        button.setPadding(dp(7), dp(7), dp(7), dp(7));
+        button.setBackground(actionBackground());
+        button.setClickable(true);
+        button.setOnClickListener(view -> action.run());
+        return button;
+    }
+
+    private void adjustSchematicAnchor(int dx, int dy, int dz) {
+        preferences.edit()
+            .putInt(
+                RelayService.KEY_SCHEMATIC_ANCHOR_X,
+                preferences.getInt(RelayService.KEY_SCHEMATIC_ANCHOR_X, 0) + dx
+            )
+            .putInt(
+                RelayService.KEY_SCHEMATIC_ANCHOR_Y,
+                preferences.getInt(RelayService.KEY_SCHEMATIC_ANCHOR_Y, 0) + dy
+            )
+            .putInt(
+                RelayService.KEY_SCHEMATIC_ANCHOR_Z,
+                preferences.getInt(RelayService.KEY_SCHEMATIC_ANCHOR_Z, 0) + dz
+            )
+            .putBoolean(RelayService.KEY_SCHEMATIC_PLACED, true)
+            .apply();
+        settingsChanged.run();
+        showPage("schematics");
+    }
+
+    private void notifySchematicReload() {
+        try {
+            context.startService(new Intent(context, RelayService.class)
+                .setAction(RelayService.ACTION_RELOAD_SCHEMATIC));
+        } catch (Throwable error) {
+            DiagnosticsLog.appendError(
+                context,
+                "schematics",
+                "Could not reload selected schematic",
+                error
+            );
+        }
+    }
+
+    private void buildAutomationPage(LinearLayout root) {
+        root.addView(toggle(
+            "Авто-тотем в левую руку",
+            RelayService.KEY_AUTO_TOTEM,
+            false
+        ));
+        root.addView(toggle(
+            "Автоматически надевать лучшую броню",
+            RelayService.KEY_AUTO_ARMOR,
+            false
+        ));
+        automationStatus = text("", 10, true);
+        automationStatus.setPadding(dp(10), dp(8), dp(10), dp(8));
+        automationStatus.setBackground(statusBackground());
+        root.addView(automationStatus, margins(-1, -2, 0, dp(5), 0, dp(7)));
+        refreshAutomationStatus();
+        TextView note = text(
+            "Действия отправляются штатным ItemStackRequest и только после " +
+                "синхронизации инвентаря. Во время сундука, шалкера, инвентаря " +
+                "или чата автоматизация приостанавливается.",
+            10,
+            false
+        );
+        note.setTextColor(0xff98a7b8);
+        root.addView(note);
+    }
+
+    private void buildThreatsPage(LinearLayout root) {
+        root.addView(toggle(
+            "Умный анализ враждебных мобов",
+            RelayService.KEY_THREAT_ANALYSIS,
+            true
+        ));
+        root.addView(toggle(
+            "Показывать перемещаемое предупреждение",
+            RelayService.KEY_THREAT_WARNING,
+            true
+        ));
+        int distance = RelayService.clampThreatDistance(preferences.getInt(
+            RelayService.KEY_THREAT_DISTANCE,
+            12
+        ));
+        TextView distanceLabel = settingLabel(
+            "Срабатывать не дальше: " + distance + " м"
+        );
+        root.addView(distanceLabel);
+        SeekBar distanceSlider = slider(
+            RelayService.MIN_THREAT_DISTANCE,
+            RelayService.MAX_THREAT_DISTANCE,
+            distance
+        );
+        root.addView(distanceSlider);
+        distanceSlider.setOnSeekBarChangeListener(seekListener(
+            progress -> distanceLabel.setText(
+                "Срабатывать не дальше: " + progress + " м"
+            ),
+            progress -> saveInt(
+                RelayService.KEY_THREAT_DISTANCE,
+                RelayService.clampThreatDistance(progress)
+            )
+        ));
+        int scale = RelayService.clampOverlayScale(preferences.getInt(
+            RelayService.KEY_THREAT_WARNING_SCALE,
+            90
+        ));
+        TextView scaleLabel = settingLabel(
+            "Размер предупреждения: " + scale + "%"
+        );
+        root.addView(scaleLabel);
+        SeekBar scaleSlider = slider(70, 150, scale);
+        root.addView(scaleSlider);
+        scaleSlider.setOnSeekBarChangeListener(seekListener(
+            progress -> scaleLabel.setText(
+                "Размер предупреждения: " + progress + "%"
+            ),
+            progress -> saveInt(
+                RelayService.KEY_THREAT_WARNING_SCALE,
+                RelayService.clampOverlayScale(progress)
+            )
+        ));
+        TextView colorLabel = settingLabel("Цвет опасного моба");
+        root.addView(colorLabel);
+        root.addView(colorPicker(
+            RelayService.KEY_THREAT_COLOR,
+            RelayService.DEFAULT_THREAT_COLOR,
+            "threats"
+        ));
+        TextView note = text(
+            "Учитываются тип моба, дистанция, скорость сближения, здоровье, " +
+                "голод, поглощение, броня, наличие чар и Сопротивление. " +
+                "Предупреждение можно перетащить. Без пакета цели агрессия и " +
+                "урон показываются как диапазон-оценка.",
+            10,
+            false
+        );
+        note.setTextColor(0xff98a7b8);
+        note.setPadding(dp(3), dp(7), dp(3), 0);
+        root.addView(note);
     }
 
     private void buildLogsPage(LinearLayout root) {
@@ -755,6 +1456,75 @@ final class RelayOverlayController {
         statusEvictedMemory = evictedMemory;
         statusParseFailures = parseFailures;
         refreshChunkStatus();
+    }
+
+    void updateMiniMapStatus(long decodedChunks, long decodeFailures) {
+        statusMiniMapDecoded = decodedChunks;
+        statusMiniMapFailures = decodeFailures;
+        refreshMiniMapStatus();
+    }
+
+    void updateAutomationStatus(
+        String text,
+        boolean inventoryReady,
+        boolean pending,
+        long accepted,
+        long rejected
+    ) {
+        statusAutomationText = text == null || text.isEmpty()
+            ? "Ожидание инвентаря"
+            : text;
+        statusInventoryReady = inventoryReady;
+        statusAutomationPending = pending;
+        statusAutomationAccepted = accepted;
+        statusAutomationRejected = rejected;
+        refreshAutomationStatus();
+    }
+
+    private void refreshMiniMapStatus() {
+        if (miniMapStatus == null) return;
+        boolean enabled = preferences.getBoolean(RelayService.KEY_MINIMAP, true);
+        if (!enabled) {
+            miniMapStatus.setText("Мини-карта выключена");
+            miniMapStatus.setTextColor(0xffc4cad3);
+            return;
+        }
+        miniMapStatus.setText(String.format(
+            Locale.getDefault(),
+            "Декодировано чанков: %,d%s",
+            statusMiniMapDecoded,
+            statusMiniMapFailures > 0
+                ? " • ошибок: " + statusMiniMapFailures
+                : " • ошибок нет"
+        ));
+        miniMapStatus.setTextColor(
+            statusMiniMapFailures == 0 ? 0xff9ee493 : 0xffffd27a
+        );
+    }
+
+    private void refreshAutomationStatus() {
+        if (automationStatus == null) return;
+        boolean enabled = preferences.getBoolean(
+            RelayService.KEY_AUTO_ARMOR,
+            false
+        ) || preferences.getBoolean(RelayService.KEY_AUTO_TOTEM, false);
+        if (!enabled) {
+            automationStatus.setText("Автоматизация выключена");
+            automationStatus.setTextColor(0xffc4cad3);
+            return;
+        }
+        automationStatus.setText(String.format(
+            Locale.getDefault(),
+            "%s\nИнвентарь: %s%s • принято: %,d • отклонено: %,d",
+            statusAutomationText,
+            statusInventoryReady ? "готов" : "ожидание",
+            statusAutomationPending ? " • запрос выполняется" : "",
+            statusAutomationAccepted,
+            statusAutomationRejected
+        ));
+        automationStatus.setTextColor(
+            statusAutomationRejected > 0 ? 0xffffd27a : 0xff9ee493
+        );
     }
 
     private void clearLiveChunkStatus() {

@@ -4205,6 +4205,17 @@ private:
             : RelayParseErrorPolicy::Disconnect;
     }
 
+    static bool isOpaqueResourcePackTransportPacket(
+        const std::string& name
+    ) noexcept {
+        return name == "resource_packs_info" ||
+            name == "resource_pack_stack" ||
+            name == "resource_pack_data_info" ||
+            name == "resource_pack_chunk_data" ||
+            name == "resource_pack_client_response" ||
+            name == "resource_pack_chunk_request";
+    }
+
     void handleLivePacket(BedrockRelayPacketEvent& event) {
         const auto player = playerForSession(event.sessionId);
         auto packetVariables = variablesForSession(event.sessionId);
@@ -4220,6 +4231,15 @@ private:
                 player && player->hasPacketHandlers(event.direction);
 
             if (!hasGlobalHandlers && !hasPlayerHandlers) {
+                // Resource-pack negotiation is a transport exchange between
+                // the real server and Minecraft.  Do not make transparent
+                // forwarding depend on this library knowing every optional
+                // or newly appended resource-pack field.  The packet ID and
+                // original bytes have already been framed by the MCPE codec;
+                // with no structured consumer there is nothing to decode.
+                if (isOpaqueResourcePackTransportPacket(event.packet.name)) {
+                    return;
+                }
                 ProtoDefPacketDecoder decoder(
                     options_.version,
                     packetVariables

@@ -25,7 +25,20 @@ public final class NativeBridge {
         int retainedRadiusChunks
     );
 
+    public static native void configureGameplayFeatures(
+        boolean autoArmorEnabled,
+        boolean autoTotemEnabled,
+        boolean miniMapEnabled
+    );
+
     public static native String snapshot();
+
+    public static native boolean minecraftUiBlocked();
+
+    public static native int[] miniMapSnapshot(
+        long afterRevision,
+        int radiusChunks
+    );
 
     public static native String entityCameraSnapshot();
 

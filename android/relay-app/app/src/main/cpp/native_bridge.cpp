@@ -9,11 +9,14 @@
 #include <jni.h>
 
 #include <atomic>
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cctype>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <filesystem>
 #include <future>
@@ -26,6 +29,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <unordered_map>
 #include <vector>
@@ -43,12 +47,42 @@ constexpr int MaximumRetainedRadiusChunks = 64;
 std::atomic<bool> configuredDetailedLogging {true};
 std::atomic<bool> configuredChunkRetention {false};
 std::atomic<int> configuredRetainedRadiusChunks {24};
+std::atomic<bool> configuredAutoArmor {false};
+std::atomic<bool> configuredAutoTotem {false};
+std::atomic<bool> configuredMiniMap {false};
 
 int clampRetainedRadiusChunks(int radius) {
     return std::max(
         MinimumRetainedRadiusChunks,
         std::min(MaximumRetainedRadiusChunks, radius)
     );
+}
+
+std::array<int, 3> parsedVersion(std::string_view version) noexcept {
+    std::array<int, 3> result {};
+    std::size_t offset = 0;
+    for (std::size_t index = 0; index < result.size(); ++index) {
+        int value = 0;
+        bool foundDigit = false;
+        while (offset < version.size() && version[offset] >= '0' &&
+               version[offset] <= '9') {
+            foundDigit = true;
+            value = value * 10 + (version[offset] - '0');
+            ++offset;
+        }
+        result[index] = foundDigit ? value : 0;
+        if (offset < version.size() && version[offset] == '.') ++offset;
+    }
+    return result;
+}
+
+bool versionAtLeast(
+    std::string_view version,
+    int major,
+    int minor,
+    int patch
+) noexcept {
+    return parsedVersion(version) >= std::array<int, 3> {major, minor, patch};
 }
 
 #if defined(BEDROCK_ANDROID_RELEASE_BUILD)
@@ -318,6 +352,26 @@ bool isClientboundEquipmentFlood(std::string_view name) {
     return name == "mob_equipment" || name == "mob_armor_equipment";
 }
 
+bool isResourcePackTransportPacket(std::string_view name) {
+    return name == "resource_packs_info" ||
+        name == "resource_pack_stack" ||
+        name == "resource_pack_data_info" ||
+        name == "resource_pack_chunk_data" ||
+        name == "resource_pack_client_response" ||
+        name == "resource_pack_chunk_request";
+}
+
+bool shouldPublishResourcePackSample(
+    std::string_view name,
+    uint64_t sampleIndex
+) {
+    if (name != "resource_pack_chunk_data" &&
+        name != "resource_pack_chunk_request") {
+        return true;
+    }
+    return sampleIndex <= 8 || sampleIndex % 32 == 0;
+}
+
 bool shouldRecordEquipmentSample(uint64_t sampleIndex) {
     return sampleIndex <= 8 || sampleIndex % 128 == 0;
 }
@@ -330,12 +384,7 @@ bool isFlightPacket(std::string_view name) {
         name == "crafting_data" ||
         name == "trim_data" ||
         name == "clientbound_map_item_data" ||
-        name == "resource_packs_info" ||
-        name == "resource_pack_data_info" ||
-        name == "resource_pack_chunk_data" ||
-        name == "resource_pack_stack" ||
-        name == "resource_pack_client_response" ||
-        name == "resource_pack_chunk_request" ||
+        isResourcePackTransportPacket(name) ||
         name == "network_settings" ||
         name == "server_to_client_handshake" ||
         name == "client_to_server_handshake" ||
@@ -617,6 +666,8 @@ struct RelayState {
     struct EquipmentItem {
         bool present = false;
         int64_t networkId = 0;
+        int32_t count = 0;
+        int32_t stackId = 0;
         std::string name;
         int32_t damage = 0;
         bool damageKnown = false;
@@ -631,6 +682,37 @@ struct RelayState {
         int64_t timestampMs = 0;
         std::string component;
         std::string message;
+    };
+
+    struct MiniMapKey {
+        int32_t dimension = 0;
+        int32_t x = 0;
+        int32_t z = 0;
+
+        bool operator==(const MiniMapKey&) const = default;
+    };
+
+    struct MiniMapKeyHash {
+        std::size_t operator()(const MiniMapKey& key) const noexcept {
+            std::size_t result = std::hash<int32_t> {}(key.dimension);
+            result ^= std::hash<int32_t> {}(key.x) +
+                0x9e3779b9u + (result << 6u) + (result >> 2u);
+            result ^= std::hash<int32_t> {}(key.z) +
+                0x9e3779b9u + (result << 6u) + (result >> 2u);
+            return result;
+        }
+    };
+
+    struct MiniMapTile {
+        MiniMapKey key;
+        std::array<int32_t, 256> pixels {};
+        uint64_t revision = 0;
+    };
+
+    struct MiniMapChunkJob {
+        std::string version;
+        std::vector<uint8_t> payload;
+        uint64_t generation = 0;
     };
 
     mutable std::mutex mutex;
@@ -663,8 +745,14 @@ struct RelayState {
     std::atomic<uint64_t> clientboundEquipmentPackets {0};
     std::atomic<uint64_t> clientboundEquipmentTransportPackets {0};
     std::atomic<uint64_t> clientboundEquipmentForwardedPackets {0};
+    std::atomic<uint64_t> resourcePackPacketsSeen {0};
+    std::atomic<uint64_t> resourcePackPacketsForwarded {0};
     std::atomic<bool> detailedLogging {true};
     std::atomic<bool> chunkRetentionEnabled {false};
+    std::atomic<bool> minecraftUiBlocked {false};
+    std::atomic<bool> autoArmorEnabled {false};
+    std::atomic<bool> autoTotemEnabled {false};
+    std::atomic<bool> miniMapEnabled {false};
     std::atomic<int> retainedRadiusChunks {24};
     std::atomic<uint64_t> chunkPublisherPacketsObserved {0};
     std::atomic<uint64_t> chunkPublisherPacketsRewritten {0};
@@ -684,12 +772,304 @@ struct RelayState {
     std::atomic<uint64_t> cameraOrientationUpdates {0};
     std::atomic<uint64_t> cameraOrientationDecodeFailures {0};
     bedrock::EntityPositionTracker entityPositions;
-    std::array<EquipmentItem, 5> equipment;
+    // main hand, off hand, helmet, chestplate, leggings, boots
+    std::array<EquipmentItem, 6> equipment;
     uint64_t equipmentRevision = 0;
+    std::vector<EquipmentItem> playerInventory;
+    bool playerInventoryReady = false;
+    int32_t nextAutomationRequestId = 1'000'000;
+    int32_t pendingAutomationRequestId = 0;
+    uint64_t pendingAutomationStartedAtMs = 0;
+    uint64_t lastAutomationAttemptAtMs = 0;
+    uint64_t automationAccepted = 0;
+    uint64_t automationRejected = 0;
+    std::string automationStatus = "Ожидание инвентаря";
+    double playerHealth = 20.0;
+    double playerMaximumHealth = 20.0;
+    double playerHunger = 20.0;
+    double playerSaturation = 5.0;
+    double playerAbsorption = 0.0;
+    bool playerHealthKnown = false;
+    bool playerHungerKnown = false;
+    bool playerAbsorptionKnown = false;
+    int32_t playerResistanceLevel = 0;
     std::unordered_map<int64_t, std::string> itemNames;
     bedrock::ProtoDefVariableStorePtr itemProtocolVariables =
         bedrock::makeProtoDefVariableStore();
     std::mutex itemDecodeMutex;
+    std::atomic<int32_t> miniMapDimension {0};
+    std::atomic<uint64_t> miniMapDecodedChunks {0};
+    std::atomic<uint64_t> miniMapDecodeFailures {0};
+    std::atomic<uint64_t> miniMapCachedChunksSkipped {0};
+    mutable std::mutex miniMapMutex;
+    std::condition_variable miniMapCondition;
+    std::deque<MiniMapChunkJob> miniMapJobs;
+    std::unordered_map<MiniMapKey, MiniMapTile, MiniMapKeyHash> miniMapTiles;
+    std::thread miniMapWorker;
+    bool miniMapStopping = false;
+    uint64_t miniMapGeneration = 1;
+    uint64_t miniMapRevision = 0;
+
+    RelayState() {
+        miniMapWorker = std::thread([this]() { miniMapWorkerLoop(); });
+    }
+
+    ~RelayState() {
+        {
+            std::lock_guard lock(miniMapMutex);
+            miniMapStopping = true;
+            miniMapJobs.clear();
+        }
+        miniMapCondition.notify_all();
+        if (miniMapWorker.joinable()) miniMapWorker.join();
+    }
+
+    static int32_t floatBits(float value) noexcept {
+        static_assert(sizeof(float) == sizeof(int32_t));
+        int32_t result = 0;
+        std::memcpy(&result, &value, sizeof(result));
+        return result;
+    }
+
+    static int32_t miniMapSurfaceColor(
+        int32_t stateId,
+        uint32_t biomeId,
+        int32_t height,
+        int32_t dimension
+    ) noexcept {
+        if (stateId == 0) return 0x00000000;
+        static constexpr std::array<std::array<int, 3>, 10> Overworld {{
+            {{89, 139, 76}}, {{107, 151, 81}}, {{126, 111, 79}},
+            {{104, 119, 128}}, {{184, 170, 119}}, {{67, 111, 88}},
+            {{118, 139, 72}}, {{144, 121, 92}}, {{91, 132, 142}},
+            {{174, 181, 187}}
+        }};
+        static constexpr std::array<std::array<int, 3>, 6> Nether {{
+            {{118, 48, 40}}, {{91, 39, 37}}, {{129, 75, 43}},
+            {{72, 59, 55}}, {{123, 91, 53}}, {{83, 44, 66}}
+        }};
+        static constexpr std::array<std::array<int, 3>, 5> End {{
+            {{204, 207, 139}}, {{179, 181, 124}}, {{116, 101, 132}},
+            {{93, 85, 108}}, {{218, 216, 157}}
+        }};
+
+        uint32_t mixed = static_cast<uint32_t>(stateId) * 0x9e3779b1u;
+        mixed ^= biomeId * 0x85ebca6bu;
+        std::array<int, 3> base {};
+        if (dimension == 1) {
+            base = End[mixed % End.size()];
+        } else if (dimension == -1) {
+            base = Nether[mixed % Nether.size()];
+        } else {
+            base = Overworld[mixed % Overworld.size()];
+        }
+        const int shade = std::clamp((height - 64) / 3, -30, 34);
+        const int red = std::clamp(base[0] + shade, 18, 245);
+        const int green = std::clamp(base[1] + shade, 18, 245);
+        const int blue = std::clamp(base[2] + shade, 18, 245);
+        return static_cast<int32_t>(
+            0xff000000u |
+            (static_cast<uint32_t>(red) << 16u) |
+            (static_cast<uint32_t>(green) << 8u) |
+            static_cast<uint32_t>(blue)
+        );
+    }
+
+    void resetMiniMapWorld(int32_t dimension) noexcept {
+        miniMapDimension.store(dimension, std::memory_order_relaxed);
+        {
+            std::lock_guard lock(miniMapMutex);
+            ++miniMapGeneration;
+            ++miniMapRevision;
+            miniMapJobs.clear();
+            miniMapTiles.clear();
+        }
+        miniMapCondition.notify_all();
+    }
+
+    void enqueueMiniMapChunk(
+        const std::string& version,
+        const bedrock::VersionedGamePacket& packet
+    ) noexcept {
+        if (!miniMapEnabled.load(std::memory_order_relaxed) ||
+            packet.name != "level_chunk") {
+            return;
+        }
+        try {
+            std::lock_guard lock(miniMapMutex);
+            if (miniMapStopping) return;
+            while (miniMapJobs.size() >= 32) miniMapJobs.pop_front();
+            miniMapJobs.push_back(MiniMapChunkJob {
+                version,
+                packet.payload,
+                miniMapGeneration
+            });
+            miniMapCondition.notify_one();
+        } catch (...) {
+        }
+    }
+
+    void miniMapWorkerLoop() noexcept {
+        for (;;) {
+            MiniMapChunkJob job;
+            {
+                std::unique_lock lock(miniMapMutex);
+                miniMapCondition.wait(lock, [this]() {
+                    return miniMapStopping || !miniMapJobs.empty();
+                });
+                if (miniMapStopping) return;
+                job = std::move(miniMapJobs.front());
+                miniMapJobs.pop_front();
+            }
+
+            try {
+                auto packet = bedrock::BedrockLevelChunkCodec::decodePacketPayload(
+                    job.payload
+                );
+                if (packet.cacheEnabled) {
+                    miniMapCachedChunksSkipped.fetch_add(
+                        1,
+                        std::memory_order_relaxed
+                    );
+                    continue;
+                }
+                auto column = bedrock::BedrockLevelChunkCodec::decodeNoCacheColumn(
+                    packet,
+                    versionAtLeast(job.version, 1, 18, 0)
+                );
+                MiniMapTile tile;
+                tile.key = MiniMapKey {packet.dimension, packet.x, packet.z};
+                for (int32_t z = 0; z < 16; ++z) {
+                    for (int32_t x = 0; x < 16; ++x) {
+                        int32_t surfaceState = 0;
+                        int32_t surfaceY = column.minY();
+                        for (int32_t sectionY = column.maxCY() - 1;
+                             sectionY >= column.minCY() && surfaceState == 0;
+                             --sectionY) {
+                            const auto* section = column.getSectionAtIndex(sectionY);
+                            if (section == nullptr) continue;
+                            for (int32_t localY = 15; localY >= 0; --localY) {
+                                const auto stateId = section->getBlockStateId(
+                                    static_cast<uint8_t>(x),
+                                    static_cast<uint8_t>(localY),
+                                    static_cast<uint8_t>(z)
+                                );
+                                if (stateId == 0) continue;
+                                surfaceState = stateId;
+                                surfaceY = sectionY * 16 + localY;
+                                break;
+                            }
+                        }
+                        uint32_t biome = 0;
+                        try {
+                            biome = column.getBiomeId({
+                                x,
+                                surfaceY,
+                                z,
+                                std::nullopt
+                            });
+                        } catch (...) {
+                        }
+                        tile.pixels[static_cast<std::size_t>(z * 16 + x)] =
+                            miniMapSurfaceColor(
+                                surfaceState,
+                                biome,
+                                surfaceY,
+                                packet.dimension
+                            );
+                    }
+                }
+
+                {
+                    std::lock_guard lock(miniMapMutex);
+                    if (job.generation != miniMapGeneration || miniMapStopping) {
+                        continue;
+                    }
+                    tile.revision = ++miniMapRevision;
+                    miniMapDimension.store(
+                        packet.dimension,
+                        std::memory_order_relaxed
+                    );
+                    miniMapTiles.insert_or_assign(tile.key, std::move(tile));
+                    while (miniMapTiles.size() > 2048) {
+                        auto oldest = miniMapTiles.begin();
+                        for (auto current = miniMapTiles.begin();
+                             current != miniMapTiles.end(); ++current) {
+                            if (current->second.revision <
+                                oldest->second.revision) {
+                                oldest = current;
+                            }
+                        }
+                        miniMapTiles.erase(oldest);
+                    }
+                }
+                miniMapDecodedChunks.fetch_add(1, std::memory_order_relaxed);
+            } catch (...) {
+                miniMapDecodeFailures.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+
+    std::vector<int32_t> miniMapSnapshotValues(
+        uint64_t afterRevision,
+        int radiusChunks
+    ) const {
+        const auto camera = entityPositions.cameraSnapshot();
+        const int clampedRadius = std::clamp(radiusChunks, 1, 12);
+        const int32_t cameraChunkX = static_cast<int32_t>(
+            std::floor(camera.x / 16.0f)
+        );
+        const int32_t cameraChunkZ = static_cast<int32_t>(
+            std::floor(camera.z / 16.0f)
+        );
+        const int32_t dimension = miniMapDimension.load(
+            std::memory_order_relaxed
+        );
+
+        std::vector<const MiniMapTile*> selected;
+        uint64_t revision = 0;
+        uint64_t generation = 0;
+        {
+            std::lock_guard lock(miniMapMutex);
+            revision = miniMapRevision;
+            generation = miniMapGeneration;
+            selected.reserve(miniMapTiles.size());
+            for (const auto& [key, tile] : miniMapTiles) {
+                if (key.dimension != dimension ||
+                    std::abs(key.x - cameraChunkX) > clampedRadius ||
+                    std::abs(key.z - cameraChunkZ) > clampedRadius ||
+                    (afterRevision != 0 && tile.revision <= afterRevision)) {
+                    continue;
+                }
+                selected.push_back(&tile);
+            }
+
+            std::vector<int32_t> result;
+            result.reserve(12 + selected.size() * 258);
+            result.push_back(0x4350454d); // CPEM
+            result.push_back(1);
+            result.push_back(camera.known ? 1 : 0);
+            result.push_back(floatBits(camera.x));
+            result.push_back(floatBits(camera.y));
+            result.push_back(floatBits(camera.z));
+            result.push_back(floatBits(camera.yaw));
+            result.push_back(dimension);
+            result.push_back(static_cast<int32_t>(revision & 0xffffffffu));
+            result.push_back(static_cast<int32_t>(revision >> 32u));
+            result.push_back(static_cast<int32_t>(generation & 0xffffffffu));
+            result.push_back(static_cast<int32_t>(selected.size()));
+            for (const auto* tile : selected) {
+                result.push_back(tile->key.x);
+                result.push_back(tile->key.z);
+                result.insert(
+                    result.end(),
+                    tile->pixels.begin(),
+                    tile->pixels.end()
+                );
+            }
+            return result;
+        }
+    }
 
     static void refreshDurability(
         EquipmentItem& item,
@@ -720,19 +1100,39 @@ struct RelayState {
         const std::string& prefix
     ) {
         EquipmentItem item;
+        std::string itemPrefix = prefix;
         item.networkId = decoded.getInt(prefix + ".network_id", 0);
+        if (item.networkId == 0 &&
+            decoded.has(prefix + ".item.network_id")) {
+            itemPrefix += ".item";
+            item.networkId = decoded.getInt(itemPrefix + ".network_id", 0);
+        }
         item.present = item.networkId != 0;
         if (!item.present) return item;
-        auto nbtDamage = itemNbtInteger(decoded, prefix, "Damage");
+        item.count = static_cast<int32_t>(std::max<int64_t>(
+            1,
+            decoded.getInt(
+                itemPrefix + ".count",
+                decoded.getInt(prefix + ".count", 1)
+            )
+        ));
+        item.stackId = static_cast<int32_t>(decoded.getInt(
+            prefix + ".stack_id",
+            decoded.getInt(
+                prefix + ".runtime_id",
+                decoded.getInt(itemPrefix + ".stack_id", 0)
+            )
+        ));
+        auto nbtDamage = itemNbtInteger(decoded, itemPrefix, "Damage");
         if (!nbtDamage.has_value()) {
-            nbtDamage = itemNbtInteger(decoded, prefix, "damage");
+            nbtDamage = itemNbtInteger(decoded, itemPrefix, "damage");
         }
         item.damageKnown = nbtDamage.has_value();
         item.damage = std::max(0, nbtDamage.value_or(0));
         item.enchanted = packetValueHasContent(
-            decoded.value(prefix + ".extra.nbt.nbt.value.ench")
+            decoded.value(itemPrefix + ".extra.nbt.nbt.value.ench")
         );
-        const auto* itemValue = decoded.value(prefix);
+        const auto* itemValue = decoded.value(itemPrefix);
         if (!item.enchanted && itemValue != nullptr) {
             item.enchanted = packetValueHasContent(
                 findNamedPacketValue(*itemValue, "ench")
@@ -777,9 +1177,262 @@ struct RelayState {
                 refreshDurability(item, version);
                 equipmentChanged = true;
             }
+            for (auto& item : playerInventory) {
+                if (!item.present) continue;
+                const auto known = itemNames.find(item.networkId);
+                if (known == itemNames.end()) continue;
+                item.name = known->second;
+                refreshDurability(item, version);
+            }
             if (equipmentChanged) ++equipmentRevision;
         } catch (...) {
         }
+    }
+
+    static std::string decodedWindowId(
+        const bedrock::RelayPacketEvent& decoded
+    ) {
+        auto value = decoded.getString("window_id", "");
+        if (value.empty()) value = decoded.getString("inventory_id", "");
+        return value;
+    }
+
+    struct AutomationPlan {
+        bool valid = false;
+        bool totem = false;
+        std::size_t inventorySlot = 0;
+        std::size_t equipmentIndex = 0;
+        uint8_t equipmentSlot = 0;
+        int32_t requestId = 0;
+        EquipmentItem source;
+        EquipmentItem destination;
+    };
+
+    static int armorType(std::string_view name) noexcept {
+        if (name.find("helmet") != std::string_view::npos) return 0;
+        if (name.find("chestplate") != std::string_view::npos) return 1;
+        if (name.find("leggings") != std::string_view::npos) return 2;
+        if (name.find("boots") != std::string_view::npos) return 3;
+        return -1;
+    }
+
+    static int armorScore(const EquipmentItem& item) noexcept {
+        if (!item.present) return -1;
+        int material = -1;
+        if (item.name.find("netherite") != std::string::npos) material = 5;
+        else if (item.name.find("diamond") != std::string::npos) material = 4;
+        else if (item.name.find("turtle") != std::string::npos) material = 3;
+        else if (item.name.find("iron") != std::string::npos) material = 3;
+        else if (item.name.find("chainmail") != std::string::npos) material = 2;
+        else if (item.name.find("gold") != std::string::npos) material = 1;
+        else if (item.name.find("leather") != std::string::npos) material = 0;
+        if (material < 0) return -1;
+        const int durability = item.damageKnown
+            ? item.durabilityPercent
+            : 100;
+        return material * 100 + std::clamp(durability, 0, 100);
+    }
+
+    AutomationPlan chooseAutomationPlanLocked() {
+        AutomationPlan plan;
+        if (!playerInventoryReady || playerInventory.empty()) return plan;
+
+        if (autoTotemEnabled.load(std::memory_order_relaxed) &&
+            equipment[1].name != "minecraft:totem_of_undying") {
+            for (std::size_t slot = 0; slot < playerInventory.size(); ++slot) {
+                const auto& item = playerInventory[slot];
+                if (item.name != "minecraft:totem_of_undying" ||
+                    item.stackId == 0) {
+                    continue;
+                }
+                plan.valid = true;
+                plan.totem = true;
+                plan.inventorySlot = slot;
+                plan.equipmentIndex = 1;
+                plan.equipmentSlot = 0;
+                plan.source = item;
+                plan.destination = equipment[1];
+                return plan;
+            }
+        }
+
+        if (!autoArmorEnabled.load(std::memory_order_relaxed)) return plan;
+        int bestGain = 0;
+        int bestScore = -1;
+        for (std::size_t slot = 0; slot < playerInventory.size(); ++slot) {
+            const auto& item = playerInventory[slot];
+            if (!item.present || item.stackId == 0) continue;
+            const int type = armorType(item.name);
+            if (type < 0) continue;
+            const auto equipmentIndex = static_cast<std::size_t>(type + 2);
+            const int candidateScore = armorScore(item);
+            const int currentScore = armorScore(equipment[equipmentIndex]);
+            const int gain = candidateScore - currentScore;
+            if (candidateScore < 0 || gain <= 0) continue;
+            if (!plan.valid || gain > bestGain ||
+                (gain == bestGain && candidateScore > bestScore)) {
+                plan.valid = true;
+                plan.totem = false;
+                plan.inventorySlot = slot;
+                plan.equipmentIndex = equipmentIndex;
+                plan.equipmentSlot = static_cast<uint8_t>(type);
+                plan.source = item;
+                plan.destination = equipment[equipmentIndex];
+                bestGain = gain;
+                bestScore = candidateScore;
+            }
+        }
+        return plan;
+    }
+
+    static int legacyContainerSlotId(std::string_view type) noexcept {
+        if (type == "armor") return 6;
+        if (type == "offhand") return 34;
+        return 12; // hotbar_and_inventory
+    }
+
+    static bedrock::ProtoDefValue stackRequestSlot(
+        const std::string& version,
+        std::string type,
+        uint8_t slot,
+        int32_t stackId
+    ) {
+        using Value = bedrock::ProtoDefValue;
+        if (!versionAtLeast(version, 1, 16, 210)) {
+            return Value::object({
+                {"container_id", Value::integer(legacyContainerSlotId(type))},
+                {"slot_id", Value::uinteger(slot)},
+                {"stack_id", Value::integer(stackId)}
+            });
+        }
+        if (versionAtLeast(version, 1, 21, 20)) {
+            return Value::object({
+                {"slot_type", Value::object({
+                    {"container_id", Value::string(std::move(type))},
+                    {"dynamic_container_id", Value::uinteger(0)}
+                })},
+                {"slot", Value::uinteger(slot)},
+                {"stack_id", Value::integer(stackId)}
+            });
+        }
+        return Value::object({
+            {"slot_type", Value::string(std::move(type))},
+            {"slot", Value::uinteger(slot)},
+            {"stack_id", Value::integer(stackId)}
+        });
+    }
+
+    bedrock::VersionedGamePacket makeAutomationPacket(
+        const std::string& version,
+        const AutomationPlan& plan
+    ) {
+        using Value = bedrock::ProtoDefValue;
+        const std::string destinationType = plan.totem
+            ? "offhand"
+            : "armor";
+        auto request = Value::object({
+            {"request_id", Value::integer(plan.requestId)},
+            {"actions", Value::array({Value::object({
+                {"type_id", Value::string("swap")},
+                {"source", stackRequestSlot(
+                    version,
+                    "hotbar_and_inventory",
+                    static_cast<uint8_t>(plan.inventorySlot),
+                    plan.source.stackId
+                )},
+                {"destination", stackRequestSlot(
+                    version,
+                    destinationType,
+                    plan.equipmentSlot,
+                    plan.destination.stackId
+                )}
+            })})},
+            {"custom_names", Value::array({})},
+            {"cause", Value::string("chat_public")}
+        });
+        auto payload = bedrock::ProtoDefPacketEncoder(
+            version,
+            itemProtocolVariables
+        ).encodePacket("item_stack_request", Value::object({
+            {"requests", Value::array({std::move(request)})}
+        }));
+        return bedrock::VersionedMcpeCodec::forVersion(version)
+            .packetCodec()
+            .makePacketByName("item_stack_request", payload);
+    }
+
+    void maybeInjectAutomation(
+        const std::string& version,
+        bedrock::BedrockRelayPacketEvent& event
+    ) noexcept {
+        if (event.packet.name != "player_auth_input" &&
+            event.packet.name != "move_player") {
+            return;
+        }
+        if ((!autoArmorEnabled.load(std::memory_order_relaxed) &&
+             !autoTotemEnabled.load(std::memory_order_relaxed)) ||
+            minecraftUiBlocked.load(std::memory_order_relaxed)) {
+            return;
+        }
+
+        const uint64_t now = steadyMilliseconds();
+        AutomationPlan plan;
+        {
+            std::lock_guard lock(mutex);
+            if (pendingAutomationRequestId != 0) {
+                if (now - pendingAutomationStartedAtMs < 1'500) return;
+                pendingAutomationRequestId = 0;
+                playerInventoryReady = false;
+                automationStatus = "Нет ответа сервера — ожидается синхронизация";
+                return;
+            }
+            if (now - lastAutomationAttemptAtMs < 500) return;
+            plan = chooseAutomationPlanLocked();
+            if (!plan.valid) return;
+            plan.requestId = nextAutomationRequestId++;
+        }
+
+        bedrock::VersionedGamePacket injected;
+        try {
+            std::lock_guard decodeLock(itemDecodeMutex);
+            injected = makeAutomationPacket(version, plan);
+        } catch (const std::exception& error) {
+            {
+                std::lock_guard lock(mutex);
+                lastAutomationAttemptAtMs = now;
+                automationStatus =
+                    "Пакет автоматизации не поддержан этой версией";
+            }
+            push(
+                "automation_encode_failed",
+                "version=" + version + " error=" + safeMessage(error.what()),
+                "WARN",
+                "automation"
+            );
+            return;
+        }
+
+        {
+            std::lock_guard lock(mutex);
+            if (plan.inventorySlot >= playerInventory.size() ||
+                playerInventory[plan.inventorySlot].stackId !=
+                    plan.source.stackId) {
+                return;
+            }
+            playerInventory[plan.inventorySlot] = plan.destination;
+            equipment[plan.equipmentIndex] = plan.source;
+            ++equipmentRevision;
+            pendingAutomationRequestId = plan.requestId;
+            pendingAutomationStartedAtMs = now;
+            lastAutomationAttemptAtMs = now;
+            automationStatus = plan.totem
+                ? "Тотем перемещается в левую руку"
+                : "Надевается " + plan.source.name;
+        }
+        event.replace(std::vector<bedrock::VersionedGamePacket> {
+            event.packet,
+            std::move(injected)
+        });
     }
 
     void observeDecodedGameplayPacket(
@@ -788,14 +1441,62 @@ struct RelayState {
         bool serverbound
     ) noexcept {
         const auto& name = event.packet.name;
+        if ((!serverbound && name == "container_open") ||
+            (serverbound && name == "set_player_inventory_options")) {
+            minecraftUiBlocked.store(true, std::memory_order_relaxed);
+        } else if (name == "container_close") {
+            minecraftUiBlocked.store(false, std::memory_order_relaxed);
+        }
         if (!serverbound && name == "item_registry") {
             observeItemRegistry(version, event.packet);
             return;
         }
         if (!serverbound && name == "start_game") {
+            minecraftUiBlocked.store(false, std::memory_order_relaxed);
+            resetMiniMapWorld(0);
             std::lock_guard lock(mutex);
             equipment = {};
+            playerInventory.clear();
+            playerInventoryReady = false;
+            pendingAutomationRequestId = 0;
+            automationStatus = "Ожидание инвентаря";
+            playerHealth = 20.0;
+            playerMaximumHealth = 20.0;
+            playerHunger = 20.0;
+            playerSaturation = 5.0;
+            playerAbsorption = 0.0;
+            playerHealthKnown = false;
+            playerHungerKnown = false;
+            playerAbsorptionKnown = false;
+            playerResistanceLevel = 0;
             ++equipmentRevision;
+            return;
+        }
+        if (!serverbound && name == "change_dimension") {
+            try {
+                bedrock::VersionedPayloadCursor cursor(event.packet.payload);
+                resetMiniMapWorld(cursor.readVarInt());
+            } catch (...) {
+                resetMiniMapWorld(
+                    miniMapDimension.load(std::memory_order_relaxed)
+                );
+            }
+        }
+        if (serverbound && name == "interact") {
+            try {
+                std::lock_guard decodeLock(itemDecodeMutex);
+                bedrock::RelayPacketEvent decoded(
+                    version,
+                    event,
+                    itemProtocolVariables,
+                    true
+                );
+                if (decoded.getString("action_id", "") ==
+                    "open_inventory") {
+                    minecraftUiBlocked.store(true, std::memory_order_relaxed);
+                }
+            } catch (...) {
+            }
             return;
         }
         const bool relevant = name == "add_item_entity" ||
@@ -803,7 +1504,11 @@ struct RelayState {
             name == "mob_armor_equipment" ||
             name == "inventory_content" ||
             name == "inventory_slot" ||
-            name == "player_armor_damage";
+            name == "item_stack_response" ||
+            name == "player_armor_damage" ||
+            name == "set_health" ||
+            name == "update_attributes" ||
+            name == "mob_effect";
         if (!relevant) return;
 
         try {
@@ -814,6 +1519,138 @@ struct RelayState {
                 itemProtocolVariables,
                 true
             );
+            if (!serverbound && name == "set_health") {
+                std::lock_guard lock(mutex);
+                playerHealth = std::max(
+                    0.0,
+                    decoded.getDouble("health", playerHealth)
+                );
+                playerHealthKnown = true;
+                return;
+            }
+            if (!serverbound && name == "update_attributes") {
+                const auto camera = entityPositions.cameraSnapshot();
+                const auto runtimeId = decoded.getUInt(
+                    "runtime_entity_id",
+                    0
+                );
+                if (camera.runtimeId != 0 && runtimeId != camera.runtimeId) {
+                    return;
+                }
+                const auto* attributes = decoded.value("attributes");
+                if (attributes == nullptr ||
+                    attributes->kind != bedrock::PacketValue::Kind::Array) {
+                    return;
+                }
+                std::lock_guard lock(mutex);
+                for (std::size_t index = 0;
+                     index < attributes->arrayValue.size(); ++index) {
+                    const auto prefix = "attributes[" +
+                        std::to_string(index) + "]";
+                    auto attributeName = decoded.getString(
+                        prefix + ".name",
+                        ""
+                    );
+                    std::transform(
+                        attributeName.begin(),
+                        attributeName.end(),
+                        attributeName.begin(),
+                        [](unsigned char value) {
+                            return static_cast<char>(std::tolower(value));
+                        }
+                    );
+                    const auto current = decoded.getDouble(
+                        prefix + ".current",
+                        0.0
+                    );
+                    const auto maximum = decoded.getDouble(
+                        prefix + ".max",
+                        current
+                    );
+                    if (attributeName.find("health") != std::string::npos &&
+                        attributeName.find("absorption") ==
+                            std::string::npos) {
+                        playerHealth = std::max(0.0, current);
+                        playerMaximumHealth = std::max(1.0, maximum);
+                        playerHealthKnown = true;
+                    } else if (attributeName.find("hunger") !=
+                        std::string::npos) {
+                        playerHunger = std::clamp(current, 0.0, 20.0);
+                        playerHungerKnown = true;
+                    } else if (attributeName.find("saturation") !=
+                        std::string::npos) {
+                        playerSaturation = std::max(0.0, current);
+                        playerHungerKnown = true;
+                    } else if (attributeName.find("absorption") !=
+                        std::string::npos) {
+                        playerAbsorption = std::max(0.0, current);
+                        playerAbsorptionKnown = true;
+                    }
+                }
+                return;
+            }
+            if (!serverbound && name == "mob_effect") {
+                const auto camera = entityPositions.cameraSnapshot();
+                const auto runtimeId = decoded.getUInt(
+                    "runtime_entity_id",
+                    0
+                );
+                if (camera.runtimeId != 0 && runtimeId != camera.runtimeId) {
+                    return;
+                }
+                // Bedrock effect id 11 is Resistance on every supported
+                // protocol generation. Amplifier 0 means Resistance I.
+                if (decoded.getInt("effect_id", -1) == 11) {
+                    const auto action = decoded.getString("event_id", "");
+                    std::lock_guard lock(mutex);
+                    playerResistanceLevel = action == "remove" ||
+                            decoded.getInt("event_id", 0) == 3
+                        ? 0
+                        : std::max(
+                            1,
+                            static_cast<int32_t>(
+                                decoded.getInt("amplifier", 0) + 1
+                            )
+                        );
+                }
+                return;
+            }
+            if (!serverbound && name == "item_stack_response") {
+                const auto* responses = decoded.value("responses");
+                if (responses == nullptr ||
+                    responses->kind != bedrock::PacketValue::Kind::Array) {
+                    return;
+                }
+                std::lock_guard lock(mutex);
+                for (std::size_t index = 0;
+                     index < responses->arrayValue.size(); ++index) {
+                    const std::string prefix =
+                        "responses[" + std::to_string(index) + "]";
+                    const auto requestId = static_cast<int32_t>(
+                        decoded.getInt(prefix + ".request_id", 0)
+                    );
+                    if (requestId != pendingAutomationRequestId) continue;
+                    const auto status = decoded.getString(
+                        prefix + ".status",
+                        decoded.getString(prefix + ".result", "")
+                    );
+                    const bool accepted = status == "ok" ||
+                        decoded.getInt(prefix + ".status", 1) == 0 ||
+                        decoded.getInt(prefix + ".result", 1) == 0;
+                    pendingAutomationRequestId = 0;
+                    if (accepted) {
+                        ++automationAccepted;
+                        automationStatus = "Последнее действие подтверждено";
+                    } else {
+                        ++automationRejected;
+                        playerInventoryReady = false;
+                        automationStatus =
+                            "Сервер отклонил действие — ожидается синхронизация";
+                    }
+                    break;
+                }
+                return;
+            }
             if (!serverbound && name == "add_item_entity") {
                 const auto networkId = decoded.getInt("item.network_id", 0);
                 const auto runtimeId = decoded.getUInt(
@@ -850,8 +1687,12 @@ struct RelayState {
                     return;
                 }
                 auto hand = decodedItem(version, decoded, "item");
+                const auto equipmentIndex =
+                    decoded.getString("window_id", "") == "offhand"
+                        ? std::size_t {1}
+                        : std::size_t {0};
                 std::lock_guard lock(mutex);
-                equipment[0] = std::move(hand);
+                equipment[equipmentIndex] = std::move(hand);
                 ++equipmentRevision;
                 return;
             }
@@ -871,13 +1712,52 @@ struct RelayState {
                 };
                 std::lock_guard lock(mutex);
                 for (std::size_t index = 0; index < armor.size(); ++index) {
-                    equipment[index + 1] = std::move(armor[index]);
+                    equipment[index + 2] = std::move(armor[index]);
                 }
                 ++equipmentRevision;
                 return;
             }
+            const auto windowId = decodedWindowId(decoded);
             if (!serverbound && name == "inventory_content" &&
-                decoded.getString("window_id", "") == "armor") {
+                windowId == "inventory") {
+                const auto* items = decoded.value("input");
+                if (items == nullptr ||
+                    items->kind != bedrock::PacketValue::Kind::Array) {
+                    return;
+                }
+                std::vector<EquipmentItem> inventory;
+                inventory.reserve(items->arrayValue.size());
+                for (std::size_t index = 0;
+                     index < items->arrayValue.size(); ++index) {
+                    inventory.push_back(decodedItem(
+                        version,
+                        decoded,
+                        "input[" + std::to_string(index) + "]"
+                    ));
+                }
+                std::lock_guard lock(mutex);
+                playerInventory = std::move(inventory);
+                playerInventoryReady = true;
+                if (pendingAutomationRequestId == 0) {
+                    automationStatus = "Инвентарь синхронизирован";
+                }
+                return;
+            }
+            if (!serverbound && name == "inventory_content" &&
+                windowId == "offhand") {
+                const auto* items = decoded.value("input");
+                auto offhand = items != nullptr &&
+                        items->kind == bedrock::PacketValue::Kind::Array &&
+                        !items->arrayValue.empty()
+                    ? decodedItem(version, decoded, "input[0]")
+                    : EquipmentItem {};
+                std::lock_guard lock(mutex);
+                equipment[1] = std::move(offhand);
+                ++equipmentRevision;
+                return;
+            }
+            if (!serverbound && name == "inventory_content" &&
+                windowId == "armor") {
                 const auto* items = decoded.value("input");
                 if (items == nullptr ||
                     items->kind != bedrock::PacketValue::Kind::Array) {
@@ -895,18 +1775,39 @@ struct RelayState {
                 }
                 std::lock_guard lock(mutex);
                 for (std::size_t index = 0; index < armor.size(); ++index) {
-                    equipment[index + 1] = std::move(armor[index]);
+                    equipment[index + 2] = std::move(armor[index]);
                 }
                 ++equipmentRevision;
                 return;
             }
             if (!serverbound && name == "inventory_slot" &&
-                decoded.getString("window_id", "") == "armor") {
+                windowId == "inventory") {
+                const auto slot = decoded.getUInt("slot", 999);
+                auto item = decodedItem(version, decoded, "item");
+                std::lock_guard lock(mutex);
+                if (slot >= playerInventory.size()) {
+                    playerInventory.resize(static_cast<std::size_t>(slot) + 1);
+                }
+                playerInventory[static_cast<std::size_t>(slot)] =
+                    std::move(item);
+                playerInventoryReady = true;
+                return;
+            }
+            if (!serverbound && name == "inventory_slot" &&
+                windowId == "offhand") {
+                auto offhand = decodedItem(version, decoded, "item");
+                std::lock_guard lock(mutex);
+                equipment[1] = std::move(offhand);
+                ++equipmentRevision;
+                return;
+            }
+            if (!serverbound && name == "inventory_slot" &&
+                windowId == "armor") {
                 const auto slot = decoded.getUInt("slot", 99);
                 if (slot < 4) {
                     auto armor = decodedItem(version, decoded, "item");
                     std::lock_guard lock(mutex);
-                    equipment[static_cast<std::size_t>(slot) + 1] =
+                    equipment[static_cast<std::size_t>(slot) + 2] =
                         std::move(armor);
                     ++equipmentRevision;
                 }
@@ -922,15 +1823,15 @@ struct RelayState {
                 std::lock_guard lock(mutex);
                 for (std::size_t index = 0; index < DamageFields.size(); ++index) {
                     if (decoded.has(DamageFields[index]) &&
-                        equipment[index + 1].present &&
-                        equipment[index + 1].damageKnown) {
-                        equipment[index + 1].damage = std::max(
+                        equipment[index + 2].present &&
+                        equipment[index + 2].damageKnown) {
+                        equipment[index + 2].damage = std::max(
                             0,
-                            equipment[index + 1].damage + static_cast<int32_t>(
+                            equipment[index + 2].damage + static_cast<int32_t>(
                                 decoded.getInt(DamageFields[index], 0)
                             )
                         );
-                        refreshDurability(equipment[index + 1], version);
+                        refreshDurability(equipment[index + 2], version);
                     }
                 }
                 ++equipmentRevision;
@@ -940,10 +1841,40 @@ struct RelayState {
     }
 
     void clearGameplayTelemetry() {
+        minecraftUiBlocked.store(false, std::memory_order_relaxed);
+        resetMiniMapWorld(0);
         std::lock_guard lock(mutex);
         equipment = {};
+        playerInventory.clear();
+        playerInventoryReady = false;
+        pendingAutomationRequestId = 0;
+        automationStatus = "Ожидание инвентаря";
+        playerHealth = 20.0;
+        playerMaximumHealth = 20.0;
+        playerHunger = 20.0;
+        playerSaturation = 5.0;
+        playerAbsorption = 0.0;
+        playerHealthKnown = false;
+        playerHungerKnown = false;
+        playerAbsorptionKnown = false;
+        playerResistanceLevel = 0;
         itemNames.clear();
         ++equipmentRevision;
+    }
+
+    void configureGameplayFeatures(
+        bool armor,
+        bool totem,
+        bool miniMap
+    ) {
+        autoArmorEnabled.store(armor, std::memory_order_relaxed);
+        autoTotemEnabled.store(totem, std::memory_order_relaxed);
+        miniMapEnabled.store(miniMap, std::memory_order_relaxed);
+        if (!armor && !totem) {
+            std::lock_guard lock(mutex);
+            pendingAutomationRequestId = 0;
+            automationStatus = "Автоматизация выключена";
+        }
     }
 
     void configureRuntime(
@@ -1151,8 +2082,8 @@ bedrock::JsRuntimeValue snapshotValue(
     std::optional<bool> ok = std::nullopt
 ) {
     std::lock_guard lock(state->mutex);
-    static constexpr std::array<std::string_view, 5> EquipmentSlots {
-        "hand", "helmet", "chestplate", "leggings", "boots"
+    static constexpr std::array<std::string_view, 6> EquipmentSlots {
+        "hand", "offhand", "helmet", "chestplate", "leggings", "boots"
     };
     std::vector<bedrock::JsRuntimeValue> equipment;
     equipment.reserve(state->equipment.size());
@@ -1166,6 +2097,8 @@ bedrock::JsRuntimeValue snapshotValue(
             {"networkId", bedrock::JsRuntimeValue::number(
                 static_cast<double>(item.networkId)
             )},
+            {"count", bedrock::JsRuntimeValue::number(item.count)},
+            {"stackId", bedrock::JsRuntimeValue::number(item.stackId)},
             {"name", bedrock::JsRuntimeValue::string(item.name)},
             {"damage", bedrock::JsRuntimeValue::number(item.damage)},
             {"damageKnown", bedrock::JsRuntimeValue::boolean(
@@ -1202,6 +2135,33 @@ bedrock::JsRuntimeValue snapshotValue(
         )},
         {"chunkRetentionEnabled", bedrock::JsRuntimeValue::boolean(
             state->chunkRetentionEnabled.load(std::memory_order_relaxed)
+        )},
+        {"minecraftUiBlocked", bedrock::JsRuntimeValue::boolean(
+            state->minecraftUiBlocked.load(std::memory_order_relaxed)
+        )},
+        {"autoArmorEnabled", bedrock::JsRuntimeValue::boolean(
+            state->autoArmorEnabled.load(std::memory_order_relaxed)
+        )},
+        {"autoTotemEnabled", bedrock::JsRuntimeValue::boolean(
+            state->autoTotemEnabled.load(std::memory_order_relaxed)
+        )},
+        {"miniMapEnabled", bedrock::JsRuntimeValue::boolean(
+            state->miniMapEnabled.load(std::memory_order_relaxed)
+        )},
+        {"miniMapDecodedChunks", bedrock::JsRuntimeValue::number(
+            static_cast<double>(state->miniMapDecodedChunks.load(
+                std::memory_order_relaxed
+            ))
+        )},
+        {"miniMapDecodeFailures", bedrock::JsRuntimeValue::number(
+            static_cast<double>(state->miniMapDecodeFailures.load(
+                std::memory_order_relaxed
+            ))
+        )},
+        {"miniMapCachedChunksSkipped", bedrock::JsRuntimeValue::number(
+            static_cast<double>(state->miniMapCachedChunksSkipped.load(
+                std::memory_order_relaxed
+            ))
         )},
         {"retainedRadiusChunks", bedrock::JsRuntimeValue::number(
             state->retainedRadiusChunks.load(std::memory_order_relaxed)
@@ -1310,6 +2270,48 @@ bedrock::JsRuntimeValue snapshotValue(
             static_cast<double>(state->equipmentRevision)
         )},
         {"equipment", bedrock::JsRuntimeValue::array(std::move(equipment))},
+        {"playerInventoryReady", bedrock::JsRuntimeValue::boolean(
+            state->playerInventoryReady
+        )},
+        {"automationPending", bedrock::JsRuntimeValue::boolean(
+            state->pendingAutomationRequestId != 0
+        )},
+        {"automationAccepted", bedrock::JsRuntimeValue::number(
+            static_cast<double>(state->automationAccepted)
+        )},
+        {"automationRejected", bedrock::JsRuntimeValue::number(
+            static_cast<double>(state->automationRejected)
+        )},
+        {"automationStatus", bedrock::JsRuntimeValue::string(
+            state->automationStatus
+        )},
+        {"playerHealthKnown", bedrock::JsRuntimeValue::boolean(
+            state->playerHealthKnown
+        )},
+        {"playerHealth", bedrock::JsRuntimeValue::number(
+            state->playerHealth
+        )},
+        {"playerMaximumHealth", bedrock::JsRuntimeValue::number(
+            state->playerMaximumHealth
+        )},
+        {"playerHungerKnown", bedrock::JsRuntimeValue::boolean(
+            state->playerHungerKnown
+        )},
+        {"playerHunger", bedrock::JsRuntimeValue::number(
+            state->playerHunger
+        )},
+        {"playerSaturation", bedrock::JsRuntimeValue::number(
+            state->playerSaturation
+        )},
+        {"playerAbsorptionKnown", bedrock::JsRuntimeValue::boolean(
+            state->playerAbsorptionKnown
+        )},
+        {"playerAbsorption", bedrock::JsRuntimeValue::number(
+            state->playerAbsorption
+        )},
+        {"playerResistanceLevel", bedrock::JsRuntimeValue::number(
+            state->playerResistanceLevel
+        )},
         {"error", bedrock::JsRuntimeValue::string(state->lastError)}
     });
     if (ok.has_value()) {
@@ -1454,6 +2456,10 @@ public:
         options.forceSingle = true;
         options.replaceExisting = true;
         options.logging = false;
+        // The mobile relay has raw packet observers, not packet editors.
+        // Preserve backend extensions byte-for-byte instead of disconnecting
+        // when a server uses a newer optional packet field.
+        options.parseErrorPolicy = bedrock::RelayParseErrorPolicy::ForwardRaw;
         options.enableChunkCaching = false;
         options.destination.host = destinationHost;
         options.destination.port = destinationPort;
@@ -1769,6 +2775,27 @@ public:
                 state->entityPositions.observeServerbound(event.packet);
             }
             state->observeDecodedGameplayPacket(version, event, true);
+            state->maybeInjectAutomation(version, event);
+            if (isResourcePackTransportPacket(event.packet.name)) {
+                const auto sampleIndex =
+                    state->resourcePackPacketsSeen.fetch_add(
+                        1,
+                        std::memory_order_relaxed
+                    ) + 1;
+                if (shouldPublishResourcePackSample(
+                        event.packet.name,
+                        sampleIndex
+                    )) {
+                    state->push(
+                        "resource_pack_flow",
+                        "stage=received_from_minecraft sample=" +
+                            std::to_string(sampleIndex) + " " +
+                            packetBreadcrumb("serverbound", event.packet),
+                        "INFO",
+                        "resource_pack"
+                    );
+                }
+            }
             if (isFlightPacket(event.packet.name)) {
                 state->recordFlight(
                     "relay_seen",
@@ -1788,6 +2815,27 @@ public:
         ) {
             state->entityPositions.observeClientbound(event.packet);
             state->observeDecodedGameplayPacket(version, event, false);
+            state->enqueueMiniMapChunk(version, event.packet);
+            if (isResourcePackTransportPacket(event.packet.name)) {
+                const auto sampleIndex =
+                    state->resourcePackPacketsSeen.fetch_add(
+                        1,
+                        std::memory_order_relaxed
+                    ) + 1;
+                if (shouldPublishResourcePackSample(
+                        event.packet.name,
+                        sampleIndex
+                    )) {
+                    state->push(
+                        "resource_pack_flow",
+                        "stage=received_from_server sample=" +
+                            std::to_string(sampleIndex) + " " +
+                            packetBreadcrumb("clientbound", event.packet),
+                        "INFO",
+                        "resource_pack"
+                    );
+                }
+            }
             if (event.packet.name == "network_chunk_publisher_update" &&
                 state->chunkRetentionEnabled.load(std::memory_order_relaxed)) {
                 const auto minimumRadiusBlocks = static_cast<uint32_t>(
@@ -1905,6 +2953,32 @@ public:
         relay->live().onForwarded([state, liveRelay](
             const bedrock::BedrockRelayPacketEvent& event
         ) {
+            if (isResourcePackTransportPacket(event.packet.name)) {
+                const auto sampleIndex =
+                    state->resourcePackPacketsForwarded.fetch_add(
+                        1,
+                        std::memory_order_relaxed
+                    ) + 1;
+                if (shouldPublishResourcePackSample(
+                        event.packet.name,
+                        sampleIndex
+                    )) {
+                    state->push(
+                        "resource_pack_flow",
+                        "stage=forwarded sample=" +
+                            std::to_string(sampleIndex) + " " +
+                            packetBreadcrumb(
+                                event.direction ==
+                                        bedrock::BedrockRelayDirection::Clientbound
+                                    ? "clientbound"
+                                    : "serverbound",
+                                event.packet
+                            ),
+                        "INFO",
+                        "resource_pack"
+                    );
+                }
+            }
             if (event.direction ==
                     bedrock::BedrockRelayDirection::Clientbound &&
                 (event.packet.name == "level_chunk" ||
@@ -2398,6 +3472,11 @@ Java_com_m9chko_bedrockrelay_NativeBridge_startRelay(
         configuredChunkRetention.load(std::memory_order_relaxed),
         configuredRetainedRadiusChunks.load(std::memory_order_relaxed)
     );
+    state->configureGameplayFeatures(
+        configuredAutoArmor.load(std::memory_order_relaxed),
+        configuredAutoTotem.load(std::memory_order_relaxed),
+        configuredMiniMap.load(std::memory_order_relaxed)
+    );
     try {
         initializeJavaBridge(environment, bridgeClass);
         const auto destinationHost = fromJavaString(
@@ -2552,6 +3631,29 @@ Java_com_m9chko_bedrockrelay_NativeBridge_configureRuntime(
     }
 }
 
+extern "C" JNIEXPORT void JNICALL
+Java_com_m9chko_bedrockrelay_NativeBridge_configureGameplayFeatures(
+    JNIEnv*,
+    jclass,
+    jboolean autoArmorEnabled,
+    jboolean autoTotemEnabled,
+    jboolean miniMapEnabled
+) {
+    const bool armor = autoArmorEnabled == JNI_TRUE;
+    const bool totem = autoTotemEnabled == JNI_TRUE;
+    const bool miniMap = miniMapEnabled == JNI_TRUE;
+    configuredAutoArmor.store(armor, std::memory_order_relaxed);
+    configuredAutoTotem.store(totem, std::memory_order_relaxed);
+    configuredMiniMap.store(miniMap, std::memory_order_relaxed);
+
+    std::shared_ptr<RelayState> state;
+    {
+        std::lock_guard lock(controllerMutex);
+        state = currentState;
+    }
+    if (state) state->configureGameplayFeatures(armor, totem, miniMap);
+}
+
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_m9chko_bedrockrelay_NativeBridge_snapshot(
     JNIEnv* environment,
@@ -2563,6 +3665,51 @@ Java_com_m9chko_bedrockrelay_NativeBridge_snapshot(
         state = currentState;
     }
     return toJavaString(environment, jsonString(snapshotValue(state)));
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_m9chko_bedrockrelay_NativeBridge_minecraftUiBlocked(
+    JNIEnv*,
+    jclass
+) {
+    std::shared_ptr<RelayState> state;
+    {
+        std::lock_guard lock(controllerMutex);
+        state = currentState;
+    }
+    return state && state->minecraftUiBlocked.load(
+        std::memory_order_relaxed
+    ) ? JNI_TRUE : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jintArray JNICALL
+Java_com_m9chko_bedrockrelay_NativeBridge_miniMapSnapshot(
+    JNIEnv* environment,
+    jclass,
+    jlong afterRevision,
+    jint radiusChunks
+) {
+    std::shared_ptr<RelayState> state;
+    {
+        std::lock_guard lock(controllerMutex);
+        state = currentState;
+    }
+    auto values = state->miniMapSnapshotValues(
+        static_cast<uint64_t>(afterRevision),
+        static_cast<int>(radiusChunks)
+    );
+    auto result = environment->NewIntArray(
+        static_cast<jsize>(values.size())
+    );
+    if (result == nullptr || values.empty()) return result;
+    static_assert(sizeof(jint) == sizeof(int32_t));
+    environment->SetIntArrayRegion(
+        result,
+        0,
+        static_cast<jsize>(values.size()),
+        reinterpret_cast<const jint*>(values.data())
+    );
+    return result;
 }
 
 extern "C" JNIEXPORT jstring JNICALL

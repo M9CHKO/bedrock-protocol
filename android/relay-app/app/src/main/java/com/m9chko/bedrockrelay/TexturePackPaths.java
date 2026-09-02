@@ -10,6 +10,11 @@ import java.util.Set;
 final class TexturePackPaths {
     private static final String ITEM_MARKER =
         "resource_pack/textures/items/";
+    private static final String BLOCK_MARKER =
+        "resource_pack/textures/blocks/";
+    private static final String BLOCKS_DEFINITION = "resource_pack/blocks.json";
+    private static final String TERRAIN_DEFINITION =
+        "resource_pack/textures/terrain_texture.json";
     private static final String GLINT_PATH =
         "resource_pack/textures/misc/enchanted_item_glint.png";
 
@@ -34,6 +39,97 @@ final class TexturePackPaths {
         if (path == null) return false;
         int marker = markerIndex(path, GLINT_PATH);
         return marker >= 0 && marker + GLINT_PATH.length() == path.length();
+    }
+
+    static String blockRelativeFileName(String archiveEntry) {
+        String path = normalizedArchivePath(archiveEntry);
+        if (path == null) return null;
+        int marker = markerIndex(path, BLOCK_MARKER);
+        if (marker < 0) return null;
+        String relative = path.substring(marker + BLOCK_MARKER.length());
+        if (relative.isEmpty() || relative.endsWith("/") ||
+            relative.length() > 240 ||
+            (!relative.endsWith(".png") && !relative.endsWith(".tga"))) {
+            return null;
+        }
+        String[] parts = relative.split("/");
+        if (parts.length > 8) return null;
+        for (String part : parts) {
+            if (!safePngPathPart(part)) return null;
+        }
+        return relative.endsWith(".tga")
+            ? relative.substring(0, relative.length() - 4) + ".png"
+            : relative;
+    }
+
+    static boolean isBlocksDefinition(String archiveEntry) {
+        return isExactResourcePath(archiveEntry, BLOCKS_DEFINITION);
+    }
+
+    static boolean isTerrainDefinition(String archiveEntry) {
+        return isExactResourcePath(archiveEntry, TERRAIN_DEFINITION);
+    }
+
+    static List<String> blockFileCandidates(String registryName) {
+        Set<String> names = new LinkedHashSet<>();
+        String value = normalizedBlockName(registryName);
+        if (value.isEmpty()) return new ArrayList<>();
+        add(names, value);
+        if (value.endsWith("_planks")) {
+            add(names, "planks_" + value.substring(0,
+                value.length() - "_planks".length()));
+        }
+        if (value.endsWith("_log")) {
+            String wood = value.substring(0, value.length() - "_log".length());
+            add(names, "log_" + wood);
+            add(names, "log_" + wood + "_top");
+        }
+        if (value.endsWith("_leaves")) {
+            String wood = value.substring(0,
+                value.length() - "_leaves".length());
+            add(names, "leaves_" + wood);
+            add(names, "leaves_" + wood + "_opaque");
+        }
+        if (value.endsWith("_wool")) {
+            add(names, "wool_colored_" + value.substring(0,
+                value.length() - "_wool".length()));
+        }
+        if (value.endsWith("_concrete")) {
+            add(names, "concrete_" + value.substring(0,
+                value.length() - "_concrete".length()));
+        }
+        if (value.endsWith("_terracotta")) {
+            add(names, "hardened_clay_stained_" + value.substring(0,
+                value.length() - "_terracotta".length()));
+        }
+        switch (value) {
+            case "grass_block":
+                add(names, "grass_side_carried");
+                add(names, "grass_top");
+                break;
+            case "dirt_path":
+                add(names, "grass_path_side");
+                add(names, "grass_path_top");
+                break;
+            case "water": add(names, "water_still_grey"); break;
+            case "lava": add(names, "lava_still"); break;
+            default: break;
+        }
+        List<String> result = new ArrayList<>(names.size());
+        for (String name : names) result.add(name + ".png");
+        return result;
+    }
+
+    static String normalizedBlockName(String registryName) {
+        String value = registryName == null
+            ? ""
+            : registryName.toLowerCase(Locale.ROOT).trim();
+        int properties = value.indexOf('[');
+        if (properties >= 0) value = value.substring(0, properties);
+        int namespace = value.indexOf(':');
+        if (namespace >= 0) value = value.substring(namespace + 1);
+        value = value.replaceAll("[^a-z0-9_]+", "_");
+        return trimUnderscores(value);
     }
 
     static List<String> textureCandidates(String registryName) {
@@ -107,6 +203,13 @@ final class TexturePackPaths {
         }
     }
 
+    private static boolean isExactResourcePath(String value, String expected) {
+        String path = normalizedArchivePath(value);
+        if (path == null) return false;
+        int marker = markerIndex(path, expected);
+        return marker >= 0 && marker + expected.length() == path.length();
+    }
+
     private static String normalizedArchivePath(String value) {
         if (value == null || value.isEmpty() || value.indexOf('\0') >= 0) {
             return null;
@@ -122,6 +225,11 @@ final class TexturePackPaths {
     private static boolean safePngName(String value) {
         return value.length() <= 120 &&
             value.matches("[a-z0-9][a-z0-9_.-]*\\.png");
+    }
+
+    private static boolean safePngPathPart(String value) {
+        return value.length() <= 120 &&
+            value.matches("[a-z0-9][a-z0-9_.-]*");
     }
 
     private static String trimUnderscores(String value) {

@@ -1708,6 +1708,18 @@ bool checkResourcePackServerboundOrdering() {
     const std::string secretContentKey = "do-not-log-content-key";
     const std::string cdnUrl =
         "https://cdn.example.invalid/pack.mcpack?sig=relay-secret-token";
+    const auto packChunkPayload = []() {
+        // Large enough to require RakNet fragmentation and to catch relay
+        // paths that accidentally treat resource-pack data as small control
+        // packets. Keep it deterministic and poorly compressible.
+        std::vector<uint8_t> payload(256u * 1024u);
+        uint32_t state = 0x7f4a7c15u;
+        for (auto& byte : payload) {
+            state = state * 1664525u + 1013904223u;
+            byte = static_cast<uint8_t>(state >> 24u);
+        }
+        return payload;
+    }();
 
     const auto zeroPacksInfo = encodedPacket(
         version,
@@ -1740,7 +1752,7 @@ bool checkResourcePackServerboundOrdering() {
                 Value::object({
                     {"uuid", Value::string(packId)},
                     {"version", Value::string(packVersion)},
-                    {"size", Value::uinteger(6)},
+                    {"size", Value::uinteger(packChunkPayload.size())},
                     {"content_key", Value::string(secretContentKey)},
                     {"sub_pack_name", Value::string("")},
                     {"content_identity", Value::string(packId)},
@@ -1752,14 +1764,32 @@ bool checkResourcePackServerboundOrdering() {
             })}
         })
     );
+    // A proxy must not reject a resource-pack negotiation merely because a
+    // server appends a field introduced after the relay's local schema.  The
+    // real Minecraft client for that protocol remains the authority that
+    // interprets these bytes.
+    auto extendedPacksInfo = zeroPacksInfo;
+    const std::vector<uint8_t> simulatedFutureFields {
+        0x02, 0x0a, 0x66, 0x75, 0x74, 0x75, 0x72, 0x65, 0x2d, 0x63, 0x64, 0x6e
+    };
+    extendedPacksInfo.payload.insert(
+        extendedPacksInfo.payload.end(),
+        simulatedFutureFields.begin(),
+        simulatedFutureFields.end()
+    );
+    extendedPacksInfo.fullPacket.insert(
+        extendedPacksInfo.fullPacket.end(),
+        simulatedFutureFields.begin(),
+        simulatedFutureFields.end()
+    );
     const auto dataInfo = encodedPacket(
         version,
         "resource_pack_data_info",
         Value::object({
             {"pack_id", Value::string(packId)},
-            {"max_chunk_size", Value::uinteger(4)},
-            {"chunk_count", Value::uinteger(2)},
-            {"size", Value::uinteger(6)},
+            {"max_chunk_size", Value::uinteger(packChunkPayload.size())},
+            {"chunk_count", Value::uinteger(1)},
+            {"size", Value::uinteger(packChunkPayload.size())},
             {"hash", Value::bytes({0x10, 0x20, 0x30, 0x40})},
             {"is_premium", Value::boolean(false)},
             {"pack_type", Value::string("cached")}
@@ -1771,8 +1801,8 @@ bool checkResourcePackServerboundOrdering() {
         Value::object({
             {"pack_id", Value::string(packId)},
             {"chunk_index", Value::uinteger(0)},
-            {"progress", Value::uinteger(4)},
-            {"payload", Value::bytes({0xde, 0xad, 0xbe, 0xef})}
+            {"progress", Value::uinteger(packChunkPayload.size())},
+            {"payload", Value::bytes(packChunkPayload)}
         })
     );
     const auto packStack = encodedPacket(
@@ -1797,11 +1827,20 @@ bool checkResourcePackServerboundOrdering() {
     const std::vector<bedrock::VersionedGamePacket> expectedClientbound {
         zeroPacksInfo,
         cdnPacksInfo,
+        extendedPacksInfo,
         dataInfo,
         chunkData,
         packStack
     };
 
+    const auto sendPacks = encodedPacket(
+        version,
+        "resource_pack_client_response",
+        Value::object({
+            {"response_status", Value::string("send_packs")},
+            {"resourcepackids", Value::array({Value::string(packReference)})}
+        })
+    );
     const auto haveAllPacks = encodedPacket(
         version,
         "resource_pack_client_response",
@@ -1827,8 +1866,9 @@ bool checkResourcePackServerboundOrdering() {
         })
     );
     const std::vector<bedrock::VersionedGamePacket> expectedServerbound {
-        haveAllPacks,
+        sendPacks,
         chunkRequest,
+        haveAllPacks,
         completed
     };
 
@@ -1871,6 +1911,7 @@ bool checkResourcePackServerboundOrdering() {
     options.itemResourceDiagnostics = true;
     bedrock::Relay relay(std::move(options));
     std::atomic<int> joins {0};
+    std::atomic<int> parseErrors {0};
     std::mutex diagnosticsMutex;
     std::vector<std::string> diagnostics;
     relay.onJoin([&](bedrock::RelayPlayer&, bedrock::BedrockNetworkClient&) {
@@ -1879,6 +1920,9 @@ bool checkResourcePackServerboundOrdering() {
     relay.onDiagnostic([&](const std::string& message) {
         std::lock_guard<std::mutex> lock(diagnosticsMutex);
         diagnostics.push_back(message);
+    });
+    relay.onParseError([&](const bedrock::RelayParseError&) {
+        ++parseErrors;
     });
     relay.onError([&](const std::string& message) {
         errors.add("relay", message);
@@ -1988,6 +2032,10 @@ bool checkResourcePackServerboundOrdering() {
             "resource-pack diagnostics leaked content_key or CDN token"
         );
     }
+    ok &= check(
+        parseErrors.load() == 0,
+        "opaque resource-pack transport unexpectedly entered strict parsing"
+    );
     ok &= check(errors.empty(), "resource-pack ordering error: " + errors.text());
 
     downstream.close("resource-pack ordering regression complete");

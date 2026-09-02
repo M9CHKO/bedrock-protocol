@@ -17,11 +17,18 @@ import android.os.IBinder;
 import android.os.Looper;
 import android.os.PowerManager;
 import android.os.SystemClock;
+import android.view.WindowInsets;
+import android.view.WindowManager;
+import android.widget.Toast;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import com.m9chko.bedrockrelay.schematic.SchematicModel;
+import com.m9chko.bedrockrelay.schematic.SchematicRepository;
+
 import java.io.File;
+import java.io.InputStream;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -61,20 +68,59 @@ public final class RelayService extends Service {
         "chunk_widget_minimized";
     public static final String KEY_EQUIPMENT_HUD = "equipment_hud";
     public static final String KEY_EQUIPMENT_HUD_SCALE = "equipment_hud_scale";
+    public static final String KEY_EQUIPMENT_HUD_X = "equipment_hud_x";
+    public static final String KEY_EQUIPMENT_HUD_Y = "equipment_hud_y";
+    public static final String KEY_MINIMAP = "mini_map";
+    public static final String KEY_MINIMAP_RADIUS = "mini_map_radius_chunks";
+    public static final String KEY_MINIMAP_SCALE = "mini_map_scale";
+    public static final String KEY_MINIMAP_ROUND = "mini_map_round";
+    public static final String KEY_MINIMAP_X = "mini_map_x";
+    public static final String KEY_MINIMAP_Y = "mini_map_y";
+    public static final String KEY_AUTO_ARMOR = "auto_armor";
+    public static final String KEY_AUTO_TOTEM = "auto_totem";
+    public static final String KEY_THREAT_ANALYSIS = "threat_analysis";
+    public static final String KEY_THREAT_WARNING = "threat_warning";
+    public static final String KEY_THREAT_DISTANCE = "threat_distance";
+    public static final String KEY_THREAT_WARNING_SCALE =
+        "threat_warning_scale";
+    public static final String KEY_THREAT_COLOR = "threat_color";
+    public static final String KEY_THREAT_WARNING_X = "threat_warning_x";
+    public static final String KEY_THREAT_WARNING_Y = "threat_warning_y";
+    public static final String KEY_SCHEMATIC_ENABLED = "schematic_enabled";
+    public static final String KEY_SCHEMATIC_OPACITY = "schematic_opacity";
+    public static final String KEY_SCHEMATIC_DISTANCE = "schematic_distance";
+    public static final String KEY_SCHEMATIC_ROTATION = "schematic_rotation";
+    public static final String KEY_SCHEMATIC_MIRROR = "schematic_mirror";
+    public static final String KEY_SCHEMATIC_LAYER = "schematic_layer";
+    public static final String KEY_SCHEMATIC_PLACED = "schematic_placed";
+    public static final String KEY_SCHEMATIC_ANCHOR_X = "schematic_anchor_x";
+    public static final String KEY_SCHEMATIC_ANCHOR_Y = "schematic_anchor_y";
+    public static final String KEY_SCHEMATIC_ANCHOR_Z = "schematic_anchor_z";
 
     public static final int DEFAULT_PLAYER_COLOR = 0xff4fd5ff;
     public static final int DEFAULT_MOB_COLOR = 0xffff5b62;
     public static final int DEFAULT_ITEM_COLOR = 0xffffcf4a;
+    public static final int DEFAULT_THREAT_COLOR = 0xffff3b30;
 
     public static final int MIN_RETAINED_RADIUS_CHUNKS = 10;
     public static final int MAX_RETAINED_RADIUS_CHUNKS = 64;
     public static final int MIN_ENTITY_FOV = 50;
     public static final int MAX_ENTITY_FOV = 110;
+    public static final int MIN_MINIMAP_RADIUS_CHUNKS = 2;
+    public static final int MAX_MINIMAP_RADIUS_CHUNKS = 10;
+    public static final int MIN_THREAT_DISTANCE = 3;
+    public static final int MAX_THREAT_DISTANCE = 32;
 
     public static final String ACTION_START =
         "com.m9chko.bedrockrelay.action.START";
     public static final String ACTION_STOP =
         "com.m9chko.bedrockrelay.action.STOP";
+    public static final String ACTION_RELOAD_SCHEMATIC =
+        "com.m9chko.bedrockrelay.action.RELOAD_SCHEMATIC";
+    public static final String ACTION_IMPORT_SCHEMATIC_DOCUMENT =
+        "com.m9chko.bedrockrelay.action.IMPORT_SCHEMATIC_DOCUMENT";
+    public static final String EXTRA_SCHEMATIC_URI = "schematic_uri";
+    public static final String EXTRA_SCHEMATIC_NAME = "schematic_name";
     public static final String EXTRA_HOST = "host";
     public static final String EXTRA_PORT = "port";
     public static final String EXTRA_VERSION = "version";
@@ -85,6 +131,8 @@ public final class RelayService extends Service {
     private static final int ENTITY_SNAPSHOT_EVERY_POLLS = 4;
 
     private final ExecutorService commandExecutor =
+        Executors.newSingleThreadExecutor();
+    private final ExecutorService schematicExecutor =
         Executors.newSingleThreadExecutor();
     private final ScheduledExecutorService pollExecutor =
         Executors.newSingleThreadScheduledExecutor();
@@ -100,8 +148,14 @@ public final class RelayService extends Service {
     private EntityOutlineOverlayController entityOverlayController;
     private ChunkStatusOverlayController chunkOverlayController;
     private EquipmentOverlayController equipmentOverlayController;
+    private MiniMapOverlayController miniMapOverlayController;
+    private ThreatAnalysisOverlayController threatOverlayController;
+    private SchematicOverlayController schematicOverlayController;
+    private SchematicRepository schematicRepository;
     private volatile boolean serviceStopping;
     private volatile boolean overlayShouldBeVisible;
+    private volatile boolean overlayWindowsVisible;
+    private volatile boolean minecraftUiBlocked;
     private volatile boolean overlaySessionReady;
     private volatile long nextOverlayShowRetryAtMs;
     private volatile String notificationStatus = "Запуск UDP relay…";
@@ -109,6 +163,7 @@ public final class RelayService extends Service {
     private volatile long lastPollingErrorAt;
     private volatile long lastEntityPollingErrorAt;
     private int entityPollTick;
+    private int uiPollTick;
 
     @Override
     public void onCreate() {
@@ -125,6 +180,21 @@ public final class RelayService extends Service {
             preferences
         );
         equipmentOverlayController = new EquipmentOverlayController(this);
+        miniMapOverlayController = new MiniMapOverlayController(
+            this,
+            preferences
+        );
+        threatOverlayController = new ThreatAnalysisOverlayController(
+            this,
+            preferences,
+            entityOverlayController
+        );
+        schematicRepository = new SchematicRepository(this);
+        schematicOverlayController = new SchematicOverlayController(
+            this,
+            preferences
+        );
+        reloadSchematicModel();
         createNotificationChannel();
         DiagnosticsLog.append(
             this,
@@ -142,6 +212,37 @@ public final class RelayService extends Service {
         if (ACTION_STOP.equals(action)) {
             DiagnosticsLog.append(this, "INFO", "service", "Stop action received");
             stopRelayAndSelf();
+            return START_NOT_STICKY;
+        }
+        if (ACTION_RELOAD_SCHEMATIC.equals(action)) {
+            boolean relayRunning = false;
+            try {
+                relayRunning = new JSONObject(NativeBridge.snapshot())
+                    .optBoolean("running", false);
+            } catch (Throwable ignored) {
+            }
+            if (relayRunning) {
+                reloadSchematicModel();
+            } else {
+                stopSelf(startId);
+            }
+            return START_NOT_STICKY;
+        }
+        if (ACTION_IMPORT_SCHEMATIC_DOCUMENT.equals(action)) {
+            boolean relayRunning = false;
+            try {
+                relayRunning = new JSONObject(NativeBridge.snapshot())
+                    .optBoolean("running", false);
+            } catch (Throwable ignored) {
+            }
+            if (relayRunning) {
+                importSchematicDocument(
+                    intent.getStringExtra(EXTRA_SCHEMATIC_URI),
+                    intent.getStringExtra(EXTRA_SCHEMATIC_NAME)
+                );
+            } else {
+                stopSelf(startId);
+            }
             return START_NOT_STICKY;
         }
         if (!ACTION_START.equals(action)) {
@@ -208,6 +309,15 @@ public final class RelayService extends Service {
         if (equipmentOverlayController != null) {
             equipmentOverlayController.destroy();
         }
+        if (miniMapOverlayController != null) {
+            miniMapOverlayController.destroy();
+        }
+        if (threatOverlayController != null) {
+            threatOverlayController.destroy();
+        }
+        if (schematicOverlayController != null) {
+            schematicOverlayController.hideImmediately();
+        }
         DiagnosticsLog.append(this, "INFO", "service", "Service destroying");
         try {
             NativeBridge.stopRelay();
@@ -223,6 +333,7 @@ public final class RelayService extends Service {
         releaseWakeLock();
         pollExecutor.shutdownNow();
         entityPollExecutor.shutdownNow();
+        schematicExecutor.shutdownNow();
         commandExecutor.shutdownNow();
         super.onDestroy();
     }
@@ -321,19 +432,58 @@ public final class RelayService extends Service {
     private void startEntityPolling() {
         if (!entityPollingStarted.compareAndSet(false, true)) return;
         entityPollExecutor.scheduleWithFixedDelay(() -> {
-            if (serviceStopping || entityOverlayController == null ||
-                !entityOverlayController.wantsFrames()) {
+            if (serviceStopping) {
                 return;
             }
             try {
-                if ((entityPollTick++ % ENTITY_SNAPSHOT_EVERY_POLLS) == 0) {
-                    entityOverlayController.offerSnapshot(
-                        NativeBridge.entityOverlaySnapshot()
+                final int pollTick = uiPollTick++;
+                if ((pollTick & 3) == 0) {
+                    updateMinecraftUiBlocked(
+                        NativeBridge.minecraftUiBlocked() || isImeVisible()
                     );
+                }
+                if ((pollTick % 8) == 0 && miniMapOverlayController != null &&
+                    miniMapOverlayController.wantsFrames()) {
+                    miniMapOverlayController.offerSnapshot(
+                        NativeBridge.miniMapSnapshot(
+                            miniMapOverlayController.requestedRevision(),
+                            miniMapOverlayController.requestedRadiusChunks()
+                        )
+                    );
+                }
+                boolean outlineFrames = entityOverlayController != null &&
+                    entityOverlayController.wantsFrames();
+                boolean threatFrames = threatOverlayController != null &&
+                    threatOverlayController.wantsFrames();
+                boolean schematicFrames = schematicOverlayController != null &&
+                    schematicOverlayController.wantsFrames();
+                if (!outlineFrames && !threatFrames && !schematicFrames) return;
+
+                boolean entityFrames = outlineFrames || threatFrames;
+                if (entityFrames &&
+                    ((entityPollTick++ % ENTITY_SNAPSHOT_EVERY_POLLS) == 0 ||
+                        !outlineFrames)) {
+                    EntityOutlineOverlayController.Frame frame =
+                        EntityOutlineOverlayController.Frame.parse(
+                            NativeBridge.entityOverlaySnapshot()
+                        );
+                    if (outlineFrames) {
+                        entityOverlayController.offerFrame(frame);
+                    }
+                    if (threatFrames) {
+                        threatOverlayController.offerFrame(frame);
+                    }
+                    if (schematicFrames) {
+                        schematicOverlayController.offerCamera(frame.camera);
+                    }
                 } else {
-                    entityOverlayController.offerCameraSnapshot(
-                        NativeBridge.entityCameraSnapshot()
-                    );
+                    String cameraJson = NativeBridge.entityCameraSnapshot();
+                    if (outlineFrames) {
+                        entityOverlayController.offerCameraSnapshot(cameraJson);
+                    }
+                    if (schematicFrames) {
+                        schematicOverlayController.offerCameraSnapshot(cameraJson);
+                    }
                 }
             } catch (Throwable error) {
                 long now = System.currentTimeMillis();
@@ -348,6 +498,125 @@ public final class RelayService extends Service {
                 }
             }
         }, 0, OVERLAY_POLL_INTERVAL_MS, TimeUnit.MILLISECONDS);
+    }
+
+    private void reloadSchematicModel() {
+        final SchematicRepository repository = schematicRepository;
+        if (repository == null) return;
+        schematicExecutor.execute(() -> {
+            try {
+                SchematicModel loaded = repository.loadActive();
+                mainHandler.post(() -> {
+                    if (schematicOverlayController != null) {
+                        schematicOverlayController.setModel(loaded);
+                    }
+                    applyRuntimeOptions(false);
+                });
+                DiagnosticsLog.append(
+                    this,
+                    "INFO",
+                    "schematics",
+                    loaded == null
+                        ? "No active schematic"
+                        : "Loaded schematic " + loaded.sourceName() +
+                            " " + loaded.description()
+                );
+            } catch (Throwable error) {
+                DiagnosticsLog.appendError(
+                    this,
+                    "schematics",
+                    "Failed to load active schematic",
+                    error
+                );
+                mainHandler.post(() -> {
+                    if (schematicOverlayController != null) {
+                        schematicOverlayController.setModel(null);
+                    }
+                });
+            }
+        });
+    }
+
+    private void importSchematicDocument(String uriValue, String sourceName) {
+        if (uriValue == null || uriValue.trim().isEmpty()) {
+            if (overlayController != null) {
+                overlayController.updateSchematicImportStatus(
+                    "Не выбран файл схемы",
+                    true
+                );
+            }
+            return;
+        }
+        String safeName = sourceName == null || sourceName.trim().isEmpty()
+            ? "scheme.nbt"
+            : sourceName.trim();
+        if (overlayController != null) {
+            overlayController.updateSchematicImportStatus(
+                "Импортируем " + safeName + "…",
+                false
+            );
+        }
+        final SchematicRepository repository = schematicRepository;
+        schematicExecutor.execute(() -> {
+            try (InputStream input = getContentResolver().openInputStream(
+                Uri.parse(uriValue)
+            )) {
+                if (input == null) throw new IllegalStateException(
+                    "Файл схемы не открылся"
+                );
+                SchematicRepository.ImportResult result =
+                    repository.importAndActivate(input, safeName);
+                preferences.edit()
+                    .putBoolean(KEY_SCHEMATIC_ENABLED, true)
+                    .putBoolean(KEY_SCHEMATIC_PLACED, false)
+                    .apply();
+                DiagnosticsLog.append(
+                    this,
+                    "INFO",
+                    "schematics",
+                    "Imported from in-game folder: " +
+                        result.model.sourceName() + " " +
+                        result.model.description()
+                );
+                mainHandler.post(() -> {
+                    if (schematicOverlayController != null) {
+                        schematicOverlayController.setModel(result.model);
+                    }
+                    applyRuntimeOptions(false);
+                    if (overlayController != null) {
+                        overlayController.updateSchematicImportStatus(
+                            "Готово: " + result.model.description(),
+                            false
+                        );
+                    }
+                    Toast.makeText(
+                        this,
+                        "Схема импортирована",
+                        Toast.LENGTH_SHORT
+                    ).show();
+                });
+            } catch (Throwable error) {
+                DiagnosticsLog.appendError(
+                    this,
+                    "schematics",
+                    "In-game schematic import failed",
+                    error
+                );
+                String message = error.getMessage();
+                String visible = message == null || message.trim().isEmpty()
+                    ? "Не удалось импортировать схему"
+                    : message;
+                mainHandler.post(() -> {
+                    if (overlayController != null) {
+                        overlayController.updateSchematicImportStatus(
+                            visible,
+                            true
+                        );
+                    }
+                    Toast.makeText(this, visible, Toast.LENGTH_LONG).show();
+                });
+            }
+        });
     }
 
     private void handleEvent(JSONObject event) {
@@ -462,6 +731,7 @@ public final class RelayService extends Service {
         setOverlayVisible(overlaySessionReady);
         updateOverlayChunkStatus(state);
         updateOverlayEquipment(state);
+        updateOverlayGameplayStatus(state);
         if (!running) {
             return;
         }
@@ -603,6 +873,36 @@ public final class RelayService extends Service {
             equipment,
             revision
         ));
+    }
+
+    private void updateOverlayGameplayStatus(JSONObject state) {
+        if (threatOverlayController != null) {
+            threatOverlayController.updatePlayerState(state);
+        }
+        if (overlayController == null) return;
+        final String automationStatus = state.optString(
+            "automationStatus",
+            "Ожидание инвентаря"
+        );
+        final boolean inventoryReady = state.optBoolean(
+            "playerInventoryReady",
+            false
+        );
+        final boolean pending = state.optBoolean("automationPending", false);
+        final long accepted = state.optLong("automationAccepted", 0);
+        final long rejected = state.optLong("automationRejected", 0);
+        final long mapDecoded = state.optLong("miniMapDecodedChunks", 0);
+        final long mapFailures = state.optLong("miniMapDecodeFailures", 0);
+        mainHandler.post(() -> {
+            overlayController.updateAutomationStatus(
+                automationStatus,
+                inventoryReady,
+                pending,
+                accepted,
+                rejected
+            );
+            overlayController.updateMiniMapStatus(mapDecoded, mapFailures);
+        });
     }
 
     private void stopRelayAndSelf() {
@@ -822,6 +1122,59 @@ public final class RelayService extends Service {
             KEY_EQUIPMENT_HUD_SCALE,
             80
         ));
+        boolean miniMap = preferences.getBoolean(KEY_MINIMAP, true);
+        int miniMapRadius = clampMiniMapRadius(preferences.getInt(
+            KEY_MINIMAP_RADIUS,
+            4
+        ));
+        int miniMapScale = clampOverlayScale(preferences.getInt(
+            KEY_MINIMAP_SCALE,
+            90
+        ));
+        boolean miniMapRound = preferences.getBoolean(KEY_MINIMAP_ROUND, true);
+        boolean autoArmor = preferences.getBoolean(KEY_AUTO_ARMOR, false);
+        boolean autoTotem = preferences.getBoolean(KEY_AUTO_TOTEM, false);
+        boolean threatAnalysis = preferences.getBoolean(
+            KEY_THREAT_ANALYSIS,
+            true
+        );
+        boolean threatWarning = preferences.getBoolean(
+            KEY_THREAT_WARNING,
+            true
+        );
+        int threatDistance = clampThreatDistance(preferences.getInt(
+            KEY_THREAT_DISTANCE,
+            12
+        ));
+        int threatWarningScale = clampOverlayScale(preferences.getInt(
+            KEY_THREAT_WARNING_SCALE,
+            90
+        ));
+        int threatColor = preferences.getInt(
+            KEY_THREAT_COLOR,
+            DEFAULT_THREAT_COLOR
+        );
+        boolean schematicEnabled = preferences.getBoolean(
+            KEY_SCHEMATIC_ENABLED,
+            false
+        );
+        int schematicOpacity = clampSchematicOpacity(preferences.getInt(
+            KEY_SCHEMATIC_OPACITY,
+            42
+        ));
+        int schematicDistance = clampSchematicDistance(preferences.getInt(
+            KEY_SCHEMATIC_DISTANCE,
+            96
+        ));
+        int schematicRotation = Math.floorMod(preferences.getInt(
+            KEY_SCHEMATIC_ROTATION,
+            0
+        ), 4);
+        boolean schematicMirror = preferences.getBoolean(
+            KEY_SCHEMATIC_MIRROR,
+            false
+        );
+        int schematicLayer = preferences.getInt(KEY_SCHEMATIC_LAYER, -1);
         preferences.edit()
             .putInt(KEY_RETAINED_RADIUS_CHUNKS, radiusChunks)
             .putInt(KEY_ENTITY_FOV, entityFov)
@@ -829,6 +1182,13 @@ public final class RelayService extends Service {
             .putInt(KEY_ENTITY_MAX_DISTANCE, maximumDistance)
             .putInt(KEY_CHUNK_WIDGET_SCALE, chunkWidgetScale)
             .putInt(KEY_EQUIPMENT_HUD_SCALE, equipmentScale)
+            .putInt(KEY_MINIMAP_RADIUS, miniMapRadius)
+            .putInt(KEY_MINIMAP_SCALE, miniMapScale)
+            .putInt(KEY_THREAT_DISTANCE, threatDistance)
+            .putInt(KEY_THREAT_WARNING_SCALE, threatWarningScale)
+            .putInt(KEY_SCHEMATIC_OPACITY, schematicOpacity)
+            .putInt(KEY_SCHEMATIC_DISTANCE, schematicDistance)
+            .putInt(KEY_SCHEMATIC_ROTATION, schematicRotation)
             .apply();
         mainHandler.post(() -> {
             if (entityOverlayController != null) {
@@ -857,12 +1217,45 @@ public final class RelayService extends Service {
                     equipmentScale
                 );
             }
+            if (miniMapOverlayController != null) {
+                miniMapOverlayController.configure(
+                    miniMap,
+                    miniMapRadius,
+                    miniMapScale,
+                    miniMapRound
+                );
+            }
+            if (threatOverlayController != null) {
+                threatOverlayController.configure(
+                    threatAnalysis,
+                    threatWarning,
+                    threatDistance,
+                    threatWarningScale,
+                    threatColor
+                );
+            }
+            if (schematicOverlayController != null) {
+                schematicOverlayController.configure(
+                    schematicEnabled,
+                    entityFov,
+                    schematicOpacity,
+                    schematicDistance,
+                    schematicRotation,
+                    schematicMirror,
+                    schematicLayer
+                );
+            }
         });
         try {
             NativeBridge.configureRuntime(
                 detailedLogs,
                 retainChunks,
                 radiusChunks
+            );
+            NativeBridge.configureGameplayFeatures(
+                autoArmor,
+                autoTotem,
+                miniMap
             );
             if (logChange) {
                 DiagnosticsLog.append(
@@ -880,7 +1273,19 @@ public final class RelayService extends Service {
                         " thickness=" + (thicknessTenths / 10.0f) +
                         " maxDistance=" + maximumDistance +
                         " chunkWidget=" + chunkWidget +
-                        " equipmentHud=" + equipmentHud
+                        " equipmentHud=" + equipmentHud +
+                        " miniMap=" + miniMap +
+                        " miniMapRadius=" + miniMapRadius +
+                        " autoArmor=" + autoArmor +
+                        " autoTotem=" + autoTotem +
+                        " threatAnalysis=" + threatAnalysis +
+                        " threatDistance=" + threatDistance +
+                        " schematic=" + schematicEnabled +
+                        " schematicOpacity=" + schematicOpacity +
+                        " schematicDistance=" + schematicDistance +
+                        " schematicRotation=" + schematicRotation +
+                        " schematicMirror=" + schematicMirror +
+                        " schematicLayer=" + schematicLayer
                 );
             }
         } catch (Throwable error) {
@@ -894,8 +1299,20 @@ public final class RelayService extends Service {
     }
 
     private void setOverlayVisible(boolean visible) {
-        boolean changed = overlayShouldBeVisible != visible;
         overlayShouldBeVisible = visible;
+        reconcileOverlayVisibility();
+    }
+
+    private void updateMinecraftUiBlocked(boolean blocked) {
+        if (minecraftUiBlocked == blocked) return;
+        minecraftUiBlocked = blocked;
+        reconcileOverlayVisibility();
+    }
+
+    private void reconcileOverlayVisibility() {
+        boolean visible = overlayShouldBeVisible && !minecraftUiBlocked;
+        boolean changed = overlayWindowsVisible != visible;
+        overlayWindowsVisible = visible;
         long now = SystemClock.elapsedRealtime();
         if (!changed) {
             if (!visible) return;
@@ -907,7 +1324,26 @@ public final class RelayService extends Service {
         }
         nextOverlayShowRetryAtMs = visible ? now + 1_000L : 0L;
         mainHandler.post(() -> {
-            if (overlayShouldBeVisible) {
+            boolean showNow = overlayShouldBeVisible && !minecraftUiBlocked;
+            if (entityOverlayController != null) {
+                entityOverlayController.setUiBlocked(minecraftUiBlocked);
+            }
+            if (chunkOverlayController != null) {
+                chunkOverlayController.setUiBlocked(minecraftUiBlocked);
+            }
+            if (equipmentOverlayController != null) {
+                equipmentOverlayController.setUiBlocked(minecraftUiBlocked);
+            }
+            if (miniMapOverlayController != null) {
+                miniMapOverlayController.setUiBlocked(minecraftUiBlocked);
+            }
+            if (threatOverlayController != null) {
+                threatOverlayController.setUiBlocked(minecraftUiBlocked);
+            }
+            if (schematicOverlayController != null) {
+                schematicOverlayController.setUiBlocked(minecraftUiBlocked);
+            }
+            if (showNow) {
                 if (entityOverlayController != null) {
                     entityOverlayController.setSessionVisible(true);
                 }
@@ -916,6 +1352,15 @@ public final class RelayService extends Service {
                 }
                 if (equipmentOverlayController != null) {
                     equipmentOverlayController.setSessionVisible(true);
+                }
+                if (miniMapOverlayController != null) {
+                    miniMapOverlayController.setSessionVisible(true);
+                }
+                if (threatOverlayController != null) {
+                    threatOverlayController.setSessionVisible(true);
+                }
+                if (schematicOverlayController != null) {
+                    schematicOverlayController.setSessionVisible(true);
                 }
                 if (overlayController != null) overlayController.show();
             } else {
@@ -929,8 +1374,31 @@ public final class RelayService extends Service {
                 if (equipmentOverlayController != null) {
                     equipmentOverlayController.setSessionVisible(false);
                 }
+                if (miniMapOverlayController != null) {
+                    miniMapOverlayController.setSessionVisible(false);
+                }
+                if (threatOverlayController != null) {
+                    threatOverlayController.setSessionVisible(false);
+                }
+                if (schematicOverlayController != null) {
+                    schematicOverlayController.setSessionVisible(false);
+                }
             }
         });
+    }
+
+    private boolean isImeVisible() {
+        if (Build.VERSION.SDK_INT < 30) return false;
+        try {
+            WindowManager manager = (WindowManager) getSystemService(
+                WINDOW_SERVICE
+            );
+            return manager != null && manager.getCurrentWindowMetrics()
+                .getWindowInsets()
+                .isVisible(WindowInsets.Type.ime());
+        } catch (Throwable ignored) {
+            return false;
+        }
     }
 
     public static int clampRetainedRadius(int radius) {
@@ -954,5 +1422,27 @@ public final class RelayService extends Service {
 
     public static int clampOverlayScale(int value) {
         return Math.max(70, Math.min(150, value));
+    }
+
+    public static int clampMiniMapRadius(int value) {
+        return Math.max(
+            MIN_MINIMAP_RADIUS_CHUNKS,
+            Math.min(MAX_MINIMAP_RADIUS_CHUNKS, value)
+        );
+    }
+
+    public static int clampThreatDistance(int value) {
+        return Math.max(
+            MIN_THREAT_DISTANCE,
+            Math.min(MAX_THREAT_DISTANCE, value)
+        );
+    }
+
+    public static int clampSchematicOpacity(int value) {
+        return Math.max(10, Math.min(85, value));
+    }
+
+    public static int clampSchematicDistance(int value) {
+        return Math.max(16, Math.min(192, value));
     }
 }

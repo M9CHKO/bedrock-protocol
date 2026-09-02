@@ -24,6 +24,7 @@ final class ChunkStatusOverlayController {
     private final WindowManager windowManager;
 
     private boolean sessionVisible;
+    private boolean uiBlocked;
     private boolean enabled;
     private int scalePercent = 100;
     private boolean minimized;
@@ -62,6 +63,12 @@ final class ChunkStatusOverlayController {
 
     void setSessionVisible(boolean visible) {
         sessionVisible = visible;
+        reconcile();
+    }
+
+    void setUiBlocked(boolean blocked) {
+        if (uiBlocked == blocked) return;
+        uiBlocked = blocked;
         reconcile();
     }
 
@@ -110,7 +117,7 @@ final class ChunkStatusOverlayController {
     }
 
     private void reconcile() {
-        if (sessionVisible && enabled && retentionEnabled) {
+        if (sessionVisible && enabled && retentionEnabled && !uiBlocked) {
             addWindow();
         } else {
             removeWindow();

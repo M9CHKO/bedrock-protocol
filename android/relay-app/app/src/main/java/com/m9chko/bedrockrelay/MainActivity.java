@@ -18,6 +18,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.provider.DocumentsContract;
 import android.provider.Settings;
 import android.provider.OpenableColumns;
 import android.text.InputType;
@@ -37,6 +38,9 @@ import android.widget.Toast;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import com.m9chko.bedrockrelay.schematic.SchematicRepository;
+import com.m9chko.bedrockrelay.schematic.SchematicSourceFolder;
+
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
@@ -46,15 +50,23 @@ import java.util.concurrent.Executors;
 public final class MainActivity extends Activity {
     public static final String ACTION_IMPORT_TEXTURE_PACK =
         "com.m9chko.bedrockrelay.action.IMPORT_TEXTURE_PACK";
+    public static final String ACTION_IMPORT_SCHEMATIC =
+        "com.m9chko.bedrockrelay.action.IMPORT_SCHEMATIC";
+    public static final String ACTION_CHOOSE_SCHEMATIC_FOLDER =
+        "com.m9chko.bedrockrelay.action.CHOOSE_SCHEMATIC_FOLDER";
     private static final int NOTIFICATION_PERMISSION_REQUEST = 100;
     private static final int OVERLAY_PERMISSION_REQUEST = 101;
     private static final int TEXTURE_PACK_REQUEST = 102;
+    private static final int SCHEMATIC_REQUEST = 103;
+    private static final int SCHEMATIC_FOLDER_REQUEST = 104;
     private static final String MINECRAFT_PACKAGE = "com.mojang.minecraftpe";
     private static final String OFFICIAL_TEXTURE_RELEASES =
         "https://github.com/Mojang/bedrock-samples/releases";
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final ExecutorService textureImportExecutor =
+        Executors.newSingleThreadExecutor();
+    private final ExecutorService schematicImportExecutor =
         Executors.newSingleThreadExecutor();
     private final Runnable refreshTask = new Runnable() {
         @Override public void run() {
@@ -65,6 +77,8 @@ public final class MainActivity extends Activity {
 
     private SharedPreferences preferences;
     private OfficialTexturePack texturePack;
+    private SchematicRepository schematicRepository;
+    private SchematicSourceFolder schematicSourceFolder;
     private EditText hostInput;
     private EditText portInput;
     private Spinner versionInput;
@@ -83,6 +97,7 @@ public final class MainActivity extends Activity {
     private Button texturePackImportButton;
     private Button texturePackDeleteButton;
     private boolean texturePackImportBusy;
+    private boolean schematicImportBusy;
     private long nextLogRefreshAt;
     private boolean pendingOverlayRelayStart;
     private boolean pendingOverlayMinecraftLaunch;
@@ -95,6 +110,8 @@ public final class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         preferences = getSharedPreferences(RelayService.PREFERENCES, MODE_PRIVATE);
         texturePack = new OfficialTexturePack(this);
+        schematicRepository = new SchematicRepository(this);
+        schematicSourceFolder = new SchematicSourceFolder(this);
         if (savedInstanceState != null) {
             pendingOverlayRelayStart = savedInstanceState.getBoolean(
                 "pending_overlay_start",
@@ -117,14 +134,14 @@ public final class MainActivity extends Activity {
         }
         DiagnosticsLog.append(this, "INFO", "ui", "Main screen opened");
         setContentView(buildContent());
-        maybeOpenTexturePackPicker(getIntent());
+        maybeOpenImportPicker(getIntent());
     }
 
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
-        maybeOpenTexturePackPicker(intent);
+        maybeOpenImportPicker(intent);
     }
 
     @Override
@@ -160,6 +177,7 @@ public final class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         textureImportExecutor.shutdownNow();
+        schematicImportExecutor.shutdownNow();
         super.onDestroy();
     }
 
@@ -271,7 +289,7 @@ public final class MainActivity extends Activity {
         content.addView(serverCard, margins(-1, -2, 0, 0, 0, dp(10)));
 
         LinearLayout texturesCard = card();
-        TextView texturesTitle = text("ТЕКСТУРЫ СНАРЯЖЕНИЯ", 12, true);
+        TextView texturesTitle = text("ТЕКСТУРЫ HUD И СХЕМ", 12, true);
         texturesTitle.setTextColor(0xffc79aff);
         texturesCard.addView(
             texturesTitle,
@@ -309,8 +327,9 @@ public final class MainActivity extends Activity {
         );
         TextView textureNote = text(
             "Выберите официальный FULL-архив bedrock-samples один раз. " +
-                "Приложение сохранит только item PNG во внутренней памяти; " +
-                "они не добавляются в APK или Git.",
+                "Приложение сохранит item и block PNG во внутренней памяти. " +
+                "Схемы используют их автоматически; файлы не добавляются в APK " +
+                "или Git.",
             9,
             false
         );
@@ -590,16 +609,175 @@ public final class MainActivity extends Activity {
             } catch (Throwable ignored) {
             }
             importTexturePack(source, displayName(source));
+        } else if (requestCode == SCHEMATIC_REQUEST &&
+            resultCode == RESULT_OK && data != null && data.getData() != null) {
+            Uri source = data.getData();
+            try {
+                if ((data.getFlags() & Intent.FLAG_GRANT_READ_URI_PERMISSION) != 0) {
+                    getContentResolver().takePersistableUriPermission(
+                        source,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    );
+                }
+            } catch (Throwable ignored) {
+            }
+            importSchematic(source, displayName(source));
+        } else if (requestCode == SCHEMATIC_FOLDER_REQUEST &&
+            resultCode == RESULT_OK && data != null && data.getData() != null) {
+            Uri tree = data.getData();
+            try {
+                getContentResolver().takePersistableUriPermission(
+                    tree,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION
+                );
+                schematicSourceFolder.saveTree(tree);
+                toast("Папка схем подключена");
+            } catch (Throwable error) {
+                DiagnosticsLog.appendError(
+                    this,
+                    "schematics",
+                    "Could not persist schematic folder access",
+                    error
+                );
+                toast("Не удалось сохранить доступ к папке");
+            }
+            if (preferences.getBoolean(RelayService.KEY_RELAY_ACTIVE, false)) {
+                openMinecraft();
+            }
         }
     }
 
-    private void maybeOpenTexturePackPicker(Intent intent) {
-        if (intent == null ||
-            !ACTION_IMPORT_TEXTURE_PACK.equals(intent.getAction())) {
+    private void maybeOpenImportPicker(Intent intent) {
+        if (intent == null) return;
+        if (ACTION_IMPORT_TEXTURE_PACK.equals(intent.getAction())) {
+            intent.setAction(null);
+            handler.post(this::openTexturePackPicker);
+        } else if (ACTION_IMPORT_SCHEMATIC.equals(intent.getAction())) {
+            intent.setAction(null);
+            handler.post(this::openSchematicPicker);
+        } else if (ACTION_CHOOSE_SCHEMATIC_FOLDER.equals(intent.getAction())) {
+            intent.setAction(null);
+            handler.post(this::openSchematicFolderPicker);
+        }
+    }
+
+    private void openSchematicFolderPicker() {
+        Intent picker = new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE);
+        picker.addFlags(
+            Intent.FLAG_GRANT_READ_URI_PERMISSION |
+                Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION |
+                Intent.FLAG_GRANT_PREFIX_URI_PERMISSION
+        );
+        Uri current = schematicSourceFolder == null
+            ? null
+            : schematicSourceFolder.treeUri();
+        if (current != null) {
+            picker.putExtra(DocumentsContract.EXTRA_INITIAL_URI, current);
+        }
+        try {
+            startActivityForResult(picker, SCHEMATIC_FOLDER_REQUEST);
+        } catch (Throwable error) {
+            DiagnosticsLog.appendError(
+                this,
+                "schematics",
+                "Could not open schematic folder picker",
+                error
+            );
+            toast("Не удалось открыть выбор папки");
+        }
+    }
+
+    private void openSchematicPicker() {
+        if (schematicImportBusy) return;
+        Intent picker = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+        picker.addCategory(Intent.CATEGORY_OPENABLE);
+        picker.setType("*/*");
+        picker.putExtra(Intent.EXTRA_MIME_TYPES, new String[] {
+            "application/octet-stream",
+            "application/gzip",
+            "application/x-gzip",
+            "application/nbt"
+        });
+        picker.addFlags(
+            Intent.FLAG_GRANT_READ_URI_PERMISSION |
+                Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+        );
+        try {
+            startActivityForResult(picker, SCHEMATIC_REQUEST);
+        } catch (Throwable error) {
+            DiagnosticsLog.appendError(
+                this,
+                "schematics",
+                "Could not open schematic picker",
+                error
+            );
+            toast("Не удалось открыть выбор схемы");
+        }
+    }
+
+    private void importSchematic(Uri source, String sourceName) {
+        if (schematicImportBusy) return;
+        schematicImportBusy = true;
+        toast("Импорт схемы…");
+        schematicImportExecutor.execute(() -> {
+            try (InputStream input = getContentResolver().openInputStream(source)) {
+                SchematicRepository.ImportResult result =
+                    schematicRepository.importAndActivate(input, sourceName);
+                preferences.edit()
+                    .putBoolean(RelayService.KEY_SCHEMATIC_ENABLED, true)
+                    .putBoolean(RelayService.KEY_SCHEMATIC_PLACED, false)
+                    .apply();
+                DiagnosticsLog.append(
+                    this,
+                    "INFO",
+                    "schematics",
+                    "Imported " + result.model.sourceName() + " " +
+                        result.model.description()
+                );
+                runOnUiThread(() -> {
+                    schematicImportBusy = false;
+                    notifySchematicReload();
+                    toast("Схема импортирована: " + result.model.description());
+                    if (preferences.getBoolean(
+                        RelayService.KEY_RELAY_ACTIVE,
+                        false
+                    )) {
+                        openMinecraft();
+                    }
+                });
+            } catch (Throwable error) {
+                DiagnosticsLog.appendError(
+                    this,
+                    "schematics",
+                    "Schematic import failed",
+                    error
+                );
+                runOnUiThread(() -> {
+                    schematicImportBusy = false;
+                    String message = error.getMessage();
+                    toast(message == null || message.trim().isEmpty()
+                        ? "Не удалось импортировать схему"
+                        : message);
+                });
+            }
+        });
+    }
+
+    private void notifySchematicReload() {
+        if (!preferences.getBoolean(RelayService.KEY_RELAY_ACTIVE, false)) {
             return;
         }
-        intent.setAction(null);
-        handler.post(this::openTexturePackPicker);
+        try {
+            startService(new Intent(this, RelayService.class)
+                .setAction(RelayService.ACTION_RELOAD_SCHEMATIC));
+        } catch (Throwable error) {
+            DiagnosticsLog.appendError(
+                this,
+                "schematics",
+                "Could not notify relay about imported schematic",
+                error
+            );
+        }
     }
 
     private void openTexturePackPicker() {
@@ -641,7 +819,8 @@ public final class MainActivity extends Activity {
                     texturePackImportBusy = false;
                     refreshTexturePackStatus();
                     toast(
-                        "Импортировано текстур: " + result.textureCount +
+                        "Импорт: предметы " + result.itemTextureCount +
+                            ", блоки " + result.blockTextureCount +
                             (result.enchantmentGlint ? " + glint" : "")
                     );
                 });

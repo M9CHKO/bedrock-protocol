@@ -86,4 +86,57 @@ public final class TexturePackPathsTest {
             TexturePackPaths.textureCandidates("minecraft:totem_of_undying")
         );
     }
+
+    @Test
+    public void findsBlockTexturesAndDefinitionsInFullArchive() {
+        assertEquals(
+            "subfolder/copper_block.png",
+            TexturePackPaths.blockRelativeFileName(
+                "bedrock-samples-main/resource_pack/textures/blocks/" +
+                    "subfolder/copper_block.png"
+            )
+        );
+        assertTrue(TexturePackPaths.isBlocksDefinition(
+            "bedrock-samples-main/resource_pack/blocks.json"
+        ));
+        assertTrue(TexturePackPaths.isTerrainDefinition(
+            "resource_pack/textures/terrain_texture.json"
+        ));
+        assertEquals(
+            "grass_side.png",
+            TexturePackPaths.blockRelativeFileName(
+                "resource_pack/textures/blocks/grass_side.tga"
+            )
+        );
+        assertNull(TexturePackPaths.blockRelativeFileName(
+            "../resource_pack/textures/blocks/stone.png"
+        ));
+    }
+
+    @Test
+    public void addsBedrockBlockFilenameFallbacks() {
+        assertEquals(
+            List.of("oak_planks.png", "planks_oak.png"),
+            TexturePackPaths.blockFileCandidates(
+                "minecraft:oak_planks[wood_type=oak]"
+            )
+        );
+        assertEquals(
+            "grass_block",
+            TexturePackPaths.normalizedBlockName(
+                "minecraft:grass_block[snowy=false]"
+            )
+        );
+    }
+
+    @Test
+    public void removesPackJsonCommentsWithoutDamagingStringUrls() {
+        String cleaned = OfficialTexturePack.cleanJson(
+            "// header\n{\"url\":\"https://example.test/a//b\",/*note*/\"n\":1}"
+        );
+        assertEquals(
+            "\n{\"url\":\"https://example.test/a//b\",\"n\":1}",
+            cleaned
+        );
+    }
 }

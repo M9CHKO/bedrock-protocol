@@ -15,7 +15,9 @@ import android.os.SystemClock;
 import android.provider.Settings;
 import android.util.LruCache;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.View;
+import android.view.ViewConfiguration;
 import android.view.WindowManager;
 
 import org.json.JSONArray;
@@ -26,7 +28,7 @@ import java.util.HashSet;
 import java.util.Locale;
 import java.util.Set;
 
-/** Click-through top-right HUD for the local player's equipment. */
+/** Draggable, session-scoped HUD for the local player's equipment. */
 final class EquipmentOverlayController {
     private final Context context;
     private final WindowManager windowManager;
@@ -35,9 +37,11 @@ final class EquipmentOverlayController {
     private final SharedPreferences.OnSharedPreferenceChangeListener
         texturePreferenceListener;
     private boolean sessionVisible;
+    private boolean uiBlocked;
     private boolean enabled = true;
     private int scalePercent = 100;
     private EquipmentView view;
+    private WindowManager.LayoutParams windowParams;
     private long lastRevision = Long.MIN_VALUE;
     private EquipmentItem[] latestItems;
 
@@ -66,6 +70,12 @@ final class EquipmentOverlayController {
         reconcile();
     }
 
+    void setUiBlocked(boolean blocked) {
+        if (uiBlocked == blocked) return;
+        uiBlocked = blocked;
+        reconcile();
+    }
+
     void configure(boolean show, int scale) {
         int clamped = RelayService.clampOverlayScale(scale);
         boolean recreate = scalePercent != clamped;
@@ -78,7 +88,7 @@ final class EquipmentOverlayController {
     void update(JSONArray equipment, long revision) {
         if (revision == lastRevision) return;
         lastRevision = revision;
-        EquipmentItem[] items = new EquipmentItem[5];
+        EquipmentItem[] items = new EquipmentItem[6];
         for (int index = 0; index < items.length; ++index) {
             items[index] = EquipmentItem.empty(index);
         }
@@ -108,7 +118,7 @@ final class EquipmentOverlayController {
     }
 
     private void reconcile() {
-        if (sessionVisible && enabled) addWindow();
+        if (sessionVisible && enabled && !uiBlocked) addWindow();
         else removeWindow();
     }
 
@@ -124,17 +134,30 @@ final class EquipmentOverlayController {
             added.preferredHeight(),
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE |
-                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE |
                 WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL |
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT
         );
-        params.gravity = Gravity.TOP | Gravity.END;
-        params.x = dp(12);
-        params.y = dp(82);
+        params.gravity = Gravity.TOP | Gravity.START;
+        int screenWidth = context.getResources()
+            .getDisplayMetrics().widthPixels;
+        int defaultX = Math.max(
+            0,
+            screenWidth - added.preferredWidth() - dp(12)
+        );
+        params.x = texturePreferences.getInt(
+            RelayService.KEY_EQUIPMENT_HUD_X,
+            defaultX
+        );
+        params.y = texturePreferences.getInt(
+            RelayService.KEY_EQUIPMENT_HUD_Y,
+            dp(46)
+        );
+        attachDrag(added, params);
         try {
             windowManager.addView(added, params);
             view = added;
+            windowParams = params;
             if (latestItems != null) added.setItems(latestItems);
         } catch (Throwable error) {
             DiagnosticsLog.appendError(
@@ -149,6 +172,7 @@ final class EquipmentOverlayController {
     private void removeWindow() {
         EquipmentView current = view;
         view = null;
+        windowParams = null;
         if (current == null) return;
         try {
             windowManager.removeViewImmediate(current);
@@ -165,12 +189,89 @@ final class EquipmentOverlayController {
     private static int slotIndex(String slot) {
         switch (slot) {
             case "hand": return 0;
-            case "helmet": return 1;
-            case "chestplate": return 2;
-            case "leggings": return 3;
-            case "boots": return 4;
+            case "offhand": return 1;
+            case "helmet": return 2;
+            case "chestplate": return 3;
+            case "leggings": return 4;
+            case "boots": return 5;
             default: return -1;
         }
+    }
+
+    private void attachDrag(
+        EquipmentView target,
+        WindowManager.LayoutParams targetParams
+    ) {
+        final int slop = ViewConfiguration.get(context)
+            .getScaledTouchSlop();
+        target.setOnTouchListener(new View.OnTouchListener() {
+            private float downRawX;
+            private float downRawY;
+            private int downX;
+            private int downY;
+            private boolean moved;
+
+            @Override
+            public boolean onTouch(View touched, MotionEvent event) {
+                if (view != target || windowParams != targetParams) {
+                    return false;
+                }
+                switch (event.getActionMasked()) {
+                    case MotionEvent.ACTION_DOWN:
+                        downRawX = event.getRawX();
+                        downRawY = event.getRawY();
+                        downX = targetParams.x;
+                        downY = targetParams.y;
+                        moved = false;
+                        return true;
+                    case MotionEvent.ACTION_MOVE:
+                        float dx = event.getRawX() - downRawX;
+                        float dy = event.getRawY() - downRawY;
+                        moved |= Math.abs(dx) > slop || Math.abs(dy) > slop;
+                        if (!moved) return true;
+                        int screenWidth = context.getResources()
+                            .getDisplayMetrics().widthPixels;
+                        int screenHeight = context.getResources()
+                            .getDisplayMetrics().heightPixels;
+                        targetParams.x = Math.max(
+                            0,
+                            Math.min(
+                                Math.max(0, screenWidth - target.getWidth()),
+                                downX + Math.round(dx)
+                            )
+                        );
+                        targetParams.y = Math.max(
+                            0,
+                            Math.min(
+                                Math.max(0, screenHeight - target.getHeight()),
+                                downY + Math.round(dy)
+                            )
+                        );
+                        try {
+                            windowManager.updateViewLayout(target, targetParams);
+                        } catch (Throwable ignored) {
+                        }
+                        return true;
+                    case MotionEvent.ACTION_UP:
+                    case MotionEvent.ACTION_CANCEL:
+                        if (moved) {
+                            texturePreferences.edit()
+                                .putInt(
+                                    RelayService.KEY_EQUIPMENT_HUD_X,
+                                    targetParams.x
+                                )
+                                .putInt(
+                                    RelayService.KEY_EQUIPMENT_HUD_Y,
+                                    targetParams.y
+                                )
+                                .apply();
+                        }
+                        return true;
+                    default:
+                        return false;
+                }
+            }
+        });
     }
 
     private static final class EquipmentItem {
@@ -243,9 +344,11 @@ final class EquipmentOverlayController {
 
     private static final class EquipmentView extends View {
         private static final String[] SLOT_NAMES = {
-            "РУКА", "ШЛЕМ", "НАГРУДНИК", "ПОНОЖИ", "БОТИНКИ"
+            "ПРАВАЯ РУКА", "ЛЕВАЯ РУКА", "ШЛЕМ", "НАГРУДНИК",
+            "ПОНОЖИ", "БОТИНКИ"
         };
         private static final int[] ICONS = {
+            R.drawable.ic_equipment_hand,
             R.drawable.ic_equipment_hand,
             R.drawable.ic_equipment_helmet,
             R.drawable.ic_equipment_chest,
@@ -268,7 +371,7 @@ final class EquipmentOverlayController {
         private final RectF bitmapDestination = new RectF();
         private final RectF glintDestination = new RectF();
         private final Rect bitmapSource = new Rect();
-        private final Drawable[] icons = new Drawable[5];
+        private final Drawable[] icons = new Drawable[6];
         private final OfficialTexturePack texturePack;
         private final Set<String> missingTextures = new HashSet<>();
         private final LruCache<String, Bitmap> textureCache =
@@ -280,7 +383,7 @@ final class EquipmentOverlayController {
             };
         private long textureRevision = Long.MIN_VALUE;
         private Bitmap enchantmentGlint;
-        private EquipmentItem[] items = new EquipmentItem[5];
+        private EquipmentItem[] items = new EquipmentItem[6];
 
         EquipmentView(
             Context context,
@@ -292,7 +395,7 @@ final class EquipmentOverlayController {
             density = context.getResources().getDisplayMetrics().density;
             scale = scalePercent / 100f;
             width = px(198);
-            height = px(174);
+            height = px(203);
             setBackgroundColor(Color.TRANSPARENT);
             setWillNotDraw(false);
 
