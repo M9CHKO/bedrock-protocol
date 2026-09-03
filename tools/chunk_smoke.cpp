@@ -166,6 +166,119 @@ static std::vector<uint8_t> entityGolden() {
     );
 }
 
+static bool checkZeroStorageSubChunk(uint8_t version) {
+    const int8_t emptyY = version == 8 ? 0 : -4;
+    const int8_t populatedY = static_cast<int8_t>(emptyY + 1);
+    const int32_t airStateId = 700 + version;
+    const int32_t populatedStateId = 800 + version;
+
+    std::vector<uint8_t> encodedEmpty {version, 0};
+    if (version == 9) {
+        encodedEmpty.push_back(static_cast<uint8_t>(emptyY));
+    }
+
+    auto populated = bedrock::BedrockSubChunk::createAir(
+        populatedY,
+        populatedStateId
+    );
+    populated.setSubChunkVersion(version);
+    const auto encodedPopulated = populated.encode(
+        bedrock::ChunkStorageType::Runtime
+    );
+
+    std::vector<uint8_t> joined = encodedEmpty;
+    joined.insert(joined.end(), encodedPopulated.begin(), encodedPopulated.end());
+    bedrock::BinaryStream stream(joined);
+
+    // v8 has no embedded Y, so callers seed it. v9 must replace the seed with
+    // its signed wire Y. In both cases, a zero-storage section consumes only
+    // its header and must not steal bytes from the following section.
+    bedrock::BedrockSubChunk empty(emptyY, version);
+    empty.setAirStateId(airStateId);
+    empty.decodeFrom(
+        bedrock::ChunkStorageType::Runtime,
+        stream,
+        airStateId
+    );
+    bedrock::BedrockSubChunk decodedPopulated(populatedY, version);
+    decodedPopulated.decodeFrom(
+        bedrock::ChunkStorageType::Runtime,
+        stream
+    );
+
+    const char* label = version == 8 ? "v8" : "v9";
+    if (!stream.eof() || empty.subChunkVersion() != version ||
+        empty.y() != emptyY || empty.airStateId() != airStateId ||
+        empty.layerCount() != 0 || empty.hasLayer(0) ||
+        !empty.getPalette(0).empty() ||
+        empty.getBlockStateId(0, 0, 0) != airStateId ||
+        empty.getBlockStateId(1, 15, 15, 15) != airStateId ||
+        decodedPopulated.subChunkVersion() != version ||
+        decodedPopulated.y() != populatedY ||
+        decodedPopulated.getBlockStateId(15, 15, 15) != populatedStateId) {
+        std::cerr << "[CHUNK-SMOKE] zero-storage " << label
+                  << " alignment/air-state mismatch\n";
+        return false;
+    }
+
+    if (empty.encode(bedrock::ChunkStorageType::Runtime) != encodedEmpty) {
+        std::cerr << "[CHUNK-SMOKE] zero-storage " << label
+                  << " roundtrip mismatch\n";
+        return false;
+    }
+
+    constexpr uint8_t changedX = 2;
+    constexpr uint8_t changedY = 3;
+    constexpr uint8_t changedZ = 4;
+    empty.setBlockStateId(changedX, changedY, changedZ, populatedStateId);
+    std::size_t airCells = 0;
+    for (uint8_t x = 0; x < 16; ++x) {
+        for (uint8_t y = 0; y < 16; ++y) {
+            for (uint8_t z = 0; z < 16; ++z) {
+                const int32_t actual = empty.getBlockStateId(x, y, z);
+                if (x == changedX && y == changedY && z == changedZ) {
+                    if (actual != populatedStateId) {
+                        std::cerr << "[CHUNK-SMOKE] zero-storage " << label
+                                  << " materialized block mismatch\n";
+                        return false;
+                    }
+                } else if (actual == airStateId) {
+                    ++airCells;
+                } else {
+                    std::cerr << "[CHUNK-SMOKE] zero-storage " << label
+                              << " materialized neighbor lost custom air\n";
+                    return false;
+                }
+            }
+        }
+    }
+    if (empty.layerCount() != 1 || airCells != 4095) {
+        std::cerr << "[CHUNK-SMOKE] zero-storage " << label
+                  << " materialization count mismatch\n";
+        return false;
+    }
+
+    std::vector<uint8_t> tooManyStorages {version, 3};
+    if (version == 9) {
+        tooManyStorages.push_back(static_cast<uint8_t>(emptyY));
+    }
+    bool rejected = false;
+    try {
+        (void) bedrock::BedrockSubChunk::decode(
+            bedrock::ChunkStorageType::Runtime,
+            tooManyStorages
+        );
+    } catch (const bedrock::BedrockChunkError&) {
+        rejected = true;
+    }
+    if (!rejected) {
+        std::cerr << "[CHUNK-SMOKE] " << label
+                  << " storage count above two was accepted\n";
+        return false;
+    }
+    return true;
+}
+
 static bool checkPersistentSubChunk(
     bedrock::ChunkStorageType storageType,
     bedrock::BedrockNbtEncoding nbtEncoding,
@@ -224,6 +337,38 @@ int main() {
     }
 
     const int32_t stateId = 42;
+
+    if (!checkZeroStorageSubChunk(8) || !checkZeroStorageSubChunk(9)) {
+        return 1;
+    }
+
+    constexpr int32_t customAirStateId = 4567;
+    constexpr int32_t placedStateId = 8901;
+    bedrock::BedrockChunkColumn customAirColumn(2, -3);
+    customAirColumn.setBounds(-4, 20);
+    customAirColumn.setAirStateId(customAirStateId);
+    if (customAirColumn.airStateId() != customAirStateId ||
+        customAirColumn.getBlockStateId({.x = 0, .y = -64, .z = 0}) !=
+            customAirStateId) {
+        std::cerr << "[CHUNK-SMOKE] missing section custom air mismatch\n";
+        return 1;
+    }
+    customAirColumn.setBlockStateId(
+        {.x = 1, .y = -63, .z = 2},
+        placedStateId
+    );
+    const auto* ensuredCustomAir = customAirColumn.getSectionAtIndex(-4);
+    auto& newCustomAir = customAirColumn.newSection(-3);
+    if (ensuredCustomAir == nullptr || ensuredCustomAir->layerCount() != 1 ||
+        ensuredCustomAir->getBlockStateId(1, 1, 2) != placedStateId ||
+        ensuredCustomAir->getBlockStateId(0, 0, 0) != customAirStateId ||
+        newCustomAir.layerCount() != 1 ||
+        newCustomAir.getBlockStateId(15, 15, 15) != customAirStateId ||
+        customAirColumn.getBlockStateId({.x = 0, .y = 0, .z = 0}) !=
+            customAirStateId) {
+        std::cerr << "[CHUNK-SMOKE] ensure/new section custom air mismatch\n";
+        return 1;
+    }
 
     std::vector<uint8_t> encoded;
     encoded.push_back(9); // subChunkVersion
@@ -425,27 +570,29 @@ int main() {
     }
 
     // IGN/Nukkit-compatible modern columns can still contain sequential v8
-    // sections without an embedded Y byte. The first section belongs at the
-    // modern minimum (-4 / world Y -64), not at section zero.
-    bedrock::BedrockChunkColumn modernV8Column(0, 0);
-    modernV8Column.setBounds(-4, 20);
-    modernV8Column.setBlockStateId({.x = 2, .y = -63, .z = 6}, 321);
-    modernV8Column.setBiomeId({.x = 2, .y = -63, .z = 6}, 9);
-    auto modernV8Payload = modernV8Column.networkEncodeNoCache(true);
-    if (modernV8Payload.size() < 3 || modernV8Payload[0] != 9 ||
-        modernV8Payload[2] != static_cast<uint8_t>(-4)) {
-        std::cerr << "[CHUNK-SMOKE] modern v9 fixture mismatch\n";
-        return 1;
-    }
-    modernV8Payload[0] = 8;
-    modernV8Payload.erase(modernV8Payload.begin() + 2);
+    // sections without an embedded Y byte. Prismarine-style decoding assigns
+    // those sections their zero-based packet index; only v9 carries signed Y.
+    auto modernV8Section = bedrock::BedrockSubChunk::createAir(0, 0);
+    modernV8Section.setSubChunkVersion(8);
+    modernV8Section.setBlockStateId(2, 1, 6, 321);
+    auto modernV8Payload = modernV8Section.encode(
+        bedrock::ChunkStorageType::Runtime
+    );
+    bedrock::BedrockChunkColumn modernV8Trailer(0, 0);
+    modernV8Trailer.setBounds(-4, 20);
+    const auto modernTrailerBytes = modernV8Trailer.networkEncodeNoCache(true);
+    modernV8Payload.insert(
+        modernV8Payload.end(),
+        modernTrailerBytes.begin(),
+        modernTrailerBytes.end()
+    );
     bedrock::BedrockChunkColumn decodedModernV8Column(0, 0);
     decodedModernV8Column.setBounds(-4, 20);
     decodedModernV8Column.networkDecodeNoCache(modernV8Payload, 1, true);
-    if (decodedModernV8Column.getSectionAtIndex(-4) == nullptr ||
-        decodedModernV8Column.getSectionAtIndex(0) != nullptr ||
+    if (decodedModernV8Column.getSectionAtIndex(0) == nullptr ||
+        decodedModernV8Column.getSectionAtIndex(-4) != nullptr ||
         decodedModernV8Column.getBlockStateId(
-            {.x = 2, .y = -63, .z = 6}
+            {.x = 2, .y = 1, .z = 6}
         ) != 321) {
         std::cerr << "[CHUNK-SMOKE] modern sequential v8 Y offset mismatch\n";
         return 1;
@@ -531,6 +678,26 @@ int main() {
     if (decodedSubChunkColumn.getBlockStateId({.x = 4, .y = -16, .z = 5}) != 123 ||
         decodedSubChunkColumn.blockEntityCount() != 1) {
         std::cerr << "[CHUNK-SMOKE] standalone subchunk decode mismatch\n";
+        return 1;
+    }
+
+    constexpr int32_t standaloneAirStateId = 9321;
+    bedrock::BedrockChunkColumn zeroSubChunkColumn(
+        0,
+        0,
+        standaloneAirStateId
+    );
+    zeroSubChunkColumn.setBounds(-4, 20);
+    zeroSubChunkColumn.networkDecodeSubChunkNoCache(
+        -2,
+        {9, 0, static_cast<uint8_t>(-2)}
+    );
+    if (zeroSubChunkColumn.getSectionAtIndex(-2) == nullptr ||
+        zeroSubChunkColumn.getSectionAtIndex(-2)->airStateId() !=
+            standaloneAirStateId ||
+        zeroSubChunkColumn.getBlockStateId({.x = 8, .y = -30, .z = 9}) !=
+            standaloneAirStateId) {
+        std::cerr << "[CHUNK-SMOKE] standalone zero subchunk custom air mismatch\n";
         return 1;
     }
 
@@ -621,6 +788,33 @@ int main() {
     }
 
     bedrock::BedrockBlobStore cachedStore;
+    constexpr uint64_t zeroSectionHash = 0x0102030405060708ull;
+    bedrock::BlobEntry zeroCachedSection;
+    zeroCachedSection.x = 0;
+    zeroCachedSection.y = -2;
+    zeroCachedSection.z = 0;
+    zeroCachedSection.type = bedrock::BlobType::ChunkSection;
+    zeroCachedSection.buffer = {8, 0};
+    cachedStore.set(zeroSectionHash, std::move(zeroCachedSection));
+    bedrock::BedrockChunkColumn zeroCachedColumn(0, 0, standaloneAirStateId);
+    zeroCachedColumn.setBounds(-4, 20);
+    const auto zeroCachedMisses = zeroCachedColumn.networkDecodeCached(
+        {zeroSectionHash},
+        cachedStore,
+        {}
+    );
+    if (!zeroCachedMisses.empty() ||
+        zeroCachedColumn.getSectionAtIndex(-2) == nullptr ||
+        zeroCachedColumn.getSectionAtIndex(-2)->airStateId() !=
+            standaloneAirStateId ||
+        zeroCachedColumn.getBlockStateId({.x = 15, .y = -17, .z = 15}) !=
+            standaloneAirStateId ||
+        zeroCachedColumn.getBlockStateId({.x = 0, .y = 0, .z = 0}) !=
+            standaloneAirStateId) {
+        std::cerr << "[CHUNK-SMOKE] cached zero subchunk custom air mismatch\n";
+        return 1;
+    }
+
     const uint64_t sectionHash = 0x1111222233334444ull;
     const uint64_t biomeHash = 0x5555666677778888ull;
     bedrock::BlobEntry cachedSection;

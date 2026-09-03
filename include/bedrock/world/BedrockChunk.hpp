@@ -178,7 +178,11 @@ private:
 
 class BedrockSubChunk {
 public:
-    explicit BedrockSubChunk(int8_t y = 0, uint8_t subChunkVersion = 9);
+    explicit BedrockSubChunk(
+        int8_t y = 0,
+        uint8_t subChunkVersion = 9,
+        int32_t airStateId = 0
+    );
 
     static BedrockSubChunk createAir(int8_t y = 0, int32_t airStateId = 0);
     static BedrockSubChunk decode(
@@ -211,6 +215,8 @@ public:
     void setY(int8_t y);
     uint8_t subChunkVersion() const;
     void setSubChunkVersion(uint8_t version);
+    int32_t airStateId() const;
+    void setAirStateId(int32_t airStateId);
 
     std::size_t layerCount() const;
     bool hasLayer(uint8_t layer) const;
@@ -358,18 +364,20 @@ public:
 
     static BedrockChunkColumn decodeNoCacheColumn(
         const BedrockLevelChunkPacket& packet,
-        bool useCavesAndCliffsBounds = true
+        bool useCavesAndCliffsBounds = true,
+        int32_t airStateId = 0
     );
 
     // Recovery-only path for modern servers that append a LevelChunk trailer
     // incompatible with the strict biome/border/block-entity decoder. This
     // accepts exactly packet.subChunkCount v8/v9 block sections. Sequential
-    // v8 sections are normalized from the modern minimum section Y (-4), while
-    // v9 sections retain their signed embedded Y. The remaining trailer is
+    // v8 sections use their zero-based packet index, matching Prismarine and
+    // IGN, while v9 sections retain their signed embedded Y. The trailer is
     // deliberately ignored. Prefer decodeNoCacheColumn() and invoke this only
     // after the strict decoder rejects the same no-cache packet.
     static BedrockChunkColumn decodeNoCacheBlockSectionsFallback(
-        const BedrockLevelChunkPacket& packet
+        const BedrockLevelChunkPacket& packet,
+        int32_t airStateId = 0
     );
 
     static BedrockLevelChunkPacket encodeNoCacheColumn(
@@ -387,7 +395,11 @@ public:
 
 class BedrockChunkColumn {
 public:
-    explicit BedrockChunkColumn(int32_t x = 0, int32_t z = 0);
+    explicit BedrockChunkColumn(
+        int32_t x = 0,
+        int32_t z = 0,
+        int32_t airStateId = 0
+    );
 
     void setBounds(int32_t minCY, int32_t maxCY);
 
@@ -398,6 +410,8 @@ public:
     int32_t minY() const;
     int32_t maxY() const;
     int32_t worldHeight() const;
+    int32_t airStateId() const;
+    void setAirStateId(int32_t airStateId);
 
     void initialize(
         const BedrockBlockRegistry& registry,
@@ -516,6 +530,7 @@ private:
     int32_t maxY_ = 256;
     int32_t worldHeight_ = 256;
     int32_t co_ = 0;
+    int32_t airStateId_ = 0;
     std::vector<std::optional<BedrockSubChunk>> sections_;
     std::vector<BedrockBiomeSection> biomes_;
     std::unordered_map<std::string, std::vector<uint8_t>> blockEntities_;

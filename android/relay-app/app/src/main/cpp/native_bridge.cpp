@@ -1364,6 +1364,21 @@ struct RelayState {
         schematicBlockAppearances.clear();
     }
 
+    int32_t actualAirRuntimeId() const {
+        std::lock_guard lock(blockRegistryMutex);
+        if (!blockRegistry.has_value()) return 0;
+        const auto* air = blockRegistry->blockByName("air");
+        if (air == nullptr) return 0;
+        if (!blockRuntimeIdsAreHashes) return air->defaultState;
+        const auto* state = blockRegistry->stateById(air->defaultState);
+        return state == nullptr
+            ? 0
+            : bedrock::BedrockBlockRegistry::computeRuntimeHash(
+                state->name,
+                state->properties
+            );
+    }
+
     void resetMiniMapWorld(int32_t dimension) noexcept {
         miniMapDimension.store(dimension, std::memory_order_relaxed);
         {
@@ -1797,10 +1812,16 @@ struct RelayState {
         uint64_t afterRevision,
         const std::vector<int32_t>& worldPositions
     ) const {
+        struct SchematicBlockSample {
+            bool known = false;
+            bool semanticAir = false;
+            int32_t runtimeId = 0;
+        };
+
         const auto positionCount = worldPositions.size() / 3;
         uint64_t revision = 0;
         int32_t dimension = 0;
-        std::vector<std::optional<int32_t>> runtimeIds;
+        std::vector<SchematicBlockSample> samples;
         {
             std::lock_guard lock(miniMapMutex);
             revision = schematicRevision;
@@ -1816,7 +1837,7 @@ struct RelayState {
                 };
             }
 
-            runtimeIds.reserve(positionCount);
+            samples.reserve(positionCount);
             for (std::size_t index = 0; index < positionCount; ++index) {
                 const int32_t x = worldPositions[index * 3];
                 const int32_t y = worldPositions[index * 3 + 1];
@@ -1824,7 +1845,9 @@ struct RelayState {
                 const SchematicBlockKey blockKey {dimension, x, y, z};
                 const auto overridden = schematicBlockOverrides.find(blockKey);
                 if (overridden != schematicBlockOverrides.end()) {
-                    runtimeIds.emplace_back(overridden->second.runtimeId);
+                    // UpdateBlock carries a real runtime ID. Even ID zero must
+                    // be classified through the active runtime registry.
+                    samples.push_back({true, false, overridden->second.runtimeId});
                     continue;
                 }
                 const auto cached = schematicColumns.find(MiniMapKey {
@@ -1834,7 +1857,7 @@ struct RelayState {
                 });
                 if (cached == schematicColumns.end() ||
                     !cached->second.column) {
-                    runtimeIds.emplace_back(std::nullopt);
+                    samples.emplace_back();
                     continue;
                 }
                 const auto& entry = cached->second;
@@ -1849,7 +1872,7 @@ struct RelayState {
                     (!entry.completeBlockColumn &&
                      entry.knownSections.find(sectionY) ==
                         entry.knownSections.end())) {
-                    runtimeIds.emplace_back(std::nullopt);
+                    samples.emplace_back();
                     continue;
                 }
                 bedrock::BlockPosition position;
@@ -1857,28 +1880,42 @@ struct RelayState {
                 position.y = storedY;
                 position.z = z;
                 position.layer = 0;
-                runtimeIds.emplace_back(
-                    entry.column->getBlockStateId(position)
-                );
+                const auto* section = entry.column->getSection(storedY);
+                // A fixed LevelChunk makes omitted in-range sections known
+                // air, while an explicit zero-storage section has no layer.
+                // Preserve that semantic fact instead of treating the
+                // BedrockChunk fallback value 0 as a real runtime ID.
+                const bool semanticAir = section == nullptr ||
+                    section->layerCount() == 0;
+                samples.push_back({
+                    true,
+                    semanticAir,
+                    semanticAir ? 0 : entry.column->getBlockStateId(position)
+                });
             }
         }
 
         std::vector<int32_t> result;
-        result.reserve(6 + runtimeIds.size() * 3);
+        result.reserve(6 + samples.size() * 3);
         result.push_back(0x43504553); // CPES
         result.push_back(2);
         result.push_back(static_cast<int32_t>(revision & 0xffffffffu));
         result.push_back(static_cast<int32_t>(revision >> 32u));
         result.push_back(dimension);
-        result.push_back(static_cast<int32_t>(runtimeIds.size()));
+        result.push_back(static_cast<int32_t>(samples.size()));
         std::lock_guard registryLock(blockRegistryMutex);
-        for (const auto runtimeId : runtimeIds) {
-            if (!runtimeId.has_value()) {
+        for (const auto& sample : samples) {
+            if (!sample.known) {
                 result.insert(result.end(), {0, 0, 0});
                 continue;
             }
+            if (sample.semanticAir) {
+                result.insert(result.end(), {1, 0, 0});
+                continue;
+            }
+            const int32_t runtimeId = sample.runtimeId;
             const auto cachedAppearance = schematicBlockAppearances.find(
-                *runtimeId
+                runtimeId
             );
             if (cachedAppearance != schematicBlockAppearances.end()) {
                 result.push_back(cachedAppearance->second.presence);
@@ -1888,10 +1925,10 @@ struct RelayState {
             }
             SchematicBlockAppearance appearance;
             const auto* state = blockRegistry.has_value()
-                ? blockRegistry->stateByRuntimeId(*runtimeId)
+                ? blockRegistry->stateByRuntimeId(runtimeId)
                 : nullptr;
             if (state == nullptr) {
-                appearance.presence = *runtimeId == 0 ? 1 : 0;
+                appearance.presence = runtimeId == 0 ? 1 : 0;
             } else {
                 const auto name = normalizedBaseBlockName(state->name);
                 if (name.empty()) {
@@ -1909,7 +1946,7 @@ struct RelayState {
                     );
                 }
             }
-            schematicBlockAppearances.emplace(*runtimeId, appearance);
+            schematicBlockAppearances.emplace(runtimeId, appearance);
             result.push_back(appearance.presence);
             result.push_back(appearance.nameHash);
             result.push_back(appearance.stateHash);
@@ -2102,7 +2139,9 @@ struct RelayState {
                             break;
                         }
                         const auto* section = column.getSectionAtIndex(sectionY);
-                        if (section == nullptr) continue;
+                        if (section == nullptr || section->layerCount() == 0) {
+                            continue;
+                        }
                         for (int32_t localY = 15;
                              localY >= 0 && (!surfaceFound || !groundFound);
                              --localY) {
@@ -2359,6 +2398,7 @@ struct RelayState {
                 job.payload,
                 job.version
             );
+        const int32_t airRuntimeId = actualAirRuntimeId();
         const auto camera = entityPositions.cameraSnapshot();
         const int32_t cameraChunkX = camera.known
             ? static_cast<int32_t>(std::floor(camera.x / 16.0f))
@@ -2380,7 +2420,7 @@ struct RelayState {
                     bedrock::BedrockSubChunkResult::SuccessAllAir) {
                 decodedSection = bedrock::BedrockSubChunk::createAir(
                     static_cast<int8_t>(sectionY),
-                    0
+                    airRuntimeId
                 );
             } else if (sectionY >= std::numeric_limits<int8_t>::min() &&
                        sectionY <= std::numeric_limits<int8_t>::max() &&
@@ -2389,7 +2429,8 @@ struct RelayState {
                        !entry.payload.empty()) {
                 decodedSection = bedrock::BedrockSubChunk::decode(
                     bedrock::ChunkStorageType::Runtime,
-                    entry.payload
+                    entry.payload,
+                    airRuntimeId
                 );
                 decodedSection->setY(static_cast<int8_t>(sectionY));
             }
@@ -2459,7 +2500,8 @@ struct RelayState {
             } else {
                 column = std::make_shared<bedrock::BedrockChunkColumn>(
                     chunkX,
-                    chunkZ
+                    chunkZ,
+                    airRuntimeId
                 );
                 column->setBounds(-4, 20);
             }
@@ -2611,12 +2653,14 @@ struct RelayState {
                     invalidateFailedMiniMapJob(job);
                     continue;
                 }
+                const int32_t airRuntimeId = actualAirRuntimeId();
                 std::shared_ptr<bedrock::BedrockChunkColumn> column;
                 try {
                     column = std::make_shared<bedrock::BedrockChunkColumn>(
                         bedrock::BedrockLevelChunkCodec::decodeNoCacheColumn(
                             packet,
-                            versionAtLeast(job.version, 1, 18, 0)
+                            versionAtLeast(job.version, 1, 18, 0),
+                            airRuntimeId
                         )
                     );
                 } catch (const std::exception& strictError) {
@@ -2627,7 +2671,10 @@ struct RelayState {
                     try {
                         column = std::make_shared<bedrock::BedrockChunkColumn>(
                             bedrock::BedrockLevelChunkCodec::
-                                decodeNoCacheBlockSectionsFallback(packet)
+                                decodeNoCacheBlockSectionsFallback(
+                                    packet,
+                                    airRuntimeId
+                                )
                         );
                     } catch (const std::exception& fallbackError) {
                         throw bedrock::BedrockChunkError(
@@ -2818,7 +2865,9 @@ struct RelayState {
                     return fallback;
                 }
                 const auto* section = column.getSectionAtIndex(sectionY);
-                if (section == nullptr) continue;
+                if (section == nullptr || section->layerCount() == 0) {
+                    continue;
+                }
                 for (int32_t localY = 15; localY >= 0; --localY) {
                     const auto runtimeId = section->getBlockStateId(
                         static_cast<uint8_t>(localX),

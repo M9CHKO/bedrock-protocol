@@ -6,8 +6,8 @@ Standalone Android 8+ relay app (no Termux), including a directly
 installable arm64 APK: [Android relay app](android/relay-app/README.md).
 
 Current Android build:
-[CPE Relay 1.2.4](android/relay-app/apk/CPE-Relay-v1.2.4-arm64-v8a-release-debug-signed.apk)
-([SHA-256](android/relay-app/apk/CPE-Relay-v1.2.4-arm64-v8a-release-debug-signed.apk.sha256)).
+[CPE Relay 1.2.5](android/relay-app/apk/CPE-Relay-v1.2.5-arm64-v8a-release-debug-signed.apk)
+([SHA-256](android/relay-app/apk/CPE-Relay-v1.2.5-arm64-v8a-release-debug-signed.apk.sha256)).
 The Android frontend transparently carries server-required resource packs and
 adds an optional packet-derived HUD: entity projection, retained-chunk status,
 equipment and durability, mini-map, threat analysis, auto-equipment, and a

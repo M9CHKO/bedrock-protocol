@@ -123,13 +123,17 @@ std::pair<uint32_t, uint8_t> PalettedStorage::storageIndex(
     };
 }
 
-BedrockSubChunk::BedrockSubChunk(int8_t y, uint8_t subChunkVersion)
+BedrockSubChunk::BedrockSubChunk(
+    int8_t y,
+    uint8_t subChunkVersion,
+    int32_t airStateId
+)
     : y_(y),
-      subChunkVersion_(subChunkVersion) {}
+      subChunkVersion_(subChunkVersion),
+      airStateId_(airStateId) {}
 
 BedrockSubChunk BedrockSubChunk::createAir(int8_t y, int32_t airStateId) {
-    BedrockSubChunk out(y, 9);
-    out.airStateId_ = airStateId;
+    BedrockSubChunk out(y, 9, airStateId);
     out.ensureLayer(0);
     out.palettes_[0].clear();
     out.blocks_[0] = PalettedStorage(1);
@@ -144,7 +148,7 @@ BedrockSubChunk BedrockSubChunk::decode(
     BedrockBlockStateResolver resolver
 ) {
     BinaryStream stream(data);
-    BedrockSubChunk sub;
+    BedrockSubChunk sub(0, 9, airStateId);
     sub.decodeFrom(format, stream, airStateId, std::move(resolver));
     return sub;
 }
@@ -187,8 +191,15 @@ void BedrockSubChunk::decodeFrom(
             throw BedrockChunkError("unsupported sub chunk version: " + std::to_string(subChunkVersion_));
     }
 
-    if (storageCount == 0 || storageCount > 2) {
-        throw BedrockChunkError("expected storage count 1 or 2, got " + std::to_string(storageCount));
+    // Modern Bedrock servers may encode an all-air section with no paletted
+    // storages at all. This is especially common in IGN LevelChunk payloads.
+    // Keep the section object (and its Y) so the following section remains
+    // aligned, while block lookups naturally resolve to airStateId_.
+    if (storageCount > 2) {
+        throw BedrockChunkError(
+            "expected storage count 0, 1 or 2, got " +
+            std::to_string(storageCount)
+        );
     }
 
     for (uint8_t layer = 0; layer < storageCount; ++layer) {
@@ -236,6 +247,22 @@ uint8_t BedrockSubChunk::subChunkVersion() const {
 
 void BedrockSubChunk::setSubChunkVersion(uint8_t version) {
     subChunkVersion_ = version;
+}
+
+int32_t BedrockSubChunk::airStateId() const {
+    return airStateId_;
+}
+
+void BedrockSubChunk::setAirStateId(int32_t airStateId) {
+    if (airStateId == airStateId_) {
+        return;
+    }
+    if (!blocks_.empty() || !palettes_.empty()) {
+        throw BedrockChunkError(
+            "cannot change subchunk air state after block storage materialization"
+        );
+    }
+    airStateId_ = airStateId;
 }
 
 std::size_t BedrockSubChunk::layerCount() const {
@@ -918,13 +945,14 @@ std::vector<uint8_t> BedrockLevelChunkCodec::encodePacketPayload(
 
 BedrockChunkColumn BedrockLevelChunkCodec::decodeNoCacheColumn(
     const BedrockLevelChunkPacket& packet,
-    bool useCavesAndCliffsBounds
+    bool useCavesAndCliffsBounds,
+    int32_t airStateId
 ) {
     if (packet.cacheEnabled) {
         throw BedrockChunkError("decodeNoCacheColumn requires cacheEnabled=false");
     }
 
-    BedrockChunkColumn column(packet.x, packet.z);
+    BedrockChunkColumn column(packet.x, packet.z, airStateId);
     if (useCavesAndCliffsBounds) {
         column.setBounds(-4, 20);
     }
@@ -937,7 +965,8 @@ BedrockChunkColumn BedrockLevelChunkCodec::decodeNoCacheColumn(
 }
 
 BedrockChunkColumn BedrockLevelChunkCodec::decodeNoCacheBlockSectionsFallback(
-    const BedrockLevelChunkPacket& packet
+    const BedrockLevelChunkPacket& packet,
+    int32_t airStateId
 ) {
     if (packet.cacheEnabled) {
         throw BedrockChunkError(
@@ -954,13 +983,15 @@ BedrockChunkColumn BedrockLevelChunkCodec::decodeNoCacheBlockSectionsFallback(
         );
     }
 
-    BedrockChunkColumn column(packet.x, packet.z);
+    BedrockChunkColumn column(packet.x, packet.z, airStateId);
     column.setBounds(minSectionY, maxSectionY);
     BinaryStream stream = BinaryStream::view(packet.payload);
     std::array<bool, static_cast<std::size_t>(sectionCapacity)> seenSections {};
 
     for (int32_t i = 0; i < packet.subChunkCount; ++i) {
-        if (stream.remaining() < 3) {
+        // A zero-storage v8 section is exactly two bytes (version + count).
+        // v9 needs a third Y byte, which decodeFrom validates below.
+        if (stream.remaining() < 2) {
             throw BedrockChunkError(
                 "truncated v8/v9 block section at index " + std::to_string(i)
             );
@@ -975,13 +1006,24 @@ BedrockChunkColumn BedrockLevelChunkCodec::decodeNoCacheBlockSectionsFallback(
                 std::to_string(i) + " has version " + std::to_string(version)
             );
         }
+        const std::size_t requiredHeaderBytes = version == 9 ? 3u : 2u;
+        if (stream.remaining() < requiredHeaderBytes) {
+            throw BedrockChunkError(
+                "truncated v8/v9 block section header at index " +
+                std::to_string(i)
+            );
+        }
 
-        // v8 has no Y byte, so seed it with the modern sequential position.
+        // v8 has no Y byte, so seed it with the zero-based packet index.
         // v9 replaces the seed while decoding with its signed embedded Y.
-        const int32_t sequentialY = minSectionY + i;
-        BedrockSubChunk section(static_cast<int8_t>(sequentialY), version);
+        const int32_t sequentialY = i;
+        BedrockSubChunk section(
+            static_cast<int8_t>(sequentialY),
+            version,
+            airStateId
+        );
         try {
-            section.decodeFrom(ChunkStorageType::Runtime, stream);
+            section.decodeFrom(ChunkStorageType::Runtime, stream, airStateId);
         } catch (const std::exception& error) {
             throw BedrockChunkError(
                 "invalid v8/v9 block section at index " + std::to_string(i) +
@@ -1077,9 +1119,14 @@ std::vector<uint8_t> BedrockLevelChunkCodec::encodeClientCacheBlobStatusPayload(
     return stream.buffer();
 }
 
-BedrockChunkColumn::BedrockChunkColumn(int32_t x, int32_t z)
+BedrockChunkColumn::BedrockChunkColumn(
+    int32_t x,
+    int32_t z,
+    int32_t airStateId
+)
     : x_(x),
-      z_(z) {
+      z_(z),
+      airStateId_(airStateId) {
     setBounds(0, 16);
 }
 
@@ -1109,6 +1156,26 @@ int32_t BedrockChunkColumn::maxCY() const { return maxCY_; }
 int32_t BedrockChunkColumn::minY() const { return minY_; }
 int32_t BedrockChunkColumn::maxY() const { return maxY_; }
 int32_t BedrockChunkColumn::worldHeight() const { return worldHeight_; }
+int32_t BedrockChunkColumn::airStateId() const { return airStateId_; }
+
+void BedrockChunkColumn::setAirStateId(int32_t airStateId) {
+    if (airStateId == airStateId_) {
+        return;
+    }
+    for (const auto& section : sections_) {
+        if (section.has_value() && section->layerCount() != 0) {
+            throw BedrockChunkError(
+                "cannot change chunk air state after block storage materialization"
+            );
+        }
+    }
+    for (auto& section : sections_) {
+        if (section.has_value()) {
+            section->setAirStateId(airStateId);
+        }
+    }
+    airStateId_ = airStateId;
+}
 
 void BedrockChunkColumn::initialize(
     const BedrockBlockRegistry& registry,
@@ -1117,6 +1184,11 @@ void BedrockChunkColumn::initialize(
     if (!initializer) {
         throw BedrockChunkError("chunk initializer must not be empty");
     }
+    const auto* air = registry.blockByName("air");
+    if (air == nullptr) {
+        throw BedrockChunkError("Bedrock block registry does not contain air");
+    }
+    setAirStateId(air->defaultState);
     for (int32_t y = minY_; y < maxY_; ++y) {
         for (int32_t z = 0; z < 16; ++z) {
             for (int32_t x = 0; x < 16; ++x) {
@@ -1170,7 +1242,10 @@ BedrockSubChunk& BedrockChunkColumn::ensureSection(int32_t blockY) {
         throw BedrockChunkError("block Y outside chunk bounds");
     }
     if (!sections_[index].has_value()) {
-        sections_[index] = BedrockSubChunk(static_cast<int8_t>(sectionY), 9);
+        sections_[index] = BedrockSubChunk::createAir(
+            static_cast<int8_t>(sectionY),
+            airStateId_
+        );
     }
     return sections_[index].value();
 }
@@ -1180,7 +1255,10 @@ BedrockSubChunk& BedrockChunkColumn::newSection(int32_t sectionY) {
     if (index < 0 || static_cast<std::size_t>(index) >= sections_.size()) {
         throw BedrockChunkError("section Y outside chunk bounds");
     }
-    sections_[index] = BedrockSubChunk(static_cast<int8_t>(sectionY), 9);
+    sections_[index] = BedrockSubChunk::createAir(
+        static_cast<int8_t>(sectionY),
+        airStateId_
+    );
     return sections_[index].value();
 }
 
@@ -1189,6 +1267,9 @@ void BedrockChunkColumn::setSection(int32_t sectionY, BedrockSubChunk section) {
     if (index < 0 || static_cast<std::size_t>(index) >= sections_.size()) {
         throw BedrockChunkError("section Y outside chunk bounds");
     }
+    if (section.layerCount() == 0) {
+        section.setAirStateId(airStateId_);
+    }
     section.setY(static_cast<int8_t>(sectionY));
     sections_[index] = std::move(section);
 }
@@ -1196,7 +1277,7 @@ void BedrockChunkColumn::setSection(int32_t sectionY, BedrockSubChunk section) {
 int32_t BedrockChunkColumn::getBlockStateId(const BlockPosition& pos) const {
     const auto* section = getSection(pos.y);
     if (!section) {
-        return 0;
+        return airStateId_;
     }
     const uint8_t layer = pos.layer.value_or(0);
     return section->getBlockStateId(layer, localCoord(pos.x), localCoord(pos.y), localCoord(pos.z));
@@ -1697,17 +1778,20 @@ void BedrockChunkColumn::networkDecodeNoCache(
         sections_.clear();
         sections_.resize(static_cast<std::size_t>(maxCY_ - minCY_));
         for (int32_t i = 0; i < sectionCount; ++i) {
-            // v8 (and the old v1 alias) does not carry a section Y byte. In a
-            // caves-and-cliffs column its first sequential section starts at
-            // minCY (-4), not at zero. v9 overwrites this seed with its signed
-            // embedded Y, so the same initialization is correct for both.
-            const int32_t sequentialY = minCY_ + i;
+            // v8 (and the old v1 alias) does not carry a section Y byte. IGN
+            // and Prismarine assign it the zero-based packet index. v9
+            // overwrites this seed with its signed embedded Y.
+            const int32_t sequentialY = i;
             if (sequentialY < std::numeric_limits<int8_t>::min() ||
                 sequentialY > std::numeric_limits<int8_t>::max()) {
                 throw BedrockChunkError("sequential subchunk Y is out of range");
             }
-            BedrockSubChunk section(static_cast<int8_t>(sequentialY), 9);
-            section.decodeFrom(ChunkStorageType::Runtime, stream);
+            BedrockSubChunk section(
+                static_cast<int8_t>(sequentialY),
+                9,
+                airStateId_
+            );
+            section.decodeFrom(ChunkStorageType::Runtime, stream, airStateId_);
             setSection(section.y(), section);
         }
     }
@@ -1764,8 +1848,8 @@ void BedrockChunkColumn::networkDecodeSubChunkNoCache(
     const std::vector<uint8_t>& payload
 ) {
     BinaryStream stream(payload);
-    BedrockSubChunk section(static_cast<int8_t>(sectionY), 9);
-    section.decodeFrom(ChunkStorageType::Runtime, stream);
+    BedrockSubChunk section(static_cast<int8_t>(sectionY), 9, airStateId_);
+    section.decodeFrom(ChunkStorageType::Runtime, stream, airStateId_);
     const int32_t decodedY = section.y();
     setSection(decodedY, std::move(section));
     decodeBlockEntities(stream, BedrockNbtEncoding::LittleVarInt);
@@ -1957,11 +2041,15 @@ std::vector<uint64_t> BedrockChunkColumn::networkDecodeCached(
             }
         } else if (entry->type == BlobType::ChunkSection) {
             BinaryStream stream(entry->buffer);
-            BedrockSubChunk section(static_cast<int8_t>(entry->y), 8);
+            BedrockSubChunk section(
+                static_cast<int8_t>(entry->y),
+                8,
+                airStateId_
+            );
             section.decodeFrom(
                 ChunkStorageType::NetworkPersistence,
                 stream,
-                0,
+                airStateId_,
                 resolver
             );
             if (!stream.eof()) {
