@@ -4551,6 +4551,15 @@ struct SchematicDebugMarker {
 // by server scripts. The ASCII prefix "CPE" makes accidental overlap with a
 // destination server's debug drawer registry practically impossible.
 constexpr uint64_t SchematicDebugNetworkIdBase = 0x4350450000000000ULL;
+// Keep each clientbound operation comfortably bounded for RakNet queueing and
+// as a defence-in-depth limit against oversized schematic allocations, while
+// retaining stable keyed IDs across every batch.
+constexpr std::size_t SchematicDebugShapesPerPacket = 64;
+
+std::size_t schematicDebugBatchCount(std::size_t shapeCount) noexcept {
+    return shapeCount / SchematicDebugShapesPerPacket +
+        (shapeCount % SchematicDebugShapesPerPacket != 0 ? 1u : 0u);
+}
 
 bool supportsSchematicScriptDebugDrawer(std::string_view version) noexcept {
     // ServerScriptDebugDrawer was added in protocol 818 (Bedrock 1.21.90).
@@ -4632,18 +4641,29 @@ bedrock::VersionedGamePacket makeSchematicScriptDebugDrawerPacket(
     const bedrock::ProtoDefPacketEncoder& encoder,
     const bedrock::VersionedPacketCodec& packetCodec,
     const std::vector<SchematicDebugMarker>& markers,
-    int opacityPercent
+    int opacityPercent,
+    std::size_t markerOffset,
+    std::size_t markerCount
 ) {
+    if (markerOffset > markers.size() ||
+        markerCount > markers.size() - markerOffset ||
+        markerCount > SchematicDebugShapesPerPacket) {
+        throw std::out_of_range("invalid schematic debug marker batch");
+    }
     std::vector<bedrock::ProtoDefValue> shapes;
-    shapes.reserve(markers.size());
-    uint64_t networkId = SchematicDebugNetworkIdBase;
-    for (const auto& marker : markers) {
+    shapes.reserve(markerCount);
+    for (std::size_t index = markerOffset;
+         index < markerOffset + markerCount;
+         ++index) {
+        const auto& marker = markers[index];
         // A DebugBox is centred at Location; a one-block bound therefore
         // aligns exactly with the server block cell without creating a block
         // or client collision. All unused option fields must still be present
         // as null so the generated protocol codec emits their presence flags.
         shapes.push_back(bedrock::ProtoDefValue::object({
-            {"network_id", bedrock::ProtoDefValue::uinteger(networkId++)},
+            {"network_id", bedrock::ProtoDefValue::uinteger(
+                SchematicDebugNetworkIdBase + index
+            )},
             {"shape_type", bedrock::ProtoDefValue::string("box")},
             {"location", schematicDebugVec3(
                 marker.x + 0.5,
@@ -4680,8 +4700,12 @@ bedrock::VersionedGamePacket makeSchematicScriptDebugDrawerPacket(
 bedrock::VersionedGamePacket makeSchematicScriptDebugRemovalPacket(
     const bedrock::ProtoDefPacketEncoder& encoder,
     const bedrock::VersionedPacketCodec& packetCodec,
+    std::size_t markerOffset,
     std::size_t markerCount
 ) {
+    if (markerCount > SchematicDebugShapesPerPacket) {
+        throw std::out_of_range("invalid schematic debug removal batch");
+    }
     std::vector<bedrock::ProtoDefValue> removals;
     removals.reserve(markerCount);
     for (std::size_t index = 0; index < markerCount; ++index) {
@@ -4690,7 +4714,7 @@ bedrock::VersionedGamePacket makeSchematicScriptDebugRemovalPacket(
         // retail client rather than a registry-wide clear.
         removals.push_back(bedrock::ProtoDefValue::object({
             {"network_id", bedrock::ProtoDefValue::uinteger(
-                SchematicDebugNetworkIdBase + index
+                SchematicDebugNetworkIdBase + markerOffset + index
             )},
             {"shape_type", bedrock::ProtoDefValue::null()},
             {"location", bedrock::ProtoDefValue::null()},
@@ -4718,20 +4742,31 @@ bedrock::VersionedGamePacket makeSchematicScriptDebugRemovalPacket(
     );
 }
 
-bedrock::VersionedGamePacket makeSchematicDebugClearPacket(
+std::vector<bedrock::VersionedGamePacket> makeSchematicDebugClearPackets(
     const std::string& version,
     std::size_t markerCount
 ) {
     bedrock::ProtoDefPacketEncoder encoder(version);
     const auto codec = bedrock::VersionedMcpeCodec::forVersion(version);
     if (supportsSchematicScriptDebugDrawer(version)) {
-        return makeSchematicScriptDebugRemovalPacket(
-            encoder,
-            codec.packetCodec(),
-            markerCount
-        );
+        std::vector<bedrock::VersionedGamePacket> packets;
+        packets.reserve(schematicDebugBatchCount(markerCount));
+        for (std::size_t offset = 0; offset < markerCount;
+             offset += SchematicDebugShapesPerPacket) {
+            const auto count = std::min(
+                SchematicDebugShapesPerPacket,
+                markerCount - offset
+            );
+            packets.push_back(makeSchematicScriptDebugRemovalPacket(
+                encoder,
+                codec.packetCodec(),
+                offset,
+                count
+            ));
+        }
+        return packets;
     }
-    return makeLegacySchematicDebugClearPacket(encoder, codec.packetCodec());
+    return {makeLegacySchematicDebugClearPacket(encoder, codec.packetCodec())};
 }
 
 class RelayController {
@@ -5165,12 +5200,15 @@ public:
             state->enqueueMiniMapChunk(version, event.packet);
             if (event.packet.name == "start_game" ||
                 event.packet.name == "change_dimension") {
-                if (auto clear = takeSchematicLifecycleClear(version);
-                    clear.has_value()) {
-                    event.replace(std::vector<bedrock::VersionedGamePacket> {
-                        event.packet,
-                        std::move(*clear)
-                    });
+                if (auto clearPackets = takeSchematicLifecycleClear(version);
+                    clearPackets.has_value()) {
+                    std::vector<bedrock::VersionedGamePacket> replacement;
+                    replacement.reserve(clearPackets->size() + 1u);
+                    replacement.push_back(event.packet);
+                    for (auto& clearPacket : *clearPackets) {
+                        replacement.push_back(std::move(clearPacket));
+                    }
+                    event.replace(std::move(replacement));
                 }
             }
             if (isResourcePackTransportPacket(event.packet.name)) {
@@ -5721,22 +5759,51 @@ public:
             std::string_view backend;
             if (supportsSchematicScriptDebugDrawer(state_->version)) {
                 // Shape records are keyed operations. Remove the previous
-                // relay-owned IDs in one packet, then publish the replacement
-                // set in one packet. This avoids both stale tail markers and
-                // the old one-RakNet-packet-per-cube flood.
-                if (previousMarkerCount != 0) {
+                // relay-owned IDs, then publish the replacement set. Arrays
+                // are capped so a large schematic cannot exhaust the Android
+                // process while ProtoDef builds its nested container values.
+                // This remains dozens of batches, not the legacy packet per
+                // cube flood.
+                packets.reserve(
+                    schematicDebugBatchCount(previousMarkerCount) +
+                    schematicDebugBatchCount(markers.size())
+                );
+                for (std::size_t offset = 0; offset < previousMarkerCount;
+                     offset += SchematicDebugShapesPerPacket) {
+                    const auto count = std::min(
+                        SchematicDebugShapesPerPacket,
+                        previousMarkerCount - offset
+                    );
                     packets.push_back(makeSchematicScriptDebugRemovalPacket(
                         debugEncoder,
                         debugCodec.packetCodec(),
-                        previousMarkerCount
+                        offset,
+                        count
                     ));
                 }
-                if (!markers.empty() || packets.empty()) {
+                for (std::size_t offset = 0; offset < markers.size();
+                     offset += SchematicDebugShapesPerPacket) {
+                    const auto count = std::min(
+                        SchematicDebugShapesPerPacket,
+                        markers.size() - offset
+                    );
                     packets.push_back(makeSchematicScriptDebugDrawerPacket(
                         debugEncoder,
                         debugCodec.packetCodec(),
                         markers,
-                        opacityPercent
+                        opacityPercent,
+                        offset,
+                        count
+                    ));
+                }
+                if (packets.empty()) {
+                    packets.push_back(makeSchematicScriptDebugDrawerPacket(
+                        debugEncoder,
+                        debugCodec.packetCodec(),
+                        markers,
+                        opacityPercent,
+                        0,
+                        0
                     ));
                 }
                 backend = "server_script_debug_drawer";
@@ -5797,13 +5864,16 @@ public:
                     activeSchematicOpacity_ = 0;
                     ++schematicMarkerGeneration_;
                 }
-                const auto clear = makeSchematicDebugClearPacket(
+                auto clearPackets = makeSchematicDebugClearPackets(
                     state_->version,
                     displayedMarkers
                 );
                 std::lock_guard relayLock(relayMutex_);
-                if (relay_) {
-                    relay_->live().queueClientboundPackets(downstream, {clear});
+                if (relay_ && !clearPackets.empty()) {
+                    relay_->live().queueClientboundPackets(
+                        downstream,
+                        clearPackets
+                    );
                 }
                 return false;
             }
@@ -5865,23 +5935,24 @@ public:
                 activeSchematicOpacity_ = 0;
             }
             if (!downstream.has_value()) return;
-            const auto clear = makeSchematicDebugClearPacket(
+            auto clearPackets = makeSchematicDebugClearPackets(
                 state_->version,
                 markerCount
             );
+            if (clearPackets.empty()) return;
             bool queued = false;
             {
                 std::lock_guard relayLock(relayMutex_);
                 if (relay_) {
                     queued = relay_->live().queueClientboundPackets(
                         *downstream,
-                        {clear}
+                        clearPackets
                     );
                 }
             }
             if (queued) {
                 state_->schematicMarkerPackets.fetch_add(
-                    1,
+                    clearPackets.size(),
                     std::memory_order_relaxed
                 );
             }
@@ -5966,7 +6037,7 @@ private:
         resetSchematicCounters();
     }
 
-    std::optional<bedrock::VersionedGamePacket>
+    std::optional<std::vector<bedrock::VersionedGamePacket>>
     takeSchematicLifecycleClear(const std::string& version) noexcept {
         try {
             std::lock_guard lock(schematicMarkerMutex_);
@@ -5980,7 +6051,7 @@ private:
             state_->schematicMissingBlocks.store(0, std::memory_order_relaxed);
             state_->schematicWrongBlocks.store(0, std::memory_order_relaxed);
             state_->schematicUnknownBlocks.store(0, std::memory_order_relaxed);
-            return makeSchematicDebugClearPacket(version, markerCount);
+            return makeSchematicDebugClearPackets(version, markerCount);
         } catch (...) {
             return std::nullopt;
         }

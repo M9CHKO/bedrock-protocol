@@ -212,6 +212,27 @@ bool checkPrimitiveStructure() {
             std::cerr << "[FAIL] ordinary scalar compareTo decode\n";
             ok = false;
         }
+
+        // Array item switches resolve against a field on the containing
+        // packet via "../". This must remain correct without embedding a
+        // deep copy of the packet (and its array) into every item.
+        const std::string parentSwitchType =
+            R"(["container",[{"name":"action","type":"u8"},{"name":"entries","type":["array",{"countType":"u8","type":["container",[{"name":"value","type":["switch",{"compareTo":"../action","fields":{"1":"u8","2":"u16"}}]}]]}]}]])";
+        const auto parentSwitchBytes = encodePrimitive(
+            parentSwitchType,
+            Value::object({
+                {"action", Value::uinteger(2)},
+                {"entries", Value::array({
+                    Value::object({{"value", Value::uinteger(0x1234)}}),
+                    Value::object({{"value", Value::uinteger(0x5678)}})
+                })}
+            })
+        );
+        ok = sameBytes(
+            "array item parent compareTo",
+            parentSwitchBytes,
+            {0x02, 0x02, 0x12, 0x34, 0x56, 0x78}
+        ) && ok;
     } catch (const std::exception& error) {
         std::cerr << "[FAIL] primitive structured decode: " << error.what() << "\n";
         ok = false;
@@ -489,6 +510,6 @@ int main() {
     ok = checkBufferAndRelayReconstruction() && ok;
     ok = checkItemStructuralMarkers() && ok;
     if (!ok) return 1;
-    std::cout << "[PROTODEF-STRUCTURED] counts, bitflags, binary fields, options, arrays, and relay reconstruction ok\n";
+    std::cout << "[PROTODEF-STRUCTURED] counts, parent paths, bitflags, binary fields, options, arrays, and relay reconstruction ok\n";
     return 0;
 }

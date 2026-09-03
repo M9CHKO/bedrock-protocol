@@ -32,6 +32,13 @@ struct ProtoDefValue {
     std::unordered_map<std::string, ProtoDefValue> objectValue;
     std::vector<ProtoDefValue> arrayValue;
 
+    // Encoder-only navigation link used while a structured value is being
+    // encoded. ProtoDef compareTo paths such as "../action" need access to
+    // the containing object. Keeping that relationship as a non-owning link
+    // avoids recursively copying the complete parent (which may itself own a
+    // large array) into every array item.
+    const ProtoDefValue* parentValue = nullptr;
+
     static ProtoDefValue null() {
         return {};
     }
@@ -93,6 +100,9 @@ struct ProtoDefValue {
     }
 
     const ProtoDefValue* get(const std::string& key) const {
+        if (key == ".." && parentValue) {
+            return parentValue;
+        }
         auto it = objectValue.find(key);
         if (it == objectValue.end()) {
             return nullptr;

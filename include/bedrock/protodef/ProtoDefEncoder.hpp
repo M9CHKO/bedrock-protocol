@@ -1217,21 +1217,20 @@ private:
     }
 
     static ProtoDefValue withParent(const ProtoDefValue& value, const ProtoDefValue& parent) {
-        if (value.kind == ProtoDefValue::Kind::Object) {
-            ProtoDefValue copy = value;
-            copy.objectValue[".."] = parent;
-            return copy;
-        }
+        ProtoDefValue copy = value;
+        attachParent(copy, parent);
+        return copy;
+    }
 
-        if (value.kind == ProtoDefValue::Kind::Array) {
-            ProtoDefValue copy = value;
-            for (auto& item : copy.arrayValue) {
-                item = withParent(item, parent);
-            }
-            return copy;
+    static void attachParent(
+        ProtoDefValue& value,
+        const ProtoDefValue& parent
+    ) {
+        value.parentValue = &parent;
+        if (value.kind != ProtoDefValue::Kind::Array) return;
+        for (auto& item : value.arrayValue) {
+            attachParent(item, parent);
         }
-
-        return value;
     }
 
     static std::optional<std::string> resolveCompareValue(

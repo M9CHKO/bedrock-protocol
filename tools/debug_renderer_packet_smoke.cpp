@@ -21,6 +21,8 @@ constexpr uint32_t kPacketId = 0xa4;
 constexpr const char* kScriptDrawerPacketName = "server_script_debug_drawer";
 constexpr uint32_t kScriptDrawerPacketId = 0x148;
 constexpr uint64_t kScriptDrawerNetworkId = 0x4350450000000000ULL;
+constexpr std::size_t kScriptDrawerBatchSize = 64;
+constexpr std::size_t kLargeSchematicShapeCount = 1'290;
 
 using Value = bedrock::ProtoDefValue;
 
@@ -134,9 +136,11 @@ Value addCubeValue() {
     });
 }
 
-Value scriptDrawerShapeValue() {
+Value scriptDrawerShapeValue(
+    uint64_t networkId = kScriptDrawerNetworkId
+) {
     return Value::object({
-        {"network_id", Value::uinteger(kScriptDrawerNetworkId)},
+        {"network_id", Value::uinteger(networkId)},
         {"shape_type", Value::string("box")},
         {"location", Value::object({
             {"x", Value::floating(1.5)},
@@ -170,23 +174,50 @@ Value scriptDrawerValue(bool withShape) {
     });
 }
 
+Value scriptDrawerRemovalShapeValue(uint64_t networkId) {
+    return Value::object({
+        {"network_id", Value::uinteger(networkId)},
+        {"shape_type", Value::null()},
+        {"location", Value::null()},
+        {"scale", Value::null()},
+        {"rotation", Value::null()},
+        {"time_left", Value::null()},
+        {"color", Value::null()},
+        {"text", Value::null()},
+        {"box_bound", Value::null()},
+        {"line_end_location", Value::null()},
+        {"arrow_head_length", Value::null()},
+        {"arrow_head_radius", Value::null()},
+        {"segment_count", Value::null()}
+    });
+}
+
 Value scriptDrawerRemovalValue() {
     return Value::object({
-        {"shapes", Value::array({Value::object({
-            {"network_id", Value::uinteger(kScriptDrawerNetworkId)},
-            {"shape_type", Value::null()},
-            {"location", Value::null()},
-            {"scale", Value::null()},
-            {"rotation", Value::null()},
-            {"time_left", Value::null()},
-            {"color", Value::null()},
-            {"text", Value::null()},
-            {"box_bound", Value::null()},
-            {"line_end_location", Value::null()},
-            {"arrow_head_length", Value::null()},
-            {"arrow_head_radius", Value::null()},
-            {"segment_count", Value::null()}
-        })})}
+        {"shapes", Value::array({
+            scriptDrawerRemovalShapeValue(kScriptDrawerNetworkId)
+        })}
+    });
+}
+
+Value scriptDrawerRangeValue(
+    std::size_t offset,
+    std::size_t count,
+    bool removals
+) {
+    std::vector<Value> shapes;
+    shapes.reserve(count);
+    for (std::size_t index = 0; index < count; ++index) {
+        const uint64_t networkId =
+            kScriptDrawerNetworkId + offset + index;
+        shapes.push_back(
+            removals
+                ? scriptDrawerRemovalShapeValue(networkId)
+                : scriptDrawerShapeValue(networkId)
+        );
+    }
+    return Value::object({
+        {"shapes", Value::array(std::move(shapes))}
     });
 }
 
@@ -420,6 +451,121 @@ bool checkServerScriptDebugDrawerPacket(
     return ok;
 }
 
+bool checkScriptDrawerRange(
+    const bedrock::VersionedPacketCodec& codec,
+    const bedrock::ProtoDefPacketEncoder& encoder,
+    const bedrock::ProtoDefPacketDecoder& decoder,
+    std::size_t offset,
+    std::size_t count,
+    bool removals,
+    const std::string& label
+) {
+    const auto payload = encoder.encodePacket(
+        kScriptDrawerPacketName,
+        scriptDrawerRangeValue(offset, count, removals)
+    );
+    const auto encoded = codec.makePacketByName(
+        kScriptDrawerPacketName,
+        payload
+    );
+
+    bool ok = true;
+    ok &= check(
+        encoded.packetId == kScriptDrawerPacketId,
+        label + " packet id mismatch"
+    );
+    try {
+        const auto fields = decoder.decodePacketStrict(
+            kScriptDrawerPacketName,
+            encoded.payload
+        );
+        ok &= checkField(
+            fields,
+            "shapes.$count",
+            std::to_string(count)
+        );
+        if (count != 0) {
+            ok &= checkField(
+                fields,
+                "shapes[0].network_id",
+                std::to_string(kScriptDrawerNetworkId + offset)
+            );
+            ok &= checkField(
+                fields,
+                "shapes[" + std::to_string(count - 1u) + "].network_id",
+                std::to_string(
+                    kScriptDrawerNetworkId + offset + count - 1u
+                )
+            );
+        }
+    } catch (const std::exception& error) {
+        ok = false;
+        std::cerr << "[DEBUG-RENDERER-PACKET-SMOKE] " << label
+                  << " strict decode failed: " << error.what() << "\n";
+    }
+    return ok;
+}
+
+bool checkLargeAndBatchedServerScriptDebugDrawerPackets(
+    const bedrock::VersionedPacketCodec& codec,
+    const bedrock::ProtoDefPacketEncoder& encoder,
+    const bedrock::ProtoDefPacketDecoder& decoder
+) {
+    // The Android crash was triggered while ProtoDef constructed a single
+    // 1,290-entry container. Keep this direct regression so the structured
+    // value ownership path cannot silently return to quadratic growth.
+    bool ok = checkScriptDrawerRange(
+        codec,
+        encoder,
+        decoder,
+        0,
+        kLargeSchematicShapeCount,
+        false,
+        "large script drawer"
+    );
+
+    // Production deliberately caps each keyed operation array. Verify every
+    // ID is covered exactly once for both additions and removals and that the
+    // final partial batch keeps its global network-ID offset.
+    for (const bool removals : {false, true}) {
+        std::size_t offset = 0;
+        std::size_t packetCount = 0;
+        while (offset < kLargeSchematicShapeCount) {
+            const auto count = std::min(
+                kScriptDrawerBatchSize,
+                kLargeSchematicShapeCount - offset
+            );
+            ok &= check(count <= kScriptDrawerBatchSize,
+                        "script drawer batch exceeded shape cap");
+            ok &= checkScriptDrawerRange(
+                codec,
+                encoder,
+                decoder,
+                offset,
+                count,
+                removals,
+                removals
+                    ? "script drawer removal batch"
+                    : "script drawer addition batch"
+            );
+            offset += count;
+            ++packetCount;
+        }
+        const auto expectedPackets =
+            kLargeSchematicShapeCount / kScriptDrawerBatchSize +
+            (kLargeSchematicShapeCount % kScriptDrawerBatchSize != 0 ? 1u : 0u);
+        ok &= check(
+            offset == kLargeSchematicShapeCount,
+            "script drawer batches did not cover every shape"
+        );
+        ok &= check(
+            packetCount == expectedPackets,
+            "script drawer batch packet count mismatch"
+        );
+    }
+    return ok;
+}
+
 } // namespace
 
 int main() {
@@ -449,10 +595,17 @@ int main() {
         ok &= checkClearPacket(codec, encoder, decoder);
         ok &= checkAddCubePacket(codec, encoder, decoder);
         ok &= checkServerScriptDebugDrawerPacket(codec, encoder, decoder);
+        ok &= checkLargeAndBatchedServerScriptDebugDrawerPackets(
+            codec,
+            encoder,
+            decoder
+        );
 
         if (!ok) return 1;
         std::cout << "[DEBUG-RENDERER-PACKET-SMOKE] OK version=" << kVersion
-                  << " protocol=827 packet_ids=0xa4,0x148\n";
+                  << " protocol=827 packet_ids=0xa4,0x148 large_shapes="
+                  << kLargeSchematicShapeCount << " batch="
+                  << kScriptDrawerBatchSize << "\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "[DEBUG-RENDERER-PACKET-SMOKE] " << error.what() << "\n";
