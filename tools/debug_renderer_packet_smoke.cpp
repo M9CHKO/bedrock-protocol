@@ -18,6 +18,9 @@ namespace {
 constexpr const char* kVersion = "1.21.100";
 constexpr const char* kPacketName = "debug_renderer";
 constexpr uint32_t kPacketId = 0xa4;
+constexpr const char* kScriptDrawerPacketName = "server_script_debug_drawer";
+constexpr uint32_t kScriptDrawerPacketId = 0x148;
+constexpr uint64_t kScriptDrawerNetworkId = 0x4350450000000000ULL;
 
 using Value = bedrock::ProtoDefValue;
 
@@ -49,6 +52,17 @@ std::vector<uint8_t> unhex(const std::string& text) {
             throw std::runtime_error("invalid hex digit");
         }
         result.push_back(static_cast<uint8_t>((high << 4) | low));
+    }
+    return result;
+}
+
+std::string hex(const std::vector<uint8_t>& bytes) {
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(bytes.size() * 2u);
+    for (const uint8_t byte : bytes) {
+        result.push_back(digits[byte >> 4u]);
+        result.push_back(digits[byte & 0x0fu]);
     }
     return result;
 }
@@ -117,6 +131,62 @@ Value addCubeValue() {
         {"blue", Value::floating(0.5)},
         {"alpha", Value::floating(0.25)},
         {"duration", Value::integer(5000)}
+    });
+}
+
+Value scriptDrawerShapeValue() {
+    return Value::object({
+        {"network_id", Value::uinteger(kScriptDrawerNetworkId)},
+        {"shape_type", Value::string("box")},
+        {"location", Value::object({
+            {"x", Value::floating(1.5)},
+            {"y", Value::floating(2.5)},
+            {"z", Value::floating(3.5)}
+        })},
+        {"scale", Value::floating(1.0)},
+        {"rotation", Value::null()},
+        {"time_left", Value::null()},
+        // 0xAARRGGBB is serialised as B,G,R,A by the li32 field, matching
+        // Bedrock's BEARGB representation.
+        {"color", Value::integer(0x44332211)},
+        {"text", Value::null()},
+        {"box_bound", Value::object({
+            {"x", Value::floating(1.0)},
+            {"y", Value::floating(1.0)},
+            {"z", Value::floating(1.0)}
+        })},
+        {"line_end_location", Value::null()},
+        {"arrow_head_length", Value::null()},
+        {"arrow_head_radius", Value::null()},
+        {"segment_count", Value::null()}
+    });
+}
+
+Value scriptDrawerValue(bool withShape) {
+    std::vector<Value> shapes;
+    if (withShape) shapes.push_back(scriptDrawerShapeValue());
+    return Value::object({
+        {"shapes", Value::array(std::move(shapes))}
+    });
+}
+
+Value scriptDrawerRemovalValue() {
+    return Value::object({
+        {"shapes", Value::array({Value::object({
+            {"network_id", Value::uinteger(kScriptDrawerNetworkId)},
+            {"shape_type", Value::null()},
+            {"location", Value::null()},
+            {"scale", Value::null()},
+            {"rotation", Value::null()},
+            {"time_left", Value::null()},
+            {"color", Value::null()},
+            {"text", Value::null()},
+            {"box_bound", Value::null()},
+            {"line_end_location", Value::null()},
+            {"arrow_head_length", Value::null()},
+            {"arrow_head_radius", Value::null()},
+            {"segment_count", Value::null()}
+        })})}
     });
 }
 
@@ -244,6 +314,112 @@ bool checkAddCubePacket(
     return ok;
 }
 
+bool checkServerScriptDebugDrawerPacket(
+    const bedrock::VersionedPacketCodec& codec,
+    const bedrock::ProtoDefPacketEncoder& encoder,
+    const bedrock::ProtoDefPacketDecoder& decoder
+) {
+    // This single-box golden exercises every field used by the schematic
+    // backend and all unused option-presence bytes. Location is the centre of
+    // the block cell.
+    const auto golden = unhex(
+        "c802"
+        "01"
+        "8080808080a091a843"
+        "0101"
+        "010000c03f0000204000006040"
+        "010000803f"
+        "00"
+        "00"
+        "0111223344"
+        "00"
+        "010000803f0000803f0000803f"
+        "00000000"
+    );
+    const auto payload = encoder.encodePacket(
+        kScriptDrawerPacketName,
+        scriptDrawerValue(true)
+    );
+    const auto encoded = codec.makePacketByName(
+        kScriptDrawerPacketName,
+        payload
+    );
+
+    bool ok = true;
+    if (!check(encoded.fullPacket == golden, "script drawer golden bytes mismatch")) {
+        std::cerr << "[DEBUG-RENDERER-PACKET-SMOKE] actual="
+                  << hex(encoded.fullPacket) << "\n"
+                  << "[DEBUG-RENDERER-PACKET-SMOKE] expected="
+                  << hex(golden) << "\n";
+        ok = false;
+    }
+    ok &= check(
+        encoded.packetId == kScriptDrawerPacketId,
+        "script drawer packet id mismatch"
+    );
+
+    const auto packet = codec.decodeFullPacket(golden);
+    ok &= check(
+        packet.name == kScriptDrawerPacketName,
+        "decoded script drawer packet name mismatch"
+    );
+    ok &= check(
+        packet.paramsType == "packet_server_script_debug_drawer",
+        "decoded script drawer params type mismatch"
+    );
+    ok &= check(packet.payload == payload, "decoded script drawer payload mismatch");
+
+    try {
+        const auto fields = decoder.decodePacketStrict(packet.name, packet.payload);
+        ok &= checkField(fields, "shapes.$count", "1");
+        ok &= checkField(
+            fields,
+            "shapes[0].network_id",
+            "4850452664980340736"
+        );
+        ok &= checkField(fields, "shapes[0].shape_type", "1/box");
+        ok &= checkField(fields, "shapes[0].location.$present", "true");
+        ok &= checkField(fields, "shapes[0].location", "1.500000,2.500000,3.500000");
+        ok &= checkField(fields, "shapes[0].color.$present", "true");
+        ok &= checkField(fields, "shapes[0].color", "1144201745");
+        ok &= checkField(fields, "shapes[0].box_bound.$present", "true");
+        ok &= checkField(fields, "shapes[0].box_bound", "1.000000,1.000000,1.000000");
+    } catch (const std::exception& error) {
+        ok = false;
+        std::cerr << "[DEBUG-RENDERER-PACKET-SMOKE] script drawer strict decode failed: "
+                  << error.what() << "\n";
+    }
+
+    try {
+        ok &= checkStructuredReencode(codec, encoder, golden, "script drawer");
+    } catch (const std::exception& error) {
+        ok = false;
+        std::cerr << "[DEBUG-RENDERER-PACKET-SMOKE] script drawer re-encode failed: "
+                  << error.what() << "\n";
+    }
+
+    // A keyed record with every optional field absent is the removal
+    // operation. The array lets the relay group all removals into one packet.
+    const auto removalPayload = encoder.encodePacket(
+        kScriptDrawerPacketName,
+        scriptDrawerRemovalValue()
+    );
+    const auto removal = codec.makePacketByName(
+        kScriptDrawerPacketName,
+        removalPayload
+    );
+    ok &= check(
+        removal.fullPacket == unhex(
+            "c802"
+            "01"
+            "8080808080a091a843"
+            "000000000000000000000000"
+        ),
+        "script drawer keyed-removal bytes mismatch"
+    );
+    return ok;
+}
+
 } // namespace
 
 int main() {
@@ -256,16 +432,27 @@ int main() {
             definition.packetParamsType(kPacketName) == "packet_debug_renderer",
             "packet schema type mismatch"
         );
+        ok &= check(
+            definition.packetId(kScriptDrawerPacketName) ==
+                kScriptDrawerPacketId,
+            "script drawer packet id is not 0x148"
+        );
+        ok &= check(
+            definition.packetParamsType(kScriptDrawerPacketName) ==
+                "packet_server_script_debug_drawer",
+            "script drawer packet schema type mismatch"
+        );
 
         const auto codec = bedrock::VersionedPacketCodec::forVersion(kVersion);
         const bedrock::ProtoDefPacketEncoder encoder(kVersion);
         const bedrock::ProtoDefPacketDecoder decoder(kVersion);
         ok &= checkClearPacket(codec, encoder, decoder);
         ok &= checkAddCubePacket(codec, encoder, decoder);
+        ok &= checkServerScriptDebugDrawerPacket(codec, encoder, decoder);
 
         if (!ok) return 1;
         std::cout << "[DEBUG-RENDERER-PACKET-SMOKE] OK version=" << kVersion
-                  << " protocol=827 packet_id=0xa4\n";
+                  << " protocol=827 packet_ids=0xa4,0x148\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "[DEBUG-RENDERER-PACKET-SMOKE] " << error.what() << "\n";

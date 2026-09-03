@@ -4,6 +4,9 @@
 #include <bedrock/bedrock.hpp>
 #include <bedrock/relay/EntityPositionTracker.hpp>
 #include <bedrock/relay/ItemDurability.hpp>
+#include <bedrock/generated/GeneratedProtocolTypes.hpp>
+#include <bedrock/protodef/ProtoDefEncoder.hpp>
+#include <bedrock/protodef/ProtoDefWriter.hpp>
 #include <bedrock/world/BedrockBlockRegistry.hpp>
 #include <bedrock/world/BedrockSubChunkPacket.hpp>
 
@@ -687,6 +690,7 @@ struct RelayState {
         int64_t networkId = 0;
         int32_t count = 0;
         int32_t stackId = 0;
+        bedrock::ProtoDefValue transactionItem;
         std::string name;
         int32_t damage = 0;
         bool damageKnown = false;
@@ -872,6 +876,9 @@ struct RelayState {
     bool playerInventoryReady = false;
     int32_t nextAutomationRequestId = 1'000'000;
     int32_t pendingAutomationRequestId = 0;
+    int64_t pendingAutomationNetworkId = 0;
+    int32_t pendingAutomationStackId = 0;
+    std::size_t pendingAutomationEquipmentIndex = 0;
     uint64_t pendingAutomationStartedAtMs = 0;
     uint64_t lastAutomationAttemptAtMs = 0;
     uint64_t automationAccepted = 0;
@@ -2955,6 +2962,10 @@ struct RelayState {
             decoded.value(itemPrefix + ".extra.nbt.nbt.value.ench")
         );
         const auto* itemValue = decoded.value(itemPrefix);
+        if (itemValue != nullptr &&
+            itemValue->kind == bedrock::ProtoDefValue::Kind::Object) {
+            item.transactionItem = *itemValue;
+        }
         if (!item.enchanted && itemValue != nullptr) {
             item.enchanted = packetValueHasContent(
                 findNamedPacketValue(*itemValue, "ench")
@@ -3064,7 +3075,8 @@ struct RelayState {
             for (std::size_t slot = 0; slot < playerInventory.size(); ++slot) {
                 const auto& item = playerInventory[slot];
                 if (item.name != "minecraft:totem_of_undying" ||
-                    item.stackId == 0) {
+                    item.transactionItem.kind !=
+                        bedrock::ProtoDefValue::Kind::Object) {
                     continue;
                 }
                 plan.valid = true;
@@ -3083,7 +3095,10 @@ struct RelayState {
         int bestScore = -1;
         for (std::size_t slot = 0; slot < playerInventory.size(); ++slot) {
             const auto& item = playerInventory[slot];
-            if (!item.present || item.stackId == 0) continue;
+            if (!item.present || item.transactionItem.kind !=
+                bedrock::ProtoDefValue::Kind::Object) {
+                continue;
+            }
             const int type = armorType(item.name);
             if (type < 0) continue;
             const auto equipmentIndex = static_cast<std::size_t>(type + 2);
@@ -3107,40 +3122,41 @@ struct RelayState {
         return plan;
     }
 
-    static int legacyContainerSlotId(std::string_view type) noexcept {
-        if (type == "armor") return 6;
-        if (type == "offhand") return 34;
-        return 12; // hotbar_and_inventory
-    }
-
-    static bedrock::ProtoDefValue stackRequestSlot(
-        const std::string& version,
-        std::string type,
-        uint8_t slot,
-        int32_t stackId
+    static bedrock::ProtoDefValue legacyTransactionItem(
+        const EquipmentItem& item
     ) {
         using Value = bedrock::ProtoDefValue;
-        if (!versionAtLeast(version, 1, 16, 210)) {
-            return Value::object({
-                {"container_id", Value::integer(legacyContainerSlotId(type))},
-                {"slot_id", Value::uinteger(slot)},
-                {"stack_id", Value::integer(stackId)}
-            });
+        if (!item.present) {
+            return Value::object({{"network_id", Value::integer(0)}});
         }
-        if (versionAtLeast(version, 1, 21, 20)) {
-            return Value::object({
-                {"slot_type", Value::object({
-                    {"container_id", Value::string(std::move(type))},
-                    {"dynamic_container_id", Value::uinteger(0)}
-                })},
-                {"slot", Value::uinteger(slot)},
-                {"stack_id", Value::integer(stackId)}
-            });
+        if (item.transactionItem.kind != Value::Kind::Object) {
+            throw std::runtime_error(
+                "server-confirmed item payload is unavailable"
+            );
         }
+
+        // IGN accepts the legacy InventoryTransaction path used by
+        // weathertop_bot. Its working client trace intentionally omits the
+        // stack network id even though InventorySlot carried one.
+        auto value = item.transactionItem;
+        value.objectValue["has_stack_id"] = Value::uinteger(0);
+        value.objectValue.erase("stack_id");
+        return value;
+    }
+
+    static bedrock::ProtoDefValue legacyAutomationAction(
+        std::string inventoryId,
+        uint8_t slot,
+        const EquipmentItem& oldItem,
+        const EquipmentItem& newItem
+    ) {
+        using Value = bedrock::ProtoDefValue;
         return Value::object({
-            {"slot_type", Value::string(std::move(type))},
+            {"source_type", Value::string("container")},
+            {"inventory_id", Value::string(std::move(inventoryId))},
             {"slot", Value::uinteger(slot)},
-            {"stack_id", Value::integer(stackId)}
+            {"old_item", legacyTransactionItem(oldItem)},
+            {"new_item", legacyTransactionItem(newItem)}
         });
     }
 
@@ -3149,38 +3165,92 @@ struct RelayState {
         const AutomationPlan& plan
     ) {
         using Value = bedrock::ProtoDefValue;
-        const std::string destinationType = plan.totem
+        const std::string destinationInventory = plan.totem
             ? "offhand"
             : "armor";
-        auto request = Value::object({
-            {"request_id", Value::integer(plan.requestId)},
-            {"actions", Value::array({Value::object({
-                {"type_id", Value::string("swap")},
-                {"source", stackRequestSlot(
-                    version,
-                    "hotbar_and_inventory",
+        auto transaction = Value::object({
+            {"legacy", Value::object({
+                {"legacy_request_id", Value::integer(0)}
+            })},
+            {"transaction_type", Value::string("normal")},
+            {"actions", Value::array({
+                legacyAutomationAction(
+                    "inventory",
                     static_cast<uint8_t>(plan.inventorySlot),
-                    plan.source.stackId
-                )},
-                {"destination", stackRequestSlot(
-                    version,
-                    destinationType,
+                    plan.source,
+                    plan.destination
+                ),
+                legacyAutomationAction(
+                    destinationInventory,
                     plan.equipmentSlot,
-                    plan.destination.stackId
-                )}
-            })})},
-            {"custom_names", Value::array({})},
-            {"cause", Value::string("chat_public")}
+                    plan.destination,
+                    plan.source
+                )
+            })}
         });
-        auto payload = bedrock::ProtoDefPacketEncoder(
+        // The generated C++ 1.21.100 table names this field
+        // WindowIDZigzag32, but the working weathertop/node codec and the IGN
+        // server use WindowIDVarint for legacy TransactionActions. Override
+        // only this nested type while leaving every Item codec versioned.
+        const auto packetSchema = bedrock::generatedProtocolTypeJson(
             version,
-            itemProtocolVariables
-        ).encodePacket("item_stack_request", Value::object({
-            {"requests", Value::array({std::move(request)})}
-        }));
+            "packet_inventory_transaction"
+        );
+        if (!packetSchema.has_value()) {
+            throw std::runtime_error(
+                "inventory_transaction schema is unavailable"
+            );
+        }
+        bedrock::ProtoDefEncoder encoder(
+            [&version](const std::string& typeName)
+                -> std::optional<std::string> {
+                if (typeName == "WindowIDZigzag32") {
+                    if (auto legacyWindow = bedrock::generatedProtocolTypeJson(
+                            version,
+                            "WindowIDVarint"
+                        ); legacyWindow.has_value()) {
+                        return legacyWindow;
+                    }
+                }
+                return bedrock::generatedProtocolTypeJson(version, typeName);
+            }
+        );
+        encoder.setVariables(itemProtocolVariables->snapshot());
+        bedrock::ProtoDefWriter writer;
+        encoder.encode(
+            *packetSchema,
+            Value::object({{"transaction", std::move(transaction)}}),
+            writer
+        );
+        auto payload = writer.take();
         return bedrock::VersionedMcpeCodec::forVersion(version)
             .packetCodec()
-            .makePacketByName("item_stack_request", payload);
+            .makePacketByName("inventory_transaction", payload);
+    }
+
+    void resolveLegacyAutomationLocked(std::size_t equipmentIndex) {
+        if (pendingAutomationRequestId == 0 ||
+            equipmentIndex != pendingAutomationEquipmentIndex) {
+            return;
+        }
+        const bool accepted = equipmentIndex < equipment.size() &&
+            equipment[equipmentIndex].present &&
+            equipment[equipmentIndex].networkId == pendingAutomationNetworkId &&
+            (pendingAutomationStackId == 0 ||
+             equipment[equipmentIndex].stackId == pendingAutomationStackId);
+        pendingAutomationRequestId = 0;
+        pendingAutomationNetworkId = 0;
+        pendingAutomationStackId = 0;
+        pendingAutomationEquipmentIndex = 0;
+        if (accepted) {
+            ++automationAccepted;
+            automationStatus = "Legacy-транзакция подтверждена сервером";
+        } else {
+            ++automationRejected;
+            playerInventoryReady = false;
+            automationStatus =
+                "Сервер отклонил legacy-транзакцию — ожидается синхронизация";
+        }
     }
 
     void maybeInjectAutomation(
@@ -3204,6 +3274,9 @@ struct RelayState {
             if (pendingAutomationRequestId != 0) {
                 if (now - pendingAutomationStartedAtMs < 1'500) return;
                 pendingAutomationRequestId = 0;
+                pendingAutomationNetworkId = 0;
+                pendingAutomationStackId = 0;
+                pendingAutomationEquipmentIndex = 0;
                 playerInventoryReady = false;
                 automationStatus = "Нет ответа сервера — ожидается синхронизация";
                 return;
@@ -3236,15 +3309,25 @@ struct RelayState {
 
         {
             std::lock_guard lock(mutex);
-            if (plan.inventorySlot >= playerInventory.size() ||
-                playerInventory[plan.inventorySlot].stackId !=
-                    plan.source.stackId) {
+            if (plan.inventorySlot >= playerInventory.size()) {
+                return;
+            }
+            const auto& currentSource = playerInventory[plan.inventorySlot];
+            if (currentSource.networkId != plan.source.networkId ||
+                currentSource.count != plan.source.count ||
+                (plan.source.stackId != 0 &&
+                 currentSource.stackId != plan.source.stackId) ||
+                (plan.source.damageKnown && currentSource.damageKnown &&
+                 currentSource.damage != plan.source.damage)) {
                 return;
             }
             playerInventory[plan.inventorySlot] = plan.destination;
             equipment[plan.equipmentIndex] = plan.source;
             ++equipmentRevision;
             pendingAutomationRequestId = plan.requestId;
+            pendingAutomationNetworkId = plan.source.networkId;
+            pendingAutomationStackId = plan.source.stackId;
+            pendingAutomationEquipmentIndex = plan.equipmentIndex;
             pendingAutomationStartedAtMs = now;
             lastAutomationAttemptAtMs = now;
             automationStatus = plan.totem
@@ -3295,6 +3378,9 @@ struct RelayState {
             playerInventory.clear();
             playerInventoryReady = false;
             pendingAutomationRequestId = 0;
+            pendingAutomationNetworkId = 0;
+            pendingAutomationStackId = 0;
+            pendingAutomationEquipmentIndex = 0;
             automationStatus = "Ожидание инвентаря";
             playerHealth = 20.0;
             playerMaximumHealth = 20.0;
@@ -3452,7 +3538,6 @@ struct RelayState {
             name == "mob_armor_equipment" ||
             name == "inventory_content" ||
             name == "inventory_slot" ||
-            name == "item_stack_response" ||
             name == "player_armor_damage" ||
             name == "set_health" ||
             name == "update_attributes" ||
@@ -3563,42 +3648,6 @@ struct RelayState {
                 }
                 return;
             }
-            if (!serverbound && name == "item_stack_response") {
-                const auto* responses = decoded.value("responses");
-                if (responses == nullptr ||
-                    responses->kind != bedrock::PacketValue::Kind::Array) {
-                    return;
-                }
-                std::lock_guard lock(mutex);
-                for (std::size_t index = 0;
-                     index < responses->arrayValue.size(); ++index) {
-                    const std::string prefix =
-                        "responses[" + std::to_string(index) + "]";
-                    const auto requestId = static_cast<int32_t>(
-                        decoded.getInt(prefix + ".request_id", 0)
-                    );
-                    if (requestId != pendingAutomationRequestId) continue;
-                    const auto status = decoded.getString(
-                        prefix + ".status",
-                        decoded.getString(prefix + ".result", "")
-                    );
-                    const bool accepted = status == "ok" ||
-                        decoded.getInt(prefix + ".status", 1) == 0 ||
-                        decoded.getInt(prefix + ".result", 1) == 0;
-                    pendingAutomationRequestId = 0;
-                    if (accepted) {
-                        ++automationAccepted;
-                        automationStatus = "Последнее действие подтверждено";
-                    } else {
-                        ++automationRejected;
-                        playerInventoryReady = false;
-                        automationStatus =
-                            "Сервер отклонил действие — ожидается синхронизация";
-                    }
-                    break;
-                }
-                return;
-            }
             if (!serverbound && name == "add_item_entity") {
                 const auto networkId = decoded.getInt("item.network_id", 0);
                 const auto runtimeId = decoded.getUInt(
@@ -3641,6 +3690,9 @@ struct RelayState {
                         : std::size_t {0};
                 std::lock_guard lock(mutex);
                 equipment[equipmentIndex] = std::move(hand);
+                if (!serverbound) {
+                    resolveLegacyAutomationLocked(equipmentIndex);
+                }
                 ++equipmentRevision;
                 return;
             }
@@ -3661,6 +3713,12 @@ struct RelayState {
                 std::lock_guard lock(mutex);
                 for (std::size_t index = 0; index < armor.size(); ++index) {
                     equipment[index + 2] = std::move(armor[index]);
+                }
+                if (pendingAutomationEquipmentIndex >= 2 &&
+                    pendingAutomationEquipmentIndex < equipment.size()) {
+                    resolveLegacyAutomationLocked(
+                        pendingAutomationEquipmentIndex
+                    );
                 }
                 ++equipmentRevision;
                 return;
@@ -3701,6 +3759,7 @@ struct RelayState {
                     : EquipmentItem {};
                 std::lock_guard lock(mutex);
                 equipment[1] = std::move(offhand);
+                resolveLegacyAutomationLocked(1);
                 ++equipmentRevision;
                 return;
             }
@@ -3725,6 +3784,12 @@ struct RelayState {
                 for (std::size_t index = 0; index < armor.size(); ++index) {
                     equipment[index + 2] = std::move(armor[index]);
                 }
+                if (pendingAutomationEquipmentIndex >= 2 &&
+                    pendingAutomationEquipmentIndex < equipment.size()) {
+                    resolveLegacyAutomationLocked(
+                        pendingAutomationEquipmentIndex
+                    );
+                }
                 ++equipmentRevision;
                 return;
             }
@@ -3746,6 +3811,7 @@ struct RelayState {
                 auto offhand = decodedItem(version, decoded, "item");
                 std::lock_guard lock(mutex);
                 equipment[1] = std::move(offhand);
+                resolveLegacyAutomationLocked(1);
                 ++equipmentRevision;
                 return;
             }
@@ -3757,6 +3823,9 @@ struct RelayState {
                     std::lock_guard lock(mutex);
                     equipment[static_cast<std::size_t>(slot) + 2] =
                         std::move(armor);
+                    resolveLegacyAutomationLocked(
+                        static_cast<std::size_t>(slot) + 2
+                    );
                     ++equipmentRevision;
                 }
                 return;
@@ -3796,6 +3865,9 @@ struct RelayState {
         playerInventory.clear();
         playerInventoryReady = false;
         pendingAutomationRequestId = 0;
+        pendingAutomationNetworkId = 0;
+        pendingAutomationStackId = 0;
+        pendingAutomationEquipmentIndex = 0;
         automationStatus = "Ожидание инвентаря";
         playerHealth = 20.0;
         playerMaximumHealth = 20.0;
@@ -3844,6 +3916,9 @@ struct RelayState {
         if (!armor && !totem) {
             std::lock_guard lock(mutex);
             pendingAutomationRequestId = 0;
+            pendingAutomationNetworkId = 0;
+            pendingAutomationStackId = 0;
+            pendingAutomationEquipmentIndex = 0;
             automationStatus = "Автоматизация выключена";
         }
     }
@@ -4472,7 +4547,43 @@ struct SchematicDebugMarker {
     auto operator<=>(const SchematicDebugMarker&) const = default;
 };
 
-bedrock::VersionedGamePacket makeSchematicDebugClearPacket(
+// Keep relay-owned shapes away from the small sequential IDs commonly used
+// by server scripts. The ASCII prefix "CPE" makes accidental overlap with a
+// destination server's debug drawer registry practically impossible.
+constexpr uint64_t SchematicDebugNetworkIdBase = 0x4350450000000000ULL;
+
+bool supportsSchematicScriptDebugDrawer(std::string_view version) noexcept {
+    // ServerScriptDebugDrawer was added in protocol 818 (Bedrock 1.21.90).
+    // Unlike the older DebugRenderer packet, it is the packet used by the
+    // current in-world debug-shape API and is rendered by retail 1.21.100.
+    return versionAtLeast(version, 1, 21, 90);
+}
+
+bedrock::ProtoDefValue schematicDebugVec3(double x, double y, double z) {
+    return bedrock::ProtoDefValue::object({
+        {"x", bedrock::ProtoDefValue::floating(x)},
+        {"y", bedrock::ProtoDefValue::floating(y)},
+        {"z", bedrock::ProtoDefValue::floating(z)}
+    });
+}
+
+int32_t schematicDebugArgb(const SchematicDebugMarker& marker, int opacityPercent) {
+    const bool wrong = marker.status == 3;
+    const uint32_t alpha = static_cast<uint32_t>(std::lround(
+        std::clamp(opacityPercent, 10, 85) * 255.0 / 100.0
+    ));
+    const uint32_t red = wrong ? 255u : 38u;
+    const uint32_t green = wrong ? 26u : 217u;
+    const uint32_t blue = wrong ? 26u : 255u;
+    // The schema calls this field li32 while Bedrock interprets its bytes as
+    // BEARGB. Packing conventional 0xAARRGGBB and writing it little-endian
+    // produces the required B,G,R,A byte order.
+    const uint32_t argb =
+        (alpha << 24u) | (red << 16u) | (green << 8u) | blue;
+    return static_cast<int32_t>(argb);
+}
+
+bedrock::VersionedGamePacket makeLegacySchematicDebugClearPacket(
     const bedrock::ProtoDefPacketEncoder& encoder,
     const bedrock::VersionedPacketCodec& packetCodec
 ) {
@@ -4485,7 +4596,7 @@ bedrock::VersionedGamePacket makeSchematicDebugClearPacket(
     return packetCodec.makePacketByName("debug_renderer", payload);
 }
 
-bedrock::VersionedGamePacket makeSchematicDebugCubePacket(
+bedrock::VersionedGamePacket makeLegacySchematicDebugCubePacket(
     const bedrock::ProtoDefPacketEncoder& encoder,
     const bedrock::VersionedPacketCodec& packetCodec,
     const SchematicDebugMarker& marker,
@@ -4517,12 +4628,110 @@ bedrock::VersionedGamePacket makeSchematicDebugCubePacket(
     return packetCodec.makePacketByName("debug_renderer", payload);
 }
 
+bedrock::VersionedGamePacket makeSchematicScriptDebugDrawerPacket(
+    const bedrock::ProtoDefPacketEncoder& encoder,
+    const bedrock::VersionedPacketCodec& packetCodec,
+    const std::vector<SchematicDebugMarker>& markers,
+    int opacityPercent
+) {
+    std::vector<bedrock::ProtoDefValue> shapes;
+    shapes.reserve(markers.size());
+    uint64_t networkId = SchematicDebugNetworkIdBase;
+    for (const auto& marker : markers) {
+        // A DebugBox is centred at Location; a one-block bound therefore
+        // aligns exactly with the server block cell without creating a block
+        // or client collision. All unused option fields must still be present
+        // as null so the generated protocol codec emits their presence flags.
+        shapes.push_back(bedrock::ProtoDefValue::object({
+            {"network_id", bedrock::ProtoDefValue::uinteger(networkId++)},
+            {"shape_type", bedrock::ProtoDefValue::string("box")},
+            {"location", schematicDebugVec3(
+                marker.x + 0.5,
+                marker.y + 0.5,
+                marker.z + 0.5
+            )},
+            {"scale", bedrock::ProtoDefValue::floating(1.0)},
+            {"rotation", bedrock::ProtoDefValue::null()},
+            {"time_left", bedrock::ProtoDefValue::null()},
+            {"color", bedrock::ProtoDefValue::integer(
+                schematicDebugArgb(marker, opacityPercent)
+            )},
+            {"text", bedrock::ProtoDefValue::null()},
+            {"box_bound", schematicDebugVec3(1.0, 1.0, 1.0)},
+            {"line_end_location", bedrock::ProtoDefValue::null()},
+            {"arrow_head_length", bedrock::ProtoDefValue::null()},
+            {"arrow_head_radius", bedrock::ProtoDefValue::null()},
+            {"segment_count", bedrock::ProtoDefValue::null()}
+        }));
+    }
+
+    const auto payload = encoder.encodePacket(
+        "server_script_debug_drawer",
+        bedrock::ProtoDefValue::object({
+            {"shapes", bedrock::ProtoDefValue::array(std::move(shapes))}
+        })
+    );
+    return packetCodec.makePacketByName(
+        "server_script_debug_drawer",
+        payload
+    );
+}
+
+bedrock::VersionedGamePacket makeSchematicScriptDebugRemovalPacket(
+    const bedrock::ProtoDefPacketEncoder& encoder,
+    const bedrock::VersionedPacketCodec& packetCodec,
+    std::size_t markerCount
+) {
+    std::vector<bedrock::ProtoDefValue> removals;
+    removals.reserve(markerCount);
+    for (std::size_t index = 0; index < markerCount; ++index) {
+        // A shape record containing only its key is the protocol removal
+        // operation. Do not rely on an empty packet: that is a no-op on the
+        // retail client rather than a registry-wide clear.
+        removals.push_back(bedrock::ProtoDefValue::object({
+            {"network_id", bedrock::ProtoDefValue::uinteger(
+                SchematicDebugNetworkIdBase + index
+            )},
+            {"shape_type", bedrock::ProtoDefValue::null()},
+            {"location", bedrock::ProtoDefValue::null()},
+            {"scale", bedrock::ProtoDefValue::null()},
+            {"rotation", bedrock::ProtoDefValue::null()},
+            {"time_left", bedrock::ProtoDefValue::null()},
+            {"color", bedrock::ProtoDefValue::null()},
+            {"text", bedrock::ProtoDefValue::null()},
+            {"box_bound", bedrock::ProtoDefValue::null()},
+            {"line_end_location", bedrock::ProtoDefValue::null()},
+            {"arrow_head_length", bedrock::ProtoDefValue::null()},
+            {"arrow_head_radius", bedrock::ProtoDefValue::null()},
+            {"segment_count", bedrock::ProtoDefValue::null()}
+        }));
+    }
+    const auto payload = encoder.encodePacket(
+        "server_script_debug_drawer",
+        bedrock::ProtoDefValue::object({
+            {"shapes", bedrock::ProtoDefValue::array(std::move(removals))}
+        })
+    );
+    return packetCodec.makePacketByName(
+        "server_script_debug_drawer",
+        payload
+    );
+}
+
 bedrock::VersionedGamePacket makeSchematicDebugClearPacket(
-    const std::string& version
+    const std::string& version,
+    std::size_t markerCount
 ) {
     bedrock::ProtoDefPacketEncoder encoder(version);
     const auto codec = bedrock::VersionedMcpeCodec::forVersion(version);
-    return makeSchematicDebugClearPacket(encoder, codec.packetCodec());
+    if (supportsSchematicScriptDebugDrawer(version)) {
+        return makeSchematicScriptDebugRemovalPacket(
+            encoder,
+            codec.packetCodec(),
+            markerCount
+        );
+    }
+    return makeLegacySchematicDebugClearPacket(encoder, codec.packetCodec());
 }
 
 class RelayController {
@@ -5436,48 +5645,6 @@ public:
     ) noexcept {
         try {
             std::lock_guard sendLock(schematicSendMutex_);
-            // Protocol 898 replaced the documented add-cube action with a
-            // different keyed DebugMarkerData layout. Do not invent fields or
-            // emit the 827 payload on those clients. The requested target,
-            // 1.21.100/protocol 827, uses the fully verified branch below.
-            if (versionAtLeast(state_->version, 1, 21, 130)) {
-                state_->schematicTotalBlocks.store(
-                    total,
-                    std::memory_order_relaxed
-                );
-                state_->schematicCorrectBlocks.store(
-                    correct,
-                    std::memory_order_relaxed
-                );
-                state_->schematicMissingBlocks.store(
-                    missing,
-                    std::memory_order_relaxed
-                );
-                state_->schematicWrongBlocks.store(
-                    wrong,
-                    std::memory_order_relaxed
-                );
-                state_->schematicUnknownBlocks.store(
-                    unknown,
-                    std::memory_order_relaxed
-                );
-                state_->schematicDisplayedMarkers.store(
-                    0,
-                    std::memory_order_relaxed
-                );
-                if (!unsupportedDebugRendererLogged_.exchange(true)) {
-                    state_->push(
-                        "schematic_debug_renderer_unsupported",
-                        "Clientbound debug marker layout changed in " +
-                            state_->version +
-                            "; markers are disabled instead of sending an "
-                            "unverified packet",
-                        "WARN",
-                        "schematics"
-                    );
-                }
-                return true;
-            }
             if (!state_->schematicSnapshotMatches(
                     expectedWorldRevision,
                     expectedDimension
@@ -5509,6 +5676,7 @@ public:
             bedrock::BedrockServerConnection downstream;
             std::string downstreamSessionId;
             uint64_t markerGeneration = 0;
+            std::size_t previousMarkerCount = 0;
             {
                 std::lock_guard markerLock(schematicMarkerMutex_);
                 if (!state_->schematicSnapshotMatches(
@@ -5542,6 +5710,7 @@ public:
                 downstream = *schematicDownstream_;
                 downstreamSessionId = schematicDownstreamSessionId_;
                 markerGeneration = schematicMarkerGeneration_;
+                previousMarkerCount = activeSchematicMarkers_.size();
             }
 
             bedrock::ProtoDefPacketEncoder debugEncoder(state_->version);
@@ -5549,18 +5718,43 @@ public:
                 state_->version
             );
             std::vector<bedrock::VersionedGamePacket> packets;
-            packets.reserve(markers.size() + 1);
-            packets.push_back(makeSchematicDebugClearPacket(
-                debugEncoder,
-                debugCodec.packetCodec()
-            ));
-            for (const auto& marker : markers) {
-                packets.push_back(makeSchematicDebugCubePacket(
+            std::string_view backend;
+            if (supportsSchematicScriptDebugDrawer(state_->version)) {
+                // Shape records are keyed operations. Remove the previous
+                // relay-owned IDs in one packet, then publish the replacement
+                // set in one packet. This avoids both stale tail markers and
+                // the old one-RakNet-packet-per-cube flood.
+                if (previousMarkerCount != 0) {
+                    packets.push_back(makeSchematicScriptDebugRemovalPacket(
+                        debugEncoder,
+                        debugCodec.packetCodec(),
+                        previousMarkerCount
+                    ));
+                }
+                if (!markers.empty() || packets.empty()) {
+                    packets.push_back(makeSchematicScriptDebugDrawerPacket(
+                        debugEncoder,
+                        debugCodec.packetCodec(),
+                        markers,
+                        opacityPercent
+                    ));
+                }
+                backend = "server_script_debug_drawer";
+            } else {
+                packets.reserve(markers.size() + 1);
+                packets.push_back(makeLegacySchematicDebugClearPacket(
                     debugEncoder,
-                    debugCodec.packetCodec(),
-                    marker,
-                    opacityPercent
+                    debugCodec.packetCodec()
                 ));
+                for (const auto& marker : markers) {
+                    packets.push_back(makeLegacySchematicDebugCubePacket(
+                        debugEncoder,
+                        debugCodec.packetCodec(),
+                        marker,
+                        opacityPercent
+                    ));
+                }
+                backend = "legacy_debug_renderer";
             }
 
             bool queued = false;
@@ -5603,7 +5797,10 @@ public:
                     activeSchematicOpacity_ = 0;
                     ++schematicMarkerGeneration_;
                 }
-                const auto clear = makeSchematicDebugClearPacket(state_->version);
+                const auto clear = makeSchematicDebugClearPacket(
+                    state_->version,
+                    displayedMarkers
+                );
                 std::lock_guard relayLock(relayMutex_);
                 if (relay_) {
                     relay_->live().queueClientboundPackets(downstream, {clear});
@@ -5620,7 +5817,7 @@ public:
             );
             state_->push(
                 "schematic_markers",
-                "backend=clientbound_debug_renderer total=" +
+                "backend=" + std::string(backend) + " total=" +
                     std::to_string(total) + " correct=" +
                     std::to_string(correct) + " missing=" +
                     std::to_string(missing) + " wrong=" +
@@ -5657,16 +5854,21 @@ public:
             std::lock_guard sendLock(schematicSendMutex_);
             if (resetCounters) resetSchematicCounters();
             std::optional<bedrock::BedrockServerConnection> downstream;
+            std::size_t markerCount = 0;
             {
                 std::lock_guard markerLock(schematicMarkerMutex_);
                 ++schematicMarkerGeneration_;
                 if (activeSchematicMarkers_.empty()) return;
                 downstream = schematicDownstream_;
+                markerCount = activeSchematicMarkers_.size();
                 activeSchematicMarkers_.clear();
                 activeSchematicOpacity_ = 0;
             }
             if (!downstream.has_value()) return;
-            const auto clear = makeSchematicDebugClearPacket(state_->version);
+            const auto clear = makeSchematicDebugClearPacket(
+                state_->version,
+                markerCount
+            );
             bool queued = false;
             {
                 std::lock_guard relayLock(relayMutex_);
@@ -5723,7 +5925,6 @@ private:
     std::vector<SchematicDebugMarker> activeSchematicMarkers_;
     int activeSchematicOpacity_ = 0;
     uint64_t schematicMarkerGeneration_ = 0;
-    std::atomic<bool> unsupportedDebugRendererLogged_ {false};
     std::atomic<bool> stopped_ {false};
     std::mutex loginWatchdogMutex_;
     std::condition_variable loginWatchdogCv_;
@@ -5770,6 +5971,7 @@ private:
         try {
             std::lock_guard lock(schematicMarkerMutex_);
             if (activeSchematicMarkers_.empty()) return std::nullopt;
+            const std::size_t markerCount = activeSchematicMarkers_.size();
             ++schematicMarkerGeneration_;
             activeSchematicMarkers_.clear();
             activeSchematicOpacity_ = 0;
@@ -5778,7 +5980,7 @@ private:
             state_->schematicMissingBlocks.store(0, std::memory_order_relaxed);
             state_->schematicWrongBlocks.store(0, std::memory_order_relaxed);
             state_->schematicUnknownBlocks.store(0, std::memory_order_relaxed);
-            return makeSchematicDebugClearPacket(version);
+            return makeSchematicDebugClearPacket(version, markerCount);
         } catch (...) {
             return std::nullopt;
         }

@@ -1275,7 +1275,9 @@ final class RelayOverlayController {
                 preferences.getInt(RelayService.KEY_SCHEMATIC_ANCHOR_Z, 0) + dz
             )
             .apply();
-        settingsChanged.run();
+        // SchematicOverlayController reads the persisted anchor from its
+        // snapshot worker. Re-applying every unrelated runtime option here
+        // only floods the log/native bridge while the user taps X/Y/Z.
         showPage("schematics");
     }
 
@@ -1498,6 +1500,7 @@ final class RelayOverlayController {
     }
 
     private void saveInt(String key, int value) {
+        if (preferences.getInt(key, Integer.MIN_VALUE) == value) return;
         preferences.edit().putInt(key, value).apply();
         settingsChanged.run();
     }

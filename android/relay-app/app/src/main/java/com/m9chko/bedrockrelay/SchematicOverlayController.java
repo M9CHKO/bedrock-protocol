@@ -36,6 +36,11 @@ final class SchematicOverlayController {
     private static final int BLOCK_SNAPSHOT_VERSION = 2;
     private static final int BLOCK_SNAPSHOT_HEADER = 6;
     private static final int BLOCK_QUERY_BATCH_SIZE = 4_096;
+    // Anchor buttons may be tapped several times a second. Keep the last
+    // published plan visible while the placement is moving and only scan/send
+    // the final position. Otherwise every intermediate coordinate produces a
+    // full debug-drawer replacement containing hundreds of shapes.
+    private static final long PLACEMENT_SETTLE_MILLIS = 350L;
     private static final long FORCE_BLOCK_SNAPSHOT = Long.MIN_VALUE;
     private static final byte BLOCK_UNKNOWN = 0;
     private static final byte BLOCK_MISSING = 1;
@@ -337,6 +342,7 @@ final class SchematicOverlayController {
             if (debugMarkerPlanPublished) clearDebugMarkers();
             return;
         }
+        if (!query.placementSettled()) return;
         long afterRevision;
         int batchStart;
         int batchCount;
@@ -690,6 +696,7 @@ final class SchematicOverlayController {
         final int cameraChunkZ;
         final int maximumDistance;
         final int selectedLayer;
+        final long placementReadyAtMs;
         final boolean exactBedrockProperties;
         final SchematicPlacementTransform transform;
         final SchematicBlockMatcher.ExpectedBlock[] paletteExpectedBlocks;
@@ -728,6 +735,8 @@ final class SchematicOverlayController {
             this.cameraChunkZ = cameraChunkZ;
             this.maximumDistance = maximumDistance;
             this.selectedLayer = selectedLayer;
+            placementReadyAtMs = SystemClock.uptimeMillis() +
+                PLACEMENT_SETTLE_MILLIS;
             // .mcstructure states already use Bedrock property names/values.
             // Directional properties need a separate transform before exact
             // comparison, so rotated/mirrored placements safely fall back to
@@ -789,6 +798,10 @@ final class SchematicOverlayController {
 
         int blockCount() {
             return blockIndices.length;
+        }
+
+        boolean placementSettled() {
+            return SystemClock.uptimeMillis() >= placementReadyAtMs;
         }
 
         int[] worldCoordinates(int start, int count) {
