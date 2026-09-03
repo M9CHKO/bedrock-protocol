@@ -57,6 +57,18 @@ void checkGolden(
         throw std::runtime_error(version + " Node ProtoDef golden mismatch");
     }
 
+    const auto header = bedrock::BedrockSubChunkPacketCodec::decodePacketHeader(
+        encoded,
+        version
+    );
+    if ((version != "1.18.0" &&
+         header.cacheEnabled != packet.cacheEnabled) ||
+        header.dimension != packet.dimension ||
+        header.originX != packet.originX || header.originY != packet.originY ||
+        header.originZ != packet.originZ || !header.entries.empty()) {
+        throw std::runtime_error(version + " header-only decode mismatch");
+    }
+
     const auto decoded = bedrock::BedrockSubChunkPacketCodec::decodePacketPayload(
         encoded,
         version
@@ -163,6 +175,25 @@ int main() {
             "1.21.100",
             296,
             "49eee102335fae3532db7e9abe7b68f007eb19775212768a44d5e1f022605237"
+        );
+
+        bedrock::BedrockSubChunkPacket allCopied;
+        allCopied.cacheEnabled = false;
+        allCopied.dimension = 0;
+        allCopied.originX = 1;
+        allCopied.originY = -4;
+        allCopied.originZ = 2;
+        bedrock::BedrockSubChunkPacketEntry allCopiedEntry;
+        allCopiedEntry.result = bedrock::BedrockSubChunkResult::SuccessAllAir;
+        allCopiedEntry.heightMapType = bedrock::BedrockHeightMapType::AllCopied;
+        allCopiedEntry.renderHeightMapType =
+            bedrock::BedrockHeightMapType::AllCopied;
+        allCopied.entries.push_back(std::move(allCopiedEntry));
+        checkGolden(
+            allCopied,
+            "1.21.100",
+            16,
+            "29ddc7ff207324e2d3751a79aaa318f498c413ae00c7aa35f4b33fce195f0010"
         );
 
         expectThrows([] {

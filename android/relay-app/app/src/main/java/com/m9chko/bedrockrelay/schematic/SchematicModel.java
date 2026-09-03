@@ -1,6 +1,7 @@
 package com.m9chko.bedrockrelay.schematic;
 
 import java.util.ArrayList;
+import java.util.BitSet;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
@@ -19,6 +20,7 @@ public final class SchematicModel {
     private final int[] blocks;
     private final int[] boundaryBlocks;
     private final boolean[] airPalette;
+    private final BitSet nonAirMask;
     private final int nonAirBlocks;
 
     SchematicModel(
@@ -55,6 +57,7 @@ public final class SchematicModel {
 
         int nonAir = 0;
         int boundaryCount = 0;
+        BitSet occupied = new BitSet(this.blocks.length);
         boolean[] air = new boolean[this.palette.size()];
         for (int index = 0; index < air.length; ++index) {
             air[index] = isAirState(this.palette.get(index));
@@ -68,10 +71,12 @@ public final class SchematicModel {
                 );
             }
             if (air[paletteIndex]) continue;
+            occupied.set(index);
             ++nonAir;
             if (isBoundary(index, air)) ++boundaryCount;
         }
         nonAirBlocks = nonAir;
+        nonAirMask = occupied;
         boundaryBlocks = new int[boundaryCount];
         int output = 0;
         for (int index = 0; index < this.blocks.length; ++index) {
@@ -132,6 +137,16 @@ public final class SchematicModel {
 
     public int paletteIndexAtLinear(int index) {
         return blocks[index];
+    }
+
+    /**
+     * Returns the next non-air linear index at or after {@code fromIndex}, or
+     * {@code -1}. The compact bit set lets radius-window queries skip long air
+     * runs without allocating an integer index for every schematic block.
+     */
+    public int nextNonAirBlockIndex(int fromIndex) {
+        if (fromIndex < 0) throw new IndexOutOfBoundsException("Negative index");
+        return nonAirMask.nextSetBit(fromIndex);
     }
 
     public String paletteState(int index) {

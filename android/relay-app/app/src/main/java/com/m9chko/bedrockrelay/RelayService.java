@@ -102,6 +102,12 @@ public final class RelayService extends Service {
     public static final String KEY_SCHEMATIC_ANCHOR_Y_EXACT =
         "schematic_anchor_y_exact";
     public static final String KEY_SCHEMATIC_ANCHOR_Z = "schematic_anchor_z";
+    public static final String KEY_SCHEMATIC_TOTAL = "schematic_total";
+    public static final String KEY_SCHEMATIC_CORRECT = "schematic_correct";
+    public static final String KEY_SCHEMATIC_MISSING = "schematic_missing";
+    public static final String KEY_SCHEMATIC_WRONG = "schematic_wrong";
+    public static final String KEY_SCHEMATIC_UNKNOWN = "schematic_unknown";
+    public static final String KEY_SCHEMATIC_DISPLAYED = "schematic_displayed";
 
     public static final int DEFAULT_PLAYER_COLOR = 0xff4fd5ff;
     public static final int DEFAULT_MOB_COLOR = 0xffff5b62;
@@ -1317,9 +1323,7 @@ public final class RelayService extends Service {
             }
         });
         try {
-            boolean schematicWorldTracking = schematicEnabled ||
-                (schematicOverlayController != null &&
-                    schematicOverlayController.model() != null);
+            boolean schematicWorldTracking = schematicEnabled;
             NativeBridge.configureRuntime(
                 detailedLogs,
                 retainChunks,

@@ -957,6 +957,55 @@ LevelChunkRetentionStats BedrockLiveRelay::levelChunkRetentionStats() const noex
     return out;
 }
 
+bool BedrockLiveRelay::queueClientboundPackets(
+    const BedrockServerConnection& connection,
+    const std::vector<VersionedGamePacket>& packets
+) {
+    if (packets.empty()) return false;
+
+    const auto session = findSession(connection);
+    if (!session) return false;
+
+    // Serialize with ordinary relay forwarding and teardown. This API is an
+    // output sink: it deliberately does not call applyHandlers(), enter the
+    // upstream path, or otherwise re-enter packet callbacks.
+    std::lock_guard<std::recursive_mutex> dispatchLock(handlerDispatchMutex_);
+    BedrockServerConnection downstream;
+    {
+        std::lock_guard<std::mutex> lock(session->mutex);
+        if (!relaySessionAcceptsPackets(*session) ||
+            session->downstreamPhase != RelayDownstreamPhase::Game) {
+            return false;
+        }
+        downstream = session->downstream;
+        if (downstream.status() == BedrockServerClientStatus::Disconnected) {
+            return false;
+        }
+        server_->queuePackets(
+            downstream,
+            packets,
+            options_.clientboundCompression
+        );
+    }
+
+    for (const auto& packet : packets) {
+        if (options_.logging &&
+            shouldLogRelayPacket("Proxy -> Client", packet.name)) {
+            std::ostringstream out;
+            out << "* Proxy -> Client " << session->id << " " << packet.name
+                << packetSummary(options_.server.version, packet);
+            relayLogLine(out.str());
+        }
+        retainClientboundLevelChunk(session, packet);
+        emitForwarded(
+            session,
+            BedrockRelayDirection::Clientbound,
+            packet
+        );
+    }
+    return true;
+}
+
 BedrockServer& BedrockLiveRelay::server() {
     return *server_;
 }

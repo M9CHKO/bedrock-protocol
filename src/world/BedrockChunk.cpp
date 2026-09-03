@@ -936,6 +936,85 @@ BedrockChunkColumn BedrockLevelChunkCodec::decodeNoCacheColumn(
     return column;
 }
 
+BedrockChunkColumn BedrockLevelChunkCodec::decodeNoCacheBlockSectionsFallback(
+    const BedrockLevelChunkPacket& packet
+) {
+    if (packet.cacheEnabled) {
+        throw BedrockChunkError(
+            "decodeNoCacheBlockSectionsFallback requires cacheEnabled=false"
+        );
+    }
+
+    constexpr int32_t minSectionY = -4;
+    constexpr int32_t maxSectionY = 20;
+    constexpr int32_t sectionCapacity = maxSectionY - minSectionY;
+    if (packet.subChunkCount <= 0 || packet.subChunkCount > sectionCapacity) {
+        throw BedrockChunkError(
+            "decodeNoCacheBlockSectionsFallback requires 1..24 v8/v9 sections"
+        );
+    }
+
+    BedrockChunkColumn column(packet.x, packet.z);
+    column.setBounds(minSectionY, maxSectionY);
+    BinaryStream stream = BinaryStream::view(packet.payload);
+    std::array<bool, static_cast<std::size_t>(sectionCapacity)> seenSections {};
+
+    for (int32_t i = 0; i < packet.subChunkCount; ++i) {
+        if (stream.remaining() < 3) {
+            throw BedrockChunkError(
+                "truncated v8/v9 block section at index " + std::to_string(i)
+            );
+        }
+
+        const std::size_t sectionOffset = stream.offset();
+        const uint8_t version = stream.readU8();
+        stream.seek(sectionOffset);
+        if (version != 8 && version != 9) {
+            throw BedrockChunkError(
+                "fallback requires v8/v9 block sections; index " +
+                std::to_string(i) + " has version " + std::to_string(version)
+            );
+        }
+
+        // v8 has no Y byte, so seed it with the modern sequential position.
+        // v9 replaces the seed while decoding with its signed embedded Y.
+        const int32_t sequentialY = minSectionY + i;
+        BedrockSubChunk section(static_cast<int8_t>(sequentialY), version);
+        try {
+            section.decodeFrom(ChunkStorageType::Runtime, stream);
+        } catch (const std::exception& error) {
+            throw BedrockChunkError(
+                "invalid v8/v9 block section at index " + std::to_string(i) +
+                ": " + error.what()
+            );
+        }
+
+        const int32_t sectionY = version == 8
+            ? sequentialY
+            : static_cast<int32_t>(section.y());
+        if (sectionY < minSectionY || sectionY >= maxSectionY) {
+            throw BedrockChunkError(
+                "v8/v9 block section Y outside modern bounds: " +
+                std::to_string(sectionY)
+            );
+        }
+        const auto seenIndex = static_cast<std::size_t>(sectionY - minSectionY);
+        if (seenSections[seenIndex]) {
+            throw BedrockChunkError(
+                "duplicate v8/v9 block section Y: " + std::to_string(sectionY)
+            );
+        }
+        seenSections[seenIndex] = true;
+        column.setSection(sectionY, std::move(section));
+    }
+
+    // A LevelChunk trailer is intentionally not consumed here. Some IGN-like
+    // servers send legacy or otherwise incompatible biome/trailer bytes after
+    // valid modern v8/v9 sections. The relay only needs the recovered block
+    // data; the original packet bytes continue to be forwarded unchanged.
+    return column;
+}
+
 BedrockLevelChunkPacket BedrockLevelChunkCodec::encodeNoCacheColumn(
     const BedrockChunkColumn& column,
     int32_t dimension
@@ -1618,7 +1697,16 @@ void BedrockChunkColumn::networkDecodeNoCache(
         sections_.clear();
         sections_.resize(static_cast<std::size_t>(maxCY_ - minCY_));
         for (int32_t i = 0; i < sectionCount; ++i) {
-            BedrockSubChunk section(static_cast<int8_t>(i), 9);
+            // v8 (and the old v1 alias) does not carry a section Y byte. In a
+            // caves-and-cliffs column its first sequential section starts at
+            // minCY (-4), not at zero. v9 overwrites this seed with its signed
+            // embedded Y, so the same initialization is correct for both.
+            const int32_t sequentialY = minCY_ + i;
+            if (sequentialY < std::numeric_limits<int8_t>::min() ||
+                sequentialY > std::numeric_limits<int8_t>::max()) {
+                throw BedrockChunkError("sequential subchunk Y is out of range");
+            }
+            BedrockSubChunk section(static_cast<int8_t>(sequentialY), 9);
             section.decodeFrom(ChunkStorageType::Runtime, stream);
             setSection(section.y(), section);
         }

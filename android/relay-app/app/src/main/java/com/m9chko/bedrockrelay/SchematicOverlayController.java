@@ -18,6 +18,7 @@ import android.view.Gravity;
 import android.view.View;
 import android.view.WindowManager;
 
+import com.m9chko.bedrockrelay.schematic.SchematicActiveBlockSelector;
 import com.m9chko.bedrockrelay.schematic.SchematicModel;
 
 import org.json.JSONObject;
@@ -35,7 +36,6 @@ final class SchematicOverlayController {
     private static final int BLOCK_SNAPSHOT_VERSION = 2;
     private static final int BLOCK_SNAPSHOT_HEADER = 6;
     private static final int BLOCK_QUERY_BATCH_SIZE = 4_096;
-    private static final int MAX_CONSTRUCTION_TRACKED_BLOCKS = 262_144;
     private static final long FORCE_BLOCK_SNAPSHOT = Long.MIN_VALUE;
     private static final byte BLOCK_UNKNOWN = 0;
     private static final byte BLOCK_MISSING = 1;
@@ -62,7 +62,7 @@ final class SchematicOverlayController {
     private volatile SchematicModel model;
     private volatile EntityOutlineOverlayController.CameraSample latestCamera =
         EntityOutlineOverlayController.CameraSample.unknown();
-    private boolean placementPending;
+    private volatile boolean placementPending;
     private boolean placementTargetCaptured;
     private long placementRequest;
     private long placementDeadlineMs;
@@ -73,6 +73,11 @@ final class SchematicOverlayController {
     private SchematicView view;
     private final Object blockQueryLock = new Object();
     private volatile BlockQuery blockQuery;
+    private volatile boolean debugMarkersDirty = true;
+    private volatile boolean debugMarkerPlanPublished;
+    private volatile int publishedCameraChunkX = Integer.MIN_VALUE;
+    private volatile int publishedCameraChunkY = Integer.MIN_VALUE;
+    private volatile int publishedCameraChunkZ = Integer.MIN_VALUE;
 
     SchematicOverlayController(
         Context context,
@@ -111,14 +116,32 @@ final class SchematicOverlayController {
         boolean mirrored,
         int layer
     ) {
-        invalidateBlockQuery();
+        int nextFov = RelayService.clampEntityFov(fov);
+        int nextOpacity = RelayService.clampSchematicOpacity(opacity);
+        int nextDistance = RelayService.clampSchematicDistance(distance);
+        int nextRotation = Math.floorMod(rotation, 4);
+        boolean queryChanged = rotationQuarterTurns != nextRotation ||
+            this.mirrored != mirrored;
+        boolean markerSelectionChanged = opacityPercent != nextOpacity ||
+            maximumDistance != nextDistance || selectedLayer != layer;
+        boolean enabledChanged = this.enabled != enabled;
+
         this.enabled = enabled;
-        fieldOfView = RelayService.clampEntityFov(fov);
-        opacityPercent = RelayService.clampSchematicOpacity(opacity);
-        maximumDistance = RelayService.clampSchematicDistance(distance);
-        rotationQuarterTurns = Math.floorMod(rotation, 4);
+        fieldOfView = nextFov;
+        opacityPercent = nextOpacity;
+        maximumDistance = nextDistance;
+        rotationQuarterTurns = nextRotation;
         this.mirrored = mirrored;
         selectedLayer = layer;
+        if (queryChanged) {
+            invalidateBlockQuery();
+        } else if (!enabled) {
+            if (enabledChanged || debugMarkerPlanPublished) clearDebugMarkers();
+        } else if (enabledChanged || markerSelectionChanged) {
+            // The cached world comparison remains valid. Re-plan on the
+            // snapshot executor without a visible clear/re-add flicker.
+            debugMarkersDirty = true;
+        }
         refreshPlacementRequest();
         SchematicView current = view;
         if (current != null) {
@@ -140,6 +163,7 @@ final class SchematicOverlayController {
     }
 
     void setModel(SchematicModel value) {
+        if (model == value) return;
         invalidateBlockQuery();
         model = value;
         SchematicView current = view;
@@ -152,7 +176,7 @@ final class SchematicOverlayController {
     }
 
     boolean wantsFrames() {
-        return sessionVisible && enabled && !uiBlocked && model != null &&
+        return sessionVisible && enabled && model != null &&
             (placementPending || preferences.getBoolean(
                 RelayService.KEY_SCHEMATIC_PLACED,
                 false
@@ -202,6 +226,7 @@ final class SchematicOverlayController {
 
     void hideImmediately() {
         sessionVisible = false;
+        clearDebugMarkers();
         removeWindow();
     }
 
@@ -221,6 +246,7 @@ final class SchematicOverlayController {
     }
 
     private void beginPlacement(long request) {
+        invalidateBlockQuery();
         placementPending = true;
         placementTargetCaptured = false;
         placementRequest = request;
@@ -307,14 +333,16 @@ final class SchematicOverlayController {
 
     void pollWorldSnapshot() {
         BlockQuery query = currentBlockQuery();
-        if (query == null) return;
+        if (query == null) {
+            if (debugMarkerPlanPublished) clearDebugMarkers();
+            return;
+        }
         long afterRevision;
         int batchStart;
         int batchCount;
         int[] worldCoordinates;
         synchronized (blockQueryLock) {
             if (blockQuery != query) return;
-            if (query.blockCount() == 0) return;
             batchStart = query.scanning ? query.nextIndex : 0;
             batchCount = Math.min(
                 BLOCK_QUERY_BATCH_SIZE,
@@ -341,10 +369,15 @@ final class SchematicOverlayController {
             ((long) snapshot[3] << 32);
         int count = snapshot[5];
         if (count == 0) {
+            byte[] cachedStates = null;
             synchronized (blockQueryLock) {
                 if (blockQuery == query && !query.scanning) {
                     query.completedRevision = revision;
+                    cachedStates = query.states;
                 }
+            }
+            if (cachedStates != null && shouldRefreshMarkersForCamera()) {
+                publishDebugMarkers(query, cachedStates, revision, snapshot[4]);
             }
             return;
         }
@@ -356,8 +389,6 @@ final class SchematicOverlayController {
         }
 
         byte[] completedStates = null;
-        int completedCorrect = 0;
-        int completedWrong = 0;
         synchronized (blockQueryLock) {
             if (blockQuery != query) return;
             if (query.scanning) {
@@ -409,35 +440,18 @@ final class SchematicOverlayController {
                 else if (state == BLOCK_WRONG) ++query.workingWrongBlocks;
             }
             query.nextIndex = batchStart + count;
-            if (query.nextIndex == query.blockCount()) {
-                query.finishCycle(revision);
+            if (query.nextIndex == query.blockCount() &&
+                query.finishCycle(revision)) {
                 completedStates = query.states;
-                completedCorrect = query.correctBlocks;
-                completedWrong = query.wrongBlocks;
             }
         }
         if (completedStates == null) return;
-        final byte[] states = completedStates;
-        final int ready = completedCorrect;
-        final int errors = completedWrong;
-        mainHandler.post(() -> {
-            if (blockQuery != query) return;
-            SchematicView current = view;
-            if (current != null) {
-                current.setWorldStates(
-                    query.model,
-                    query.blockIndices,
-                    states,
-                    ready,
-                    errors
-                );
-            }
-        });
+        publishDebugMarkers(query, completedStates, revision, snapshot[4]);
     }
 
     private BlockQuery currentBlockQuery() {
         SchematicModel currentModel = model;
-        if (currentModel == null || !preferences.getBoolean(
+        if (placementPending || currentModel == null || !preferences.getBoolean(
                 RelayService.KEY_SCHEMATIC_PLACED,
                 false
             )) {
@@ -454,6 +468,13 @@ final class SchematicOverlayController {
         );
         int rotation = rotationQuarterTurns;
         boolean mirror = mirrored;
+        EntityOutlineOverlayController.CameraSample camera = latestCamera;
+        if (camera == null || !camera.known) return null;
+        int cameraChunkX = blockCoordinate(camera.x);
+        int cameraChunkY = blockCoordinate(camera.y);
+        int cameraChunkZ = blockCoordinate(camera.z);
+        int distance = maximumDistance;
+        int layer = selectedLayer;
         BlockQuery cached = blockQuery;
         if (cached != null && cached.matches(
                 currentModel,
@@ -461,7 +482,12 @@ final class SchematicOverlayController {
                 anchorY,
                 anchorZ,
                 rotation,
-                mirror
+                mirror,
+                cameraChunkX,
+                cameraChunkY,
+                cameraChunkZ,
+                distance,
+                layer
             )) {
             return cached;
         }
@@ -473,7 +499,12 @@ final class SchematicOverlayController {
                     anchorY,
                     anchorZ,
                     rotation,
-                    mirror
+                    mirror,
+                    cameraChunkX,
+                    cameraChunkY,
+                    cameraChunkZ,
+                    distance,
+                    layer
                 )) {
                 return cached;
             }
@@ -487,7 +518,12 @@ final class SchematicOverlayController {
                     rotation,
                     mirror
                 ),
-                blockNameTranslator
+                blockNameTranslator,
+                cameraChunkX,
+                cameraChunkY,
+                cameraChunkZ,
+                distance,
+                layer
             );
             blockQuery = created;
             return created;
@@ -498,8 +534,148 @@ final class SchematicOverlayController {
         synchronized (blockQueryLock) {
             blockQuery = null;
         }
+        debugMarkersDirty = true;
+        publishedCameraChunkX = Integer.MIN_VALUE;
+        publishedCameraChunkY = Integer.MIN_VALUE;
+        publishedCameraChunkZ = Integer.MIN_VALUE;
+        clearDebugMarkers();
         SchematicView current = view;
         if (current != null) current.clearWorldStates();
+    }
+
+    private boolean shouldRefreshMarkersForCamera() {
+        if (debugMarkersDirty) return true;
+        EntityOutlineOverlayController.CameraSample camera = latestCamera;
+        if (camera == null || !camera.known) return false;
+        return blockCoordinate(camera.x) != publishedCameraChunkX ||
+            blockCoordinate(camera.y) != publishedCameraChunkY ||
+            blockCoordinate(camera.z) != publishedCameraChunkZ;
+    }
+
+    private static int blockCoordinate(double coordinate) {
+        return (int) Math.floor(coordinate / 16.0d);
+    }
+
+    private void publishDebugMarkers(
+        BlockQuery query,
+        byte[] states,
+        long expectedWorldRevision,
+        int expectedDimension
+    ) {
+        if (blockQuery != query || !wantsFrames()) return;
+        EntityOutlineOverlayController.CameraSample camera = latestCamera;
+        boolean cameraKnown = camera != null && camera.known;
+        if (!cameraKnown || !query.matchesWindow(
+                blockCoordinate(camera.x),
+                blockCoordinate(camera.y),
+                blockCoordinate(camera.z),
+                maximumDistance,
+                selectedLayer
+            )) {
+            debugMarkersDirty = true;
+            return;
+        }
+        SchematicDebugMarkerPlanner.Result result =
+            SchematicDebugMarkerPlanner.plan(
+                query.model,
+                query.transform,
+                query.blockIndices,
+                states,
+                cameraKnown,
+                cameraKnown ? camera.x : 0.0d,
+                cameraKnown ? camera.y : 0.0d,
+                cameraKnown ? camera.z : 0.0d,
+                query.selectedLayer,
+                query.maximumDistance,
+                opacityPercent
+            );
+        synchronized (blockQueryLock) {
+            // Serialize the last validity check, native publication and every
+            // clear. A concurrent hide/anchor/model change must either happen
+            // before this check or clear the plan immediately afterwards.
+            EntityOutlineOverlayController.CameraSample currentCamera =
+                latestCamera;
+            if (blockQuery != query || !wantsFrames() ||
+                currentCamera == null || !currentCamera.known ||
+                !query.matchesWindow(
+                    blockCoordinate(currentCamera.x),
+                    blockCoordinate(currentCamera.y),
+                    blockCoordinate(currentCamera.z),
+                    maximumDistance,
+                    selectedLayer
+                )) {
+                debugMarkersDirty = true;
+                return;
+            }
+            boolean accepted = NativeBridge.replaceSchematicDebugMarkers(
+                result.records(),
+                result.opacityPercent(),
+                result.total(),
+                result.correct(),
+                result.missing(),
+                result.wrong(),
+                result.unknown(),
+                expectedWorldRevision,
+                expectedDimension
+            );
+            if (!accepted) {
+                debugMarkersDirty = true;
+                return;
+            }
+            debugMarkerPlanPublished = true;
+            debugMarkersDirty = false;
+            if (cameraKnown) {
+                publishedCameraChunkX = blockCoordinate(camera.x);
+                publishedCameraChunkY = blockCoordinate(camera.y);
+                publishedCameraChunkZ = blockCoordinate(camera.z);
+            }
+            saveProgress(result);
+        }
+    }
+
+    private void clearDebugMarkers() {
+        synchronized (blockQueryLock) {
+            if (debugMarkerPlanPublished) {
+                try {
+                    NativeBridge.clearSchematicDebugMarkers();
+                } catch (Throwable error) {
+                    DiagnosticsLog.appendError(
+                        context,
+                        "schematics",
+                        "Failed to clear client-only schematic markers",
+                        error
+                    );
+                }
+            }
+            debugMarkerPlanPublished = false;
+            debugMarkersDirty = true;
+            saveProgress(null);
+        }
+    }
+
+    private void saveProgress(SchematicDebugMarkerPlanner.Result result) {
+        int total = result == null ? 0 : result.total();
+        int correct = result == null ? 0 : result.correct();
+        int missing = result == null ? 0 : result.missing();
+        int wrong = result == null ? 0 : result.wrong();
+        int unknown = result == null ? 0 : result.unknown();
+        int displayed = result == null ? 0 : result.displayed();
+        if (preferences.getInt(RelayService.KEY_SCHEMATIC_TOTAL, -1) == total &&
+            preferences.getInt(RelayService.KEY_SCHEMATIC_CORRECT, -1) == correct &&
+            preferences.getInt(RelayService.KEY_SCHEMATIC_MISSING, -1) == missing &&
+            preferences.getInt(RelayService.KEY_SCHEMATIC_WRONG, -1) == wrong &&
+            preferences.getInt(RelayService.KEY_SCHEMATIC_UNKNOWN, -1) == unknown &&
+            preferences.getInt(RelayService.KEY_SCHEMATIC_DISPLAYED, -1) == displayed) {
+            return;
+        }
+        preferences.edit()
+            .putInt(RelayService.KEY_SCHEMATIC_TOTAL, total)
+            .putInt(RelayService.KEY_SCHEMATIC_CORRECT, correct)
+            .putInt(RelayService.KEY_SCHEMATIC_MISSING, missing)
+            .putInt(RelayService.KEY_SCHEMATIC_WRONG, wrong)
+            .putInt(RelayService.KEY_SCHEMATIC_UNKNOWN, unknown)
+            .putInt(RelayService.KEY_SCHEMATIC_DISPLAYED, displayed)
+            .apply();
     }
 
     private static final class BlockQuery {
@@ -509,6 +685,11 @@ final class SchematicOverlayController {
         final int anchorZ;
         final int rotation;
         final boolean mirrored;
+        final int cameraChunkX;
+        final int cameraChunkY;
+        final int cameraChunkZ;
+        final int maximumDistance;
+        final int selectedLayer;
         final boolean exactBedrockProperties;
         final SchematicPlacementTransform transform;
         final SchematicBlockMatcher.ExpectedBlock[] paletteExpectedBlocks;
@@ -529,7 +710,12 @@ final class SchematicOverlayController {
             SchematicModel model,
             SchematicPlacementTransform transform,
             SchematicBlockMatcher.ExpectedBlock[] paletteExpectedBlocks,
-            int[] blockIndices
+            int[] blockIndices,
+            int cameraChunkX,
+            int cameraChunkY,
+            int cameraChunkZ,
+            int maximumDistance,
+            int selectedLayer
         ) {
             this.model = model;
             anchorX = transform.anchorX();
@@ -537,6 +723,11 @@ final class SchematicOverlayController {
             anchorZ = transform.anchorZ();
             rotation = transform.rotationQuarterTurns();
             mirrored = transform.mirrored();
+            this.cameraChunkX = cameraChunkX;
+            this.cameraChunkY = cameraChunkY;
+            this.cameraChunkZ = cameraChunkZ;
+            this.maximumDistance = maximumDistance;
+            this.selectedLayer = selectedLayer;
             // .mcstructure states already use Bedrock property names/values.
             // Directional properties need a separate transform before exact
             // comparison, so rotated/mirrored placements safely fall back to
@@ -553,7 +744,12 @@ final class SchematicOverlayController {
         static BlockQuery create(
             SchematicModel model,
             SchematicPlacementTransform transform,
-            BlockNameTranslator translator
+            BlockNameTranslator translator,
+            int cameraChunkX,
+            int cameraChunkY,
+            int cameraChunkZ,
+            int maximumDistance,
+            int selectedLayer
         ) {
             SchematicBlockMatcher.ExpectedBlock[] palette =
                 new SchematicBlockMatcher.ExpectedBlock[model.paletteSize()];
@@ -569,32 +765,26 @@ final class SchematicOverlayController {
                     translator.bedrockCandidates(state)
                 );
             }
-            int count = model.nonAirBlocks() <=
-                    MAX_CONSTRUCTION_TRACKED_BLOCKS
-                ? model.nonAirBlocks()
-                : model.boundaryBlockCount();
-            int[] blockIndices = new int[count];
-            if (model.nonAirBlocks() <= MAX_CONSTRUCTION_TRACKED_BLOCKS) {
-                int output = 0;
-                for (int linear = 0; linear < model.volume(); ++linear) {
-                    int x = model.xFromIndex(linear);
-                    int y = model.yFromIndex(linear);
-                    int z = model.zFromIndex(linear);
-                    if (!model.isAirAt(x, y, z)) {
-                        blockIndices[output++] = linear;
-                    }
-                }
-                if (output != blockIndices.length) {
-                    throw new IllegalStateException(
-                        "Schematic non-air block count changed"
-                    );
-                }
-            } else {
-                for (int index = 0; index < blockIndices.length; ++index) {
-                    blockIndices[index] = model.boundaryBlockIndexAt(index);
-                }
-            }
-            return new BlockQuery(model, transform, palette, blockIndices);
+            int[] blockIndices = SchematicActiveBlockSelector.select(
+                model,
+                transform,
+                cameraChunkX,
+                cameraChunkY,
+                cameraChunkZ,
+                maximumDistance,
+                selectedLayer
+            );
+            return new BlockQuery(
+                model,
+                transform,
+                palette,
+                blockIndices,
+                cameraChunkX,
+                cameraChunkY,
+                cameraChunkZ,
+                maximumDistance,
+                selectedLayer
+            );
         }
 
         int blockCount() {
@@ -653,15 +843,21 @@ final class SchematicOverlayController {
             workingWrongBlocks = 0;
         }
 
-        void finishCycle(long revision) {
-            boolean needsRescan = cycleChanged;
+        boolean finishCycle(long revision) {
+            if (cycleChanged) {
+                // Never publish a plan assembled from different world
+                // revisions. Keep the last coherent plan visible and force a
+                // fresh bounded pass on the next scheduler turn.
+                abortCycle();
+                completedRevision = FORCE_BLOCK_SNAPSHOT;
+                return false;
+            }
             states = workingStates;
             correctBlocks = workingCorrectBlocks;
             wrongBlocks = workingWrongBlocks;
-            completedRevision = needsRescan
-                ? FORCE_BLOCK_SNAPSHOT
-                : revision;
+            completedRevision = revision;
             abortCycle();
+            return true;
         }
 
         boolean matches(
@@ -670,11 +866,34 @@ final class SchematicOverlayController {
             int y,
             int z,
             int quarterTurns,
-            boolean mirror
+            boolean mirror,
+            int candidateCameraChunkX,
+            int candidateCameraChunkY,
+            int candidateCameraChunkZ,
+            int candidateMaximumDistance,
+            int candidateSelectedLayer
         ) {
             return model == candidate && anchorX == x && anchorY == y &&
                 anchorZ == z && rotation == Math.floorMod(quarterTurns, 4) &&
-                mirrored == mirror;
+                mirrored == mirror && cameraChunkX == candidateCameraChunkX &&
+                cameraChunkY == candidateCameraChunkY &&
+                cameraChunkZ == candidateCameraChunkZ &&
+                maximumDistance == candidateMaximumDistance &&
+                selectedLayer == candidateSelectedLayer;
+        }
+
+        boolean matchesWindow(
+            int candidateCameraChunkX,
+            int candidateCameraChunkY,
+            int candidateCameraChunkZ,
+            int candidateMaximumDistance,
+            int candidateSelectedLayer
+        ) {
+            return cameraChunkX == candidateCameraChunkX &&
+                cameraChunkY == candidateCameraChunkY &&
+                cameraChunkZ == candidateCameraChunkZ &&
+                maximumDistance == candidateMaximumDistance &&
+                selectedLayer == candidateSelectedLayer;
         }
     }
 
@@ -683,8 +902,6 @@ final class SchematicOverlayController {
         mainHandler.post(() -> {
             EntityOutlineOverlayController.CameraSample camera =
                 pendingCamera.getAndSet(null);
-            SchematicView current = view;
-            if (current != null && camera != null) current.submitCamera(camera);
             // Camera snapshots arrive on RelayService's polling executor.
             // Placement mutates SharedPreferences, View state and
             // WindowManager state, so keep the entire commit on the UI
@@ -698,15 +915,10 @@ final class SchematicOverlayController {
     }
 
     private void reconcileWindow() {
-        if (sessionVisible && enabled && !uiBlocked && model != null &&
-            preferences.getBoolean(
-                RelayService.KEY_SCHEMATIC_PLACED,
-                false
-            )) {
-            addWindow();
-        } else {
-            removeWindow();
-        }
+        // Schematics are rendered inside Minecraft with DebugRenderer
+        // packets. The old Android full-screen camera projection must never
+        // be attached: it caused view-dependent drift and could cover input.
+        removeWindow();
     }
 
     private void addWindow() {
@@ -784,7 +996,12 @@ final class SchematicOverlayController {
                         addedAnchorY,
                         addedAnchorZ,
                         rotationQuarterTurns,
-                        mirrored
+                        mirrored,
+                        cachedQuery.cameraChunkX,
+                        cachedQuery.cameraChunkY,
+                        cachedQuery.cameraChunkZ,
+                        cachedQuery.maximumDistance,
+                        cachedQuery.selectedLayer
                     )) {
                     cachedStates = cachedQuery.states;
                     cachedCorrect = cachedQuery.correctBlocks;

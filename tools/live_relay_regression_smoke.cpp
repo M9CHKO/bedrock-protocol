@@ -2177,6 +2177,259 @@ bool checkForwardRawPolicy() {
     return ok;
 }
 
+bool checkClientboundInjectionBatch() {
+    const std::string version = "1.21.100";
+    const std::vector<bedrock::VersionedGamePacket> injected {
+        encodedPacket(version, "set_time", timeValue(930001)),
+        encodedPacket(version, "set_time", timeValue(930002))
+    };
+    const auto ordinaryServerbound =
+        encodedPacket(version, "set_time", timeValue(930003));
+
+    ErrorLog errors;
+    std::atomic<int> injectedPacketsSeenUpstream {0};
+    std::mutex serverboundMutex;
+    std::vector<bedrock::VersionedGamePacket> receivedServerbound;
+    bedrock::BedrockServer upstream({
+        .host = "127.0.0.1",
+        .port = 0,
+        .version = version,
+        .motd = {{"motd", "Relay Clientbound Injection Upstream"}},
+        .maxPlayers = 2,
+        .offline = true,
+        .batchingInterval = 2
+    });
+    upstream.onConnect([&](const bedrock::BedrockServerConnection& connection) {
+        connection.onError([&](const std::string& message) {
+            errors.add("upstream player", message);
+        });
+    });
+    upstream.onAny([&](const bedrock::BedrockServerPacketEvent& event) {
+        for (const auto& packet : injected) {
+            if (event.packet.fullPacket == packet.fullPacket) {
+                ++injectedPacketsSeenUpstream;
+                return;
+            }
+        }
+        if (event.packet.fullPacket != ordinaryServerbound.fullPacket) return;
+        std::lock_guard<std::mutex> lock(serverboundMutex);
+        receivedServerbound.push_back(event.packet);
+    });
+    upstream.listen();
+
+    auto options = relayOptions(upstream.boundPort(), true);
+    options.batchingInterval = 20;
+    bedrock::Relay relay(std::move(options));
+    std::mutex connectionMutex;
+    bedrock::BedrockServerConnection relayDownstreamConnection;
+    std::atomic<bool> hasRelayDownstreamConnection {false};
+    std::atomic<bool> preGameInjectionRejected {false};
+    std::atomic<int> joins {0};
+    std::atomic<int> injectedHandlerCallbacks {0};
+    std::mutex forwardedMutex;
+    std::vector<bedrock::VersionedGamePacket> forwardedInjected;
+
+    relay.onConnect([&](bedrock::RelayPlayer& player) {
+        {
+            std::lock_guard<std::mutex> lock(connectionMutex);
+            relayDownstreamConnection = player.connection;
+            hasRelayDownstreamConnection = true;
+        }
+        preGameInjectionRejected = !relay.live().queueClientboundPackets(
+            player.connection,
+            injected
+        );
+    });
+    relay.onJoin([&](bedrock::RelayPlayer&, bedrock::BedrockNetworkClient&) {
+        ++joins;
+    });
+    relay.onClientbound([&](bedrock::RelayPacketEvent& event) {
+        for (const auto& packet : injected) {
+            if (event.packet.fullPacket == packet.fullPacket) {
+                ++injectedHandlerCallbacks;
+                return;
+            }
+        }
+    });
+    relay.live().onForwarded([&](const bedrock::BedrockRelayPacketEvent& event) {
+        if (event.direction != bedrock::BedrockRelayDirection::Clientbound) return;
+        for (const auto& packet : injected) {
+            if (event.packet.fullPacket != packet.fullPacket) continue;
+            std::lock_guard<std::mutex> lock(forwardedMutex);
+            forwardedInjected.push_back(event.packet);
+            return;
+        }
+    });
+    relay.onError([&](const std::string& message) {
+        errors.add("relay", message);
+    });
+
+    std::atomic<bool> captureTransport {false};
+    std::mutex transportMutex;
+    std::vector<bedrock::BedrockServerTransportEvent> transportEvents;
+    relay.live().server().onTransport(
+        [&](const bedrock::BedrockServerTransportEvent& event) {
+            if (!captureTransport.load() ||
+                (event.kind != bedrock::BedrockServerTransportEventKind::SendPacket &&
+                 event.kind != bedrock::BedrockServerTransportEventKind::SendBatch)) {
+                return;
+            }
+            std::lock_guard<std::mutex> lock(transportMutex);
+            transportEvents.push_back(event);
+        }
+    );
+    relay.listen();
+
+    auto downstream = bedrock::createNetworkClient(
+        downstreamOptions(relay.live().boundPort())
+    );
+    std::mutex clientboundMutex;
+    std::vector<bedrock::VersionedGamePacket> receivedInjected;
+    downstream.onAny([&](const bedrock::BedrockNetworkClientPacketEvent& event) {
+        for (const auto& packet : injected) {
+            if (event.packet.fullPacket != packet.fullPacket) continue;
+            std::lock_guard<std::mutex> lock(clientboundMutex);
+            receivedInjected.push_back(event.packet);
+            return;
+        }
+    });
+    downstream.onError([&](const std::string& message) {
+        errors.add("downstream", message);
+    });
+
+    bool ok = true;
+    const bool connected = downstream.connect();
+    const bool ready = connected && waitFor([&]() {
+        return joins.load() == 1 && relay.live().upstreamReady() &&
+            hasRelayDownstreamConnection.load();
+    });
+    ok &= check(connected, "clientbound injection downstream failed to connect");
+    ok &= check(ready, "clientbound injection relay did not become ready");
+    ok &= check(
+        preGameInjectionRejected.load(),
+        "clientbound injection accepted a negotiating downstream session"
+    );
+
+    bedrock::BedrockServerConnection target;
+    {
+        std::lock_guard<std::mutex> lock(connectionMutex);
+        target = relayDownstreamConnection;
+    }
+    std::atomic<bool> injectionAccepted {false};
+    captureTransport = true;
+    if (ready) {
+        std::thread injector([&]() {
+            injectionAccepted = relay.live().queueClientboundPackets(
+                target,
+                injected
+            );
+        });
+        injector.join();
+        relay.live().server().sendQueued(target);
+    }
+    const bool injectedDelivered = ready && waitFor([&]() {
+        std::lock_guard<std::mutex> lock(clientboundMutex);
+        return receivedInjected.size() == injected.size();
+    });
+    captureTransport = false;
+    ok &= check(
+        injectionAccepted.load(),
+        "clientbound injection rejected an open game session"
+    );
+    ok &= check(injectedDelivered, "clientbound injection was not delivered");
+    if (injectedDelivered) {
+        std::lock_guard<std::mutex> lock(clientboundMutex);
+        std::string mismatch;
+        ok &= check(
+            packetSequenceEquals(receivedInjected, injected, mismatch),
+            "clientbound injection changed packet bytes or order: " + mismatch
+        );
+    }
+
+    bool sharedBatch = false;
+    {
+        std::lock_guard<std::mutex> lock(transportMutex);
+        std::size_t pendingInjected = 0;
+        for (const auto& event : transportEvents) {
+            if (event.kind == bedrock::BedrockServerTransportEventKind::SendPacket) {
+                if (event.packetName == "set_time") ++pendingInjected;
+                continue;
+            }
+            if (event.kind == bedrock::BedrockServerTransportEventKind::SendBatch) {
+                if (pendingInjected == injected.size()) {
+                    sharedBatch = true;
+                    break;
+                }
+                pendingInjected = 0;
+            }
+        }
+    }
+    ok &= check(
+        sharedBatch,
+        "clientbound injection packets were split across downstream batches"
+    );
+    {
+        std::lock_guard<std::mutex> lock(forwardedMutex);
+        std::string mismatch;
+        ok &= check(
+            packetSequenceEquals(forwardedInjected, injected, mismatch),
+            "clientbound injection forwarded observer mismatch: " + mismatch
+        );
+    }
+    ok &= check(
+        injectedHandlerCallbacks.load() == 0,
+        "clientbound injection re-entered relay packet handlers"
+    );
+    ok &= check(
+        injectedPacketsSeenUpstream.load() == 0,
+        "clientbound injection leaked to the upstream server"
+    );
+    ok &= check(
+        !relay.live().queueClientboundPackets(target, {}),
+        "clientbound injection accepted an empty batch"
+    );
+
+    if (ready) {
+        downstream.sendBuffer(ordinaryServerbound.fullPacket);
+        downstream.sendQueued();
+    }
+    const bool serverboundDelivered = ready && waitFor([&]() {
+        std::lock_guard<std::mutex> lock(serverboundMutex);
+        return receivedServerbound.size() == 1;
+    });
+    ok &= check(
+        serverboundDelivered,
+        "ordinary serverbound packet was not delivered after injection"
+    );
+    if (serverboundDelivered) {
+        std::lock_guard<std::mutex> lock(serverboundMutex);
+        std::string mismatch;
+        ok &= check(
+            packetSequenceEquals(
+                receivedServerbound,
+                {ordinaryServerbound},
+                mismatch
+            ),
+            "clientbound injection changed ordinary serverbound bytes: " + mismatch
+        );
+    }
+
+    downstream.close("clientbound injection regression complete");
+    const bool disconnected = waitFor([&]() {
+        return relay.live().sessionCount() == 0;
+    });
+    ok &= check(disconnected, "clientbound injection session did not close");
+    ok &= check(
+        !relay.live().queueClientboundPackets(target, injected),
+        "clientbound injection accepted a closed downstream session"
+    );
+    ok &= check(errors.empty(), "clientbound injection error: " + errors.text());
+
+    relay.close("clientbound injection regression complete");
+    upstream.close("clientbound injection regression complete");
+    return ok;
+}
+
 bool checkDownstreamCloseLifecycle() {
     const std::string version = "1.21.100";
     const auto streamPacket = encodedPacket(version, "set_time", timeValue(710001));
@@ -2314,6 +2567,7 @@ int main() {
     ok = checkMapFloodAndItemOrdering() && ok;
     ok = checkResourcePackServerboundOrdering() && ok;
     ok = checkForwardRawPolicy() && ok;
+    ok = checkClientboundInjectionBatch() && ok;
     ok = checkDownstreamCloseLifecycle() && ok;
     if (ok) std::cout << "[LIVE-RELAY-REGRESSION-SMOKE] OK\n";
     return ok ? 0 : 1;

@@ -52,6 +52,28 @@ public final class NativeBridge {
         int[] worldCoordinates
     );
 
+    /**
+     * Replaces the client-only debug-renderer marker set. Records are flat
+     * [x, y, z, status] tuples where status 1 is missing and 3 is wrong.
+     */
+    public static native boolean replaceSchematicDebugMarkers(
+        int[] markerRecords,
+        int opacityPercent,
+        int total,
+        int correct,
+        int missing,
+        int wrong,
+        int unknown,
+        long expectedWorldRevision,
+        int expectedDimension
+    );
+
+    /**
+     * Clears the Bedrock debug renderer. Protocol 827 exposes only a global
+     * clear action, so the controller immediately rebuilds its retained set.
+     */
+    public static native void clearSchematicDebugMarkers();
+
     /** Exact top of the highest collision shape, or NaN when unavailable. */
     public static native float worldSurfaceY(int worldX, int worldZ);
 

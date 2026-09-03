@@ -152,6 +152,14 @@ public:
     void configureLevelChunkRetention(bool enabled, uint32_t radiusChunks);
     LevelChunkRetentionStats levelChunkRetentionStats() const noexcept;
 
+    // Queues an already encoded clientbound batch only for this relay's
+    // existing downstream game session. The packets bypass relay handlers and
+    // are never sent upstream, which makes this safe for client-only overlays.
+    bool queueClientboundPackets(
+        const BedrockServerConnection& connection,
+        const std::vector<VersionedGamePacket>& packets
+    );
+
     BedrockServer& server();
     // Compatibility view of the first active relay session.
     BedrockNetworkClient* upstream();

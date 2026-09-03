@@ -361,6 +361,17 @@ public:
         bool useCavesAndCliffsBounds = true
     );
 
+    // Recovery-only path for modern servers that append a LevelChunk trailer
+    // incompatible with the strict biome/border/block-entity decoder. This
+    // accepts exactly packet.subChunkCount v8/v9 block sections. Sequential
+    // v8 sections are normalized from the modern minimum section Y (-4), while
+    // v9 sections retain their signed embedded Y. The remaining trailer is
+    // deliberately ignored. Prefer decodeNoCacheColumn() and invoke this only
+    // after the strict decoder rejects the same no-cache packet.
+    static BedrockChunkColumn decodeNoCacheBlockSectionsFallback(
+        const BedrockLevelChunkPacket& packet
+    );
+
     static BedrockLevelChunkPacket encodeNoCacheColumn(
         const BedrockChunkColumn& column,
         int32_t dimension = 0

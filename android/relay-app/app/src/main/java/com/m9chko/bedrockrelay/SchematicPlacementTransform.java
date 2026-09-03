@@ -47,6 +47,10 @@ public final class SchematicPlacementTransform {
         return anchorZ;
     }
 
+    public int sizeX() {
+        return sizeX;
+    }
+
     public int rotationQuarterTurns() {
         return rotationQuarterTurns;
     }
@@ -99,6 +103,44 @@ public final class SchematicPlacementTransform {
     }
 
     /**
+     * Inverts {@link #worldBlock(int, int, int)} for an integer world cell.
+     * The transform is an axis-aligned quarter turn, so every world cell maps
+     * to exactly one local cell even when the result lies outside the model.
+     */
+    public BlockPosition localBlock(int worldX, int worldY, int worldZ) {
+        long dx = (long) worldX - anchorX;
+        long dz = (long) worldZ - anchorZ;
+        long effectiveX;
+        long localZ;
+        switch (rotationQuarterTurns) {
+            case 0:
+                effectiveX = dx;
+                localZ = dz;
+                break;
+            case 1:
+                effectiveX = dz;
+                localZ = -dx - 1L;
+                break;
+            case 2:
+                effectiveX = -dx - 1L;
+                localZ = -dz - 1L;
+                break;
+            case 3:
+                effectiveX = -dz - 1L;
+                localZ = dx;
+                break;
+            default:
+                throw new AssertionError("normalized rotation");
+        }
+        long localX = mirrored ? (long) sizeX - 1L - effectiveX : effectiveX;
+        return new BlockPosition(
+            checkedInt(localX, "local X"),
+            checkedInt((long) worldY - anchorY, "local Y"),
+            checkedInt(localZ, "local Z")
+        );
+    }
+
+    /**
      * Converts a collision-surface height to the first integer block cell above
      * (or exactly on) that surface. For example, a slab top at 64.5 anchors at 65.
      */
@@ -122,6 +164,13 @@ public final class SchematicPlacementTransform {
             throw new ArithmeticException("world coordinate is outside int range");
         }
         return (int) rounded;
+    }
+
+    private static int checkedInt(long value, String coordinate) {
+        if (value < Integer.MIN_VALUE || value > Integer.MAX_VALUE) {
+            throw new ArithmeticException(coordinate + " is outside int range");
+        }
+        return (int) value;
     }
 
     /** Immutable integer world block coordinate. */

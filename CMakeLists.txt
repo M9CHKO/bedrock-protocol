@@ -216,6 +216,15 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
         PRIVATE BedrockProtocol::bedrock_protocol
     )
 
+    add_executable(
+        debug-renderer-packet-smoke
+        tools/debug_renderer_packet_smoke.cpp
+    )
+    target_link_libraries(
+        debug-renderer-packet-smoke
+        PRIVATE BedrockProtocol::bedrock_protocol
+    )
+
     add_executable(snappy-codec-smoke tools/snappy_codec_smoke.cpp)
     target_link_libraries(snappy-codec-smoke PRIVATE BedrockProtocol::bedrock_protocol)
 
@@ -328,6 +337,15 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
     target_link_libraries(chunk-smoke PRIVATE BedrockProtocol::bedrock_protocol)
 
     add_executable(
+        level-chunk-section-fallback-smoke
+        tools/level_chunk_section_fallback_smoke.cpp
+    )
+    target_link_libraries(
+        level-chunk-section-fallback-smoke
+        PRIVATE BedrockProtocol::bedrock_protocol
+    )
+
+    add_executable(
         chunk-publisher-retention-smoke
         tools/chunk_publisher_retention_smoke.cpp
     )
@@ -405,6 +423,10 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
             NAME take-item-entity-schema-smoke
             COMMAND take-item-entity-schema-smoke
         )
+        add_test(
+            NAME debug-renderer-packet-smoke
+            COMMAND debug-renderer-packet-smoke
+        )
         if(Python3_Interpreter_FOUND)
             add_test(
                 NAME generated-protocol-consistency
@@ -436,6 +458,10 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
         add_test(NAME create-client-factory-smoke COMMAND create-client-factory-smoke)
         add_test(NAME legacy-encryption-smoke COMMAND legacy-encryption-smoke)
         add_test(NAME chunk-smoke COMMAND chunk-smoke)
+        add_test(
+            NAME level-chunk-section-fallback-smoke
+            COMMAND level-chunk-section-fallback-smoke
+        )
         add_test(
             NAME chunk-publisher-retention-smoke
             COMMAND chunk-publisher-retention-smoke
@@ -480,6 +506,7 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
         set_tests_properties(
             protocol-roundtrip
             take-item-entity-schema-smoke
+            debug-renderer-packet-smoke
             bedrock-nbt-file-smoke
             protodef-nbt-smoke
             protodef-variables-smoke
@@ -496,6 +523,7 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
             create-client-factory-smoke
             legacy-encryption-smoke
             chunk-smoke
+            level-chunk-section-fallback-smoke
             chunk-publisher-retention-smoke
             level-chunk-retention-cache-smoke
             entity-position-tracker-smoke

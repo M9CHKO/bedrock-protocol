@@ -423,6 +423,33 @@ int main() {
         std::cerr << "[CHUNK-SMOKE] network no-cache biome mismatch\n";
         return 1;
     }
+
+    // IGN/Nukkit-compatible modern columns can still contain sequential v8
+    // sections without an embedded Y byte. The first section belongs at the
+    // modern minimum (-4 / world Y -64), not at section zero.
+    bedrock::BedrockChunkColumn modernV8Column(0, 0);
+    modernV8Column.setBounds(-4, 20);
+    modernV8Column.setBlockStateId({.x = 2, .y = -63, .z = 6}, 321);
+    modernV8Column.setBiomeId({.x = 2, .y = -63, .z = 6}, 9);
+    auto modernV8Payload = modernV8Column.networkEncodeNoCache(true);
+    if (modernV8Payload.size() < 3 || modernV8Payload[0] != 9 ||
+        modernV8Payload[2] != static_cast<uint8_t>(-4)) {
+        std::cerr << "[CHUNK-SMOKE] modern v9 fixture mismatch\n";
+        return 1;
+    }
+    modernV8Payload[0] = 8;
+    modernV8Payload.erase(modernV8Payload.begin() + 2);
+    bedrock::BedrockChunkColumn decodedModernV8Column(0, 0);
+    decodedModernV8Column.setBounds(-4, 20);
+    decodedModernV8Column.networkDecodeNoCache(modernV8Payload, 1, true);
+    if (decodedModernV8Column.getSectionAtIndex(-4) == nullptr ||
+        decodedModernV8Column.getSectionAtIndex(0) != nullptr ||
+        decodedModernV8Column.getBlockStateId(
+            {.x = 2, .y = -63, .z = 6}
+        ) != 321) {
+        std::cerr << "[CHUNK-SMOKE] modern sequential v8 Y offset mismatch\n";
+        return 1;
+    }
     const auto* decodedBlockEntity = decodedColumn.getBlockEntity({.x = 1, .y = -16, .z = 15});
     const auto* decodedBlockEntityNbt = decodedColumn.getBlockEntityNbt({.x = 1, .y = -16, .z = 15});
     if (decodedBlockEntity == nullptr ||

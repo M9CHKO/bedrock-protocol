@@ -5,6 +5,7 @@
 #include <bedrock/relay/EntityPositionTracker.hpp>
 #include <bedrock/relay/ItemDurability.hpp>
 #include <bedrock/world/BedrockBlockRegistry.hpp>
+#include <bedrock/world/BedrockSubChunkPacket.hpp>
 
 #include <android/log.h>
 #include <jni.h>
@@ -14,6 +15,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <compare>
 #include <condition_variable>
 #include <cctype>
 #include <cstdint>
@@ -25,12 +27,14 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 #include <unordered_map>
 #include <vector>
@@ -724,6 +728,7 @@ struct RelayState {
         std::array<int16_t, 256> surfaceHeights {};
         std::array<float, 256> groundHeights {};
         uint64_t revision = 0;
+        bool removed = false;
     };
 
     struct MiniMapAppearance {
@@ -735,17 +740,21 @@ struct RelayState {
 
     struct MiniMapChunkJob {
         std::string version;
+        std::string packetName;
         std::vector<uint8_t> payload;
         uint64_t generation = 0;
         uint64_t packetSequence = 0;
         int32_t dimension = 0;
         int32_t x = 0;
+        int32_t y = 0;
         int32_t z = 0;
         int64_t cameraDistanceSquared = 0;
     };
 
     struct SchematicColumnEntry {
         std::shared_ptr<bedrock::BedrockChunkColumn> column;
+        std::set<int32_t> knownSections;
+        bool completeBlockColumn = false;
         uint64_t revision = 0;
         uint64_t packetSequence = 0;
     };
@@ -774,6 +783,13 @@ struct RelayState {
         int32_t runtimeId = 0;
         uint64_t revision = 0;
         uint64_t packetSequence = 0;
+    };
+
+    struct SchematicBlockChange {
+        int32_t x = 0;
+        int32_t y = 0;
+        int32_t z = 0;
+        int32_t runtimeId = 0;
     };
 
     struct SchematicBlockAppearance {
@@ -822,6 +838,14 @@ struct RelayState {
     std::atomic<bool> miniMapEnabled {false};
     std::atomic<bool> schematicEnabled {false};
     std::atomic<bool> schematicWorldTrackingActive {false};
+    std::atomic<uint64_t> schematicTotalBlocks {0};
+    std::atomic<uint64_t> schematicCorrectBlocks {0};
+    std::atomic<uint64_t> schematicMissingBlocks {0};
+    std::atomic<uint64_t> schematicWrongBlocks {0};
+    std::atomic<uint64_t> schematicUnknownBlocks {0};
+    std::atomic<uint64_t> schematicDisplayedMarkers {0};
+    std::atomic<uint64_t> schematicMarkerRebuilds {0};
+    std::atomic<uint64_t> schematicMarkerPackets {0};
     std::atomic<int> retainedRadiusChunks {24};
     std::atomic<uint64_t> chunkPublisherPacketsObserved {0};
     std::atomic<uint64_t> chunkPublisherPacketsRewritten {0};
@@ -869,16 +893,24 @@ struct RelayState {
     std::atomic<int32_t> miniMapDimension {0};
     std::atomic<uint64_t> miniMapDecodedChunks {0};
     std::atomic<uint64_t> miniMapDecodeFailures {0};
+    std::atomic<uint64_t> miniMapTileBuildFailures {0};
+    std::atomic<uint64_t> miniMapLevelChunkSectionFallbacks {0};
+    std::atomic<uint64_t> miniMapSubChunkDecodeFailures {0};
     std::atomic<uint64_t> miniMapCachedChunksSkipped {0};
     mutable std::mutex miniMapMutex;
     std::condition_variable miniMapCondition;
     std::deque<MiniMapChunkJob> miniMapJobs;
+    std::unordered_set<MiniMapKey, MiniMapKeyHash> miniMapDirtyTiles;
     std::unordered_map<MiniMapKey, MiniMapTile, MiniMapKeyHash> miniMapTiles;
     std::thread miniMapWorker;
     bool miniMapStopping = false;
     uint64_t miniMapGeneration = 1;
     uint64_t miniMapRevision = 0;
     uint64_t schematicRevision = 0;
+    bool schematicPublisherKnown = false;
+    int32_t schematicPublisherChunkX = 0;
+    int32_t schematicPublisherChunkZ = 0;
+    int32_t schematicPublisherRadiusChunks = 0;
     std::atomic<uint64_t> schematicPacketSequence {0};
     std::unordered_map<
         MiniMapKey,
@@ -910,6 +942,7 @@ struct RelayState {
             std::lock_guard lock(miniMapMutex);
             miniMapStopping = true;
             miniMapJobs.clear();
+            miniMapDirtyTiles.clear();
         }
         miniMapCondition.notify_all();
         if (miniMapWorker.joinable()) miniMapWorker.join();
@@ -954,6 +987,30 @@ struct RelayState {
         int32_t chunk = value / 16;
         if (value < 0 && value % 16 != 0) --chunk;
         return chunk;
+    }
+
+    // IGN/Nukkit may expose a legacy 0..255 internal column while world
+    // coordinates still use the modern Overworld -64 origin. This matches
+    // the proven weathertop compatibility rule without shifting normal
+    // modern (-64..319) columns or Nether/End columns.
+    static int32_t storedBlockY(
+        const bedrock::BedrockChunkColumn& column,
+        int32_t dimension,
+        int32_t worldY
+    ) noexcept {
+        return column.minY() < 0 || dimension != 0
+            ? worldY
+            : worldY + 64;
+    }
+
+    static int32_t worldBlockY(
+        const bedrock::BedrockChunkColumn& column,
+        int32_t dimension,
+        int32_t storedY
+    ) noexcept {
+        return column.minY() < 0 || dimension != 0
+            ? storedY
+            : storedY - 64;
     }
 
     static std::string normalizedBaseBlockName(std::string_view name) {
@@ -1315,11 +1372,16 @@ struct RelayState {
             ++miniMapRevision;
             ++schematicRevision;
             miniMapJobs.clear();
+            miniMapDirtyTiles.clear();
             miniMapTiles.clear();
             schematicColumns.clear();
             schematicColumnHighWatermarks.clear();
             schematicBlockOverrides.clear();
             schematicBlockOverrideOrder.clear();
+            schematicPublisherKnown = false;
+            schematicPublisherChunkX = 0;
+            schematicPublisherChunkZ = 0;
+            schematicPublisherRadiusChunks = 0;
         }
         {
             std::lock_guard lock(blockRegistryMutex);
@@ -1348,14 +1410,83 @@ struct RelayState {
         schematicColumnHighWatermarks.erase(oldest);
     }
 
+    void markMiniMapTileRemovedLocked(const MiniMapKey& key) {
+        const auto existing = miniMapTiles.find(key);
+        if (existing == miniMapTiles.end() || existing->second.removed) return;
+        MiniMapTile removed;
+        removed.key = key;
+        removed.pixels.fill(0x00000000);
+        removed.surfaceHeights.fill(UnknownSurfaceHeight);
+        removed.groundHeights.fill(std::numeric_limits<float>::quiet_NaN());
+        removed.revision = ++miniMapRevision;
+        removed.removed = true;
+        existing->second = std::move(removed);
+    }
+
+    void invalidateMiniMapColumnLocked(
+        const MiniMapKey& key,
+        uint64_t invalidationSequence
+    ) {
+        schematicColumns.erase(key);
+        recordSchematicColumnSequenceLocked(key, invalidationSequence);
+        for (auto current = schematicBlockOverrides.begin();
+             current != schematicBlockOverrides.end();) {
+            if (current->first.dimension == key.dimension &&
+                blockToChunkCoordinate(current->first.x) == key.x &&
+                blockToChunkCoordinate(current->first.z) == key.z &&
+                current->second.packetSequence <= invalidationSequence) {
+                current = schematicBlockOverrides.erase(current);
+            } else {
+                ++current;
+            }
+        }
+        markMiniMapTileRemovedLocked(key);
+        ++schematicRevision;
+    }
+
+    void invalidateMiniMapQueueGapLocked(uint64_t invalidationSequence) {
+        ++miniMapGeneration;
+        ++miniMapRevision;
+        ++schematicRevision;
+        miniMapJobs.clear();
+        miniMapDirtyTiles.clear();
+        miniMapTiles.clear();
+        schematicColumns.clear();
+        schematicColumnHighWatermarks.clear();
+        if (invalidationSequence == std::numeric_limits<uint64_t>::max()) {
+            schematicBlockOverrides.clear();
+            schematicBlockOverrideOrder.clear();
+        } else {
+            for (auto current = schematicBlockOverrides.begin();
+                 current != schematicBlockOverrides.end();) {
+                if (current->second.packetSequence <= invalidationSequence) {
+                    current = schematicBlockOverrides.erase(current);
+                } else {
+                    ++current;
+                }
+            }
+        }
+    }
+
     void cacheSchematicColumnLocked(
         const MiniMapKey& key,
         std::shared_ptr<bedrock::BedrockChunkColumn> column,
+        std::set<int32_t> knownSections,
+        bool completeBlockColumn,
         bool cameraKnown,
         int32_t cameraChunkX,
         int32_t cameraChunkZ,
         uint64_t packetSequence
     ) {
+        if (schematicPublisherKnown &&
+            (key.dimension !=
+                miniMapDimension.load(std::memory_order_relaxed) ||
+             std::abs(key.x - schematicPublisherChunkX) >
+                    schematicPublisherRadiusChunks ||
+             std::abs(key.z - schematicPublisherChunkZ) >
+                    schematicPublisherRadiusChunks)) {
+            return;
+        }
         const auto watermark = schematicColumnHighWatermarks.find(key);
         if (watermark != schematicColumnHighWatermarks.end() &&
             watermark->second > packetSequence) {
@@ -1366,7 +1497,6 @@ struct RelayState {
             existing->second.packetSequence > packetSequence) {
             return;
         }
-        uint64_t effectiveSequence = packetSequence;
         for (auto current = schematicBlockOverrides.begin();
              current != schematicBlockOverrides.end();) {
             const auto& position = current->first;
@@ -1376,18 +1506,28 @@ struct RelayState {
                 ++current;
                 continue;
             }
-            if (position.y < column->minY() || position.y >= column->maxY()) {
+            const int32_t storedY = storedBlockY(
+                *column,
+                key.dimension,
+                position.y
+            );
+            if (storedY < column->minY() || storedY >= column->maxY()) {
+                ++current;
+                continue;
+            }
+            const int32_t storedSectionY = blockToChunkCoordinate(storedY);
+            const bool sectionKnown = completeBlockColumn ||
+                knownSections.find(storedSectionY) != knownSections.end();
+            if (!sectionKnown) {
+                // A packet for another section cannot confirm or supersede
+                // this exact block, regardless of packet ordering.
                 ++current;
                 continue;
             }
             if (current->second.packetSequence > packetSequence) {
-                effectiveSequence = std::max(
-                    effectiveSequence,
-                    current->second.packetSequence
-                );
                 bedrock::BlockPosition blockPosition;
                 blockPosition.x = position.x;
-                blockPosition.y = position.y;
+                blockPosition.y = storedY;
                 blockPosition.z = position.z;
                 blockPosition.layer = 0;
                 column->setBlockStateId(
@@ -1403,13 +1543,17 @@ struct RelayState {
             key,
             SchematicColumnEntry {
                 std::move(column),
+                std::move(knownSections),
+                completeBlockColumn,
                 revision,
-                effectiveSequence
+                packetSequence
             }
         );
-        recordSchematicColumnSequenceLocked(key, effectiveSequence);
+        recordSchematicColumnSequenceLocked(key, packetSequence);
 
-        constexpr std::size_t MaximumSchematicColumns = 64;
+        // A 192-block schematic radius covers at most about 625 chunk columns;
+        // retain the nearest 640 while still bounding decoded mobile memory.
+        constexpr std::size_t MaximumSchematicColumns = 640;
         while (schematicColumns.size() > MaximumSchematicColumns) {
             auto farthest = schematicColumns.begin();
             int64_t farthestDistance = -1;
@@ -1439,12 +1583,110 @@ struct RelayState {
         }
     }
 
-    void observeSchematicBlockUpdate(
-        int32_t x,
-        int32_t y,
-        int32_t z,
-        int32_t runtimeId
+    void observeSchematicPublisherWindow(
+        int32_t centerXBlocks,
+        int32_t centerZBlocks,
+        uint32_t radiusBlocks
     ) noexcept {
+        try {
+            const int32_t centerChunkX = blockToChunkCoordinate(centerXBlocks);
+            const int32_t centerChunkZ = blockToChunkCoordinate(centerZBlocks);
+            // Keep one guard chunk because publisher coordinates may move
+            // before the matching LevelChunk burst reaches the worker.
+            const int32_t radiusChunks = std::max<int32_t>(
+                1,
+                static_cast<int32_t>((radiusBlocks + 15u) / 16u) + 1
+            );
+            const int32_t dimension = miniMapDimension.load(
+                std::memory_order_relaxed
+            );
+            std::lock_guard lock(miniMapMutex);
+            schematicPublisherKnown = true;
+            schematicPublisherChunkX = centerChunkX;
+            schematicPublisherChunkZ = centerChunkZ;
+            schematicPublisherRadiusChunks = radiusChunks;
+            const auto outsideWindow = [&](const MiniMapKey& key) {
+                return key.dimension != dimension ||
+                    std::abs(key.x - centerChunkX) > radiusChunks ||
+                    std::abs(key.z - centerChunkZ) > radiusChunks;
+            };
+
+            bool changed = false;
+            for (auto current = schematicColumns.begin();
+                 current != schematicColumns.end();) {
+                if (outsideWindow(current->first)) {
+                    schematicColumnHighWatermarks.erase(current->first);
+                    current = schematicColumns.erase(current);
+                    changed = true;
+                } else {
+                    ++current;
+                }
+            }
+            for (auto current = miniMapJobs.begin();
+                 current != miniMapJobs.end();) {
+                const MiniMapKey queuedKey {
+                    current->dimension,
+                    current->x,
+                    current->z
+                };
+                if (current->packetName == "level_chunk" &&
+                    outsideWindow(queuedKey)) {
+                    current = miniMapJobs.erase(current);
+                } else {
+                    ++current;
+                }
+            }
+            for (auto current = miniMapDirtyTiles.begin();
+                 current != miniMapDirtyTiles.end();) {
+                if (outsideWindow(*current)) {
+                    current = miniMapDirtyTiles.erase(current);
+                } else {
+                    ++current;
+                }
+            }
+            for (auto current = schematicBlockOverrides.begin();
+                 current != schematicBlockOverrides.end();) {
+                const auto chunkX = blockToChunkCoordinate(current->first.x);
+                const auto chunkZ = blockToChunkCoordinate(current->first.z);
+                if (current->first.dimension != dimension ||
+                    std::abs(chunkX - centerChunkX) > radiusChunks ||
+                    std::abs(chunkZ - centerChunkZ) > radiusChunks) {
+                    current = schematicBlockOverrides.erase(current);
+                    changed = true;
+                } else {
+                    ++current;
+                }
+            }
+            for (auto current = miniMapTiles.begin();
+                 current != miniMapTiles.end();) {
+                if (current->first.dimension != dimension ||
+                    std::abs(current->first.x - centerChunkX) > radiusChunks ||
+                    std::abs(current->first.z - centerChunkZ) > radiusChunks) {
+                    if (!current->second.removed) {
+                        current->second.pixels.fill(0x00000000);
+                        current->second.surfaceHeights.fill(
+                            UnknownSurfaceHeight
+                        );
+                        current->second.groundHeights.fill(
+                            std::numeric_limits<float>::quiet_NaN()
+                        );
+                        current->second.revision = ++miniMapRevision;
+                        current->second.removed = true;
+                    }
+                    ++current;
+                } else {
+                    ++current;
+                }
+            }
+            if (changed) ++schematicRevision;
+        } catch (...) {
+        }
+    }
+
+    void observeSchematicBlockUpdates(
+        const std::vector<SchematicBlockChange>& changes
+    ) noexcept {
+        if (changes.empty()) return;
         const int32_t dimension = miniMapDimension.load(
             std::memory_order_relaxed
         );
@@ -1453,62 +1695,102 @@ struct RelayState {
                 1,
                 std::memory_order_relaxed
             ) + 1;
-            std::lock_guard lock(miniMapMutex);
-            const auto revision = ++schematicRevision;
-            const SchematicBlockKey blockKey {dimension, x, y, z};
-            const auto columnKey = MiniMapKey {
-                dimension,
-                blockToChunkCoordinate(x),
-                blockToChunkCoordinate(z)
-            };
-            const auto cached = schematicColumns.find(columnKey);
-            recordSchematicColumnSequenceLocked(columnKey, packetSequence);
-            if (cached != schematicColumns.end() && cached->second.column &&
-                y >= cached->second.column->minY() &&
-                y < cached->second.column->maxY()) {
-                bedrock::BlockPosition position;
-                position.x = x;
-                position.y = y;
-                position.z = z;
-                position.layer = 0;
-                cached->second.column->setBlockStateId(position, runtimeId);
-                cached->second.revision = revision;
-                cached->second.packetSequence = packetSequence;
-            }
+            std::vector<MiniMapKey> changedColumns;
+            {
+                std::lock_guard lock(miniMapMutex);
+                const auto revision = ++schematicRevision;
+                changedColumns.reserve(changes.size());
+                for (const auto& change : changes) {
+                    const SchematicBlockKey blockKey {
+                        dimension,
+                        change.x,
+                        change.y,
+                        change.z
+                    };
+                    const auto columnKey = MiniMapKey {
+                        dimension,
+                        blockToChunkCoordinate(change.x),
+                        blockToChunkCoordinate(change.z)
+                    };
+                    changedColumns.push_back(columnKey);
+                    const auto cached = schematicColumns.find(columnKey);
+                    if (cached != schematicColumns.end() &&
+                        cached->second.column) {
+                        const int32_t storedY = storedBlockY(
+                            *cached->second.column,
+                            dimension,
+                            change.y
+                        );
+                        if (storedY >= cached->second.column->minY() &&
+                            storedY < cached->second.column->maxY()) {
+                            const int32_t sectionY =
+                                blockToChunkCoordinate(storedY);
+                            const bool sectionKnown =
+                                cached->second.completeBlockColumn ||
+                                cached->second.knownSections.find(sectionY) !=
+                                    cached->second.knownSections.end();
+                            if (sectionKnown) {
+                                bedrock::BlockPosition position;
+                                position.x = change.x;
+                                position.y = storedY;
+                                position.z = change.z;
+                                position.layer = 0;
+                                cached->second.column->setBlockStateId(
+                                    position,
+                                    change.runtimeId
+                                );
+                                cached->second.revision = revision;
+                            }
+                        }
+                    }
 
-            // Keep a bounded update journal even when the column is cached.
-            // The column may be evicted while an older LevelChunk job is
-            // still decoding; retaining this entry prevents that stale job
-            // from resurrecting the pre-update block state.
-            schematicBlockOverrides.insert_or_assign(
-                blockKey,
-                SchematicBlockOverride {
-                    runtimeId,
-                    revision,
-                    packetSequence
+                    // Keep a bounded update journal even when the column is
+                    // cached. A background decode that started earlier must
+                    // have every newer change overlaid before publication.
+                    schematicBlockOverrides.insert_or_assign(
+                        blockKey,
+                        SchematicBlockOverride {
+                            change.runtimeId,
+                            revision,
+                            packetSequence
+                        }
+                    );
+                    schematicBlockOverrideOrder.emplace_back(
+                        blockKey,
+                        revision
+                    );
                 }
-            );
-            schematicBlockOverrideOrder.emplace_back(blockKey, revision);
-            constexpr std::size_t MaximumSchematicBlockOverrides = 8192;
-            constexpr std::size_t MaximumSchematicOverrideOrder =
-                MaximumSchematicBlockOverrides * 2;
-            while ((schematicBlockOverrides.size() >
-                        MaximumSchematicBlockOverrides ||
-                    schematicBlockOverrideOrder.size() >
-                        MaximumSchematicOverrideOrder) &&
-                   !schematicBlockOverrideOrder.empty()) {
-                const auto oldest = schematicBlockOverrideOrder.front();
-                schematicBlockOverrideOrder.pop_front();
-                const auto current = schematicBlockOverrides.find(
-                    oldest.first
-                );
-                if (current != schematicBlockOverrides.end() &&
-                    current->second.revision == oldest.second) {
-                    schematicBlockOverrides.erase(current);
+                constexpr std::size_t MaximumSchematicBlockOverrides = 8192;
+                constexpr std::size_t MaximumSchematicOverrideOrder =
+                    MaximumSchematicBlockOverrides * 2;
+                while ((schematicBlockOverrides.size() >
+                            MaximumSchematicBlockOverrides ||
+                        schematicBlockOverrideOrder.size() >
+                            MaximumSchematicOverrideOrder) &&
+                       !schematicBlockOverrideOrder.empty()) {
+                    const auto oldest = schematicBlockOverrideOrder.front();
+                    schematicBlockOverrideOrder.pop_front();
+                    const auto current = schematicBlockOverrides.find(
+                        oldest.first
+                    );
+                    if (current != schematicBlockOverrides.end() &&
+                        current->second.revision == oldest.second) {
+                        schematicBlockOverrides.erase(current);
+                    }
                 }
             }
+            enqueueMiniMapTileRebuilds(changedColumns);
         } catch (...) {
         }
+    }
+
+    void observeSchematicBlockUpdate(
+        int32_t x,
+        int32_t y,
+        int32_t z,
+        int32_t runtimeId
+    ) noexcept {
+        observeSchematicBlockUpdates({{x, y, z, runtimeId}});
     }
 
     std::vector<int32_t> schematicBlockSnapshotValues(
@@ -1551,19 +1833,32 @@ struct RelayState {
                     blockToChunkCoordinate(z)
                 });
                 if (cached == schematicColumns.end() ||
-                    !cached->second.column ||
-                    y < cached->second.column->minY() ||
-                    y >= cached->second.column->maxY()) {
+                    !cached->second.column) {
+                    runtimeIds.emplace_back(std::nullopt);
+                    continue;
+                }
+                const auto& entry = cached->second;
+                const int32_t storedY = storedBlockY(
+                    *entry.column,
+                    dimension,
+                    y
+                );
+                const int32_t sectionY = blockToChunkCoordinate(storedY);
+                if (storedY < entry.column->minY() ||
+                    storedY >= entry.column->maxY() ||
+                    (!entry.completeBlockColumn &&
+                     entry.knownSections.find(sectionY) ==
+                        entry.knownSections.end())) {
                     runtimeIds.emplace_back(std::nullopt);
                     continue;
                 }
                 bedrock::BlockPosition position;
                 position.x = x;
-                position.y = y;
+                position.y = storedY;
                 position.z = z;
                 position.layer = 0;
                 runtimeIds.emplace_back(
-                    cached->second.column->getBlockStateId(position)
+                    entry.column->getBlockStateId(position)
                 );
             }
         }
@@ -1622,21 +1917,63 @@ struct RelayState {
         return result;
     }
 
+    bool schematicSnapshotMatches(
+        uint64_t expectedRevision,
+        int32_t expectedDimension
+    ) const noexcept {
+        try {
+            std::lock_guard lock(miniMapMutex);
+            return schematicRevision == expectedRevision &&
+                miniMapDimension.load(std::memory_order_relaxed) ==
+                    expectedDimension;
+        } catch (...) {
+            return false;
+        }
+    }
+
     void enqueueMiniMapChunk(
         const std::string& version,
         const bedrock::VersionedGamePacket& packet
     ) noexcept {
         if ((!miniMapEnabled.load(std::memory_order_relaxed) &&
              !schematicWorldTrackingActive.load(std::memory_order_relaxed)) ||
-            packet.name != "level_chunk") {
+            (packet.name != "level_chunk" && packet.name != "subchunk")) {
             return;
         }
         try {
-            bedrock::VersionedPayloadCursor cursor(packet.payload);
-            const int32_t chunkX = cursor.readVarInt();
-            const int32_t chunkZ = cursor.readVarInt();
-            const int32_t dimension = cursor.readVarInt();
+            uint64_t observedGeneration = 0;
+            {
+                std::lock_guard lock(miniMapMutex);
+                if (miniMapStopping) return;
+                observedGeneration = miniMapGeneration;
+            }
             const auto camera = entityPositions.cameraSnapshot();
+            int32_t chunkX = camera.known
+                ? static_cast<int32_t>(std::floor(camera.x / 16.0f))
+                : 0;
+            int32_t chunkZ = camera.known
+                ? static_cast<int32_t>(std::floor(camera.z / 16.0f))
+                : 0;
+            int32_t chunkY = 0;
+            int32_t dimension = miniMapDimension.load(
+                std::memory_order_relaxed
+            );
+            if (packet.name == "level_chunk") {
+                bedrock::VersionedPayloadCursor cursor(packet.payload);
+                chunkX = cursor.readVarInt();
+                chunkZ = cursor.readVarInt();
+                dimension = cursor.readVarInt();
+            } else {
+                const auto header =
+                    bedrock::BedrockSubChunkPacketCodec::decodePacketHeader(
+                        packet.payload,
+                        version
+                    );
+                chunkX = header.originX;
+                chunkY = header.originY;
+                chunkZ = header.originZ;
+                dimension = header.dimension;
+            }
             int64_t distanceSquared = 0;
             if (camera.known) {
                 const int32_t cameraChunkX = static_cast<int32_t>(
@@ -1658,74 +1995,611 @@ struct RelayState {
             }
             MiniMapChunkJob incoming {
                 version,
+                packet.name,
                 packet.payload,
-                0,
+                observedGeneration,
                 schematicPacketSequence.fetch_add(
                     1,
                     std::memory_order_relaxed
                 ) + 1,
                 dimension,
                 chunkX,
+                chunkY,
                 chunkZ,
                 distanceSquared
             };
             std::lock_guard lock(miniMapMutex);
-            if (miniMapStopping) return;
-            incoming.generation = miniMapGeneration;
-            for (auto& queued : miniMapJobs) {
-                if (queued.dimension == dimension && queued.x == chunkX &&
-                    queued.z == chunkZ) {
-                    queued = std::move(incoming);
-                    miniMapCondition.notify_one();
-                    return;
+            if (miniMapStopping || observedGeneration != miniMapGeneration) {
+                return;
+            }
+            if (packet.name == "level_chunk") {
+                for (auto& queued : miniMapJobs) {
+                    if (queued.packetName == "level_chunk" &&
+                        queued.dimension == dimension &&
+                        queued.x == chunkX && queued.z == chunkZ) {
+                        queued = std::move(incoming);
+                        miniMapCondition.notify_one();
+                        return;
+                    }
                 }
             }
             constexpr std::size_t MaximumQueuedChunks = 96;
             if (miniMapJobs.size() < MaximumQueuedChunks) {
                 miniMapJobs.push_back(std::move(incoming));
             } else {
-                auto farthest = std::max_element(
-                    miniMapJobs.begin(),
-                    miniMapJobs.end(),
-                    [](const auto& left, const auto& right) {
-                        return left.cameraDistanceSquared <
-                            right.cameraDistanceSquared;
+                auto farthestLevelChunk = miniMapJobs.end();
+                for (auto current = miniMapJobs.begin();
+                     current != miniMapJobs.end(); ++current) {
+                    if (current->packetName != "level_chunk") continue;
+                    if (farthestLevelChunk == miniMapJobs.end() ||
+                        current->cameraDistanceSquared >
+                            farthestLevelChunk->cameraDistanceSquared) {
+                        farthestLevelChunk = current;
                     }
-                );
-                if (farthest == miniMapJobs.end() ||
-                    incoming.cameraDistanceSquared >=
-                        farthest->cameraDistanceSquared) {
+                }
+                const MiniMapKey incomingKey {dimension, chunkX, chunkZ};
+                if (packet.name == "level_chunk" &&
+                    (farthestLevelChunk == miniMapJobs.end() ||
+                     incoming.cameraDistanceSquared >=
+                        farthestLevelChunk->cameraDistanceSquared)) {
+                    // A dropped authoritative packet makes an older cached
+                    // value unknown; never leave it marked as current.
+                    invalidateMiniMapColumnLocked(
+                        incomingKey,
+                        incoming.packetSequence
+                    );
                     return;
                 }
-                *farthest = std::move(incoming);
+                if (farthestLevelChunk != miniMapJobs.end()) {
+                    invalidateMiniMapColumnLocked({
+                        farthestLevelChunk->dimension,
+                        farthestLevelChunk->x,
+                        farthestLevelChunk->z
+                    }, farthestLevelChunk->packetSequence);
+                    *farthestLevelChunk = std::move(incoming);
+                } else {
+                    // A queue made entirely of partial SubChunk responses
+                    // cannot be thinned without parsing all entry offsets.
+                    // Reset to UNKNOWN and resume from this newest packet.
+                    invalidateMiniMapQueueGapLocked(incoming.packetSequence);
+                    incoming.generation = miniMapGeneration;
+                    miniMapJobs.push_back(std::move(incoming));
+                }
             }
             miniMapCondition.notify_one();
         } catch (...) {
         }
     }
 
+    MiniMapTile buildMiniMapTileFromColumn(
+        const MiniMapKey& key,
+        const bedrock::BedrockChunkColumn& column,
+        const std::set<int32_t>& knownSections,
+        bool completeBlockColumn
+    ) {
+        MiniMapTile tile;
+        tile.key = key;
+        tile.surfaceHeights.fill(UnknownSurfaceHeight);
+        tile.groundHeights.fill(std::numeric_limits<float>::quiet_NaN());
+        std::array<int32_t, 256> baseColors {};
+        std::array<uint32_t, 256> biomes {};
+        {
+            std::lock_guard registryLock(blockRegistryMutex);
+            for (int32_t z = 0; z < 16; ++z) {
+                for (int32_t x = 0; x < 16; ++x) {
+                    const auto offset = static_cast<std::size_t>(z * 16 + x);
+                    bool surfaceFound = false;
+                    bool groundFound = false;
+                    bool blockedByUnknownSection = false;
+                    int32_t surfaceStoredY = column.minY();
+                    for (int32_t sectionY = column.maxCY() - 1;
+                         sectionY >= column.minCY() &&
+                            (!surfaceFound || !groundFound);
+                         --sectionY) {
+                        if (!completeBlockColumn &&
+                            knownSections.find(sectionY) == knownSections.end()) {
+                            blockedByUnknownSection = true;
+                            break;
+                        }
+                        const auto* section = column.getSectionAtIndex(sectionY);
+                        if (section == nullptr) continue;
+                        for (int32_t localY = 15;
+                             localY >= 0 && (!surfaceFound || !groundFound);
+                             --localY) {
+                            const auto runtimeId = section->getBlockStateId(
+                                static_cast<uint8_t>(x),
+                                static_cast<uint8_t>(localY),
+                                static_cast<uint8_t>(z)
+                            );
+                            const auto appearance = miniMapAppearanceLocked(
+                                runtimeId,
+                                key.dimension
+                            );
+                            if (appearance.air) continue;
+                            const int32_t storedY = sectionY * 16 + localY;
+                            const int32_t worldY = worldBlockY(
+                                column,
+                                key.dimension,
+                                storedY
+                            );
+                            if (!surfaceFound) {
+                                surfaceFound = true;
+                                surfaceStoredY = storedY;
+                                tile.surfaceHeights[offset] =
+                                    static_cast<int16_t>(worldY);
+                                baseColors[offset] = appearance.color;
+                            }
+                            if (!groundFound && appearance.solid) {
+                                groundFound = true;
+                                tile.groundHeights[offset] =
+                                    static_cast<float>(worldY) +
+                                    appearance.collisionTop;
+                            }
+                        }
+                    }
+                    if (blockedByUnknownSection || !surfaceFound) {
+                        tile.surfaceHeights[offset] = UnknownSurfaceHeight;
+                        tile.groundHeights[offset] =
+                            std::numeric_limits<float>::quiet_NaN();
+                        continue;
+                    }
+                    try {
+                        biomes[offset] = column.getBiomeId({
+                            x,
+                            surfaceStoredY,
+                            z,
+                            std::nullopt
+                        });
+                    } catch (...) {
+                    }
+                }
+            }
+        }
+
+        auto heightAt = [&tile](int x, int z, int fallback) {
+            x = std::clamp(x, 0, 15);
+            z = std::clamp(z, 0, 15);
+            const auto value = tile.surfaceHeights[
+                static_cast<std::size_t>(z * 16 + x)
+            ];
+            return value == UnknownSurfaceHeight
+                ? fallback
+                : static_cast<int>(value);
+        };
+        for (int32_t z = 0; z < 16; ++z) {
+            for (int32_t x = 0; x < 16; ++x) {
+                const auto offset = static_cast<std::size_t>(z * 16 + x);
+                const int height = tile.surfaceHeights[offset];
+                if (height == UnknownSurfaceHeight) {
+                    tile.pixels[offset] = 0x00000000;
+                    continue;
+                }
+                const int west = heightAt(x - 1, z, height);
+                const int east = heightAt(x + 1, z, height);
+                const int north = heightAt(x, z - 1, height);
+                const int south = heightAt(x, z + 1, height);
+                int shade = std::clamp(
+                    (west + north - east - south) * 5 + (height - 64) / 20,
+                    -42,
+                    38
+                );
+                int contour = height % 8;
+                if (contour < 0) contour += 8;
+                if (contour == 0) shade -= 6;
+                tile.pixels[offset] = shadeMapColor(
+                    baseColors[offset],
+                    shade,
+                    biomes[offset]
+                );
+            }
+        }
+        return tile;
+    }
+
+    void rebuildMiniMapTilesFromColumns(
+        const std::vector<MiniMapKey>& keys,
+        uint64_t requiredGeneration
+    ) {
+        if (!miniMapEnabled.load(std::memory_order_relaxed) || keys.empty()) {
+            return;
+        }
+        std::unordered_set<MiniMapKey, MiniMapKeyHash> uniqueKeys;
+        uniqueKeys.reserve(keys.size());
+        for (const auto& key : keys) uniqueKeys.insert(key);
+
+        for (const auto& key : uniqueKeys) {
+            std::shared_ptr<bedrock::BedrockChunkColumn> column;
+            std::set<int32_t> knownSections;
+            bool completeBlockColumn = false;
+            uint64_t sourceRevision = 0;
+            uint64_t generation = 0;
+            {
+                std::lock_guard lock(miniMapMutex);
+                generation = miniMapGeneration;
+                if (miniMapStopping ||
+                    (requiredGeneration != 0 &&
+                     requiredGeneration != generation)) {
+                    return;
+                }
+                const auto cached = schematicColumns.find(key);
+                if (cached == schematicColumns.end() ||
+                    !cached->second.column) {
+                    markMiniMapTileRemovedLocked(key);
+                    continue;
+                }
+                column = std::make_shared<bedrock::BedrockChunkColumn>(
+                    *cached->second.column
+                );
+                knownSections = cached->second.knownSections;
+                completeBlockColumn = cached->second.completeBlockColumn;
+                sourceRevision = cached->second.revision;
+            }
+
+            auto tile = buildMiniMapTileFromColumn(
+                key,
+                *column,
+                knownSections,
+                completeBlockColumn
+            );
+            {
+                std::lock_guard lock(miniMapMutex);
+                if (miniMapStopping || generation != miniMapGeneration) return;
+                const auto cached = schematicColumns.find(key);
+                if (cached == schematicColumns.end() ||
+                    !cached->second.column ||
+                    cached->second.revision != sourceRevision) {
+                    continue;
+                }
+                tile.revision = ++miniMapRevision;
+                miniMapTiles.insert_or_assign(key, std::move(tile));
+                while (miniMapTiles.size() > 2048) {
+                    auto oldest = miniMapTiles.begin();
+                    for (auto current = miniMapTiles.begin();
+                         current != miniMapTiles.end(); ++current) {
+                        if (current->second.revision <
+                            oldest->second.revision) {
+                            oldest = current;
+                        }
+                    }
+                    miniMapTiles.erase(oldest);
+                }
+            }
+        }
+    }
+
+    void recordMiniMapTileBuildFailure(
+        const MiniMapKey& key,
+        std::string message
+    ) noexcept {
+        const auto total = miniMapTileBuildFailures.fetch_add(
+            1,
+            std::memory_order_relaxed
+        ) + 1;
+        // A bad color/height render must not be reported as a malformed
+        // LevelChunk. Keep the diagnostic useful without flooding the log
+        // during a large initial chunk burst.
+        if (total <= 4 || total % 32 == 0) {
+            push(
+                "minimap_tile_build_failed",
+                "chunk=" + std::to_string(key.x) + "," +
+                    std::to_string(key.z) + " dimension=" +
+                    std::to_string(key.dimension) + " error=" +
+                    safeMessage(std::move(message)) + " failures=" +
+                    std::to_string(total),
+                "WARN",
+                "chunks"
+            );
+        }
+    }
+
+    void rebuildMiniMapTilesSafely(
+        const std::vector<MiniMapKey>& keys,
+        uint64_t requiredGeneration
+    ) noexcept {
+        if (!miniMapEnabled.load(std::memory_order_relaxed) || keys.empty()) {
+            return;
+        }
+        try {
+            std::unordered_set<MiniMapKey, MiniMapKeyHash> uniqueKeys;
+            uniqueKeys.reserve(keys.size());
+            for (const auto& key : keys) uniqueKeys.insert(key);
+            for (const auto& key : uniqueKeys) {
+                try {
+                    rebuildMiniMapTilesFromColumns({key}, requiredGeneration);
+                } catch (const std::exception& error) {
+                    recordMiniMapTileBuildFailure(key, error.what());
+                } catch (...) {
+                    recordMiniMapTileBuildFailure(
+                        key,
+                        "unknown native exception"
+                    );
+                }
+            }
+        } catch (const std::exception& error) {
+            recordMiniMapTileBuildFailure(keys.front(), error.what());
+        } catch (...) {
+            recordMiniMapTileBuildFailure(
+                keys.front(),
+                "unknown native exception"
+            );
+        }
+    }
+
+    void enqueueMiniMapTileRebuilds(
+        const std::vector<MiniMapKey>& keys
+    ) noexcept {
+        if (!miniMapEnabled.load(std::memory_order_relaxed) || keys.empty()) {
+            return;
+        }
+        try {
+            {
+                std::lock_guard lock(miniMapMutex);
+                if (miniMapStopping) return;
+                const int32_t dimension = miniMapDimension.load(
+                    std::memory_order_relaxed
+                );
+                for (const auto& key : keys) {
+                    if (key.dimension == dimension) {
+                        miniMapDirtyTiles.insert(key);
+                    }
+                }
+            }
+            miniMapCondition.notify_one();
+        } catch (...) {
+        }
+    }
+
+    void cacheSchematicSubChunkJob(const MiniMapChunkJob& job) {
+        if (!schematicWorldTrackingActive.load(std::memory_order_relaxed) &&
+            !miniMapEnabled.load(std::memory_order_relaxed)) {
+            return;
+        }
+        const auto packet =
+            bedrock::BedrockSubChunkPacketCodec::decodePacketPayload(
+                job.payload,
+                job.version
+            );
+        const auto camera = entityPositions.cameraSnapshot();
+        const int32_t cameraChunkX = camera.known
+            ? static_cast<int32_t>(std::floor(camera.x / 16.0f))
+            : 0;
+        const int32_t cameraChunkZ = camera.known
+            ? static_cast<int32_t>(std::floor(camera.z / 16.0f))
+            : 0;
+        std::vector<MiniMapKey> changedColumns;
+        changedColumns.reserve(packet.entries.size());
+
+        for (const auto& entry : packet.entries) {
+            const int32_t chunkX = packet.originX + entry.dx;
+            const int32_t sectionY = packet.originY + entry.dy;
+            const int32_t chunkZ = packet.originZ + entry.dz;
+            std::optional<bedrock::BedrockSubChunk> decodedSection;
+            if (sectionY >= std::numeric_limits<int8_t>::min() &&
+                sectionY <= std::numeric_limits<int8_t>::max() &&
+                entry.result ==
+                    bedrock::BedrockSubChunkResult::SuccessAllAir) {
+                decodedSection = bedrock::BedrockSubChunk::createAir(
+                    static_cast<int8_t>(sectionY),
+                    0
+                );
+            } else if (sectionY >= std::numeric_limits<int8_t>::min() &&
+                       sectionY <= std::numeric_limits<int8_t>::max() &&
+                       entry.result ==
+                           bedrock::BedrockSubChunkResult::Success &&
+                       !entry.payload.empty()) {
+                decodedSection = bedrock::BedrockSubChunk::decode(
+                    bedrock::ChunkStorageType::Runtime,
+                    entry.payload
+                );
+                decodedSection->setY(static_cast<int8_t>(sectionY));
+            }
+
+            const MiniMapKey key {packet.dimension, chunkX, chunkZ};
+            std::lock_guard lock(miniMapMutex);
+            if (job.generation != miniMapGeneration || miniMapStopping) {
+                return;
+            }
+            if (schematicPublisherKnown &&
+                (key.dimension !=
+                    miniMapDimension.load(std::memory_order_relaxed) ||
+                 std::abs(key.x - schematicPublisherChunkX) >
+                    schematicPublisherRadiusChunks ||
+                 std::abs(key.z - schematicPublisherChunkZ) >
+                    schematicPublisherRadiusChunks)) {
+                continue;
+            }
+            const auto watermark = schematicColumnHighWatermarks.find(key);
+            if (watermark != schematicColumnHighWatermarks.end() &&
+                watermark->second > job.packetSequence) {
+                continue;
+            }
+
+            if (!decodedSection.has_value()) {
+                const auto invalidationRevision = ++schematicRevision;
+                if (entry.result ==
+                    bedrock::BedrockSubChunkResult::ChunkNotFound) {
+                    schematicColumns.erase(key);
+                    for (auto current = schematicBlockOverrides.begin();
+                         current != schematicBlockOverrides.end();) {
+                        if (current->first.dimension == key.dimension &&
+                            blockToChunkCoordinate(current->first.x) == key.x &&
+                            blockToChunkCoordinate(current->first.z) == key.z &&
+                            current->second.packetSequence <=
+                                job.packetSequence) {
+                            current = schematicBlockOverrides.erase(current);
+                        } else {
+                            ++current;
+                        }
+                    }
+                } else {
+                    const auto existing = schematicColumns.find(key);
+                    if (existing != schematicColumns.end()) {
+                        existing->second.knownSections.erase(sectionY);
+                        existing->second.completeBlockColumn = false;
+                        existing->second.packetSequence = job.packetSequence;
+                        existing->second.revision = invalidationRevision;
+                    }
+                }
+                recordSchematicColumnSequenceLocked(key, job.packetSequence);
+                markMiniMapTileRemovedLocked(key);
+                continue;
+            }
+
+            std::shared_ptr<bedrock::BedrockChunkColumn> column;
+            std::set<int32_t> knownSections;
+            bool completeBlockColumn = false;
+            const auto existing = schematicColumns.find(key);
+            if (existing != schematicColumns.end() &&
+                existing->second.column) {
+                column = std::make_shared<bedrock::BedrockChunkColumn>(
+                    *existing->second.column
+                );
+                knownSections = existing->second.knownSections;
+                completeBlockColumn = existing->second.completeBlockColumn;
+            } else {
+                column = std::make_shared<bedrock::BedrockChunkColumn>(
+                    chunkX,
+                    chunkZ
+                );
+                column->setBounds(-4, 20);
+            }
+            if (sectionY < column->minCY() || sectionY >= column->maxCY()) {
+                recordSchematicColumnSequenceLocked(key, job.packetSequence);
+                markMiniMapTileRemovedLocked(key);
+                continue;
+            }
+            column->setSection(sectionY, std::move(*decodedSection));
+            knownSections.insert(sectionY);
+            cacheSchematicColumnLocked(
+                key,
+                std::move(column),
+                std::move(knownSections),
+                completeBlockColumn,
+                camera.known,
+                cameraChunkX,
+                cameraChunkZ,
+                job.packetSequence
+            );
+            changedColumns.push_back(key);
+        }
+        rebuildMiniMapTilesSafely(changedColumns, job.generation);
+        miniMapDecodedChunks.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void recordMiniMapDecodeFailure(
+        const MiniMapChunkJob& job,
+        std::string message
+    ) noexcept {
+        const auto total = miniMapDecodeFailures.fetch_add(
+            1,
+            std::memory_order_relaxed
+        ) + 1;
+        if (job.packetName == "subchunk") {
+            miniMapSubChunkDecodeFailures.fetch_add(
+                1,
+                std::memory_order_relaxed
+            );
+        }
+        // Keep diagnostics useful without writing one log line per chunk in
+        // the initial server burst.
+        if (total <= 4 || total % 32 == 0) {
+            push(
+                "chunk_decode_failed",
+                "packet=" + job.packetName + " chunk=" +
+                    std::to_string(job.x) + "," + std::to_string(job.z) +
+                    " dimension=" + std::to_string(job.dimension) +
+                    " payloadBytes=" + std::to_string(job.payload.size()) +
+                    " error=" + safeMessage(std::move(message)) +
+                    " failures=" + std::to_string(total),
+                "WARN",
+                "chunks"
+            );
+        }
+    }
+
+    void invalidateFailedMiniMapJob(const MiniMapChunkJob& job) noexcept {
+        try {
+            std::lock_guard lock(miniMapMutex);
+            if (job.generation != miniMapGeneration || miniMapStopping) return;
+            if (job.packetName == "level_chunk") {
+                invalidateMiniMapColumnLocked({
+                    job.dimension,
+                    job.x,
+                    job.z
+                }, job.packetSequence);
+            } else {
+                // A malformed batched SubChunk has unknown entry offsets.
+                // Clear decoded authority instead of comparing the schematic
+                // against stale world data.
+                invalidateMiniMapQueueGapLocked(job.packetSequence);
+            }
+        } catch (...) {
+        }
+        miniMapCondition.notify_one();
+    }
+
     void miniMapWorkerLoop() noexcept {
+        constexpr std::size_t MaximumStructuralJobsBeforeDirtyTile = 8;
+        std::size_t structuralJobsSinceDirtyTile = 0;
         for (;;) {
             MiniMapChunkJob job;
+            std::optional<MiniMapKey> dirtyTile;
             {
                 std::unique_lock lock(miniMapMutex);
                 miniMapCondition.wait(lock, [this]() {
-                    return miniMapStopping || !miniMapJobs.empty();
+                    return miniMapStopping || !miniMapJobs.empty() ||
+                        !miniMapDirtyTiles.empty();
                 });
                 if (miniMapStopping) return;
-                const auto nearest = std::min_element(
-                    miniMapJobs.begin(),
-                    miniMapJobs.end(),
-                    [](const auto& left, const auto& right) {
-                        return left.cameraDistanceSquared <
-                            right.cameraDistanceSquared;
-                    }
-                );
-                job = std::move(*nearest);
-                miniMapJobs.erase(nearest);
+                const bool serviceDirtyTile =
+                    !miniMapDirtyTiles.empty() &&
+                    (miniMapJobs.empty() ||
+                     structuralJobsSinceDirtyTile >=
+                        MaximumStructuralJobsBeforeDirtyTile);
+                if (serviceDirtyTile) {
+                    const auto current = miniMapDirtyTiles.begin();
+                    dirtyTile = *current;
+                    miniMapDirtyTiles.erase(current);
+                    structuralJobsSinceDirtyTile = 0;
+                } else {
+                    // Structural world packets must be decoded in their
+                    // observed order. A newer partial SubChunk must never
+                    // make an older full LevelChunk look stale column-wide.
+                    const auto oldest = std::min_element(
+                        miniMapJobs.begin(),
+                        miniMapJobs.end(),
+                        [](const auto& left, const auto& right) {
+                            return left.packetSequence < right.packetSequence;
+                        }
+                    );
+                    job = std::move(*oldest);
+                    miniMapJobs.erase(oldest);
+                    structuralJobsSinceDirtyTile = std::min(
+                        structuralJobsSinceDirtyTile + 1,
+                        MaximumStructuralJobsBeforeDirtyTile
+                    );
+                }
             }
 
             try {
+                if (dirtyTile.has_value()) {
+                    rebuildMiniMapTilesSafely({*dirtyTile}, 0);
+                    continue;
+                }
+                {
+                    std::lock_guard lock(miniMapMutex);
+                    if (job.generation != miniMapGeneration) continue;
+                }
+                if (!miniMapEnabled.load(std::memory_order_relaxed) &&
+                    !schematicWorldTrackingActive.load(
+                        std::memory_order_relaxed
+                    )) {
+                    continue;
+                }
+                if (job.packetName == "subchunk") {
+                    cacheSchematicSubChunkJob(job);
+                    continue;
+                }
                 auto packet = bedrock::BedrockLevelChunkCodec::decodePacketPayload(
                     job.payload
                 );
@@ -1734,174 +2608,62 @@ struct RelayState {
                         1,
                         std::memory_order_relaxed
                     );
+                    invalidateFailedMiniMapJob(job);
                     continue;
                 }
-                auto column = std::make_shared<bedrock::BedrockChunkColumn>(
-                    bedrock::BedrockLevelChunkCodec::decodeNoCacheColumn(
-                        packet,
-                        versionAtLeast(job.version, 1, 18, 0)
-                    )
-                );
+                std::shared_ptr<bedrock::BedrockChunkColumn> column;
+                try {
+                    column = std::make_shared<bedrock::BedrockChunkColumn>(
+                        bedrock::BedrockLevelChunkCodec::decodeNoCacheColumn(
+                            packet,
+                            versionAtLeast(job.version, 1, 18, 0)
+                        )
+                    );
+                } catch (const std::exception& strictError) {
+                    if (!versionAtLeast(job.version, 1, 18, 0) ||
+                        packet.subChunkCount <= 0) {
+                        throw;
+                    }
+                    try {
+                        column = std::make_shared<bedrock::BedrockChunkColumn>(
+                            bedrock::BedrockLevelChunkCodec::
+                                decodeNoCacheBlockSectionsFallback(packet)
+                        );
+                    } catch (const std::exception& fallbackError) {
+                        throw bedrock::BedrockChunkError(
+                            "strict LevelChunk decode failed: " +
+                            std::string(strictError.what()) +
+                            "; section fallback failed: " +
+                            fallbackError.what()
+                        );
+                    }
+                    const auto fallbacks =
+                        miniMapLevelChunkSectionFallbacks.fetch_add(
+                            1,
+                            std::memory_order_relaxed
+                        ) + 1;
+                    if (fallbacks <= 4 || fallbacks % 64 == 0) {
+                        push(
+                            "chunk_decode_section_fallback",
+                            "packet=level_chunk chunk=" +
+                                std::to_string(packet.x) + "," +
+                                std::to_string(packet.z) + " dimension=" +
+                                std::to_string(packet.dimension) +
+                                " sections=" +
+                                std::to_string(packet.subChunkCount) +
+                                " strictError=" +
+                                safeMessage(strictError.what()) +
+                                " salvaged=" + std::to_string(fallbacks),
+                            "WARN",
+                            "chunks"
+                        );
+                    }
+                }
                 const MiniMapKey columnKey {
                     packet.dimension,
                     packet.x,
                     packet.z
                 };
-
-                // Schematic matching only needs the decoded column. Avoid
-                // the much heavier 256-column colour/biome surface scan when
-                // the minimap is disabled (the common schematic-only path).
-                if (!miniMapEnabled.load(std::memory_order_relaxed)) {
-                    const auto camera = entityPositions.cameraSnapshot();
-                    const int32_t cameraChunkX = static_cast<int32_t>(
-                        std::floor(camera.x / 16.0f)
-                    );
-                    const int32_t cameraChunkZ = static_cast<int32_t>(
-                        std::floor(camera.z / 16.0f)
-                    );
-                    {
-                        std::lock_guard lock(miniMapMutex);
-                        if (job.generation != miniMapGeneration ||
-                            miniMapStopping) {
-                            continue;
-                        }
-                        miniMapDimension.store(
-                            packet.dimension,
-                            std::memory_order_relaxed
-                        );
-                        if (schematicWorldTrackingActive.load(
-                                std::memory_order_relaxed
-                            )) {
-                            cacheSchematicColumnLocked(
-                                columnKey,
-                                std::move(column),
-                                camera.known,
-                                cameraChunkX,
-                                cameraChunkZ,
-                                job.packetSequence
-                            );
-                        }
-                    }
-                    miniMapDecodedChunks.fetch_add(
-                        1,
-                        std::memory_order_relaxed
-                    );
-                    continue;
-                }
-                MiniMapTile tile;
-                tile.key = columnKey;
-                tile.surfaceHeights.fill(UnknownSurfaceHeight);
-                tile.groundHeights.fill(
-                    std::numeric_limits<float>::quiet_NaN()
-                );
-                std::array<int32_t, 256> baseColors {};
-                std::array<uint32_t, 256> biomes {};
-                {
-                    // StartGame may switch between numeric and hashed runtime
-                    // IDs. Keep the registry mode stable for the whole tile.
-                    std::lock_guard registryLock(blockRegistryMutex);
-                    for (int32_t z = 0; z < 16; ++z) {
-                        for (int32_t x = 0; x < 16; ++x) {
-                            const auto offset = static_cast<std::size_t>(
-                                z * 16 + x
-                            );
-                            bool surfaceFound = false;
-                            bool groundFound = false;
-                            int32_t surfaceY = column->minY();
-                            for (int32_t sectionY = column->maxCY() - 1;
-                                 sectionY >= column->minCY() &&
-                                    (!surfaceFound || !groundFound);
-                                 --sectionY) {
-                                const auto* section =
-                                    column->getSectionAtIndex(sectionY);
-                                if (section == nullptr) continue;
-                                for (int32_t localY = 15;
-                                     localY >= 0 &&
-                                        (!surfaceFound || !groundFound);
-                                     --localY) {
-                                    const auto runtimeId =
-                                        section->getBlockStateId(
-                                            static_cast<uint8_t>(x),
-                                            static_cast<uint8_t>(localY),
-                                            static_cast<uint8_t>(z)
-                                        );
-                                    const auto appearance =
-                                        miniMapAppearanceLocked(
-                                            runtimeId,
-                                            packet.dimension
-                                        );
-                                    if (appearance.air) continue;
-                                    const int32_t blockY =
-                                        sectionY * 16 + localY;
-                                    if (!surfaceFound) {
-                                        surfaceFound = true;
-                                        surfaceY = blockY;
-                                        tile.surfaceHeights[offset] =
-                                            static_cast<int16_t>(blockY);
-                                        baseColors[offset] = appearance.color;
-                                    }
-                                    if (!groundFound && appearance.solid) {
-                                        groundFound = true;
-                                        tile.groundHeights[offset] =
-                                            static_cast<float>(blockY) +
-                                                appearance.collisionTop;
-                                    }
-                                }
-                            }
-                            if (!surfaceFound) continue;
-                            try {
-                                biomes[offset] = column->getBiomeId({
-                                    x,
-                                    surfaceY,
-                                    z,
-                                    std::nullopt
-                                });
-                            } catch (...) {
-                            }
-                        }
-                    }
-                }
-
-                auto heightAt = [&tile](int x, int z, int fallback) {
-                    x = std::clamp(x, 0, 15);
-                    z = std::clamp(z, 0, 15);
-                    const auto value = tile.surfaceHeights[
-                        static_cast<std::size_t>(z * 16 + x)
-                    ];
-                    return value == UnknownSurfaceHeight
-                        ? fallback
-                        : static_cast<int>(value);
-                };
-                for (int32_t z = 0; z < 16; ++z) {
-                    for (int32_t x = 0; x < 16; ++x) {
-                        const auto offset = static_cast<std::size_t>(
-                            z * 16 + x
-                        );
-                        const int height = tile.surfaceHeights[offset];
-                        if (height == UnknownSurfaceHeight) {
-                            tile.pixels[offset] = 0x00000000;
-                            continue;
-                        }
-                        const int west = heightAt(x - 1, z, height);
-                        const int east = heightAt(x + 1, z, height);
-                        const int north = heightAt(x, z - 1, height);
-                        const int south = heightAt(x, z + 1, height);
-                        int shade = std::clamp(
-                            (west + north - east - south) * 5 +
-                                (height - 64) / 20,
-                            -42,
-                            38
-                        );
-                        int contour = height % 8;
-                        if (contour < 0) contour += 8;
-                        if (contour == 0) shade -= 6;
-                        tile.pixels[offset] = shadeMapColor(
-                            baseColors[offset],
-                            shade,
-                            biomes[offset]
-                        );
-                    }
-                }
 
                 const auto camera = entityPositions.cameraSnapshot();
                 const int32_t cameraChunkX = static_cast<int32_t>(
@@ -1915,39 +2677,36 @@ struct RelayState {
                     if (job.generation != miniMapGeneration || miniMapStopping) {
                         continue;
                     }
-                    tile.revision = ++miniMapRevision;
                     miniMapDimension.store(
                         packet.dimension,
                         std::memory_order_relaxed
                     );
-                    if (schematicWorldTrackingActive.load(
-                            std::memory_order_relaxed
-                        )) {
-                        cacheSchematicColumnLocked(
-                            tile.key,
-                            column,
-                            camera.known,
-                            cameraChunkX,
-                            cameraChunkZ,
-                            job.packetSequence
-                        );
-                    }
-                    miniMapTiles.insert_or_assign(tile.key, std::move(tile));
-                    while (miniMapTiles.size() > 2048) {
-                        auto oldest = miniMapTiles.begin();
-                        for (auto current = miniMapTiles.begin();
-                             current != miniMapTiles.end(); ++current) {
-                            if (current->second.revision <
-                                oldest->second.revision) {
-                                oldest = current;
-                            }
-                        }
-                        miniMapTiles.erase(oldest);
-                    }
+                    cacheSchematicColumnLocked(
+                        columnKey,
+                        column,
+                        {},
+                        packet.subChunkCount != -1 &&
+                            packet.subChunkCount != -2,
+                        camera.known,
+                        cameraChunkX,
+                        cameraChunkZ,
+                        job.packetSequence
+                    );
                 }
+                // The heavy surface scan runs after the authoritative column
+                // (plus any newer UpdateBlock overrides) has been published.
+                // It is skipped entirely for schematic-only operation.
+                rebuildMiniMapTilesSafely(
+                    {columnKey},
+                    job.generation
+                );
                 miniMapDecodedChunks.fetch_add(1, std::memory_order_relaxed);
+            } catch (const std::exception& error) {
+                invalidateFailedMiniMapJob(job);
+                recordMiniMapDecodeFailure(job, error.what());
             } catch (...) {
-                miniMapDecodeFailures.fetch_add(1, std::memory_order_relaxed);
+                invalidateFailedMiniMapJob(job);
+                recordMiniMapDecodeFailure(job, "unknown native exception");
             }
         }
     }
@@ -2046,10 +2805,18 @@ struct RelayState {
             // miniMapMutex protects the cached column from concurrent
             // UpdateBlock mutation during this short scan.
             std::lock_guard registryLock(blockRegistryMutex);
-            const auto& column = *cached->second.column;
+            const auto& entry = cached->second;
+            const auto& column = *entry.column;
             for (int32_t sectionY = column.maxCY() - 1;
                  sectionY >= column.minCY();
                  --sectionY) {
+                if (!entry.completeBlockColumn &&
+                    entry.knownSections.find(sectionY) ==
+                        entry.knownSections.end()) {
+                    // A lower streamed section cannot prove the surface while
+                    // any section above it is still unknown.
+                    return fallback;
+                }
                 const auto* section = column.getSectionAtIndex(sectionY);
                 if (section == nullptr) continue;
                 for (int32_t localY = 15; localY >= 0; --localY) {
@@ -2063,7 +2830,12 @@ struct RelayState {
                         dimension
                     );
                     if (!appearance.solid) continue;
-                    return static_cast<float>(sectionY * 16 + localY) +
+                    const int32_t storedY = sectionY * 16 + localY;
+                    return static_cast<float>(worldBlockY(
+                        column,
+                        dimension,
+                        storedY
+                    )) +
                         appearance.collisionTop;
                 }
             }
@@ -2454,6 +3226,7 @@ struct RelayState {
         }
         if (!serverbound && name == "start_game") {
             minecraftUiBlocked.store(false, std::memory_order_relaxed);
+            int32_t initialDimension = 0;
             try {
                 std::lock_guard decodeLock(itemDecodeMutex);
                 bedrock::RelayPacketEvent decoded(version, event);
@@ -2461,9 +3234,13 @@ struct RelayState {
                     "block_network_ids_are_hashes",
                     true
                 ));
+                initialDimension = static_cast<int32_t>(decoded.getInt(
+                    "dimension",
+                    0
+                ));
             } catch (...) {
             }
-            resetMiniMapWorld(0);
+            resetMiniMapWorld(initialDimension);
             std::lock_guard lock(mutex);
             equipment = {};
             playerInventory.clear();
@@ -2509,9 +3286,9 @@ struct RelayState {
             }
             return;
         }
-        if (!serverbound && schematicWorldTrackingActive.load(
-                std::memory_order_relaxed
-            ) &&
+        if (!serverbound &&
+            (schematicWorldTrackingActive.load(std::memory_order_relaxed) ||
+             miniMapEnabled.load(std::memory_order_relaxed)) &&
             (name == "update_block" || name == "update_block_synced")) {
             try {
                 std::lock_guard decodeLock(itemDecodeMutex);
@@ -2540,74 +3317,83 @@ struct RelayState {
                 );
             } catch (...) {
             }
-            // Keep the small override journal current even while the overlay
-            // is temporarily hidden, so retained columns cannot become stale
-            // when schematic rendering is enabled again.
+            // Keep both the exact block cache and a visible minimap tile in
+            // sync with the server-confirmed primary-layer update.
             return;
         }
         if (!serverbound && name == "update_subchunk_blocks" &&
-            schematicWorldTrackingActive.load(std::memory_order_relaxed)) {
+            (schematicWorldTrackingActive.load(std::memory_order_relaxed) ||
+             miniMapEnabled.load(std::memory_order_relaxed))) {
             try {
-                std::lock_guard decodeLock(itemDecodeMutex);
-                bedrock::RelayPacketEvent decoded(
-                    version,
-                    event,
-                    itemProtocolVariables,
-                    true
-                );
-                const auto* blocks = decoded.value("blocks");
-                if (blocks == nullptr ||
-                    blocks->kind != bedrock::PacketValue::Kind::Array) {
-                    return;
-                }
-                // A subchunk contains at most 16^3 primary-layer cells.
-                // Ignore malformed excess entries rather than letting one
-                // packet monopolise the relay callback thread.
-                const auto count = std::min<std::size_t>(
-                    blocks->arrayValue.size(),
-                    4096
-                );
-                for (std::size_t index = 0; index < count; ++index) {
-                    const auto& entry = blocks->arrayValue[index];
-                    if (entry.kind != bedrock::PacketValue::Kind::Object) {
-                        continue;
+                std::vector<SchematicBlockChange> changes;
+                {
+                    std::lock_guard decodeLock(itemDecodeMutex);
+                    bedrock::RelayPacketEvent decoded(
+                        version,
+                        event,
+                        itemProtocolVariables,
+                        true
+                    );
+                    const auto* blocks = decoded.value("blocks");
+                    if (blocks == nullptr ||
+                        blocks->kind != bedrock::PacketValue::Kind::Array) {
+                        return;
                     }
-                    const auto* position = entry.get("position");
-                    if (position == nullptr ||
-                        position->kind !=
-                            bedrock::PacketValue::Kind::Object) {
-                        continue;
-                    }
-                    const auto x = packetInteger(position->get("x"));
-                    const auto y = packetInteger(position->get("y"));
-                    const auto z = packetInteger(position->get("z"));
-                    auto rawRuntime = packetInteger(entry.get("runtime_id"));
-                    if (!rawRuntime.has_value()) {
-                        rawRuntime = packetInteger(
-                            entry.get("block_runtime_id")
+                    // A subchunk contains at most 16^3 primary-layer cells.
+                    // The protocol's `extra` list is the secondary/waterlogged
+                    // layer and must not replace the primary block used by the
+                    // schematic matcher.
+                    const auto count = std::min<std::size_t>(
+                        blocks->arrayValue.size(),
+                        4096
+                    );
+                    changes.reserve(count);
+                    for (std::size_t index = 0; index < count; ++index) {
+                        const auto& entry = blocks->arrayValue[index];
+                        if (entry.kind != bedrock::PacketValue::Kind::Object) {
+                            continue;
+                        }
+                        const auto* position = entry.get("position");
+                        if (position == nullptr ||
+                            position->kind !=
+                                bedrock::PacketValue::Kind::Object) {
+                            continue;
+                        }
+                        const auto x = packetInteger(position->get("x"));
+                        const auto y = packetInteger(position->get("y"));
+                        const auto z = packetInteger(position->get("z"));
+                        auto rawRuntime = packetInteger(entry.get("runtime_id"));
+                        if (!rawRuntime.has_value()) {
+                            rawRuntime = packetInteger(
+                                entry.get("block_runtime_id")
+                            );
+                        }
+                        if (!x.has_value() || !y.has_value() ||
+                            !z.has_value() || !rawRuntime.has_value()) {
+                            continue;
+                        }
+                        const auto rawRuntimeId = static_cast<uint32_t>(
+                            *rawRuntime
                         );
+                        int32_t runtimeId = 0;
+                        static_assert(sizeof(runtimeId) == sizeof(rawRuntimeId));
+                        std::memcpy(
+                            &runtimeId,
+                            &rawRuntimeId,
+                            sizeof(runtimeId)
+                        );
+                        changes.push_back({
+                            static_cast<int32_t>(*x),
+                            static_cast<int32_t>(*y),
+                            static_cast<int32_t>(*z),
+                            runtimeId
+                        });
                     }
-                    if (!x.has_value() || !y.has_value() || !z.has_value() ||
-                        !rawRuntime.has_value()) {
-                        continue;
-                    }
-                    const auto rawRuntimeId = static_cast<uint32_t>(
-                        *rawRuntime
-                    );
-                    int32_t runtimeId = 0;
-                    static_assert(sizeof(runtimeId) == sizeof(rawRuntimeId));
-                    std::memcpy(
-                        &runtimeId,
-                        &rawRuntimeId,
-                        sizeof(runtimeId)
-                    );
-                    observeSchematicBlockUpdate(
-                        static_cast<int32_t>(*x),
-                        static_cast<int32_t>(*y),
-                        static_cast<int32_t>(*z),
-                        runtimeId
-                    );
                 }
+                // Apply the whole packet under one world-cache lock and one
+                // revision instead of up to 4096 lock/journal operations on
+                // the relay callback thread.
+                observeSchematicBlockUpdates(changes);
             } catch (...) {
             }
             return;
@@ -2983,23 +3769,28 @@ struct RelayState {
     ) {
         autoArmorEnabled.store(armor, std::memory_order_relaxed);
         autoTotemEnabled.store(totem, std::memory_order_relaxed);
-        miniMapEnabled.store(miniMap, std::memory_order_relaxed);
-        if (schematic) {
-            // Once requested in this session, keep the bounded world snapshot
-            // current while the overlay is hidden so re-enabling is exact.
-            schematicWorldTrackingActive.store(true, std::memory_order_relaxed);
-        }
+        const bool wasMiniMap = miniMapEnabled.exchange(
+            miniMap,
+            std::memory_order_relaxed
+        );
+        const bool wasTracking = schematicWorldTrackingActive.exchange(
+            schematic,
+            std::memory_order_relaxed
+        );
         const bool wasSchematic = schematicEnabled.exchange(
             schematic,
             std::memory_order_relaxed
         );
-        if (wasSchematic != schematic) {
+        if (wasSchematic != schematic || wasTracking != schematic ||
+            wasMiniMap != miniMap) {
             std::lock_guard worldLock(miniMapMutex);
-            // Keep the decoded world snapshot across a temporary UI toggle.
-            // Otherwise enabling the overlay after the initial LevelChunk
-            // burst would leave every cell unknown until the server happened
-            // to resend those chunks.
-            ++schematicRevision;
+            if (!schematic && !miniMap) {
+                invalidateMiniMapQueueGapLocked(
+                    std::numeric_limits<uint64_t>::max()
+                );
+            } else {
+                ++schematicRevision;
+            }
         }
         if (!armor && !totem) {
             std::lock_guard lock(mutex);
@@ -3304,6 +4095,16 @@ bedrock::JsRuntimeValue snapshotValue(
                 std::memory_order_relaxed
             ))
         )},
+        {"miniMapLevelChunkSectionFallbacks", bedrock::JsRuntimeValue::number(
+            static_cast<double>(state->miniMapLevelChunkSectionFallbacks.load(
+                std::memory_order_relaxed
+            ))
+        )},
+        {"miniMapSubChunkDecodeFailures", bedrock::JsRuntimeValue::number(
+            static_cast<double>(state->miniMapSubChunkDecodeFailures.load(
+                std::memory_order_relaxed
+            ))
+        )},
         {"miniMapCachedChunksSkipped", bedrock::JsRuntimeValue::number(
             static_cast<double>(state->miniMapCachedChunksSkipped.load(
                 std::memory_order_relaxed
@@ -3311,6 +4112,46 @@ bedrock::JsRuntimeValue snapshotValue(
         )},
         {"retainedRadiusChunks", bedrock::JsRuntimeValue::number(
             state->retainedRadiusChunks.load(std::memory_order_relaxed)
+        )},
+        {"schematicTotalBlocks", bedrock::JsRuntimeValue::number(
+            static_cast<double>(state->schematicTotalBlocks.load(
+                std::memory_order_relaxed
+            ))
+        )},
+        {"schematicCorrectBlocks", bedrock::JsRuntimeValue::number(
+            static_cast<double>(state->schematicCorrectBlocks.load(
+                std::memory_order_relaxed
+            ))
+        )},
+        {"schematicMissingBlocks", bedrock::JsRuntimeValue::number(
+            static_cast<double>(state->schematicMissingBlocks.load(
+                std::memory_order_relaxed
+            ))
+        )},
+        {"schematicWrongBlocks", bedrock::JsRuntimeValue::number(
+            static_cast<double>(state->schematicWrongBlocks.load(
+                std::memory_order_relaxed
+            ))
+        )},
+        {"schematicUnknownBlocks", bedrock::JsRuntimeValue::number(
+            static_cast<double>(state->schematicUnknownBlocks.load(
+                std::memory_order_relaxed
+            ))
+        )},
+        {"schematicDisplayedMarkers", bedrock::JsRuntimeValue::number(
+            static_cast<double>(state->schematicDisplayedMarkers.load(
+                std::memory_order_relaxed
+            ))
+        )},
+        {"schematicMarkerRebuilds", bedrock::JsRuntimeValue::number(
+            static_cast<double>(state->schematicMarkerRebuilds.load(
+                std::memory_order_relaxed
+            ))
+        )},
+        {"schematicMarkerPackets", bedrock::JsRuntimeValue::number(
+            static_cast<double>(state->schematicMarkerPackets.load(
+                std::memory_order_relaxed
+            ))
         )},
         {"chunkPublisherPacketsObserved", bedrock::JsRuntimeValue::number(
             static_cast<double>(
@@ -3573,6 +4414,68 @@ bedrock::JsRuntimeValue entityOverlaySnapshotValue(
     });
 }
 
+struct SchematicDebugMarker {
+    int32_t x = 0;
+    int32_t y = 0;
+    int32_t z = 0;
+    int32_t status = 0;
+
+    auto operator<=>(const SchematicDebugMarker&) const = default;
+};
+
+bedrock::VersionedGamePacket makeSchematicDebugClearPacket(
+    const bedrock::ProtoDefPacketEncoder& encoder,
+    const bedrock::VersionedPacketCodec& packetCodec
+) {
+    const auto payload = encoder.encodePacket(
+        "debug_renderer",
+        bedrock::ProtoDefValue::object({
+            {"type", bedrock::ProtoDefValue::string("clear")}
+        })
+    );
+    return packetCodec.makePacketByName("debug_renderer", payload);
+}
+
+bedrock::VersionedGamePacket makeSchematicDebugCubePacket(
+    const bedrock::ProtoDefPacketEncoder& encoder,
+    const bedrock::VersionedPacketCodec& packetCodec,
+    const SchematicDebugMarker& marker,
+    int opacityPercent
+) {
+    const bool wrong = marker.status == 3;
+    const double alpha = std::clamp(opacityPercent, 10, 85) / 100.0;
+    const auto payload = encoder.encodePacket(
+        "debug_renderer",
+        bedrock::ProtoDefValue::object({
+            {"type", bedrock::ProtoDefValue::string("add_cube")},
+            {"text", bedrock::ProtoDefValue::string("")},
+            {"position", bedrock::ProtoDefValue::object({
+                // Debug marker cubes are centred on their Vec3. Block
+                // coordinates name a corner, so use the exact block centre.
+                {"x", bedrock::ProtoDefValue::floating(marker.x + 0.5)},
+                {"y", bedrock::ProtoDefValue::floating(marker.y + 0.5)},
+                {"z", bedrock::ProtoDefValue::floating(marker.z + 0.5)}
+            })},
+            {"red", bedrock::ProtoDefValue::floating(wrong ? 1.0 : 0.15)},
+            {"green", bedrock::ProtoDefValue::floating(wrong ? 0.10 : 0.85)},
+            {"blue", bedrock::ProtoDefValue::floating(wrong ? 0.10 : 1.0)},
+            {"alpha", bedrock::ProtoDefValue::floating(alpha)},
+            // Rebuilds are event-driven; keep unchanged markers alive for a
+            // full play session without periodic packet spam.
+            {"duration", bedrock::ProtoDefValue::integer(86'400'000)}
+        })
+    );
+    return packetCodec.makePacketByName("debug_renderer", payload);
+}
+
+bedrock::VersionedGamePacket makeSchematicDebugClearPacket(
+    const std::string& version
+) {
+    bedrock::ProtoDefPacketEncoder encoder(version);
+    const auto codec = bedrock::VersionedMcpeCodec::forVersion(version);
+    return makeSchematicDebugClearPacket(encoder, codec.packetCodec());
+}
+
 class RelayController {
 public:
     explicit RelayController(std::shared_ptr<RelayState> state)
@@ -3786,6 +4689,7 @@ public:
         });
 
         relay->onConnect([this, state](bedrock::RelayPlayer& player) {
+            attachSchematicDownstream(player.connection, player.sessionId());
             state->entityPositions.clear();
             state->clientboundEquipmentPackets = 0;
             state->clientboundEquipmentTransportPackets = 0;
@@ -3844,6 +4748,7 @@ public:
         });
         relay->onDisconnect([this, state](bedrock::RelayPlayer& player) {
             cancelLoginWatchdog(player.connection.peer);
+            detachSchematicDownstream(player.sessionId());
             state->entityPositions.clear();
             state->clearGameplayTelemetry();
             state->push(
@@ -3994,12 +4899,22 @@ public:
                 "packet"
             );
         });
-        relay->live().onClientbound([state, version](
+        relay->live().onClientbound([this, state, version](
             bedrock::BedrockRelayPacketEvent& event
         ) {
             state->entityPositions.observeClientbound(event.packet);
             state->observeDecodedGameplayPacket(version, event, false);
             state->enqueueMiniMapChunk(version, event.packet);
+            if (event.packet.name == "start_game" ||
+                event.packet.name == "change_dimension") {
+                if (auto clear = takeSchematicLifecycleClear(version);
+                    clear.has_value()) {
+                    event.replace(std::vector<bedrock::VersionedGamePacket> {
+                        event.packet,
+                        std::move(*clear)
+                    });
+                }
+            }
             if (isResourcePackTransportPacket(event.packet.name)) {
                 const auto sampleIndex =
                     state->resourcePackPacketsSeen.fetch_add(
@@ -4020,8 +4935,11 @@ public:
                     );
                 }
             }
-            if (event.packet.name == "network_chunk_publisher_update" &&
-                state->chunkRetentionEnabled.load(std::memory_order_relaxed)) {
+            if (event.packet.name == "network_chunk_publisher_update") {
+                const bool retentionEnabled =
+                    state->chunkRetentionEnabled.load(
+                        std::memory_order_relaxed
+                    );
                 const auto requestedRadiusChunks =
                     state->retainedRadiusChunks.load(
                         std::memory_order_relaxed
@@ -4034,49 +4952,59 @@ public:
                     0
                 );
                 if (retention.decoded) {
-                    const auto observed =
-                        state->chunkPublisherPacketsObserved.fetch_add(
-                            1,
-                            std::memory_order_relaxed
-                        ) + 1;
-                    state->lastServerPublisherRadiusBlocks.store(
-                        retention.originalRadiusBlocks,
-                        std::memory_order_relaxed
+                    state->observeSchematicPublisherWindow(
+                        retention.centerXBlocks,
+                        retention.centerZBlocks,
+                        retention.originalRadiusBlocks
                     );
-                    state->lastEffectivePublisherRadiusBlocks.store(
-                        retention.effectiveRadiusBlocks,
-                        std::memory_order_relaxed
-                    );
-                    auto rewritten =
-                        state->chunkPublisherPacketsRewritten.load(
+                    // Schematic cache eviction still follows the actual
+                    // client's publisher window even when optional chunk
+                    // retention is disabled.
+                    if (retentionEnabled) {
+                        const auto observed =
+                            state->chunkPublisherPacketsObserved.fetch_add(
+                                1,
+                                std::memory_order_relaxed
+                            ) + 1;
+                        state->lastServerPublisherRadiusBlocks.store(
+                            retention.originalRadiusBlocks,
                             std::memory_order_relaxed
                         );
-                    if (retention.rewritten) {
-                        rewritten =
-                            state->chunkPublisherPacketsRewritten.fetch_add(
-                            1,
+                        state->lastEffectivePublisherRadiusBlocks.store(
+                            retention.effectiveRadiusBlocks,
                             std::memory_order_relaxed
-                        ) + 1;
-                    }
-                    if (observed <= 3 || observed % 128 == 0) {
-                        state->push(
-                            "chunk_retention",
-                            "serverRadiusBlocks=" + std::to_string(
-                                retention.originalRadiusBlocks
-                            ) + " requestedCacheRadiusChunks=" +
-                                std::to_string(requestedRadiusChunks) +
-                                " effectiveRadiusBlocks=" + std::to_string(
-                                retention.effectiveRadiusBlocks
-                            ) + " publisherUpdates=" +
-                                std::to_string(observed) +
-                                " rewrittenPackets=" +
-                                std::to_string(rewritten) +
-                                " forwardedUnchanged=true",
-                            "DEBUG",
-                            "chunks"
                         );
+                        auto rewritten =
+                            state->chunkPublisherPacketsRewritten.load(
+                                std::memory_order_relaxed
+                            );
+                        if (retention.rewritten) {
+                            rewritten =
+                                state->chunkPublisherPacketsRewritten.fetch_add(
+                                    1,
+                                    std::memory_order_relaxed
+                                ) + 1;
+                        }
+                        if (observed <= 3 || observed % 128 == 0) {
+                            state->push(
+                                "chunk_retention",
+                                "serverRadiusBlocks=" + std::to_string(
+                                    retention.originalRadiusBlocks
+                                ) + " requestedCacheRadiusChunks=" +
+                                    std::to_string(requestedRadiusChunks) +
+                                    " effectiveRadiusBlocks=" + std::to_string(
+                                    retention.effectiveRadiusBlocks
+                                ) + " publisherUpdates=" +
+                                    std::to_string(observed) +
+                                    " rewrittenPackets=" +
+                                    std::to_string(rewritten) +
+                                    " forwardedUnchanged=true",
+                                "DEBUG",
+                                "chunks"
+                            );
+                        }
                     }
-                } else if (retention.recognized) {
+                } else if (retention.recognized && retentionEnabled) {
                     const auto failures =
                         state->chunkPublisherDecodeFailures.fetch_add(
                             1,
@@ -4446,6 +5374,287 @@ public:
         );
     }
 
+    bool replaceSchematicDebugMarkers(
+        std::vector<SchematicDebugMarker> markers,
+        int opacityPercent,
+        uint64_t total,
+        uint64_t correct,
+        uint64_t missing,
+        uint64_t wrong,
+        uint64_t unknown,
+        uint64_t expectedWorldRevision,
+        int32_t expectedDimension
+    ) noexcept {
+        try {
+            std::lock_guard sendLock(schematicSendMutex_);
+            // Protocol 898 replaced the documented add-cube action with a
+            // different keyed DebugMarkerData layout. Do not invent fields or
+            // emit the 827 payload on those clients. The requested target,
+            // 1.21.100/protocol 827, uses the fully verified branch below.
+            if (versionAtLeast(state_->version, 1, 21, 130)) {
+                state_->schematicTotalBlocks.store(
+                    total,
+                    std::memory_order_relaxed
+                );
+                state_->schematicCorrectBlocks.store(
+                    correct,
+                    std::memory_order_relaxed
+                );
+                state_->schematicMissingBlocks.store(
+                    missing,
+                    std::memory_order_relaxed
+                );
+                state_->schematicWrongBlocks.store(
+                    wrong,
+                    std::memory_order_relaxed
+                );
+                state_->schematicUnknownBlocks.store(
+                    unknown,
+                    std::memory_order_relaxed
+                );
+                state_->schematicDisplayedMarkers.store(
+                    0,
+                    std::memory_order_relaxed
+                );
+                if (!unsupportedDebugRendererLogged_.exchange(true)) {
+                    state_->push(
+                        "schematic_debug_renderer_unsupported",
+                        "Clientbound debug marker layout changed in " +
+                            state_->version +
+                            "; markers are disabled instead of sending an "
+                            "unverified packet",
+                        "WARN",
+                        "schematics"
+                    );
+                }
+                return true;
+            }
+            if (!state_->schematicSnapshotMatches(
+                    expectedWorldRevision,
+                    expectedDimension
+                )) {
+                return false;
+            }
+            constexpr std::size_t MaximumDebugMarkers = 1'800;
+            markers.erase(
+                std::remove_if(
+                    markers.begin(),
+                    markers.end(),
+                    [](const auto& marker) {
+                        return marker.status != 1 && marker.status != 3;
+                    }
+                ),
+                markers.end()
+            );
+            std::sort(markers.begin(), markers.end());
+            markers.erase(
+                std::unique(markers.begin(), markers.end()),
+                markers.end()
+            );
+            if (markers.size() > MaximumDebugMarkers) {
+                markers.resize(MaximumDebugMarkers);
+            }
+            const std::size_t displayedMarkers = markers.size();
+            opacityPercent = std::clamp(opacityPercent, 10, 85);
+
+            bedrock::BedrockServerConnection downstream;
+            std::string downstreamSessionId;
+            uint64_t markerGeneration = 0;
+            {
+                std::lock_guard markerLock(schematicMarkerMutex_);
+                if (!state_->schematicSnapshotMatches(
+                        expectedWorldRevision,
+                        expectedDimension
+                    )) {
+                    return false;
+                }
+                state_->schematicTotalBlocks.store(total, std::memory_order_relaxed);
+                state_->schematicCorrectBlocks.store(correct, std::memory_order_relaxed);
+                state_->schematicMissingBlocks.store(missing, std::memory_order_relaxed);
+                state_->schematicWrongBlocks.store(wrong, std::memory_order_relaxed);
+                state_->schematicUnknownBlocks.store(unknown, std::memory_order_relaxed);
+                state_->schematicDisplayedMarkers.store(
+                    markers.size(),
+                    std::memory_order_relaxed
+                );
+                if (markers == activeSchematicMarkers_ &&
+                    opacityPercent == activeSchematicOpacity_) {
+                    return true;
+                }
+                if (!schematicDownstream_.has_value()) {
+                    activeSchematicMarkers_.clear();
+                    activeSchematicOpacity_ = opacityPercent;
+                    state_->schematicDisplayedMarkers.store(
+                        0,
+                        std::memory_order_relaxed
+                    );
+                    return false;
+                }
+                downstream = *schematicDownstream_;
+                downstreamSessionId = schematicDownstreamSessionId_;
+                markerGeneration = schematicMarkerGeneration_;
+            }
+
+            bedrock::ProtoDefPacketEncoder debugEncoder(state_->version);
+            const auto debugCodec = bedrock::VersionedMcpeCodec::forVersion(
+                state_->version
+            );
+            std::vector<bedrock::VersionedGamePacket> packets;
+            packets.reserve(markers.size() + 1);
+            packets.push_back(makeSchematicDebugClearPacket(
+                debugEncoder,
+                debugCodec.packetCodec()
+            ));
+            for (const auto& marker : markers) {
+                packets.push_back(makeSchematicDebugCubePacket(
+                    debugEncoder,
+                    debugCodec.packetCodec(),
+                    marker,
+                    opacityPercent
+                ));
+            }
+
+            bool queued = false;
+            {
+                std::lock_guard relayLock(relayMutex_);
+                if (relay_) {
+                    queued = relay_->live().queueClientboundPackets(
+                        downstream,
+                        packets
+                    );
+                }
+            }
+            if (!queued) {
+                std::lock_guard markerLock(schematicMarkerMutex_);
+                state_->schematicDisplayedMarkers.store(
+                    activeSchematicMarkers_.size(),
+                    std::memory_order_relaxed
+                );
+                return false;
+            }
+            bool staleLifecycle = false;
+            {
+                std::lock_guard markerLock(schematicMarkerMutex_);
+                staleLifecycle = schematicMarkerGeneration_ != markerGeneration ||
+                    schematicDownstreamSessionId_ != downstreamSessionId;
+                if (!staleLifecycle) {
+                    activeSchematicMarkers_ = std::move(markers);
+                    activeSchematicOpacity_ = opacityPercent;
+                }
+            }
+            const bool staleSnapshot = !state_->schematicSnapshotMatches(
+                expectedWorldRevision,
+                expectedDimension
+            );
+            if (staleLifecycle || staleSnapshot) {
+                resetSchematicCounters();
+                {
+                    std::lock_guard markerLock(schematicMarkerMutex_);
+                    activeSchematicMarkers_.clear();
+                    activeSchematicOpacity_ = 0;
+                    ++schematicMarkerGeneration_;
+                }
+                const auto clear = makeSchematicDebugClearPacket(state_->version);
+                std::lock_guard relayLock(relayMutex_);
+                if (relay_) {
+                    relay_->live().queueClientboundPackets(downstream, {clear});
+                }
+                return false;
+            }
+            const auto rebuild = state_->schematicMarkerRebuilds.fetch_add(
+                1,
+                std::memory_order_relaxed
+            ) + 1;
+            state_->schematicMarkerPackets.fetch_add(
+                packets.size(),
+                std::memory_order_relaxed
+            );
+            state_->push(
+                "schematic_markers",
+                "backend=clientbound_debug_renderer total=" +
+                    std::to_string(total) + " correct=" +
+                    std::to_string(correct) + " missing=" +
+                    std::to_string(missing) + " wrong=" +
+                    std::to_string(wrong) + " unknown=" +
+                    std::to_string(unknown) + " displayed=" +
+                    std::to_string(displayedMarkers) +
+                    " packets=" + std::to_string(packets.size()) +
+                    " rebuild=" + std::to_string(rebuild),
+                "DEBUG",
+                "schematics"
+            );
+            return true;
+        } catch (const std::exception& error) {
+            state_->push(
+                "schematic_debug_renderer_failed",
+                safeMessage(error.what()),
+                "ERROR",
+                "schematics"
+            );
+            return false;
+        } catch (...) {
+            state_->push(
+                "schematic_debug_renderer_failed",
+                "Unknown debug renderer failure",
+                "ERROR",
+                "schematics"
+            );
+            return false;
+        }
+    }
+
+    void clearSchematicDebugMarkers(bool resetCounters = true) noexcept {
+        try {
+            std::lock_guard sendLock(schematicSendMutex_);
+            if (resetCounters) resetSchematicCounters();
+            std::optional<bedrock::BedrockServerConnection> downstream;
+            {
+                std::lock_guard markerLock(schematicMarkerMutex_);
+                ++schematicMarkerGeneration_;
+                if (activeSchematicMarkers_.empty()) return;
+                downstream = schematicDownstream_;
+                activeSchematicMarkers_.clear();
+                activeSchematicOpacity_ = 0;
+            }
+            if (!downstream.has_value()) return;
+            const auto clear = makeSchematicDebugClearPacket(state_->version);
+            bool queued = false;
+            {
+                std::lock_guard relayLock(relayMutex_);
+                if (relay_) {
+                    queued = relay_->live().queueClientboundPackets(
+                        *downstream,
+                        {clear}
+                    );
+                }
+            }
+            if (queued) {
+                state_->schematicMarkerPackets.fetch_add(
+                    1,
+                    std::memory_order_relaxed
+                );
+            }
+        } catch (const std::exception& error) {
+            {
+                std::lock_guard markerLock(schematicMarkerMutex_);
+                activeSchematicMarkers_.clear();
+                activeSchematicOpacity_ = 0;
+                ++schematicMarkerGeneration_;
+            }
+            state_->push(
+                "schematic_debug_clear_failed",
+                safeMessage(error.what()),
+                "WARN",
+                "schematics"
+            );
+        } catch (...) {
+            std::lock_guard markerLock(schematicMarkerMutex_);
+            activeSchematicMarkers_.clear();
+            activeSchematicOpacity_ = 0;
+            ++schematicMarkerGeneration_;
+        }
+    }
+
 private:
     struct PendingLogin {
         bedrock::BedrockServerConnection connection;
@@ -4458,6 +5667,14 @@ private:
     std::shared_ptr<RelayState> state_;
     std::mutex relayMutex_;
     std::unique_ptr<bedrock::Relay> relay_;
+    std::mutex schematicSendMutex_;
+    std::mutex schematicMarkerMutex_;
+    std::optional<bedrock::BedrockServerConnection> schematicDownstream_;
+    std::string schematicDownstreamSessionId_;
+    std::vector<SchematicDebugMarker> activeSchematicMarkers_;
+    int activeSchematicOpacity_ = 0;
+    uint64_t schematicMarkerGeneration_ = 0;
+    std::atomic<bool> unsupportedDebugRendererLogged_ {false};
     std::atomic<bool> stopped_ {false};
     std::mutex loginWatchdogMutex_;
     std::condition_variable loginWatchdogCv_;
@@ -4465,6 +5682,58 @@ private:
     uint64_t loginWatchdogGeneration_ = 0;
     bool loginWatchdogStopping_ = false;
     std::thread loginWatchdogThread_;
+
+    void resetSchematicCounters() noexcept {
+        state_->schematicTotalBlocks.store(0, std::memory_order_relaxed);
+        state_->schematicCorrectBlocks.store(0, std::memory_order_relaxed);
+        state_->schematicMissingBlocks.store(0, std::memory_order_relaxed);
+        state_->schematicWrongBlocks.store(0, std::memory_order_relaxed);
+        state_->schematicUnknownBlocks.store(0, std::memory_order_relaxed);
+        state_->schematicDisplayedMarkers.store(0, std::memory_order_relaxed);
+    }
+
+    void attachSchematicDownstream(
+        const bedrock::BedrockServerConnection& connection,
+        std::string sessionId
+    ) noexcept {
+        std::lock_guard lock(schematicMarkerMutex_);
+        ++schematicMarkerGeneration_;
+        schematicDownstream_ = connection;
+        schematicDownstreamSessionId_ = std::move(sessionId);
+        activeSchematicMarkers_.clear();
+        activeSchematicOpacity_ = 0;
+        resetSchematicCounters();
+    }
+
+    void detachSchematicDownstream(std::string_view sessionId) noexcept {
+        std::lock_guard lock(schematicMarkerMutex_);
+        if (schematicDownstreamSessionId_ != sessionId) return;
+        ++schematicMarkerGeneration_;
+        schematicDownstream_.reset();
+        schematicDownstreamSessionId_.clear();
+        activeSchematicMarkers_.clear();
+        activeSchematicOpacity_ = 0;
+        resetSchematicCounters();
+    }
+
+    std::optional<bedrock::VersionedGamePacket>
+    takeSchematicLifecycleClear(const std::string& version) noexcept {
+        try {
+            std::lock_guard lock(schematicMarkerMutex_);
+            if (activeSchematicMarkers_.empty()) return std::nullopt;
+            ++schematicMarkerGeneration_;
+            activeSchematicMarkers_.clear();
+            activeSchematicOpacity_ = 0;
+            state_->schematicDisplayedMarkers.store(0, std::memory_order_relaxed);
+            state_->schematicCorrectBlocks.store(0, std::memory_order_relaxed);
+            state_->schematicMissingBlocks.store(0, std::memory_order_relaxed);
+            state_->schematicWrongBlocks.store(0, std::memory_order_relaxed);
+            state_->schematicUnknownBlocks.store(0, std::memory_order_relaxed);
+            return makeSchematicDebugClearPacket(version);
+        } catch (...) {
+            return std::nullopt;
+        }
+    }
 
     static bool samePeer(
         const bedrock::RakNetServerPeer& lhs,
@@ -4862,12 +6131,17 @@ Java_com_m9chko_bedrockrelay_NativeBridge_configureGameplayFeatures(
     configuredSchematic.store(schematic, std::memory_order_relaxed);
 
     std::shared_ptr<RelayState> state;
+    std::shared_ptr<RelayController> activeController;
     {
         std::lock_guard lock(controllerMutex);
         state = currentState;
+        activeController = controller;
     }
     if (state) {
         state->configureGameplayFeatures(armor, totem, miniMap, schematic);
+    }
+    if (activeController && !schematic) {
+        activeController->clearSchematicDebugMarkers();
     }
 }
 
@@ -5006,6 +6280,99 @@ Java_com_m9chko_bedrockrelay_NativeBridge_schematicBlockSnapshot(
         }
         return nullptr;
     }
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_m9chko_bedrockrelay_NativeBridge_replaceSchematicDebugMarkers(
+    JNIEnv* environment,
+    jclass,
+    jintArray markerRecords,
+    jint opacityPercent,
+    jint total,
+    jint correct,
+    jint missing,
+    jint wrong,
+    jint unknown,
+    jlong expectedWorldRevision,
+    jint expectedDimension
+) {
+    try {
+        constexpr jsize MaximumRecordValues = 1'800 * 4;
+        std::vector<int32_t> records;
+        if (markerRecords != nullptr) {
+            const auto length = environment->GetArrayLength(markerRecords);
+            if (length < 0 || length % 4 != 0 ||
+                length > MaximumRecordValues) {
+                throw std::invalid_argument(
+                    "schematic markers must contain at most 1800 XYZS tuples"
+                );
+            }
+            records.resize(static_cast<std::size_t>(length));
+            if (length > 0) {
+                static_assert(sizeof(jint) == sizeof(int32_t));
+                environment->GetIntArrayRegion(
+                    markerRecords,
+                    0,
+                    length,
+                    reinterpret_cast<jint*>(records.data())
+                );
+                if (environment->ExceptionCheck()) return JNI_FALSE;
+            }
+        }
+
+        std::vector<SchematicDebugMarker> markers;
+        markers.reserve(records.size() / 4);
+        for (std::size_t offset = 0; offset < records.size(); offset += 4) {
+            markers.push_back({
+                records[offset],
+                records[offset + 1],
+                records[offset + 2],
+                records[offset + 3]
+            });
+        }
+
+        std::shared_ptr<RelayController> activeController;
+        {
+            std::lock_guard lock(controllerMutex);
+            activeController = controller;
+        }
+        if (activeController) {
+            return activeController->replaceSchematicDebugMarkers(
+                std::move(markers),
+                static_cast<int>(opacityPercent),
+                static_cast<uint64_t>(std::max<jint>(0, total)),
+                static_cast<uint64_t>(std::max<jint>(0, correct)),
+                static_cast<uint64_t>(std::max<jint>(0, missing)),
+                static_cast<uint64_t>(std::max<jint>(0, wrong)),
+                static_cast<uint64_t>(std::max<jint>(0, unknown)),
+                static_cast<uint64_t>(expectedWorldRevision),
+                static_cast<int32_t>(expectedDimension)
+            ) ? JNI_TRUE : JNI_FALSE;
+        }
+        return JNI_FALSE;
+    } catch (const std::exception& error) {
+        const auto exception = environment->FindClass(
+            "java/lang/RuntimeException"
+        );
+        if (exception != nullptr) {
+            environment->ThrowNew(exception, error.what());
+            environment->DeleteLocalRef(exception);
+        }
+        return JNI_FALSE;
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_m9chko_bedrockrelay_NativeBridge_clearSchematicDebugMarkers(
+    JNIEnv*,
+    jclass
+) {
+    std::shared_ptr<RelayController> activeController;
+    {
+        std::lock_guard lock(controllerMutex);
+        activeController = controller;
+    }
+    if (activeController) activeController->clearSchematicDebugMarkers();
 }
 
 extern "C" JNIEXPORT jfloat JNICALL

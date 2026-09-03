@@ -80,7 +80,7 @@ BedrockSubChunkResult readResultU8(BinaryStream& stream) {
 
 BedrockHeightMapType readHeightMapType(BinaryStream& stream) {
     const uint8_t value = stream.readU8();
-    if (value > static_cast<uint8_t>(BedrockHeightMapType::TooLow)) {
+    if (value > static_cast<uint8_t>(BedrockHeightMapType::AllCopied)) {
         throw BedrockSubChunkPacketError("invalid subchunk heightmap type: " + std::to_string(value));
     }
     return static_cast<BedrockHeightMapType>(value);
@@ -182,6 +182,29 @@ void writeModernEntry(
 }
 
 } // namespace
+
+BedrockSubChunkPacket BedrockSubChunkPacketCodec::decodePacketHeader(
+    const std::vector<uint8_t>& payload,
+    const std::string& minecraftVersion
+) {
+    BinaryStream stream(payload);
+    BedrockSubChunkPacket packet;
+    if (legacySingleEntrySchema(minecraftVersion)) {
+        packet.dimension = readZigZag32(stream);
+        packet.originX = readZigZag32(stream);
+        packet.originY = readZigZag32(stream);
+        packet.originZ = readZigZag32(stream);
+        return packet;
+    }
+
+    packet.cacheEnabled = stream.readU8() != 0;
+    packet.dimension = readZigZag32(stream);
+    packet.originX = readZigZag32(stream);
+    packet.originY = readZigZag32(stream);
+    packet.originZ = readZigZag32(stream);
+    (void) stream.readU32LE();
+    return packet;
+}
 
 BedrockSubChunkPacket BedrockSubChunkPacketCodec::decodePacketPayload(
     const std::vector<uint8_t>& payload,

@@ -786,10 +786,35 @@ final class RelayOverlayController {
         final SchematicRepository.Entry activeEntry = active;
 
         root.addView(toggle(
-            "Показывать 3D-схему в мире",
+            "Фантомная схема в мире (без коллизии)",
             RelayService.KEY_SCHEMATIC_ENABLED,
             false
         ));
+
+        int progressTotal = preferences.getInt(
+            RelayService.KEY_SCHEMATIC_TOTAL,
+            0
+        );
+        int progressCorrect = preferences.getInt(
+            RelayService.KEY_SCHEMATIC_CORRECT,
+            0
+        );
+        int progressMissing = preferences.getInt(
+            RelayService.KEY_SCHEMATIC_MISSING,
+            0
+        );
+        int progressWrong = preferences.getInt(
+            RelayService.KEY_SCHEMATIC_WRONG,
+            0
+        );
+        int progressUnknown = preferences.getInt(
+            RelayService.KEY_SCHEMATIC_UNKNOWN,
+            0
+        );
+        int progressDisplayed = preferences.getInt(
+            RelayService.KEY_SCHEMATIC_DISPLAYED,
+            0
+        );
 
         TextView status = text(
             active == null
@@ -800,7 +825,12 @@ final class RelayOverlayController {
                         Locale.getDefault(),
                         "%,d блоков",
                         active.nonAirBlocks
-                    ),
+                    ) + (progressTotal > 0
+                        ? "\nГотово " + progressCorrect + " • нет " +
+                            progressMissing + " • неверно " + progressWrong +
+                            " • не загружено " + progressUnknown +
+                            " • показано " + progressDisplayed
+                        : ""),
             10,
             true
         );
@@ -1020,13 +1050,13 @@ final class RelayOverlayController {
             RelayService.KEY_SCHEMATIC_OPACITY,
             42
         ));
-        TextView opacityLabel = settingLabel("Прозрачность блоков: " +
+        TextView opacityLabel = settingLabel("Прозрачность фантомов: " +
             opacity + "%");
         root.addView(opacityLabel);
         SeekBar opacitySlider = slider(10, 85, opacity);
         root.addView(opacitySlider);
         opacitySlider.setOnSeekBarChangeListener(seekListener(
-            value -> opacityLabel.setText("Прозрачность блоков: " + value + "%"),
+            value -> opacityLabel.setText("Прозрачность фантомов: " + value + "%"),
             value -> saveInt(
                 RelayService.KEY_SCHEMATIC_OPACITY,
                 RelayService.clampSchematicOpacity(value)
@@ -1169,8 +1199,9 @@ final class RelayOverlayController {
 
         TextView note = text(
             "После размещения якорь остаётся неподвижным в координатах мира и " +
-                "меняется только кнопками X/Y/Z, поворота и зеркала. Слой " +
-                "скрывается в инвентаре, сундуке, шалкере и чате.",
+                "меняется только кнопками X/Y/Z, поворота и зеркала. Голубой " +
+                "куб — отсутствующий блок, красный — неправильный. Это " +
+                "клиентские маркеры без коллизии: настоящий чанк не меняется.",
             9,
             false
         );

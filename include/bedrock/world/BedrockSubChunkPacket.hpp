@@ -22,7 +22,8 @@ enum class BedrockHeightMapType : uint8_t {
     NoData = 0,
     HasData = 1,
     TooHigh = 2,
-    TooLow = 3
+    TooLow = 3,
+    AllCopied = 4
 };
 
 struct BedrockSubChunkPacketEntry {
@@ -55,6 +56,15 @@ public:
 
 class BedrockSubChunkPacketCodec {
 public:
+    // Decode only the fixed packet header. Entries intentionally remain
+    // empty so relay queue prioritisation stays off the network hot path.
+    // Minecraft 1.18.0 stores cacheEnabled after its single entry, so the
+    // header-only result leaves that legacy field false.
+    static BedrockSubChunkPacket decodePacketHeader(
+        const std::vector<uint8_t>& payload,
+        const std::string& minecraftVersion
+    );
+
     static BedrockSubChunkPacket decodePacketPayload(
         const std::vector<uint8_t>& payload,
         const std::string& minecraftVersion
