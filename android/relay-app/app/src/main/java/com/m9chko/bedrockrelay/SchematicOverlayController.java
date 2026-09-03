@@ -101,6 +101,7 @@ final class SchematicOverlayController {
             latestCamera = EntityOutlineOverlayController.CameraSample.unknown();
             placementTargetCaptured = false;
             invalidateBlockQuery();
+            clearDebugMarkers();
         }
         sessionVisible = visible;
         reconcileWindow();
@@ -138,10 +139,11 @@ final class SchematicOverlayController {
         rotationQuarterTurns = nextRotation;
         this.mirrored = mirrored;
         selectedLayer = layer;
-        if (queryChanged) {
-            invalidateBlockQuery();
-        } else if (!enabled) {
+        if (!enabled) {
+            if (queryChanged) invalidateBlockQuery();
             if (enabledChanged || debugMarkerPlanPublished) clearDebugMarkers();
+        } else if (queryChanged) {
+            invalidateBlockQuery();
         } else if (enabledChanged || markerSelectionChanged) {
             // The cached world comparison remains valid. Re-plan on the
             // snapshot executor without a visible clear/re-add flicker.
@@ -171,6 +173,10 @@ final class SchematicOverlayController {
         if (model == value) return;
         invalidateBlockQuery();
         model = value;
+        // A different file has no valid visual relationship to the active
+        // plan. Clear it explicitly; anchor moves keep using the seamless
+        // keyed replacement path instead.
+        if (debugMarkerPlanPublished) clearDebugMarkers();
         SchematicView current = view;
         if (current != null) current.setModel(value);
         reconcileWindow();
@@ -339,7 +345,12 @@ final class SchematicOverlayController {
     void pollWorldSnapshot() {
         BlockQuery query = currentBlockQuery();
         if (query == null) {
-            if (debugMarkerPlanPublished) clearDebugMarkers();
+            // Placement deliberately has a short settling window. Keep the
+            // previous anchor visible until a complete replacement plan is
+            // ready instead of flashing an empty world after the button tap.
+            if (!placementPending && debugMarkerPlanPublished) {
+                clearDebugMarkers();
+            }
             return;
         }
         if (!query.placementSettled()) return;
@@ -401,9 +412,8 @@ final class SchematicOverlayController {
                 if (query.nextIndex != batchStart) return;
                 if (query.cycleRevision != revision) {
                     // Finish this bounded scan even while unrelated chunks
-                    // stream in, then schedule one fresh pass. Restarting here
-                    // could starve large schematics and repeatedly allocate
-                    // their full state array.
+                    // stream in. Restarting here could starve large schematics
+                    // and repeatedly allocate their full state array.
                     query.cycleChanged = true;
                     query.cycleRevision = revision;
                 }
@@ -452,6 +462,8 @@ final class SchematicOverlayController {
             }
         }
         if (completedStates == null) return;
+        if (!query.lastCycleStatesChanged &&
+            !shouldRefreshMarkersForCamera()) return;
         publishDebugMarkers(query, completedStates, revision, snapshot[4]);
     }
 
@@ -544,7 +556,9 @@ final class SchematicOverlayController {
         publishedCameraChunkX = Integer.MIN_VALUE;
         publishedCameraChunkY = Integer.MIN_VALUE;
         publishedCameraChunkZ = Integer.MIN_VALUE;
-        clearDebugMarkers();
+        // Native replacement is now a keyed delta. Keep the last coherent
+        // plan on screen while a new anchor/window/model is scanned, then let
+        // the accepted replacement remove only cells that really changed.
         SchematicView current = view;
         if (current != null) current.clearWorldStates();
     }
@@ -714,6 +728,7 @@ final class SchematicOverlayController {
         int wrongBlocks;
         int workingCorrectBlocks;
         int workingWrongBlocks;
+        boolean lastCycleStatesChanged;
 
         private BlockQuery(
             SchematicModel model,
@@ -739,13 +754,13 @@ final class SchematicOverlayController {
             this.selectedLayer = selectedLayer;
             placementReadyAtMs = SystemClock.uptimeMillis() +
                 PLACEMENT_SETTLE_MILLIS;
-            // .mcstructure states already use Bedrock property names/values.
-            // Directional properties need a separate transform before exact
-            // comparison, so rotated/mirrored placements safely fall back to
-            // block-name aliases instead of producing false red errors.
+            // .mcstructure states use the same Bedrock property names/values
+            // as the decoded world cache. BlockQuery.create rotates and mirrors
+            // directional palette properties before constructing this query,
+            // so exact comparison remains valid for every placement transform.
             exactBedrockProperties = "Bedrock .mcstructure".equals(
                 model.format()
-            ) && rotation == 0 && !mirrored;
+            );
             this.transform = transform;
             this.paletteExpectedBlocks = paletteExpectedBlocks;
             this.blockIndices = blockIndices;
@@ -770,7 +785,11 @@ final class SchematicOverlayController {
             for (int paletteIndex = 0;
                 paletteIndex < palette.length;
                 ++paletteIndex) {
-                String state = model.paletteState(paletteIndex);
+                String state = SchematicBlockStateTransform.transform(
+                    model.paletteState(paletteIndex),
+                    transform.rotationQuarterTurns(),
+                    transform.mirrored()
+                );
                 palette[paletteIndex] = SchematicBlockMatcher.expected(
                     state,
                     translator.bedrockCandidates(state)
@@ -859,18 +878,24 @@ final class SchematicOverlayController {
         }
 
         boolean finishCycle(long revision) {
-            if (cycleChanged) {
-                // Never publish a plan assembled from different world
-                // revisions. Keep the last coherent plan visible and force a
-                // fresh bounded pass on the next scheduler turn.
-                abortCycle();
-                completedRevision = FORCE_BLOCK_SNAPSHOT;
-                return false;
-            }
+            // A global revision can advance because an unrelated loaded chunk
+            // changed. Discarding a multi-batch scan in that case starves large
+            // schematics while the player is moving. Publish the bounded
+            // snapshot and let the next revision-driven pass converge any cell
+            // that changed during it.
+            boolean changedDuringCycle = cycleChanged;
+            lastCycleStatesChanged = states == null ||
+                !Arrays.equals(states, workingStates);
             states = workingStates;
             correctBlocks = workingCorrectBlocks;
             wrongBlocks = workingWrongBlocks;
-            completedRevision = revision;
+            // The mixed pass is immediately useful, but it cannot be the
+            // terminal cache snapshot. Force one more bounded pass so a cell
+            // read before a concurrent UpdateBlock is guaranteed to converge
+            // once the stream becomes quiet.
+            completedRevision = changedDuringCycle
+                ? FORCE_BLOCK_SNAPSHOT
+                : revision;
             abortCycle();
             return true;
         }

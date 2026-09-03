@@ -30,9 +30,14 @@ import java.util.Locale;
 
 /** Session-scoped Toolbox-style controls displayed over Minecraft. */
 final class RelayOverlayController {
+    interface SchematicAnchorShift {
+        void shift(int dx, int dy, int dz);
+    }
+
     private final Context context;
     private final SharedPreferences preferences;
     private final Runnable settingsChanged;
+    private final SchematicAnchorShift schematicAnchorShift;
     private final WindowManager windowManager;
 
     private WindowManager.LayoutParams windowParams;
@@ -75,11 +80,13 @@ final class RelayOverlayController {
     RelayOverlayController(
         Context context,
         SharedPreferences preferences,
-        Runnable settingsChanged
+        Runnable settingsChanged,
+        SchematicAnchorShift schematicAnchorShift
     ) {
         this.context = context;
         this.preferences = preferences;
         this.settingsChanged = settingsChanged;
+        this.schematicAnchorShift = schematicAnchorShift;
         this.windowManager = (WindowManager) context.getSystemService(
             Context.WINDOW_SERVICE
         );
@@ -1201,9 +1208,8 @@ final class RelayOverlayController {
             "После размещения якорь остаётся неподвижным в координатах мира и " +
                 "меняется только кнопками X/Y/Z, поворота и зеркала. Ближайшие " +
                 "отсутствующие блоки показаны уменьшенными текстурными " +
-                "фантомами; голубая рамка отмечает их клетку, красная — " +
-                "неправильный блок. Фантомы не имеют коллизии и не меняют " +
-                "настоящий чанк.",
+                "фантомами, красная рамка отмечает только неправильный блок. " +
+                "Фантомы не имеют коллизии и не меняют настоящий чанк.",
             9,
             false
         );
@@ -1258,28 +1264,7 @@ final class RelayOverlayController {
             showPage("schematics");
             return;
         }
-        float anchorY = preferences.getFloat(
-            RelayService.KEY_SCHEMATIC_ANCHOR_Y_EXACT,
-            preferences.getInt(RelayService.KEY_SCHEMATIC_ANCHOR_Y, 0)
-        ) + dy;
-        preferences.edit()
-            .putInt(
-                RelayService.KEY_SCHEMATIC_ANCHOR_X,
-                preferences.getInt(RelayService.KEY_SCHEMATIC_ANCHOR_X, 0) + dx
-            )
-            .putInt(
-                RelayService.KEY_SCHEMATIC_ANCHOR_Y,
-                (int) Math.floor(anchorY)
-            )
-            .putFloat(RelayService.KEY_SCHEMATIC_ANCHOR_Y_EXACT, anchorY)
-            .putInt(
-                RelayService.KEY_SCHEMATIC_ANCHOR_Z,
-                preferences.getInt(RelayService.KEY_SCHEMATIC_ANCHOR_Z, 0) + dz
-            )
-            .apply();
-        // SchematicOverlayController reads the persisted anchor from its
-        // snapshot worker. Re-applying every unrelated runtime option here
-        // only floods the log/native bridge while the user taps X/Y/Z.
+        schematicAnchorShift.shift(dx, dy, dz);
         showPage("schematics");
     }
 

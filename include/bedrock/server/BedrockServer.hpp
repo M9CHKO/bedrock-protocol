@@ -1398,12 +1398,27 @@ public:
             session->queuedPackets.clear();
         }
 
+        // Bound the actual outer MCPE batches at the flush boundary. Callers
+        // may enqueue several already-bounded vectors during one batching
+        // interval, so limiting only each queuePackets() call is insufficient:
+        // the scheduler would otherwise merge them back into one large batch.
+        constexpr std::size_t MaximumPacketsPerBatch = 64;
+        constexpr std::size_t MaximumBytesPerBatch = 48 * 1024;
         std::size_t begin = 0;
         while (begin < queued.size()) {
             const auto compression = queued[begin].compression;
             std::size_t end = begin + 1;
+            std::size_t batchBytes =
+                queued[begin].packet.fullPacket.size() + 16;
             while (end < queued.size() &&
-                   queued[end].compression == compression) {
+                   queued[end].compression == compression &&
+                   end - begin < MaximumPacketsPerBatch) {
+                const auto packetBytes =
+                    queued[end].packet.fullPacket.size() + 16;
+                if (batchBytes + packetBytes > MaximumBytesPerBatch) {
+                    break;
+                }
+                batchBytes += packetBytes;
                 ++end;
             }
 

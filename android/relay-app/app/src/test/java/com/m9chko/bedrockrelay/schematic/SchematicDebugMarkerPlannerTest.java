@@ -13,7 +13,7 @@ import org.junit.Test;
 
 public final class SchematicDebugMarkerPlannerTest {
     @Test
-    public void countsWholeModelAndDisplaysOnlyLoadedMissingOrWrongCells() {
+    public void countsWholeModelAndDisplaysUnknownAndMissingCellsOnLayer() {
         SchematicModel model = model(
             2,
             2,
@@ -27,8 +27,8 @@ public final class SchematicDebugMarkerPlannerTest {
         byte[] states = {
             SchematicDebugMarkerPlanner.BLOCK_MISSING,
             SchematicDebugMarkerPlanner.BLOCK_CORRECT,
-            SchematicDebugMarkerPlanner.BLOCK_WRONG,
             SchematicDebugMarkerPlanner.BLOCK_UNKNOWN,
+            SchematicDebugMarkerPlanner.BLOCK_WRONG,
             SchematicDebugMarkerPlanner.BLOCK_MISSING
         };
 
@@ -57,10 +57,10 @@ public final class SchematicDebugMarkerPlannerTest {
         assertEquals(0.4f, result.alpha(), 0.0001f);
         assertArrayEquals(new int[] {
             10, 20, 30, SchematicDebugMarkerPlanner.BLOCK_MISSING,
-            10, 20, 31, SchematicDebugMarkerPlanner.BLOCK_WRONG
+            10, 20, 31, SchematicDebugMarkerPlanner.BLOCK_UNKNOWN
         }, result.records());
         assertArrayEquals(
-            new String[] {"minecraft:stone", null},
+            new String[] {"minecraft:stone", "minecraft:stone"},
             result.expectedBlockStates()
         );
     }
@@ -134,6 +134,98 @@ public final class SchematicDebugMarkerPlannerTest {
         int[] records = result.records();
         assertEquals(0, records[0]);
         assertEquals(1_799, records[records.length - 4]);
+        String[] expectedBlockStates = result.expectedBlockStates();
+        assertEquals(SchematicDebugMarkerPlanner.MAX_DISPLAYED_MARKERS,
+            expectedBlockStates.length);
+        for (String expectedBlockState : expectedBlockStates) {
+            assertEquals("minecraft:stone", expectedBlockState);
+        }
+    }
+
+    @Test
+    public void keepsExpectedPaletteStatesParallelAfterDistanceSorting() {
+        SchematicModel model = new SchematicModel(
+            "mixed-palette",
+            "Bedrock .mcstructure",
+            4,
+            1,
+            1,
+            Arrays.asList(
+                "minecraft:air",
+                "minecraft:stone",
+                "minecraft:dirt",
+                "minecraft:glass"
+            ),
+            new int[] {1, 2, 3, 1}
+        );
+
+        SchematicDebugMarkerPlanner.Result result =
+            SchematicDebugMarkerPlanner.plan(
+                model,
+                new SchematicPlacementTransform(0, 0, 0, 4, 0, false),
+                new int[] {3, 2, 1, 0},
+                new byte[] {
+                    SchematicDebugMarkerPlanner.BLOCK_WRONG,
+                    SchematicDebugMarkerPlanner.BLOCK_UNKNOWN,
+                    SchematicDebugMarkerPlanner.BLOCK_MISSING,
+                    SchematicDebugMarkerPlanner.BLOCK_MISSING
+                },
+                true,
+                0.5d,
+                0.5d,
+                0.5d,
+                -1,
+                16,
+                50
+            );
+
+        assertArrayEquals(new int[] {
+            0, 0, 0, SchematicDebugMarkerPlanner.BLOCK_MISSING,
+            1, 0, 0, SchematicDebugMarkerPlanner.BLOCK_MISSING,
+            2, 0, 0, SchematicDebugMarkerPlanner.BLOCK_UNKNOWN,
+            3, 0, 0, SchematicDebugMarkerPlanner.BLOCK_WRONG
+        }, result.records());
+        assertArrayEquals(new String[] {
+            "minecraft:stone",
+            "minecraft:dirt",
+            "minecraft:glass",
+            null
+        }, result.expectedBlockStates());
+    }
+
+    @Test
+    public void transformsTexturedPaletteStateWithPlacement() {
+        SchematicModel model = new SchematicModel(
+            "directional-palette",
+            "Bedrock .mcstructure",
+            1,
+            1,
+            1,
+            Arrays.asList(
+                "minecraft:air",
+                "minecraft:oak_stairs[upside_down_bit=false,weirdo_direction=3]"
+            ),
+            new int[] {1}
+        );
+
+        SchematicDebugMarkerPlanner.Result result =
+            SchematicDebugMarkerPlanner.plan(
+                model,
+                new SchematicPlacementTransform(4, 5, 6, 1, 1, false),
+                new int[] {0},
+                new byte[] {SchematicDebugMarkerPlanner.BLOCK_MISSING},
+                true,
+                3.5d,
+                5.5d,
+                6.5d,
+                -1,
+                16,
+                50
+            );
+
+        assertArrayEquals(new String[] {
+            "minecraft:oak_stairs[upside_down_bit=false,weirdo_direction=0]"
+        }, result.expectedBlockStates());
     }
 
     @Test

@@ -187,7 +187,21 @@ public final class RelayService extends Service {
         overlayController = new RelayOverlayController(
             this,
             preferences,
-            () -> applyRuntimeOptions(true)
+            () -> applyRuntimeOptions(true),
+            (dx, dy, dz) -> {
+                Runnable shiftAndRefresh = () -> {
+                    SchematicOverlayController controller =
+                        schematicOverlayController;
+                    if (controller == null) return;
+                    controller.shiftAnchor(dx, dy, dz);
+                    scheduleSchematicWorldSnapshot(controller);
+                };
+                if (Looper.myLooper() == Looper.getMainLooper()) {
+                    shiftAndRefresh.run();
+                } else {
+                    mainHandler.post(shiftAndRefresh);
+                }
+            }
         );
         entityOverlayController = new EntityOutlineOverlayController(this);
         chunkOverlayController = new ChunkStatusOverlayController(

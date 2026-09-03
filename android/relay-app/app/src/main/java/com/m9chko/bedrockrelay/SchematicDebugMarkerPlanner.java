@@ -11,8 +11,8 @@ import java.util.Objects;
  * <p>The supplied block indices and states are parallel arrays. Indices must
  * identify distinct non-air cells in {@code model}. Callers may supply only a
  * subset of the model; cells omitted from the arrays are counted as unknown.
- * Unknown cells are never displayed because their containing world chunk has
- * not been confirmed as loaded.
+ * Explicit unknown cells may be displayed while their containing world chunk
+ * is waiting to be confirmed as loaded.
  */
 public final class SchematicDebugMarkerPlanner {
     public static final byte BLOCK_UNKNOWN = 0;
@@ -21,13 +21,18 @@ public final class SchematicDebugMarkerPlanner {
     public static final byte BLOCK_WRONG = 3;
 
     public static final int MAX_DISPLAYED_MARKERS = 1_800;
-    public static final int MAX_TEXTURED_MARKERS = 64;
+    // Every retained marker may become a textured falling-block preview. The
+    // native side applies a stable cell diff, so raising this to the existing
+    // bounded marker limit no longer causes a full entity rebuild on camera
+    // movement. This is enough to show ordinary imported builds completely
+    // while preserving the hard 1,800-cell memory and packet safety cap.
+    public static final int MAX_TEXTURED_MARKERS = MAX_DISPLAYED_MARKERS;
     private static final int RECORD_WIDTH = 4;
 
     private SchematicDebugMarkerPlanner() {}
 
     /**
-     * Plans missing and wrong-block markers nearest to the current camera.
+     * Plans unknown, missing, and wrong-block markers nearest to the camera.
      *
      * @param selectedLayer local schematic Y, or {@code -1} for every layer
      * @param maximumDistance maximum camera-to-block-center distance in blocks
@@ -64,7 +69,7 @@ public final class SchematicDebugMarkerPlanner {
 
     /**
      * Plans markers and optionally includes exact palette states for the
-     * bounded set of textured missing-block previews.
+     * bounded set of textured unknown- and missing-block previews.
      */
     public static Result plan(
         SchematicModel model,
@@ -155,7 +160,9 @@ public final class SchematicDebugMarkerPlanner {
             }
 
             if (markers == null ||
-                (status != BLOCK_MISSING && status != BLOCK_WRONG) ||
+                (status != BLOCK_UNKNOWN &&
+                    status != BLOCK_MISSING &&
+                    status != BLOCK_WRONG) ||
                 (selectedLayer >= 0 && localY != selectedLayer)) {
                 continue;
             }
@@ -186,7 +193,7 @@ public final class SchematicDebugMarkerPlanner {
         }
         SortedMarkers sorted = markers == null
             ? new SortedMarkers(new int[0], new String[0])
-            : markers.sorted(model, includeTextureStates);
+            : markers.sorted(model, transform, includeTextureStates);
         return new Result(
             sorted.records,
             sorted.expectedBlockStates,
@@ -237,7 +244,9 @@ public final class SchematicDebugMarkerPlanner {
 
         /**
          * Exact Bedrock palette state parallel to each marker record. Entries
-         * without a textured preview are null to keep JNI work bounded.
+         * without a textured preview are null. The enclosing marker plan is
+         * already capped, so providing all unknown and missing states remains
+         * bounded.
          */
         public String[] expectedBlockStates() {
             return expectedBlockStates.clone();
@@ -344,6 +353,7 @@ public final class SchematicDebugMarkerPlanner {
 
         SortedMarkers sorted(
             SchematicModel model,
+            SchematicPlacementTransform transform,
             boolean includeTextureStates
         ) {
             Integer[] order = new Integer[size];
@@ -351,6 +361,9 @@ public final class SchematicDebugMarkerPlanner {
             Arrays.sort(order, this::compareSlots);
             int[] result = new int[Math.multiplyExact(size, RECORD_WIDTH)];
             String[] expectedBlockStates = new String[size];
+            String[] transformedPalette = includeTextureStates
+                ? new String[model.paletteSize()]
+                : null;
             int texturedMarkers = 0;
             for (int output = 0; output < size; ++output) {
                 int slot = order[output];
@@ -360,11 +373,22 @@ public final class SchematicDebugMarkerPlanner {
                 result[offset + 2] = z[slot];
                 result[offset + 3] = status[slot];
                 if (includeTextureStates &&
-                    status[slot] == BLOCK_MISSING &&
+                    (status[slot] == BLOCK_UNKNOWN ||
+                        status[slot] == BLOCK_MISSING) &&
                     texturedMarkers < MAX_TEXTURED_MARKERS) {
-                    expectedBlockStates[output] = model.paletteState(
-                        model.paletteIndexAtLinear(linearIndex[slot])
+                    int paletteIndex = model.paletteIndexAtLinear(
+                        linearIndex[slot]
                     );
+                    String transformedState = transformedPalette[paletteIndex];
+                    if (transformedState == null) {
+                        transformedState = SchematicBlockStateTransform.transform(
+                            model.paletteState(paletteIndex),
+                            transform.rotationQuarterTurns(),
+                            transform.mirrored()
+                        );
+                        transformedPalette[paletteIndex] = transformedState;
+                    }
+                    expectedBlockStates[output] = transformedState;
                     ++texturedMarkers;
                 }
             }
