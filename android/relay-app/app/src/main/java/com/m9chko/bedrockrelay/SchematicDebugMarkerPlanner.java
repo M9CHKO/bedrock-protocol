@@ -21,6 +21,7 @@ public final class SchematicDebugMarkerPlanner {
     public static final byte BLOCK_WRONG = 3;
 
     public static final int MAX_DISPLAYED_MARKERS = 1_800;
+    public static final int MAX_TEXTURED_MARKERS = 64;
     private static final int RECORD_WIDTH = 4;
 
     private SchematicDebugMarkerPlanner() {}
@@ -44,6 +45,40 @@ public final class SchematicDebugMarkerPlanner {
         int selectedLayer,
         int maximumDistance,
         int opacityPercent
+    ) {
+        return plan(
+            model,
+            transform,
+            blockIndices,
+            blockStates,
+            cameraKnown,
+            cameraX,
+            cameraY,
+            cameraZ,
+            selectedLayer,
+            maximumDistance,
+            opacityPercent,
+            true
+        );
+    }
+
+    /**
+     * Plans markers and optionally includes exact palette states for the
+     * bounded set of textured missing-block previews.
+     */
+    public static Result plan(
+        SchematicModel model,
+        SchematicPlacementTransform transform,
+        int[] blockIndices,
+        byte[] blockStates,
+        boolean cameraKnown,
+        double cameraX,
+        double cameraY,
+        double cameraZ,
+        int selectedLayer,
+        int maximumDistance,
+        int opacityPercent,
+        boolean includeTextureStates
     ) {
         Objects.requireNonNull(model, "model");
         Objects.requireNonNull(transform, "transform");
@@ -149,9 +184,12 @@ public final class SchematicDebugMarkerPlanner {
                 "Known block states exceed the schematic non-air block count"
             );
         }
-        int[] records = markers == null ? new int[0] : markers.sortedRecords();
+        SortedMarkers sorted = markers == null
+            ? new SortedMarkers(new int[0], new String[0])
+            : markers.sorted(model, includeTextureStates);
         return new Result(
-            records,
+            sorted.records,
+            sorted.expectedBlockStates,
             total,
             correct,
             missing,
@@ -164,6 +202,7 @@ public final class SchematicDebugMarkerPlanner {
     /** Immutable marker plan and progress counters. */
     public static final class Result {
         private final int[] records;
+        private final String[] expectedBlockStates;
         private final int total;
         private final int correct;
         private final int missing;
@@ -173,6 +212,7 @@ public final class SchematicDebugMarkerPlanner {
 
         private Result(
             int[] records,
+            String[] expectedBlockStates,
             int total,
             int correct,
             int missing,
@@ -181,6 +221,7 @@ public final class SchematicDebugMarkerPlanner {
             int opacityPercent
         ) {
             this.records = records;
+            this.expectedBlockStates = expectedBlockStates;
             this.total = total;
             this.correct = correct;
             this.missing = missing;
@@ -192,6 +233,14 @@ public final class SchematicDebugMarkerPlanner {
         /** Flat records in nearest-first order: {@code [x,y,z,status]}. */
         public int[] records() {
             return records.clone();
+        }
+
+        /**
+         * Exact Bedrock palette state parallel to each marker record. Entries
+         * without a textured preview are null to keep JNI work bounded.
+         */
+        public String[] expectedBlockStates() {
+            return expectedBlockStates.clone();
         }
 
         public int total() {
@@ -293,11 +342,16 @@ public final class SchematicDebugMarkerPlanner {
             siftDown(0);
         }
 
-        int[] sortedRecords() {
+        SortedMarkers sorted(
+            SchematicModel model,
+            boolean includeTextureStates
+        ) {
             Integer[] order = new Integer[size];
             for (int index = 0; index < size; ++index) order[index] = index;
             Arrays.sort(order, this::compareSlots);
             int[] result = new int[Math.multiplyExact(size, RECORD_WIDTH)];
+            String[] expectedBlockStates = new String[size];
+            int texturedMarkers = 0;
             for (int output = 0; output < size; ++output) {
                 int slot = order[output];
                 int offset = output * RECORD_WIDTH;
@@ -305,8 +359,16 @@ public final class SchematicDebugMarkerPlanner {
                 result[offset + 1] = y[slot];
                 result[offset + 2] = z[slot];
                 result[offset + 3] = status[slot];
+                if (includeTextureStates &&
+                    status[slot] == BLOCK_MISSING &&
+                    texturedMarkers < MAX_TEXTURED_MARKERS) {
+                    expectedBlockStates[output] = model.paletteState(
+                        model.paletteIndexAtLinear(linearIndex[slot])
+                    );
+                    ++texturedMarkers;
+                }
             }
-            return result;
+            return new SortedMarkers(result, expectedBlockStates);
         }
 
         private void siftUp(int slot) {
@@ -411,6 +473,16 @@ public final class SchematicDebugMarkerPlanner {
             double doubleValue = distanceSquared[left];
             distanceSquared[left] = distanceSquared[right];
             distanceSquared[right] = doubleValue;
+        }
+    }
+
+    private static final class SortedMarkers {
+        final int[] records;
+        final String[] expectedBlockStates;
+
+        SortedMarkers(int[] records, String[] expectedBlockStates) {
+            this.records = records;
+            this.expectedBlockStates = expectedBlockStates;
         }
     }
 }

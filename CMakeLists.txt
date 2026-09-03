@@ -225,6 +225,15 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
         PRIVATE BedrockProtocol::bedrock_protocol
     )
 
+    add_executable(
+        falling-block-entity-packet-smoke
+        tools/falling_block_entity_packet_smoke.cpp
+    )
+    target_link_libraries(
+        falling-block-entity-packet-smoke
+        PRIVATE BedrockProtocol::bedrock_protocol
+    )
+
     add_executable(snappy-codec-smoke tools/snappy_codec_smoke.cpp)
     target_link_libraries(snappy-codec-smoke PRIVATE BedrockProtocol::bedrock_protocol)
 
@@ -427,6 +436,10 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
             NAME debug-renderer-packet-smoke
             COMMAND debug-renderer-packet-smoke
         )
+        add_test(
+            NAME falling-block-entity-packet-smoke
+            COMMAND falling-block-entity-packet-smoke
+        )
         if(Python3_Interpreter_FOUND)
             add_test(
                 NAME generated-protocol-consistency
@@ -507,6 +520,7 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
             protocol-roundtrip
             take-item-entity-schema-smoke
             debug-renderer-packet-smoke
+            falling-block-entity-packet-smoke
             bedrock-nbt-file-smoke
             protodef-nbt-smoke
             protodef-variables-smoke

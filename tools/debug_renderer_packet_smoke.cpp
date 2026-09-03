@@ -143,9 +143,9 @@ Value scriptDrawerShapeValue(
         {"network_id", Value::uinteger(networkId)},
         {"shape_type", Value::string("box")},
         {"location", Value::object({
-            {"x", Value::floating(1.5)},
-            {"y", Value::floating(2.5)},
-            {"z", Value::floating(3.5)}
+            {"x", Value::floating(1.0)},
+            {"y", Value::floating(2.0)},
+            {"z", Value::floating(3.0)}
         })},
         {"scale", Value::floating(1.0)},
         {"rotation", Value::null()},
@@ -155,9 +155,9 @@ Value scriptDrawerShapeValue(
         {"color", Value::integer(0x44332211)},
         {"text", Value::null()},
         {"box_bound", Value::object({
-            {"x", Value::floating(1.0)},
-            {"y", Value::floating(1.0)},
-            {"z", Value::floating(1.0)}
+            {"x", Value::floating(0.5)},
+            {"y", Value::floating(0.5)},
+            {"z", Value::floating(0.5)}
         })},
         {"line_end_location", Value::null()},
         {"arrow_head_length", Value::null()},
@@ -351,20 +351,21 @@ bool checkServerScriptDebugDrawerPacket(
     const bedrock::ProtoDefPacketDecoder& decoder
 ) {
     // This single-box golden exercises every field used by the schematic
-    // backend and all unused option-presence bytes. Location is the centre of
-    // the block cell.
+    // backend and all unused option-presence bytes. Retail 1.21.100 uses
+    // Location as the lower block corner and renders a 0.5 bound one block
+    // wide on each axis.
     const auto golden = unhex(
         "c802"
         "01"
         "8080808080a091a843"
         "0101"
-        "010000c03f0000204000006040"
+        "010000803f0000004000004040"
         "010000803f"
         "00"
         "00"
         "0111223344"
         "00"
-        "010000803f0000803f0000803f"
+        "010000003f0000003f0000003f"
         "00000000"
     );
     const auto payload = encoder.encodePacket(
@@ -410,11 +411,11 @@ bool checkServerScriptDebugDrawerPacket(
         );
         ok &= checkField(fields, "shapes[0].shape_type", "1/box");
         ok &= checkField(fields, "shapes[0].location.$present", "true");
-        ok &= checkField(fields, "shapes[0].location", "1.500000,2.500000,3.500000");
+        ok &= checkField(fields, "shapes[0].location", "1.000000,2.000000,3.000000");
         ok &= checkField(fields, "shapes[0].color.$present", "true");
         ok &= checkField(fields, "shapes[0].color", "1144201745");
         ok &= checkField(fields, "shapes[0].box_bound.$present", "true");
-        ok &= checkField(fields, "shapes[0].box_bound", "1.000000,1.000000,1.000000");
+        ok &= checkField(fields, "shapes[0].box_bound", "0.500000,0.500000,0.500000");
     } catch (const std::exception& error) {
         ok = false;
         std::cerr << "[DEBUG-RENDERER-PACKET-SMOKE] script drawer strict decode failed: "

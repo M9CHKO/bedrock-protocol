@@ -1386,6 +1386,24 @@ struct RelayState {
             );
     }
 
+    std::optional<int32_t> schematicRuntimeId(
+        std::string_view blockState
+    ) const {
+        std::lock_guard lock(blockRegistryMutex);
+        if (!blockRegistry.has_value() || blockState.empty()) {
+            return std::nullopt;
+        }
+        const auto block = blockRegistry->fromString(blockState);
+        if (!block.has_value() || isAirBlockName(block->name)) {
+            return std::nullopt;
+        }
+        if (!blockRuntimeIdsAreHashes) return block->stateId;
+        return bedrock::BedrockBlockRegistry::computeRuntimeHash(
+            block->name,
+            block->properties
+        );
+    }
+
     void resetMiniMapWorld(int32_t dimension) noexcept {
         miniMapDimension.store(dimension, std::memory_order_relaxed);
         {
@@ -4543,6 +4561,7 @@ struct SchematicDebugMarker {
     int32_t y = 0;
     int32_t z = 0;
     int32_t status = 0;
+    std::string expectedBlockState;
 
     auto operator<=>(const SchematicDebugMarker&) const = default;
 };
@@ -4551,6 +4570,10 @@ struct SchematicDebugMarker {
 // by server scripts. The ASCII prefix "CPE" makes accidental overlap with a
 // destination server's debug drawer registry practically impossible.
 constexpr uint64_t SchematicDebugNetworkIdBase = 0x4350450000000000ULL;
+// Textured previews are relay-owned falling-block actors. They never enter
+// the authoritative chunk and use a separate ID range from debug shapes.
+constexpr uint64_t SchematicTextureActorIdBase = 0x4350451000000000ULL;
+constexpr std::size_t MaximumSchematicTextureActors = 64;
 // Keep each clientbound operation comfortably bounded for RakNet queueing and
 // as a defence-in-depth limit against oversized schematic allocations, while
 // retaining stable keyed IDs across every batch.
@@ -4656,19 +4679,20 @@ bedrock::VersionedGamePacket makeSchematicScriptDebugDrawerPacket(
          index < markerOffset + markerCount;
          ++index) {
         const auto& marker = markers[index];
-        // A DebugBox is centred at Location; a one-block bound therefore
-        // aligns exactly with the server block cell without creating a block
-        // or client collision. All unused option fields must still be present
-        // as null so the generated protocol codec emits their presence flags.
+        // Retail 1.21.100 renders a DebugBox Location as its lower corner and
+        // expands each axis to twice box_bound. Start at the integer block
+        // corner and use a half-unit bound so the wireframe matches one block
+        // exactly. All unused option fields must still be present as null so
+        // the generated protocol codec emits their presence flags.
         shapes.push_back(bedrock::ProtoDefValue::object({
             {"network_id", bedrock::ProtoDefValue::uinteger(
                 SchematicDebugNetworkIdBase + index
             )},
             {"shape_type", bedrock::ProtoDefValue::string("box")},
             {"location", schematicDebugVec3(
-                marker.x + 0.5,
-                marker.y + 0.5,
-                marker.z + 0.5
+                marker.x,
+                marker.y,
+                marker.z
             )},
             {"scale", bedrock::ProtoDefValue::floating(1.0)},
             {"rotation", bedrock::ProtoDefValue::null()},
@@ -4677,7 +4701,7 @@ bedrock::VersionedGamePacket makeSchematicScriptDebugDrawerPacket(
                 schematicDebugArgb(marker, opacityPercent)
             )},
             {"text", bedrock::ProtoDefValue::null()},
-            {"box_bound", schematicDebugVec3(1.0, 1.0, 1.0)},
+            {"box_bound", schematicDebugVec3(0.5, 0.5, 0.5)},
             {"line_end_location", bedrock::ProtoDefValue::null()},
             {"arrow_head_length", bedrock::ProtoDefValue::null()},
             {"arrow_head_radius", bedrock::ProtoDefValue::null()},
@@ -4767,6 +4791,145 @@ std::vector<bedrock::VersionedGamePacket> makeSchematicDebugClearPackets(
         return packets;
     }
     return {makeLegacySchematicDebugClearPacket(encoder, codec.packetCodec())};
+}
+
+struct SchematicTextureActor {
+    SchematicDebugMarker marker;
+    int32_t blockRuntimeId = 0;
+};
+
+bedrock::ProtoDefValue schematicEntityMetadataEntry(
+    std::string key,
+    std::string type,
+    bedrock::ProtoDefValue value
+) {
+    // MetadataDictionary first switches on the key and ordinary keys then
+    // enter a second switch selected by their metadata type. Keep both switch
+    // contexts explicit; passing the scalar directly only compiles and then
+    // fails when ProtoDef tries to encode add_entity at runtime.
+    auto switchValue = key == "flags"
+        ? std::move(value)
+        : bedrock::ProtoDefValue::object({
+            {"type", bedrock::ProtoDefValue::string(type)},
+            {"$value", std::move(value)}
+        });
+    return bedrock::ProtoDefValue::object({
+        {"key", bedrock::ProtoDefValue::string(std::move(key))},
+        {"type", bedrock::ProtoDefValue::string(std::move(type))},
+        {"value", std::move(switchValue)}
+    });
+}
+
+bedrock::VersionedGamePacket makeSchematicTextureActorPacket(
+    const bedrock::ProtoDefPacketEncoder& encoder,
+    const bedrock::VersionedPacketCodec& packetCodec,
+    const SchematicTextureActor& actor,
+    std::size_t actorIndex
+) {
+    if (actorIndex >= MaximumSchematicTextureActors) {
+        throw std::out_of_range("invalid schematic texture actor index");
+    }
+    const uint64_t entityId = SchematicTextureActorIdBase + actorIndex;
+    std::vector<bedrock::ProtoDefValue> metadata;
+    metadata.reserve(5);
+    metadata.push_back(schematicEntityMetadataEntry(
+        "flags",
+        "long",
+        bedrock::ProtoDefValue::object({
+            {"no_ai", bedrock::ProtoDefValue::boolean(true)}
+        })
+    ));
+    metadata.push_back(schematicEntityMetadataEntry(
+        "variant",
+        "int",
+        bedrock::ProtoDefValue::integer(actor.blockRuntimeId)
+    ));
+    metadata.push_back(schematicEntityMetadataEntry(
+        "scale",
+        "float",
+        // A small gap around the actor keeps the real block grid visible and
+        // makes the preview distinguishable from an authoritative block.
+        bedrock::ProtoDefValue::floating(0.92)
+    ));
+    for (const auto* key : {"boundingbox_width", "boundingbox_height"}) {
+        metadata.push_back(schematicEntityMetadataEntry(
+            key,
+            "float",
+            bedrock::ProtoDefValue::floating(0.0)
+        ));
+    }
+
+    const auto emptyArray = [] {
+        return bedrock::ProtoDefValue::array(
+            std::vector<bedrock::ProtoDefValue> {}
+        );
+    };
+    const auto payload = encoder.encodePacket(
+        "add_entity",
+        bedrock::ProtoDefValue::object({
+            {"unique_id", bedrock::ProtoDefValue::integer(
+                static_cast<int64_t>(entityId)
+            )},
+            {"runtime_id", bedrock::ProtoDefValue::uinteger(entityId)},
+            {"entity_type", bedrock::ProtoDefValue::string(
+                "minecraft:falling_block"
+            )},
+            {"position", schematicDebugVec3(
+                actor.marker.x + 0.5,
+                actor.marker.y + 0.49,
+                actor.marker.z + 0.5
+            )},
+            {"velocity", schematicDebugVec3(0.0, 0.0, 0.0)},
+            {"pitch", bedrock::ProtoDefValue::floating(0.0)},
+            {"yaw", bedrock::ProtoDefValue::floating(0.0)},
+            {"head_yaw", bedrock::ProtoDefValue::floating(0.0)},
+            {"body_yaw", bedrock::ProtoDefValue::floating(0.0)},
+            {"attributes", emptyArray()},
+            {"metadata", bedrock::ProtoDefValue::array(std::move(metadata))},
+            {"properties", bedrock::ProtoDefValue::object({
+                {"ints", emptyArray()},
+                {"floats", emptyArray()}
+            })},
+            {"links", emptyArray()}
+        })
+    );
+    return packetCodec.makePacketByName("add_entity", payload);
+}
+
+bedrock::VersionedGamePacket makeSchematicTextureActorRemovalPacket(
+    const bedrock::ProtoDefPacketEncoder& encoder,
+    const bedrock::VersionedPacketCodec& packetCodec,
+    std::size_t actorIndex
+) {
+    if (actorIndex >= MaximumSchematicTextureActors) {
+        throw std::out_of_range("invalid schematic texture actor index");
+    }
+    const uint64_t entityId = SchematicTextureActorIdBase + actorIndex;
+    const auto payload = encoder.encodePacket(
+        "remove_entity",
+        bedrock::ProtoDefValue::object({
+            {"entity_id_self", bedrock::ProtoDefValue::integer(
+                static_cast<int64_t>(entityId)
+            )}
+        })
+    );
+    return packetCodec.makePacketByName("remove_entity", payload);
+}
+
+void appendSchematicTextureActorRemovals(
+    std::vector<bedrock::VersionedGamePacket>& packets,
+    const bedrock::ProtoDefPacketEncoder& encoder,
+    const bedrock::VersionedPacketCodec& packetCodec,
+    std::size_t actorCount
+) {
+    actorCount = std::min(actorCount, MaximumSchematicTextureActors);
+    for (std::size_t index = 0; index < actorCount; ++index) {
+        packets.push_back(makeSchematicTextureActorRemovalPacket(
+            encoder,
+            packetCodec,
+            index
+        ));
+    }
 }
 
 class RelayController {
@@ -5700,9 +5863,23 @@ public:
                 ),
                 markers.end()
             );
-            std::sort(markers.begin(), markers.end());
+            // Java supplies nearest-first markers. De-duplicate defensively
+            // without sorting so the limited textured actor set follows the
+            // player instead of an arbitrary coordinate order.
+            std::set<std::array<int32_t, 4>> seenMarkerCells;
             markers.erase(
-                std::unique(markers.begin(), markers.end()),
+                std::remove_if(
+                    markers.begin(),
+                    markers.end(),
+                    [&](const auto& marker) {
+                        return !seenMarkerCells.insert({
+                            marker.x,
+                            marker.y,
+                            marker.z,
+                            marker.status
+                        }).second;
+                    }
+                ),
                 markers.end()
             );
             if (markers.size() > MaximumDebugMarkers) {
@@ -5711,10 +5888,45 @@ public:
             const std::size_t displayedMarkers = markers.size();
             opacityPercent = std::clamp(opacityPercent, 10, 85);
 
+            std::vector<SchematicTextureActor> textureActors;
+            if (supportsSchematicScriptDebugDrawer(state_->version)) {
+                textureActors.reserve(MaximumSchematicTextureActors);
+                std::unordered_map<std::string, std::optional<int32_t>>
+                    runtimeIds;
+                for (const auto& marker : markers) {
+                    if (marker.status != 1 ||
+                        textureActors.size() >= MaximumSchematicTextureActors) {
+                        continue;
+                    }
+                    auto [found, inserted] = runtimeIds.try_emplace(
+                        marker.expectedBlockState,
+                        std::nullopt
+                    );
+                    if (inserted) {
+                        found->second = state_->schematicRuntimeId(
+                            marker.expectedBlockState
+                        );
+                    }
+                    if (!found->second.has_value()) continue;
+                    textureActors.push_back({marker, *found->second});
+                }
+            }
+            const std::size_t displayedTextureActors = textureActors.size();
+
+            // The planner ranks candidates by camera distance so the actor
+            // subset stays useful. Debug shapes themselves are identical for
+            // a given cell, however, and must have a canonical order: tiny
+            // camera movements must not trigger a full remove/re-add merely
+            // because two equally visible cells exchanged ranks. Non-empty
+            // expectedBlockState entries retain the selected actor set in the
+            // equality comparison even after this sort.
+            std::sort(markers.begin(), markers.end());
+
             bedrock::BedrockServerConnection downstream;
             std::string downstreamSessionId;
             uint64_t markerGeneration = 0;
             std::size_t previousMarkerCount = 0;
+            std::size_t previousTextureActorCount = 0;
             {
                 std::lock_guard markerLock(schematicMarkerMutex_);
                 if (!state_->schematicSnapshotMatches(
@@ -5738,6 +5950,7 @@ public:
                 }
                 if (!schematicDownstream_.has_value()) {
                     activeSchematicMarkers_.clear();
+                    activeSchematicTextureActorCount_ = 0;
                     activeSchematicOpacity_ = opacityPercent;
                     state_->schematicDisplayedMarkers.store(
                         0,
@@ -5749,6 +5962,8 @@ public:
                 downstreamSessionId = schematicDownstreamSessionId_;
                 markerGeneration = schematicMarkerGeneration_;
                 previousMarkerCount = activeSchematicMarkers_.size();
+                previousTextureActorCount =
+                    activeSchematicTextureActorCount_;
             }
 
             bedrock::ProtoDefPacketEncoder debugEncoder(state_->version);
@@ -5766,7 +5981,8 @@ public:
                 // cube flood.
                 packets.reserve(
                     schematicDebugBatchCount(previousMarkerCount) +
-                    schematicDebugBatchCount(markers.size())
+                    schematicDebugBatchCount(markers.size()) +
+                    previousTextureActorCount + textureActors.size()
                 );
                 for (std::size_t offset = 0; offset < previousMarkerCount;
                      offset += SchematicDebugShapesPerPacket) {
@@ -5781,6 +5997,12 @@ public:
                         count
                     ));
                 }
+                appendSchematicTextureActorRemovals(
+                    packets,
+                    debugEncoder,
+                    debugCodec.packetCodec(),
+                    previousTextureActorCount
+                );
                 for (std::size_t offset = 0; offset < markers.size();
                      offset += SchematicDebugShapesPerPacket) {
                     const auto count = std::min(
@@ -5796,6 +6018,15 @@ public:
                         count
                     ));
                 }
+                for (std::size_t index = 0; index < textureActors.size();
+                     ++index) {
+                    packets.push_back(makeSchematicTextureActorPacket(
+                        debugEncoder,
+                        debugCodec.packetCodec(),
+                        textureActors[index],
+                        index
+                    ));
+                }
                 if (packets.empty()) {
                     packets.push_back(makeSchematicScriptDebugDrawerPacket(
                         debugEncoder,
@@ -5806,7 +6037,7 @@ public:
                         0
                     ));
                 }
-                backend = "server_script_debug_drawer";
+                backend = "server_script_debug_drawer+falling_block_texture";
             } else {
                 packets.reserve(markers.size() + 1);
                 packets.push_back(makeLegacySchematicDebugClearPacket(
@@ -5849,6 +6080,8 @@ public:
                     schematicDownstreamSessionId_ != downstreamSessionId;
                 if (!staleLifecycle) {
                     activeSchematicMarkers_ = std::move(markers);
+                    activeSchematicTextureActorCount_ =
+                        displayedTextureActors;
                     activeSchematicOpacity_ = opacityPercent;
                 }
             }
@@ -5861,12 +6094,19 @@ public:
                 {
                     std::lock_guard markerLock(schematicMarkerMutex_);
                     activeSchematicMarkers_.clear();
+                    activeSchematicTextureActorCount_ = 0;
                     activeSchematicOpacity_ = 0;
                     ++schematicMarkerGeneration_;
                 }
                 auto clearPackets = makeSchematicDebugClearPackets(
                     state_->version,
                     displayedMarkers
+                );
+                appendSchematicTextureActorRemovals(
+                    clearPackets,
+                    debugEncoder,
+                    debugCodec.packetCodec(),
+                    displayedTextureActors
                 );
                 std::lock_guard relayLock(relayMutex_);
                 if (relay_ && !clearPackets.empty()) {
@@ -5894,6 +6134,8 @@ public:
                     std::to_string(wrong) + " unknown=" +
                     std::to_string(unknown) + " displayed=" +
                     std::to_string(displayedMarkers) +
+                    " textured=" +
+                    std::to_string(displayedTextureActors) +
                     " packets=" + std::to_string(packets.size()) +
                     " rebuild=" + std::to_string(rebuild),
                 "DEBUG",
@@ -5925,19 +6167,33 @@ public:
             if (resetCounters) resetSchematicCounters();
             std::optional<bedrock::BedrockServerConnection> downstream;
             std::size_t markerCount = 0;
+            std::size_t textureActorCount = 0;
             {
                 std::lock_guard markerLock(schematicMarkerMutex_);
                 ++schematicMarkerGeneration_;
-                if (activeSchematicMarkers_.empty()) return;
+                if (activeSchematicMarkers_.empty() &&
+                    activeSchematicTextureActorCount_ == 0) return;
                 downstream = schematicDownstream_;
                 markerCount = activeSchematicMarkers_.size();
+                textureActorCount = activeSchematicTextureActorCount_;
                 activeSchematicMarkers_.clear();
+                activeSchematicTextureActorCount_ = 0;
                 activeSchematicOpacity_ = 0;
             }
             if (!downstream.has_value()) return;
             auto clearPackets = makeSchematicDebugClearPackets(
                 state_->version,
                 markerCount
+            );
+            bedrock::ProtoDefPacketEncoder encoder(state_->version);
+            const auto codec = bedrock::VersionedMcpeCodec::forVersion(
+                state_->version
+            );
+            appendSchematicTextureActorRemovals(
+                clearPackets,
+                encoder,
+                codec.packetCodec(),
+                textureActorCount
             );
             if (clearPackets.empty()) return;
             bool queued = false;
@@ -5960,6 +6216,7 @@ public:
             {
                 std::lock_guard markerLock(schematicMarkerMutex_);
                 activeSchematicMarkers_.clear();
+                activeSchematicTextureActorCount_ = 0;
                 activeSchematicOpacity_ = 0;
                 ++schematicMarkerGeneration_;
             }
@@ -5972,6 +6229,7 @@ public:
         } catch (...) {
             std::lock_guard markerLock(schematicMarkerMutex_);
             activeSchematicMarkers_.clear();
+            activeSchematicTextureActorCount_ = 0;
             activeSchematicOpacity_ = 0;
             ++schematicMarkerGeneration_;
         }
@@ -5994,6 +6252,7 @@ private:
     std::optional<bedrock::BedrockServerConnection> schematicDownstream_;
     std::string schematicDownstreamSessionId_;
     std::vector<SchematicDebugMarker> activeSchematicMarkers_;
+    std::size_t activeSchematicTextureActorCount_ = 0;
     int activeSchematicOpacity_ = 0;
     uint64_t schematicMarkerGeneration_ = 0;
     std::atomic<bool> stopped_ {false};
@@ -6022,6 +6281,7 @@ private:
         schematicDownstream_ = connection;
         schematicDownstreamSessionId_ = std::move(sessionId);
         activeSchematicMarkers_.clear();
+        activeSchematicTextureActorCount_ = 0;
         activeSchematicOpacity_ = 0;
         resetSchematicCounters();
     }
@@ -6033,6 +6293,7 @@ private:
         schematicDownstream_.reset();
         schematicDownstreamSessionId_.clear();
         activeSchematicMarkers_.clear();
+        activeSchematicTextureActorCount_ = 0;
         activeSchematicOpacity_ = 0;
         resetSchematicCounters();
     }
@@ -6041,17 +6302,35 @@ private:
     takeSchematicLifecycleClear(const std::string& version) noexcept {
         try {
             std::lock_guard lock(schematicMarkerMutex_);
-            if (activeSchematicMarkers_.empty()) return std::nullopt;
+            if (activeSchematicMarkers_.empty() &&
+                activeSchematicTextureActorCount_ == 0) return std::nullopt;
             const std::size_t markerCount = activeSchematicMarkers_.size();
+            const std::size_t textureActorCount =
+                activeSchematicTextureActorCount_;
             ++schematicMarkerGeneration_;
             activeSchematicMarkers_.clear();
+            activeSchematicTextureActorCount_ = 0;
             activeSchematicOpacity_ = 0;
             state_->schematicDisplayedMarkers.store(0, std::memory_order_relaxed);
             state_->schematicCorrectBlocks.store(0, std::memory_order_relaxed);
             state_->schematicMissingBlocks.store(0, std::memory_order_relaxed);
             state_->schematicWrongBlocks.store(0, std::memory_order_relaxed);
             state_->schematicUnknownBlocks.store(0, std::memory_order_relaxed);
-            return makeSchematicDebugClearPackets(version, markerCount);
+            auto packets = makeSchematicDebugClearPackets(
+                version,
+                markerCount
+            );
+            bedrock::ProtoDefPacketEncoder encoder(version);
+            const auto codec = bedrock::VersionedMcpeCodec::forVersion(
+                version
+            );
+            appendSchematicTextureActorRemovals(
+                packets,
+                encoder,
+                codec.packetCodec(),
+                textureActorCount
+            );
+            return packets;
         } catch (...) {
             return std::nullopt;
         }
@@ -6609,6 +6888,7 @@ Java_com_m9chko_bedrockrelay_NativeBridge_replaceSchematicDebugMarkers(
     JNIEnv* environment,
     jclass,
     jintArray markerRecords,
+    jobjectArray expectedBlockStates,
     jint opacityPercent,
     jint total,
     jint correct,
@@ -6642,14 +6922,39 @@ Java_com_m9chko_bedrockrelay_NativeBridge_replaceSchematicDebugMarkers(
             }
         }
 
+        const auto markerCount = static_cast<jsize>(records.size() / 4);
+        const auto stateCount = expectedBlockStates == nullptr
+            ? 0
+            : environment->GetArrayLength(expectedBlockStates);
+        if (stateCount != markerCount) {
+            throw std::invalid_argument(
+                "schematic marker states must match XYZS tuple count"
+            );
+        }
         std::vector<SchematicDebugMarker> markers;
-        markers.reserve(records.size() / 4);
-        for (std::size_t offset = 0; offset < records.size(); offset += 4) {
+        markers.reserve(static_cast<std::size_t>(markerCount));
+        for (jsize index = 0; index < markerCount; ++index) {
+            const auto offset = static_cast<std::size_t>(index) * 4;
+            auto blockState = static_cast<jstring>(
+                environment->GetObjectArrayElement(expectedBlockStates, index)
+            );
+            if (environment->ExceptionCheck()) return JNI_FALSE;
+            std::string expectedState;
+            if (blockState != nullptr) {
+                expectedState = fromJavaString(environment, blockState);
+                environment->DeleteLocalRef(blockState);
+            }
+            if (expectedState.size() > 1'024) {
+                throw std::invalid_argument(
+                    "schematic marker block state is invalid"
+                );
+            }
             markers.push_back({
                 records[offset],
                 records[offset + 1],
                 records[offset + 2],
-                records[offset + 3]
+                records[offset + 3],
+                std::move(expectedState)
             });
         }
 

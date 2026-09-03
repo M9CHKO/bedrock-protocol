@@ -53,11 +53,14 @@ public final class NativeBridge {
     );
 
     /**
-     * Replaces the client-only debug-renderer marker set. Records are flat
-     * [x, y, z, status] tuples where status 1 is missing and 3 is wrong.
+     * Replaces the client-only schematic preview. Records are flat
+     * [x, y, z, status] tuples where status 1 is missing and 3 is wrong;
+     * expectedBlockStates contains the exact Bedrock palette state for each
+     * textured tuple; null entries remain wireframes only.
      */
     public static native boolean replaceSchematicDebugMarkers(
         int[] markerRecords,
+        String[] expectedBlockStates,
         int opacityPercent,
         int total,
         int correct,

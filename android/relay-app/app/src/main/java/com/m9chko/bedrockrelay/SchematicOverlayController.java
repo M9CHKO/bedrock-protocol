@@ -593,7 +593,8 @@ final class SchematicOverlayController {
                 cameraKnown ? camera.z : 0.0d,
                 query.selectedLayer,
                 query.maximumDistance,
-                opacityPercent
+                opacityPercent,
+                query.exactBedrockProperties
             );
         synchronized (blockQueryLock) {
             // Serialize the last validity check, native publication and every
@@ -615,6 +616,7 @@ final class SchematicOverlayController {
             }
             boolean accepted = NativeBridge.replaceSchematicDebugMarkers(
                 result.records(),
+                result.expectedBlockStates(),
                 result.opacityPercent(),
                 result.total(),
                 result.correct(),

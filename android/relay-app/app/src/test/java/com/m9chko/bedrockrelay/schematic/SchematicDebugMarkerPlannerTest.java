@@ -59,6 +59,10 @@ public final class SchematicDebugMarkerPlannerTest {
             10, 20, 30, SchematicDebugMarkerPlanner.BLOCK_MISSING,
             10, 20, 31, SchematicDebugMarkerPlanner.BLOCK_WRONG
         }, result.records());
+        assertArrayEquals(
+            new String[] {"minecraft:stone", null},
+            result.expectedBlockStates()
+        );
     }
 
     @Test
@@ -83,7 +87,8 @@ public final class SchematicDebugMarkerPlannerTest {
                 -19.5d,
                 -1,
                 2,
-                85
+                85,
+                false
             );
 
         assertArrayEquals(new int[] {
@@ -91,6 +96,9 @@ public final class SchematicDebugMarkerPlannerTest {
             -11, 7, -19, SchematicDebugMarkerPlanner.BLOCK_MISSING,
             -11, 7, -18, SchematicDebugMarkerPlanner.BLOCK_MISSING
         }, result.records());
+        assertArrayEquals(new String[] {
+            null, null, null
+        }, result.expectedBlockStates());
     }
 
     @Test
@@ -166,6 +174,7 @@ public final class SchematicDebugMarkerPlannerTest {
             );
 
         assertEquals(0, cameraUnknown.displayed());
+        assertEquals(0, cameraUnknown.expectedBlockStates().length);
         assertEquals(1, cameraUnknown.wrong());
         assertEquals(0, transparent.displayed());
         assertEquals(1, transparent.wrong());
