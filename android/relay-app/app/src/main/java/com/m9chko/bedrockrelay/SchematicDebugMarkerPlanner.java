@@ -21,18 +21,18 @@ public final class SchematicDebugMarkerPlanner {
     public static final byte BLOCK_WRONG = 3;
 
     public static final int MAX_DISPLAYED_MARKERS = 1_800;
-    // Every retained marker may become a textured falling-block preview. The
-    // native side applies a stable cell diff, so raising this to the existing
-    // bounded marker limit no longer causes a full entity rebuild on camera
-    // movement. This is enough to show ordinary imported builds completely
-    // while preserving the hard 1,800-cell memory and packet safety cap.
+    // Every retained marker needs its exact palette state: missing cells use
+    // it for the textured preview, while correct/wrong cells use its actual
+    // collision geometry for their green/red outline. The native side applies
+    // stable keyed diffs, so the hard 1,800-cell cap remains bounded without a
+    // full rebuild when one world block changes.
     public static final int MAX_TEXTURED_MARKERS = MAX_DISPLAYED_MARKERS;
     private static final int RECORD_WIDTH = 4;
 
     private SchematicDebugMarkerPlanner() {}
 
     /**
-     * Plans unknown, missing, and wrong-block markers nearest to the camera.
+     * Plans schematic block markers nearest to the camera.
      *
      * @param selectedLayer local schematic Y, or {@code -1} for every layer
      * @param maximumDistance maximum camera-to-block-center distance in blocks
@@ -69,7 +69,7 @@ public final class SchematicDebugMarkerPlanner {
 
     /**
      * Plans markers and optionally includes exact palette states for the
-     * bounded set of textured unknown- and missing-block previews.
+     * bounded set of textured previews and geometry-aware outlines.
      */
     public static Result plan(
         SchematicModel model,
@@ -160,9 +160,6 @@ public final class SchematicDebugMarkerPlanner {
             }
 
             if (markers == null ||
-                (status != BLOCK_UNKNOWN &&
-                    status != BLOCK_MISSING &&
-                    status != BLOCK_WRONG) ||
                 (selectedLayer >= 0 && localY != selectedLayer)) {
                 continue;
             }
@@ -244,8 +241,8 @@ public final class SchematicDebugMarkerPlanner {
 
         /**
          * Exact Bedrock palette state parallel to each marker record. Entries
-         * without a textured preview are null. The enclosing marker plan is
-         * already capped, so providing all unknown and missing states remains
+         * are null only when state inclusion was disabled. The enclosing
+         * marker plan is capped, so providing every selected state remains
          * bounded.
          */
         public String[] expectedBlockStates() {
@@ -364,7 +361,7 @@ public final class SchematicDebugMarkerPlanner {
             String[] transformedPalette = includeTextureStates
                 ? new String[model.paletteSize()]
                 : null;
-            int texturedMarkers = 0;
+            int stateMarkers = 0;
             for (int output = 0; output < size; ++output) {
                 int slot = order[output];
                 int offset = output * RECORD_WIDTH;
@@ -373,9 +370,7 @@ public final class SchematicDebugMarkerPlanner {
                 result[offset + 2] = z[slot];
                 result[offset + 3] = status[slot];
                 if (includeTextureStates &&
-                    (status[slot] == BLOCK_UNKNOWN ||
-                        status[slot] == BLOCK_MISSING) &&
-                    texturedMarkers < MAX_TEXTURED_MARKERS) {
+                    stateMarkers < MAX_TEXTURED_MARKERS) {
                     int paletteIndex = model.paletteIndexAtLinear(
                         linearIndex[slot]
                     );
@@ -389,7 +384,7 @@ public final class SchematicDebugMarkerPlanner {
                         transformedPalette[paletteIndex] = transformedState;
                     }
                     expectedBlockStates[output] = transformedState;
-                    ++texturedMarkers;
+                    ++stateMarkers;
                 }
             }
             return new SortedMarkers(result, expectedBlockStates);

@@ -621,7 +621,12 @@ std::optional<BedrockBlock> BedrockBlockRegistry::fromString(
     const auto open = input.find('[');
     const std::string name = trim(input.substr(0, open));
     if (name.empty()) return std::nullopt;
-    if (open == std::string::npos) return fromProperties(name, {}, biomeId);
+    if (open == std::string::npos) {
+        const auto* block = blockByName(name);
+        return block == nullptr
+            ? std::nullopt
+            : fromStateId(block->defaultState, biomeId);
+    }
     if (input.empty() || input.back() != ']') return std::nullopt;
 
     BedrockBlockProperties properties;

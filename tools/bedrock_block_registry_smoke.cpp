@@ -2,6 +2,7 @@
 #include <bedrock/world/BedrockChunk.hpp>
 #include <bedrock/world/MinecraftDataAssets.hpp>
 
+#include <array>
 #include <cmath>
 #include <iostream>
 #include <optional>
@@ -127,6 +128,46 @@ int main() {
     if (candleLit == nullptr || candleCount == nullptr ||
         candleLit->asInteger() != 1 || candleCount->asInteger() != 0) {
         return fail("typed block property mismatch");
+    }
+
+    const auto* quartzStairsDefinition = registry.blockByName("minecraft:quartz_stairs");
+    const auto defaultQuartzStairs = registry.fromString("minecraft:quartz_stairs");
+    if (quartzStairsDefinition == nullptr || quartzStairsDefinition->defaultState != 7116 ||
+        !defaultQuartzStairs.has_value() ||
+        defaultQuartzStairs->stateId != quartzStairsDefinition->defaultState) {
+        return fail("bare block string must resolve the declared default state");
+    }
+
+    struct StairStateExpectation {
+        int32_t stateId;
+        int32_t runtimeHash;
+        bedrock::BedrockCollisionShape upperShape;
+    };
+    const std::array<StairStateExpectation, 4> stairExpectations {{
+        {7116, 2067288422, {0.75, 0.75, 0.75, 0.5, 0.5, 0.5}},
+        {7117, 2005813599, {0.25, 0.75, 0.25, 0.5, 0.5, 0.5}},
+        {7118, -2104729228, {0.25, 0.75, 0.75, 0.5, 0.5, 0.5}},
+        {7119, 2128763245, {0.75, 0.75, 0.25, 0.5, 0.5, 0.5}},
+    }};
+    const bedrock::BedrockCollisionShape stairBase {
+        0.5, 0.25, 0.5, 1, 0.5, 1
+    };
+    for (std::size_t direction = 0; direction < stairExpectations.size(); ++direction) {
+        const auto stairs = registry.fromString(
+            "minecraft:quartz_stairs[\"upside_down_bit\":false,\"weirdo_direction\":" +
+            std::to_string(direction) + "]"
+        );
+        const auto& expected = stairExpectations[direction];
+        if (!stairs.has_value() || stairs->stateId != expected.stateId ||
+            bedrock::BedrockBlockRegistry::computeRuntimeHash(
+                stairs->name,
+                stairs->properties
+            ) != expected.runtimeHash ||
+            stairs->shapes.size() != 2 ||
+            !sameShape(stairs->shapes[0], stairBase) ||
+            !sameShape(stairs->shapes[1], expected.upperShape)) {
+            return fail("directional stair state/hash/shape mismatch");
+        }
     }
 
     if (bedrock::BedrockBlockRegistry::computeHash("stone", {}) != -2144268767 ||

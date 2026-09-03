@@ -13,7 +13,7 @@ import org.junit.Test;
 
 public final class SchematicDebugMarkerPlannerTest {
     @Test
-    public void countsWholeModelAndDisplaysUnknownAndMissingCellsOnLayer() {
+    public void countsWholeModelAndDisplaysEveryStatusOnLayer() {
         SchematicModel model = model(
             2,
             2,
@@ -52,15 +52,20 @@ public final class SchematicDebugMarkerPlannerTest {
         assertEquals(2, result.missing());
         assertEquals(1, result.wrong());
         assertEquals(2, result.unknown());
-        assertEquals(2, result.displayed());
+        assertEquals(3, result.displayed());
         assertEquals(40, result.opacityPercent());
         assertEquals(0.4f, result.alpha(), 0.0001f);
         assertArrayEquals(new int[] {
             10, 20, 30, SchematicDebugMarkerPlanner.BLOCK_MISSING,
-            10, 20, 31, SchematicDebugMarkerPlanner.BLOCK_UNKNOWN
+            10, 20, 31, SchematicDebugMarkerPlanner.BLOCK_UNKNOWN,
+            11, 20, 30, SchematicDebugMarkerPlanner.BLOCK_CORRECT
         }, result.records());
         assertArrayEquals(
-            new String[] {"minecraft:stone", "minecraft:stone"},
+            new String[] {
+                "minecraft:stone",
+                "minecraft:stone",
+                "minecraft:stone"
+            },
             result.expectedBlockStates()
         );
     }
@@ -189,7 +194,7 @@ public final class SchematicDebugMarkerPlannerTest {
             "minecraft:stone",
             "minecraft:dirt",
             "minecraft:glass",
-            null
+            "minecraft:stone"
         }, result.expectedBlockStates());
     }
 

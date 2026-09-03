@@ -155,9 +155,9 @@ Value scriptDrawerShapeValue(
         {"color", Value::integer(0x44332211)},
         {"text", Value::null()},
         {"box_bound", Value::object({
-            {"x", Value::floating(0.5)},
-            {"y", Value::floating(0.5)},
-            {"z", Value::floating(0.5)}
+            {"x", Value::floating(1.0)},
+            {"y", Value::floating(1.0)},
+            {"z", Value::floating(1.0)}
         })},
         {"line_end_location", Value::null()},
         {"arrow_head_length", Value::null()},
@@ -365,7 +365,7 @@ bool checkServerScriptDebugDrawerPacket(
         "00"
         "0111223344"
         "00"
-        "010000003f0000003f0000003f"
+        "010000803f0000803f0000803f"
         "00000000"
     );
     const auto payload = encoder.encodePacket(
@@ -415,7 +415,7 @@ bool checkServerScriptDebugDrawerPacket(
         ok &= checkField(fields, "shapes[0].color.$present", "true");
         ok &= checkField(fields, "shapes[0].color", "1144201745");
         ok &= checkField(fields, "shapes[0].box_bound.$present", "true");
-        ok &= checkField(fields, "shapes[0].box_bound", "0.500000,0.500000,0.500000");
+        ok &= checkField(fields, "shapes[0].box_bound", "1.000000,1.000000,1.000000");
     } catch (const std::exception& error) {
         ok = false;
         std::cerr << "[DEBUG-RENDERER-PACKET-SMOKE] script drawer strict decode failed: "
