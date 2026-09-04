@@ -26,6 +26,7 @@
 #include <deque>
 #include <filesystem>
 #include <future>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -37,6 +38,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <unordered_set>
 #include <utility>
 #include <unordered_map>
@@ -64,6 +66,8 @@ std::atomic<bool> configuredAutoArmor {false};
 std::atomic<bool> configuredAutoTotem {false};
 std::atomic<bool> configuredMiniMap {false};
 std::atomic<bool> configuredSchematic {false};
+std::atomic<bool> configuredAreaFill {false};
+std::atomic<int> configuredAreaFillPoints {2};
 
 int clampRetainedRadiusChunks(int radius) {
     return std::max(
@@ -811,6 +815,70 @@ struct RelayState {
         int32_t stateHash = 0;
     };
 
+    struct WorldBlockSample {
+        bool known = false;
+        bool air = false;
+        int32_t runtimeId = 0;
+    };
+
+    struct AreaFillPoint {
+        int32_t x = 0;
+        int32_t y = 0;
+        int32_t z = 0;
+
+        bool operator==(const AreaFillPoint&) const = default;
+    };
+
+    struct AreaFillCell {
+        int32_t x = 0;
+        int32_t y = 0;
+        int32_t z = 0;
+        bool complete = false;
+        bool worldKnown = false;
+        bool worldAir = true;
+        uint8_t failures = 0;
+    };
+
+    struct AreaFillMarker {
+        int32_t x = 0;
+        int32_t y = 0;
+        int32_t z = 0;
+        int32_t status = 1;
+    };
+
+    struct AreaFillPlacementPlan {
+        bool valid = false;
+        std::size_t cellIndex = 0;
+        AreaFillPoint target;
+        AreaFillPoint against;
+        int32_t face = 1;
+        int32_t supportRuntimeId = 0;
+        int32_t hotbarSlot = 0;
+        EquipmentItem held;
+        float playerX = 0.0f;
+        float playerY = 0.0f;
+        float playerZ = 0.0f;
+    };
+
+    struct AreaFillRefillPlan {
+        bool valid = false;
+        std::size_t sourceSlot = 0;
+        std::size_t destinationSlot = 0;
+        EquipmentItem source;
+        EquipmentItem destination;
+    };
+
+    struct AreaFillMovementSync {
+        uint64_t revision = 0;
+        uint64_t runtimeId = 0;
+        uint64_t tick = 0;
+        float x = 0.0f;
+        float y = 0.0f;
+        float z = 0.0f;
+        float pitch = 0.0f;
+        float yaw = 0.0f;
+    };
+
     mutable std::mutex mutex;
     bool running = false;
     bool listening = false;
@@ -850,6 +918,7 @@ struct RelayState {
     std::atomic<bool> autoTotemEnabled {false};
     std::atomic<bool> miniMapEnabled {false};
     std::atomic<bool> schematicEnabled {false};
+    std::atomic<bool> areaFillEnabled {false};
     std::atomic<bool> schematicWorldTrackingActive {false};
     std::atomic<uint64_t> schematicTotalBlocks {0};
     std::atomic<uint64_t> schematicCorrectBlocks {0};
@@ -883,19 +952,60 @@ struct RelayState {
     uint64_t equipmentRevision = 0;
     std::vector<EquipmentItem> playerInventory;
     bool playerInventoryReady = false;
-    int32_t nextAutomationRequestId = 1'000'000;
+    int32_t selectedHotbarSlot = -1;
+    int32_t nextAutomationStackRequestId = -1;
+    int32_t nextAutomationLegacyTicket = 1'000'000;
     int32_t pendingAutomationRequestId = 0;
     int64_t pendingAutomationNetworkId = 0;
     int32_t pendingAutomationStackId = 0;
     std::size_t pendingAutomationEquipmentIndex = 0;
     std::size_t pendingAutomationInventorySlot = 0;
     uint64_t pendingAutomationStartedAtMs = 0;
+    uint8_t pendingAutomationVariant = 0;
+    EquipmentItem pendingAutomationSource;
+    EquipmentItem pendingAutomationDestination;
+    uint8_t nextAutomationVariant = 0;
+    int64_t automationVariantNetworkId = 0;
+    int32_t automationVariantStackId = 0;
+    std::size_t automationVariantEquipmentIndex = 0;
+    bedrock::ProtoDefValue openContainerWindowId =
+        bedrock::ProtoDefValue::null();
+    bedrock::ProtoDefValue openContainerWindowType =
+        bedrock::ProtoDefValue::null();
     uint64_t lastAutomationAttemptAtMs = 0;
     uint64_t automationRetryAfterMs = 0;
     uint32_t consecutiveAutomationFailures = 0;
     uint64_t automationAccepted = 0;
     uint64_t automationRejected = 0;
     std::string automationStatus = "Ожидание инвентаря";
+    int32_t areaFillRequiredPoints = 2;
+    std::vector<AreaFillPoint> areaFillPoints;
+    std::vector<AreaFillCell> areaFillCells;
+    bool areaFillRunning = false;
+    bool areaFillWaitingForBlocks = false;
+    bool areaFillRefillPending = false;
+    std::size_t areaFillRefillSourceSlot = 0;
+    std::size_t areaFillRefillDestinationSlot = 0;
+    uint64_t areaFillRefillStartedAtMs = 0;
+    bool areaFillPlacementPending = false;
+    std::size_t areaFillPendingCell = 0;
+    uint64_t areaFillPlacementStartedAtMs = 0;
+    uint64_t areaFillLastPlacementAtMs = 0;
+    int64_t areaFillItemNetworkId = 0;
+    std::string areaFillItemName;
+    bool areaFillSyntheticPositionKnown = false;
+    float areaFillSyntheticX = 0.0f;
+    float areaFillSyntheticY = 0.0f;
+    float areaFillSyntheticZ = 0.0f;
+    uint64_t areaFillMovementRevision = 0;
+    uint64_t areaFillMovementRuntimeId = 0;
+    uint64_t areaFillMovementTick = 0;
+    float areaFillMovementPitch = 0.0f;
+    float areaFillMovementYaw = 0.0f;
+    std::size_t areaFillRouteCell = 0;
+    std::size_t areaFillScanCursor = 0;
+    uint64_t areaFillRevision = 1;
+    std::string areaFillStatus = "Добавьте точки области";
     double playerHealth = 20.0;
     double playerMaximumHealth = 20.0;
     double playerHunger = 20.0;
@@ -2122,6 +2232,442 @@ struct RelayState {
         int32_t runtimeId
     ) noexcept {
         observeSchematicBlockUpdates({{x, y, z, runtimeId}});
+    }
+
+    WorldBlockSample worldBlockSample(
+        int32_t x,
+        int32_t y,
+        int32_t z
+    ) const noexcept {
+        try {
+            bool semanticAir = false;
+            int32_t runtimeId = 0;
+            const int32_t dimension = miniMapDimension.load(
+                std::memory_order_relaxed
+            );
+            {
+                std::lock_guard lock(miniMapMutex);
+                const SchematicBlockKey blockKey {dimension, x, y, z};
+                const auto overridden = schematicBlockOverrides.find(blockKey);
+                if (overridden != schematicBlockOverrides.end()) {
+                    runtimeId = overridden->second.runtimeId;
+                } else {
+                    const auto cached = schematicColumns.find(MiniMapKey {
+                        dimension,
+                        blockToChunkCoordinate(x),
+                        blockToChunkCoordinate(z)
+                    });
+                    if (cached == schematicColumns.end() ||
+                        !cached->second.column) {
+                        return {};
+                    }
+                    const auto& entry = cached->second;
+                    const int32_t storedY = storedBlockY(
+                        *entry.column,
+                        dimension,
+                        y
+                    );
+                    const int32_t sectionY = blockToChunkCoordinate(storedY);
+                    if (storedY < entry.column->minY() ||
+                        storedY >= entry.column->maxY() ||
+                        (!entry.completeBlockColumn &&
+                         entry.knownSections.find(sectionY) ==
+                            entry.knownSections.end())) {
+                        return {};
+                    }
+                    const auto* section = entry.column->getSection(storedY);
+                    semanticAir = section == nullptr ||
+                        section->layerCount() == 0;
+                    if (!semanticAir) {
+                        bedrock::BlockPosition position;
+                        position.x = x;
+                        position.y = storedY;
+                        position.z = z;
+                        position.layer = 0;
+                        runtimeId = entry.column->getBlockStateId(position);
+                    }
+                }
+            }
+            if (semanticAir) return {true, true, 0};
+            std::lock_guard registryLock(blockRegistryMutex);
+            if (!blockRegistry.has_value()) return {true, false, runtimeId};
+            const auto* state = blockRegistry->stateById(runtimeId);
+            return {
+                true,
+                state != nullptr && isAirBlockName(state->name),
+                runtimeId
+            };
+        } catch (...) {
+            return {};
+        }
+    }
+
+    static bool areaPointOnSegment(
+        double px,
+        double pz,
+        const AreaFillPoint& a,
+        const AreaFillPoint& b
+    ) noexcept {
+        const double ax = a.x + 0.5;
+        const double az = a.z + 0.5;
+        const double bx = b.x + 0.5;
+        const double bz = b.z + 0.5;
+        const double cross = (px - ax) * (bz - az) -
+            (pz - az) * (bx - ax);
+        if (std::abs(cross) > 1e-7) return false;
+        return px >= std::min(ax, bx) - 1e-7 &&
+            px <= std::max(ax, bx) + 1e-7 &&
+            pz >= std::min(az, bz) - 1e-7 &&
+            pz <= std::max(az, bz) + 1e-7;
+    }
+
+    static bool areaPolygonContains(
+        double x,
+        double z,
+        const std::vector<AreaFillPoint>& points
+    ) noexcept {
+        bool inside = false;
+        for (std::size_t i = 0, j = points.size() - 1;
+             i < points.size();
+             j = i++) {
+            const auto& a = points[j];
+            const auto& b = points[i];
+            if (areaPointOnSegment(x, z, a, b)) return true;
+            const double ax = a.x + 0.5;
+            const double az = a.z + 0.5;
+            const double bx = b.x + 0.5;
+            const double bz = b.z + 0.5;
+            const bool crosses = (az > z) != (bz > z);
+            if (!crosses) continue;
+            const double intersectionX = ax +
+                (z - az) * (bx - ax) / (bz - az);
+            if (x < intersectionX) inside = !inside;
+        }
+        return inside;
+    }
+
+    bool rebuildAreaFillCellsLocked(std::string& error) {
+        constexpr int32_t MaximumSpan = 96;
+        constexpr std::size_t MaximumCells = 1'800;
+        areaFillCells.clear();
+        if (areaFillPoints.size() !=
+            static_cast<std::size_t>(areaFillRequiredPoints)) {
+            return true;
+        }
+        int32_t minimumX = areaFillPoints.front().x;
+        int32_t maximumX = minimumX;
+        int32_t minimumZ = areaFillPoints.front().z;
+        int32_t maximumZ = minimumZ;
+        for (const auto& point : areaFillPoints) {
+            minimumX = std::min(minimumX, point.x);
+            maximumX = std::max(maximumX, point.x);
+            minimumZ = std::min(minimumZ, point.z);
+            maximumZ = std::max(maximumZ, point.z);
+        }
+        if (maximumX - minimumX + 1 > MaximumSpan ||
+            maximumZ - minimumZ + 1 > MaximumSpan) {
+            error = "Область слишком широкая: максимум 96 блоков по стороне";
+            return false;
+        }
+        const int32_t y = areaFillPoints.front().y;
+        for (int32_t z = minimumZ; z <= maximumZ; ++z) {
+            const bool reverse = ((z - minimumZ) & 1) != 0;
+            for (int32_t offset = 0; offset <= maximumX - minimumX; ++offset) {
+                const int32_t x = reverse
+                    ? maximumX - offset
+                    : minimumX + offset;
+                bool include = areaFillPoints.size() == 2;
+                if (!include) {
+                    include = areaPolygonContains(
+                        x + 0.5,
+                        z + 0.5,
+                        areaFillPoints
+                    );
+                }
+                if (!include) continue;
+                if (areaFillCells.size() >= MaximumCells) {
+                    areaFillCells.clear();
+                    error = "Область больше 1800 блоков — уменьшите контур";
+                    return false;
+                }
+                areaFillCells.push_back({x, y, z, false, false, true, 0});
+            }
+        }
+        if (areaFillCells.empty()) {
+            error = "Точки не образуют заполняемую область";
+            return false;
+        }
+        areaFillRouteCell = 0;
+        areaFillScanCursor = 0;
+        areaFillSyntheticPositionKnown = false;
+        areaFillStatus = "Область готова: " +
+            std::to_string(areaFillCells.size()) + " блоков";
+        ++areaFillRevision;
+        return true;
+    }
+
+    void configureAreaFill(bool enabled, int requiredPoints) noexcept {
+        requiredPoints = std::clamp(requiredPoints, 2, 8);
+        areaFillEnabled.store(enabled, std::memory_order_relaxed);
+        {
+            std::lock_guard lock(mutex);
+            if (areaFillRequiredPoints != requiredPoints) {
+                areaFillRequiredPoints = requiredPoints;
+                areaFillPoints.clear();
+                areaFillCells.clear();
+                areaFillRunning = false;
+                areaFillWaitingForBlocks = false;
+                areaFillItemNetworkId = 0;
+                areaFillItemName.clear();
+                areaFillStatus = "Количество точек изменено — отметьте область заново";
+                ++areaFillRevision;
+            }
+            if (!enabled && areaFillRunning) {
+                areaFillRunning = false;
+                areaFillSyntheticPositionKnown = false;
+                areaFillStatus = "Автозаполнение выключено";
+                ++areaFillRevision;
+            }
+        }
+        const bool tracking = enabled ||
+            schematicEnabled.load(std::memory_order_relaxed);
+        const bool wasTracking = schematicWorldTrackingActive.exchange(
+            tracking,
+            std::memory_order_relaxed
+        );
+        if (wasTracking != tracking) {
+            std::lock_guard worldLock(miniMapMutex);
+            if (!tracking && !miniMapEnabled.load(std::memory_order_relaxed)) {
+                invalidateMiniMapQueueGapLocked(
+                    std::numeric_limits<uint64_t>::max()
+                );
+            } else {
+                ++schematicRevision;
+            }
+        }
+    }
+
+    void resetAreaFillLocked(std::string status) noexcept {
+        areaFillRunning = false;
+        areaFillWaitingForBlocks = false;
+        areaFillRefillPending = false;
+        areaFillPlacementPending = false;
+        areaFillSyntheticPositionKnown = false;
+        areaFillItemNetworkId = 0;
+        areaFillItemName.clear();
+        areaFillPoints.clear();
+        areaFillCells.clear();
+        areaFillRouteCell = 0;
+        areaFillScanCursor = 0;
+        areaFillStatus = std::move(status);
+        ++areaFillRevision;
+    }
+
+    void stopAreaFill(std::string status) noexcept {
+        std::lock_guard lock(mutex);
+        if (!areaFillRunning && !areaFillSyntheticPositionKnown) return;
+        areaFillRunning = false;
+        areaFillWaitingForBlocks = false;
+        areaFillRefillPending = false;
+        areaFillPlacementPending = false;
+        areaFillSyntheticPositionKnown = false;
+        areaFillStatus = std::move(status);
+        ++areaFillRevision;
+    }
+
+    bedrock::JsRuntimeValue captureAreaFillPoint() noexcept {
+        const auto camera = entityPositions.cameraSnapshot();
+        std::lock_guard lock(mutex);
+        if (!areaFillEnabled.load(std::memory_order_relaxed)) {
+            areaFillStatus = "Сначала включите модуль";
+        } else if (!camera.known || steadyMilliseconds() - camera.updatedAtMs > 2'000) {
+            areaFillStatus = "Позиция игрока ещё не получена";
+        } else if (areaFillRunning) {
+            areaFillStatus = "Остановите заполнение перед изменением точек";
+        } else if (areaFillPoints.size() >=
+            static_cast<std::size_t>(areaFillRequiredPoints)) {
+            areaFillStatus = "Все точки уже заданы — сначала очистите область";
+        } else {
+            // PlayerAuthInput reports eye height. A tiny epsilon selects the
+            // solid block immediately below feet when the player stands on an
+            // integer-height surface.
+            const int32_t fillY = areaFillPoints.empty()
+                ? static_cast<int32_t>(std::floor(camera.y - 1.62f - 0.01f))
+                : areaFillPoints.front().y;
+            AreaFillPoint point {
+                static_cast<int32_t>(std::floor(camera.x)),
+                fillY,
+                static_cast<int32_t>(std::floor(camera.z))
+            };
+            if (std::find(areaFillPoints.begin(), areaFillPoints.end(), point) !=
+                areaFillPoints.end()) {
+                areaFillStatus = "Эта точка уже отмечена";
+            } else {
+                areaFillPoints.push_back(point);
+                areaFillStatus = "Точка " +
+                    std::to_string(areaFillPoints.size()) + "/" +
+                    std::to_string(areaFillRequiredPoints) + " добавлена: " +
+                    std::to_string(point.x) + ", " +
+                    std::to_string(point.y) + ", " +
+                    std::to_string(point.z);
+                ++areaFillRevision;
+                if (areaFillPoints.size() ==
+                    static_cast<std::size_t>(areaFillRequiredPoints)) {
+                    std::string error;
+                    if (!rebuildAreaFillCellsLocked(error)) {
+                        areaFillStatus = std::move(error);
+                    }
+                }
+            }
+        }
+        return areaFillSnapshotValueLocked();
+    }
+
+    bedrock::JsRuntimeValue clearAreaFill() noexcept {
+        std::lock_guard lock(mutex);
+        resetAreaFillLocked("Область очищена — добавьте точки");
+        return areaFillSnapshotValueLocked();
+    }
+
+    bedrock::JsRuntimeValue toggleAreaFill() noexcept {
+        std::lock_guard lock(mutex);
+        if (areaFillRunning) {
+            areaFillRunning = false;
+            areaFillSyntheticPositionKnown = false;
+            areaFillStatus = "Остановлено пользователем";
+            ++areaFillRevision;
+            return areaFillSnapshotValueLocked();
+        }
+        if (!areaFillEnabled.load(std::memory_order_relaxed)) {
+            areaFillStatus = "Сначала включите модуль в меню";
+            return areaFillSnapshotValueLocked();
+        }
+        if (areaFillCells.empty() || areaFillPoints.size() !=
+            static_cast<std::size_t>(areaFillRequiredPoints)) {
+            areaFillStatus = "Сначала отметьте все точки области";
+            return areaFillSnapshotValueLocked();
+        }
+        if (!playerInventoryReady || selectedHotbarSlot < 0 ||
+            static_cast<std::size_t>(selectedHotbarSlot) >=
+                playerInventory.size()) {
+            areaFillStatus = "Инвентарь ещё не синхронизирован";
+            return areaFillSnapshotValueLocked();
+        }
+        const auto& held = playerInventory[static_cast<std::size_t>(
+            selectedHotbarSlot
+        )];
+        if (!held.present || held.count <= 0) {
+            areaFillStatus = "Возьмите блок в основную руку";
+            return areaFillSnapshotValueLocked();
+        }
+        if (areaFillItemNetworkId != 0 &&
+            held.networkId != areaFillItemNetworkId) {
+            areaFillStatus = "Для продолжения возьмите прежний блок: " +
+                areaFillItemName;
+            return areaFillSnapshotValueLocked();
+        }
+        areaFillItemNetworkId = held.networkId;
+        areaFillItemName = held.name;
+        areaFillRunning = true;
+        areaFillWaitingForBlocks = false;
+        areaFillRefillPending = false;
+        areaFillPlacementPending = false;
+        areaFillSyntheticPositionKnown = false;
+        areaFillStatus = "Заполнение запущено: " + held.name;
+        ++areaFillRevision;
+        return areaFillSnapshotValueLocked();
+    }
+
+    bedrock::JsRuntimeValue areaFillSnapshotValueLocked() const {
+        std::size_t complete = 0;
+        for (const auto& cell : areaFillCells) complete += cell.complete ? 1u : 0u;
+        std::vector<bedrock::JsRuntimeValue> points;
+        points.reserve(areaFillPoints.size());
+        for (const auto& point : areaFillPoints) {
+            points.push_back(bedrock::JsRuntimeValue::object({
+                {"x", bedrock::JsRuntimeValue::number(point.x)},
+                {"y", bedrock::JsRuntimeValue::number(point.y)},
+                {"z", bedrock::JsRuntimeValue::number(point.z)}
+            }));
+        }
+        return bedrock::JsRuntimeValue::object({
+            {"enabled", bedrock::JsRuntimeValue::boolean(
+                areaFillEnabled.load(std::memory_order_relaxed))},
+            {"running", bedrock::JsRuntimeValue::boolean(areaFillRunning)},
+            {"waitingForBlocks", bedrock::JsRuntimeValue::boolean(
+                areaFillWaitingForBlocks)},
+            {"requiredPoints", bedrock::JsRuntimeValue::number(
+                areaFillRequiredPoints)},
+            {"pointCount", bedrock::JsRuntimeValue::number(
+                static_cast<double>(areaFillPoints.size()))},
+            {"points", bedrock::JsRuntimeValue::array(std::move(points))},
+            {"cellCount", bedrock::JsRuntimeValue::number(
+                static_cast<double>(areaFillCells.size()))},
+            {"completed", bedrock::JsRuntimeValue::number(
+                static_cast<double>(complete))},
+            {"item", bedrock::JsRuntimeValue::string(areaFillItemName)},
+            {"status", bedrock::JsRuntimeValue::string(areaFillStatus)},
+            {"revision", bedrock::JsRuntimeValue::number(
+                static_cast<double>(areaFillRevision))}
+        });
+    }
+
+    bedrock::JsRuntimeValue areaFillSnapshotValue() const {
+        std::lock_guard lock(mutex);
+        return areaFillSnapshotValueLocked();
+    }
+
+    std::pair<uint64_t, std::vector<AreaFillMarker>>
+    areaFillMarkersSnapshot(uint64_t afterRevision = 0) const {
+        constexpr std::size_t MaximumDisplayedAreaFillMarkers = 384;
+        const auto camera = entityPositions.cameraSnapshot();
+        std::lock_guard lock(mutex);
+        std::vector<AreaFillMarker> markers;
+        if (afterRevision == areaFillRevision) {
+            return {areaFillRevision, std::move(markers)};
+        }
+        if (!areaFillEnabled.load(std::memory_order_relaxed)) {
+            return {areaFillRevision, std::move(markers)};
+        }
+        markers.reserve(areaFillCells.size());
+        for (std::size_t index = 0; index < areaFillCells.size(); ++index) {
+            const auto& cell = areaFillCells[index];
+            markers.push_back({
+                cell.x,
+                cell.y,
+                cell.z,
+                static_cast<int32_t>(
+                    (areaFillPlacementPending && index == areaFillPendingCell) ||
+                            (areaFillRunning && index == areaFillRouteCell)
+                        ? 3
+                        : cell.complete ? 2 : 1
+                )
+            });
+        }
+        if (camera.known) {
+            std::stable_sort(
+                markers.begin(),
+                markers.end(),
+                [&camera](const auto& left, const auto& right) {
+                    // Always retain the active route cell, then keep the
+                    // nearest part of a large fill area around the player.
+                    const bool leftActive = left.status == 3;
+                    const bool rightActive = right.status == 3;
+                    if (leftActive != rightActive) return leftActive;
+                    const auto distanceSquared = [&camera](const auto& value) {
+                        const double dx = value.x + 0.5 - camera.x;
+                        const double dy = value.y + 0.5 - camera.y;
+                        const double dz = value.z + 0.5 - camera.z;
+                        return dx * dx + dy * dy + dz * dz;
+                    };
+                    return distanceSquared(left) < distanceSquared(right);
+                }
+            );
+        }
+        if (markers.size() > MaximumDisplayedAreaFillMarkers) {
+            markers.resize(MaximumDisplayedAreaFillMarkers);
+        }
+        return {areaFillRevision, std::move(markers)};
     }
 
     std::vector<int32_t> schematicBlockSnapshotValues(
@@ -3372,12 +3918,26 @@ struct RelayState {
     }
 
     struct AutomationPlan {
+        static constexpr uint8_t DirectHotbarRequest = 0;
+        static constexpr uint8_t DirectInventoryRequest = 1;
+        static constexpr uint8_t CursorHotbarRequest = 2;
+        static constexpr uint8_t CursorInventoryRequest = 3;
+        static constexpr uint8_t ProtocolLegacyTransaction = 4;
+        static constexpr uint8_t WeathertopLegacyTransaction = 5;
+        static constexpr uint8_t VariantCount = 6;
+
         bool valid = false;
         bool totem = false;
         std::size_t inventorySlot = 0;
         std::size_t equipmentIndex = 0;
         uint8_t equipmentSlot = 0;
+        uint8_t variant = DirectHotbarRequest;
         int32_t requestId = 0;
+        bool closeContainer = false;
+        bedrock::ProtoDefValue closeWindowId =
+            bedrock::ProtoDefValue::null();
+        bedrock::ProtoDefValue closeWindowType =
+            bedrock::ProtoDefValue::null();
         EquipmentItem source;
         EquipmentItem destination;
     };
@@ -3521,9 +4081,125 @@ struct RelayState {
         });
     }
 
-    bedrock::VersionedGamePacket makeAutomationPacket(
+    static bedrock::ProtoDefValue automationStackSlot(
+        std::string container,
+        uint8_t slot,
+        int32_t stackId
+    ) {
+        using Value = bedrock::ProtoDefValue;
+        return Value::object({
+            {"slot_type", Value::object({
+                {"container_id", Value::string(std::move(container))},
+                {"dynamic_container_id", Value::null()}
+            })},
+            {"slot", Value::uinteger(slot)},
+            {"stack_id", Value::integer(stackId)}
+        });
+    }
+
+    bedrock::VersionedGamePacket makeAutomationStackRequestPacket(
         const std::string& version,
         const AutomationPlan& plan
+    ) {
+        using Value = bedrock::ProtoDefValue;
+        const bool inventoryContainer =
+            plan.variant == AutomationPlan::DirectInventoryRequest ||
+            plan.variant == AutomationPlan::CursorInventoryRequest;
+        const bool cursorSequence =
+            plan.variant == AutomationPlan::CursorHotbarRequest ||
+            plan.variant == AutomationPlan::CursorInventoryRequest;
+        const std::string sourceType = inventoryContainer
+            ? "inventory"
+            : "hotbar_and_inventory";
+        const std::string destinationType = plan.totem
+            ? "offhand"
+            : "armor";
+        const auto source = automationStackSlot(
+            sourceType,
+            static_cast<uint8_t>(plan.inventorySlot),
+            plan.source.stackId
+        );
+        const auto destination = automationStackSlot(
+            destinationType,
+            plan.equipmentSlot,
+            plan.destination.stackId
+        );
+        std::vector<Value> actions;
+        if (!cursorSequence) {
+            actions.push_back(Value::object({
+                {"type_id", Value::string("swap")},
+                {"source", source},
+                {"destination", destination}
+            }));
+        } else {
+            const auto count = static_cast<uint8_t>(std::clamp(
+                plan.source.count,
+                1,
+                255
+            ));
+            actions.push_back(Value::object({
+                {"type_id", Value::string("take")},
+                {"count", Value::uinteger(count)},
+                {"source", source},
+                {"destination", automationStackSlot("cursor", 0, 0)}
+            }));
+            if (plan.destination.present) {
+                actions.push_back(Value::object({
+                    {"type_id", Value::string("swap")},
+                    {"source", automationStackSlot(
+                        "cursor",
+                        0,
+                        plan.source.stackId
+                    )},
+                    {"destination", destination}
+                }));
+                actions.push_back(Value::object({
+                    {"type_id", Value::string("place")},
+                    {"count", Value::uinteger(static_cast<uint8_t>(
+                        std::clamp(plan.destination.count, 1, 255)
+                    ))},
+                    {"source", automationStackSlot(
+                        "cursor",
+                        0,
+                        plan.destination.stackId
+                    )},
+                    {"destination", automationStackSlot(
+                        sourceType,
+                        static_cast<uint8_t>(plan.inventorySlot),
+                        0
+                    )}
+                }));
+            } else {
+                actions.push_back(Value::object({
+                    {"type_id", Value::string("place")},
+                    {"count", Value::uinteger(count)},
+                    {"source", automationStackSlot(
+                        "cursor",
+                        0,
+                        plan.source.stackId
+                    )},
+                    {"destination", destination}
+                }));
+            }
+        }
+        return makeAreaProtocolPacket(
+            version,
+            "item_stack_request",
+            Value::object({
+                {"requests", Value::array({Value::object({
+                    {"request_id", Value::integer(plan.requestId)},
+                    {"actions", Value::array(std::move(actions))},
+                    {"custom_names", Value::array({})},
+                    {"cause", Value::string("chat_public")}
+                })})}
+            })
+        );
+    }
+
+    bedrock::VersionedGamePacket makeAutomationLegacyPacket(
+        const std::string& version,
+        const AutomationPlan& plan,
+        bool useWeathertopWindowEncoding
     ) {
         using Value = bedrock::ProtoDefValue;
         const std::string destinationInventory = plan.totem
@@ -3549,10 +4225,9 @@ struct RelayState {
                 )
             })}
         });
-        // The generated C++ 1.21.100 table names this field
-        // WindowIDZigzag32, but the working weathertop/node codec and the IGN
-        // server use WindowIDVarint for legacy TransactionActions. Override
-        // only this nested type while leaving every Item codec versioned.
+        // Try the generated protocol encoding first. The last compatibility
+        // variant reproduces weathertop_bot's node codec, whose legacy action
+        // uses WindowIDVarint instead of WindowIDZigzag32.
         const auto packetSchema = bedrock::generatedProtocolTypeJson(
             version,
             "packet_inventory_transaction"
@@ -3563,9 +4238,12 @@ struct RelayState {
             );
         }
         bedrock::ProtoDefEncoder encoder(
-            [&version](const std::string& typeName)
+            [&version, useWeathertopWindowEncoding](
+                const std::string& typeName
+            )
                 -> std::optional<std::string> {
-                if (typeName == "WindowIDZigzag32") {
+                if (useWeathertopWindowEncoding &&
+                    typeName == "WindowIDZigzag32") {
                     if (auto legacyWindow = bedrock::generatedProtocolTypeJson(
                             version,
                             "WindowIDVarint"
@@ -3589,13 +4267,926 @@ struct RelayState {
             .makePacketByName("inventory_transaction", payload);
     }
 
+    bedrock::VersionedGamePacket makeAutomationPacket(
+        const std::string& version,
+        const AutomationPlan& plan
+    ) {
+        if (plan.variant < AutomationPlan::ProtocolLegacyTransaction) {
+            return makeAutomationStackRequestPacket(version, plan);
+        }
+        return makeAutomationLegacyPacket(
+            version,
+            plan,
+            plan.variant == AutomationPlan::WeathertopLegacyTransaction
+        );
+    }
+
+    bedrock::VersionedGamePacket makeAutomationContainerClosePacket(
+        const std::string& version,
+        const bedrock::ProtoDefValue& windowId,
+        const bedrock::ProtoDefValue& windowType
+    ) {
+        using Value = bedrock::ProtoDefValue;
+        return makeAreaProtocolPacket(
+            version,
+            "container_close",
+            Value::object({
+                {"window_id", windowId},
+                {"window_type", windowType},
+                {"server", Value::boolean(false)}
+            })
+        );
+    }
+
+    bedrock::VersionedGamePacket makeAreaFillRefillPacket(
+        const std::string& version,
+        const AreaFillRefillPlan& plan
+    ) {
+        using Value = bedrock::ProtoDefValue;
+        auto transaction = Value::object({
+            {"legacy", Value::object({
+                {"legacy_request_id", Value::integer(0)}
+            })},
+            {"transaction_type", Value::string("normal")},
+            {"actions", Value::array({
+                legacyAutomationAction(
+                    "inventory",
+                    static_cast<uint8_t>(plan.sourceSlot),
+                    plan.source,
+                    plan.destination
+                ),
+                legacyAutomationAction(
+                    "inventory",
+                    static_cast<uint8_t>(plan.destinationSlot),
+                    plan.destination,
+                    plan.source
+                )
+            })}
+        });
+        const auto packetSchema = bedrock::generatedProtocolTypeJson(
+            version,
+            "packet_inventory_transaction"
+        );
+        if (!packetSchema.has_value()) {
+            throw std::runtime_error("inventory_transaction schema is unavailable");
+        }
+        bedrock::ProtoDefEncoder encoder(
+            [&version](const std::string& typeName)
+                -> std::optional<std::string> {
+                if (typeName == "WindowIDZigzag32") {
+                    if (auto legacyWindow = bedrock::generatedProtocolTypeJson(
+                            version,
+                            "WindowIDVarint"
+                        ); legacyWindow.has_value()) {
+                        return legacyWindow;
+                    }
+                }
+                return bedrock::generatedProtocolTypeJson(version, typeName);
+            }
+        );
+        encoder.setVariables(itemProtocolVariables->snapshot());
+        bedrock::ProtoDefWriter writer;
+        encoder.encode(
+            *packetSchema,
+            Value::object({{"transaction", std::move(transaction)}}),
+            writer
+        );
+        return bedrock::VersionedMcpeCodec::forVersion(version)
+            .packetCodec()
+            .makePacketByName("inventory_transaction", writer.take());
+    }
+
+    static bedrock::ProtoDefValue areaBlockPosition(
+        const AreaFillPoint& point
+    ) {
+        using Value = bedrock::ProtoDefValue;
+        return Value::object({
+            {"x", Value::integer(point.x)},
+            {"y", Value::integer(point.y)},
+            {"z", Value::integer(point.z)}
+        });
+    }
+
+    static bedrock::ProtoDefValue areaVec3(
+        double x,
+        double y,
+        double z
+    ) {
+        using Value = bedrock::ProtoDefValue;
+        return Value::object({
+            {"x", Value::floating(x)},
+            {"y", Value::floating(y)},
+            {"z", Value::floating(z)}
+        });
+    }
+
+    bedrock::VersionedGamePacket makeAreaProtocolPacket(
+        const std::string& version,
+        const std::string& name,
+        bedrock::ProtoDefValue params
+    ) {
+        bedrock::ProtoDefPacketEncoder encoder(version, itemProtocolVariables);
+        auto payload = encoder.encodePacket(name, std::move(params));
+        return bedrock::VersionedMcpeCodec::forVersion(version)
+            .packetCodec()
+            .makePacketByName(name, payload);
+    }
+
+    std::vector<bedrock::VersionedGamePacket> makeAreaFillPlacementPackets(
+        const std::string& version,
+        const AreaFillPlacementPlan& plan
+    ) {
+        using Value = bedrock::ProtoDefValue;
+        const auto camera = entityPositions.cameraSnapshot();
+        if (camera.runtimeId == 0) {
+            throw std::runtime_error("player runtime id is unavailable");
+        }
+        auto oldItem = legacyTransactionItem(plan.held);
+        auto newItem = oldItem;
+        if (plan.held.count <= 1) {
+            newItem = Value::object({{"network_id", Value::integer(0)}});
+        } else {
+            newItem.objectValue["count"] = Value::uinteger(
+                static_cast<uint64_t>(plan.held.count - 1)
+            );
+        }
+
+        auto transaction = Value::object({
+            {"legacy", Value::object({
+                {"legacy_request_id", Value::integer(0)}
+            })},
+            {"transaction_type", Value::string("item_use")},
+            {"actions", Value::array({
+                Value::object({
+                    {"source_type", Value::string("container")},
+                    {"inventory_id", Value::string("inventory")},
+                    {"slot", Value::uinteger(
+                        static_cast<uint64_t>(plan.hotbarSlot))},
+                    {"old_item", oldItem},
+                    {"new_item", newItem}
+                })
+            })},
+            {"transaction_data", Value::object({
+                {"action_type", Value::string("click_block")},
+                {"trigger_type", Value::string("player_input")},
+                {"block_position", areaBlockPosition(plan.against)},
+                {"face", Value::integer(plan.face)},
+                {"hotbar_slot", Value::integer(plan.hotbarSlot)},
+                {"held_item", oldItem},
+                {"player_pos", areaVec3(
+                    plan.playerX,
+                    plan.playerY,
+                    plan.playerZ
+                )},
+                {"click_pos", areaVec3(
+                    plan.face == 4 ? 0.0 : plan.face == 5 ? 1.0 : 0.5,
+                    plan.face == 0 ? 0.0 : plan.face == 1 ? 1.0 : 0.5,
+                    plan.face == 2 ? 0.0 : plan.face == 3 ? 1.0 : 0.5
+                )},
+                {"block_runtime_id", Value::integer(plan.supportRuntimeId)},
+                {"client_prediction", Value::string("success")}
+            })}
+        });
+
+        const auto packetSchema = bedrock::generatedProtocolTypeJson(
+            version,
+            "packet_inventory_transaction"
+        );
+        if (!packetSchema.has_value()) {
+            throw std::runtime_error("inventory_transaction schema is unavailable");
+        }
+        bedrock::ProtoDefEncoder transactionEncoder(
+            [&version](const std::string& typeName)
+                -> std::optional<std::string> {
+                if (typeName == "WindowIDZigzag32") {
+                    if (auto legacyWindow = bedrock::generatedProtocolTypeJson(
+                            version,
+                            "WindowIDVarint"
+                        ); legacyWindow.has_value()) {
+                        return legacyWindow;
+                    }
+                }
+                return bedrock::generatedProtocolTypeJson(version, typeName);
+            }
+        );
+        transactionEncoder.setVariables(itemProtocolVariables->snapshot());
+        bedrock::ProtoDefWriter writer;
+        transactionEncoder.encode(
+            *packetSchema,
+            Value::object({{"transaction", std::move(transaction)}}),
+            writer
+        );
+        auto transactionPacket = bedrock::VersionedMcpeCodec::forVersion(
+            version
+        ).packetCodec().makePacketByName(
+            "inventory_transaction",
+            writer.take()
+        );
+
+        std::vector<bedrock::VersionedGamePacket> packets;
+        packets.reserve(4);
+        packets.push_back(makeAreaProtocolPacket(
+            version,
+            "player_action",
+            Value::object({
+                {"runtime_entity_id", Value::uinteger(camera.runtimeId)},
+                {"action", Value::string("start_item_use_on")},
+                {"position", areaBlockPosition(plan.against)},
+                {"result_position", areaBlockPosition(plan.target)},
+                {"face", Value::integer(plan.face)}
+            })
+        ));
+        packets.push_back(makeAreaProtocolPacket(
+            version,
+            "animate",
+            Value::object({
+                {"action_id", Value::string("swing_arm")},
+                {"runtime_entity_id", Value::uinteger(camera.runtimeId)}
+            })
+        ));
+        packets.push_back(std::move(transactionPacket));
+        packets.push_back(makeAreaProtocolPacket(
+            version,
+            "player_action",
+            Value::object({
+                {"runtime_entity_id", Value::uinteger(camera.runtimeId)},
+                {"action", Value::string("stop_item_use_on")},
+                {"position", areaBlockPosition(plan.target)},
+                {"result_position", areaBlockPosition(AreaFillPoint {})},
+                {"face", Value::integer(0)}
+            })
+        ));
+        return packets;
+    }
+
+    bedrock::VersionedGamePacket makeAreaFillMovementPacket(
+        const std::string& version,
+        bedrock::BedrockRelayPacketEvent& event,
+        float x,
+        float y,
+        float z,
+        float deltaX,
+        float deltaZ,
+        float yaw
+    ) {
+        bedrock::RelayPacketEvent decoded(
+            version,
+            event,
+            itemProtocolVariables,
+            true
+        );
+        decoded.set("position.x", static_cast<double>(x));
+        decoded.set("position.y", static_cast<double>(y));
+        decoded.set("position.z", static_cast<double>(z));
+        decoded.set("delta.x", static_cast<double>(deltaX));
+        decoded.set("delta.z", static_cast<double>(deltaZ));
+        decoded.set("yaw", static_cast<double>(yaw));
+        decoded.set("head_yaw", static_cast<double>(yaw));
+        decoded.set("move_vector.x", 0.0);
+        decoded.set("move_vector.z", 1.0);
+        decoded.set("analogue_move_vector.x", 0.0);
+        decoded.set("analogue_move_vector.z", 1.0);
+        decoded.set("raw_move_vector.x", 0.0);
+        decoded.set("raw_move_vector.z", 1.0);
+        decoded.set("input_data.up", true);
+        decoded.set("input_data.down", false);
+        decoded.set("input_data.left", false);
+        decoded.set("input_data.right", false);
+        decoded.set("input_data.sprinting", false);
+        bedrock::ProtoDefPacketEncoder encoder(version, itemProtocolVariables);
+        auto payload = encoder.encodePacket(
+            "player_auth_input",
+            bedrock::ProtoDefValue::object(decoded.decodedParams())
+        );
+        return bedrock::VersionedMcpeCodec::forVersion(version)
+            .packetCodec()
+            .makePacketByName("player_auth_input", payload);
+    }
+
+    std::optional<std::pair<uint64_t, bedrock::VersionedGamePacket>>
+    areaFillMovementSyncPacket(
+        const std::string& version,
+        uint64_t afterRevision
+    ) noexcept {
+        AreaFillMovementSync sync;
+        {
+            std::lock_guard lock(mutex);
+            if (!areaFillSyntheticPositionKnown ||
+                areaFillMovementRevision == 0 ||
+                areaFillMovementRevision == afterRevision) {
+                return std::nullopt;
+            }
+            sync.revision = areaFillMovementRevision;
+            sync.runtimeId = areaFillMovementRuntimeId;
+            sync.tick = areaFillMovementTick;
+            sync.x = areaFillSyntheticX;
+            sync.y = areaFillSyntheticY;
+            sync.z = areaFillSyntheticZ;
+            sync.pitch = areaFillMovementPitch;
+            sync.yaw = areaFillMovementYaw;
+        }
+        if (sync.runtimeId == 0) return std::nullopt;
+        try {
+            std::lock_guard decodeLock(itemDecodeMutex);
+            auto packet = makeAreaProtocolPacket(
+                version,
+                "move_player",
+                bedrock::ProtoDefValue::object({
+                    {"runtime_id", bedrock::ProtoDefValue::uinteger(
+                        sync.runtimeId)},
+                    {"position", areaVec3(sync.x, sync.y, sync.z)},
+                    {"pitch", bedrock::ProtoDefValue::floating(sync.pitch)},
+                    {"yaw", bedrock::ProtoDefValue::floating(sync.yaw)},
+                    {"head_yaw", bedrock::ProtoDefValue::floating(sync.yaw)},
+                    {"mode", bedrock::ProtoDefValue::string("teleport")},
+                    {"on_ground", bedrock::ProtoDefValue::boolean(true)},
+                    {"ridden_runtime_id", bedrock::ProtoDefValue::uinteger(0)},
+                    {"teleport", bedrock::ProtoDefValue::object({
+                        {"cause", bedrock::ProtoDefValue::string("behavior")},
+                        {"source_entity_type",
+                            bedrock::ProtoDefValue::string("player")}
+                    })},
+                    {"tick", bedrock::ProtoDefValue::uinteger(sync.tick)}
+                })
+            );
+            return std::pair<uint64_t, bedrock::VersionedGamePacket> {
+                sync.revision,
+                std::move(packet)
+            };
+        } catch (const std::exception& error) {
+            stopAreaFill(
+                "Автопроход остановлен: не удалось синхронизировать позицию"
+            );
+            push(
+                "area_fill_movement_sync_failed",
+                safeMessage(error.what()),
+                "WARN",
+                "area_fill"
+            );
+            return std::nullopt;
+        }
+    }
+
+    void refreshAreaFillWorldSamples(std::size_t maximumSamples = 48) noexcept {
+        std::vector<std::pair<std::size_t, AreaFillPoint>> requests;
+        {
+            std::lock_guard lock(mutex);
+            if (!areaFillRunning || areaFillCells.empty()) return;
+            requests.reserve(std::min(maximumSamples, areaFillCells.size()));
+            for (std::size_t count = 0;
+                 count < maximumSamples && count < areaFillCells.size();
+                 ++count) {
+                const auto index = areaFillScanCursor++ % areaFillCells.size();
+                const auto& cell = areaFillCells[index];
+                requests.push_back({index, {cell.x, cell.y, cell.z}});
+            }
+        }
+        std::vector<WorldBlockSample> samples;
+        samples.reserve(requests.size());
+        for (const auto& request : requests) {
+            samples.push_back(worldBlockSample(
+                request.second.x,
+                request.second.y,
+                request.second.z
+            ));
+        }
+        std::lock_guard lock(mutex);
+        bool changed = false;
+        for (std::size_t index = 0; index < requests.size(); ++index) {
+            if (requests[index].first >= areaFillCells.size()) continue;
+            const auto& sample = samples[index];
+            if (!sample.known) continue;
+            auto& cell = areaFillCells[requests[index].first];
+            if (!cell.worldKnown || cell.worldAir != sample.air) changed = true;
+            cell.worldKnown = true;
+            cell.worldAir = sample.air;
+            if (cell.complete != !sample.air) {
+                cell.complete = !sample.air;
+                changed = true;
+            }
+        }
+        if (changed) ++areaFillRevision;
+    }
+
+    void observeAreaFillWorldUpdate(
+        int32_t x,
+        int32_t y,
+        int32_t z
+    ) noexcept {
+        if (!areaFillEnabled.load(std::memory_order_relaxed)) return;
+        const auto sample = worldBlockSample(x, y, z);
+        if (!sample.known) return;
+        std::lock_guard lock(mutex);
+        bool changed = false;
+        for (std::size_t index = 0; index < areaFillCells.size(); ++index) {
+            auto& cell = areaFillCells[index];
+            if (cell.x != x || cell.y != y || cell.z != z) continue;
+            cell.worldKnown = true;
+            cell.worldAir = sample.air;
+            if (cell.complete != !sample.air) {
+                cell.complete = !sample.air;
+                changed = true;
+            }
+            if (areaFillPlacementPending && areaFillPendingCell == index &&
+                !sample.air) {
+                areaFillPlacementPending = false;
+                areaFillStatus = "Установка подтверждена сервером";
+                changed = true;
+            }
+            break;
+        }
+        if (changed) ++areaFillRevision;
+    }
+
+    std::optional<std::tuple<AreaFillPoint, int32_t, int32_t>>
+    areaFillSupportFor(const AreaFillPoint& target) const noexcept {
+        static constexpr std::array<std::array<int32_t, 4>, 6> Supports {{
+            {{0, -1, 0, 1}},
+            {{0, 1, 0, 0}},
+            {{0, 0, 1, 2}},
+            {{0, 0, -1, 3}},
+            {{1, 0, 0, 4}},
+            {{-1, 0, 0, 5}}
+        }};
+        for (const auto& support : Supports) {
+            AreaFillPoint against {
+                target.x + support[0],
+                target.y + support[1],
+                target.z + support[2]
+            };
+            const auto sample = worldBlockSample(
+                against.x,
+                against.y,
+                against.z
+            );
+            if (sample.known && !sample.air) {
+                return std::tuple<AreaFillPoint, int32_t, int32_t> {
+                    against,
+                    support[3],
+                    sample.runtimeId
+                };
+            }
+        }
+        return std::nullopt;
+    }
+
+    bool maybeInjectAreaFill(
+        const std::string& version,
+        bedrock::BedrockRelayPacketEvent& event
+    ) noexcept {
+        if (event.packet.name != "player_auth_input" ||
+            !areaFillEnabled.load(std::memory_order_relaxed)) {
+            return false;
+        }
+        refreshAreaFillWorldSamples();
+
+        float packetX = 0.0f;
+        float packetY = 0.0f;
+        float packetZ = 0.0f;
+        float packetPitch = 0.0f;
+        uint64_t packetTick = 0;
+        bool manualMovement = false;
+        try {
+            std::lock_guard decodeLock(itemDecodeMutex);
+            bedrock::RelayPacketEvent decoded(
+                version,
+                event,
+                itemProtocolVariables,
+                true
+            );
+            packetX = static_cast<float>(decoded.getDouble("position.x", 0.0));
+            packetY = static_cast<float>(decoded.getDouble("position.y", 0.0));
+            packetZ = static_cast<float>(decoded.getDouble("position.z", 0.0));
+            packetPitch = static_cast<float>(decoded.getDouble("pitch", 0.0));
+            packetTick = decoded.getUInt("tick", 0);
+            manualMovement = decoded.getBool("input_data.up", false) ||
+                decoded.getBool("input_data.down", false) ||
+                decoded.getBool("input_data.left", false) ||
+                decoded.getBool("input_data.right", false) ||
+                decoded.getBool("input_data.jumping", false) ||
+                decoded.getBool("input_data.sneaking", false);
+        } catch (const std::exception& error) {
+            std::lock_guard lock(mutex);
+            if (areaFillRunning) {
+                areaFillRunning = false;
+                areaFillStatus = "Не удалось прочитать движение игрока: " +
+                    safeMessage(error.what());
+                ++areaFillRevision;
+            }
+            return false;
+        }
+
+        const uint64_t now = steadyMilliseconds();
+        if (manualMovement) {
+            std::lock_guard lock(mutex);
+            if (areaFillRunning) {
+                areaFillSyntheticPositionKnown = false;
+                areaFillStatus = "Ручное управление — автопроход временно уступил";
+            }
+            return false;
+        }
+
+        AreaFillRefillPlan refill;
+        AreaFillPlacementPlan placement;
+        bool planMovement = false;
+        float nextX = packetX;
+        float nextY = packetY;
+        float nextZ = packetZ;
+        float deltaX = 0.0f;
+        float deltaZ = 0.0f;
+        float nextYaw = 0.0f;
+        AreaFillPoint movementFloor;
+        {
+            std::lock_guard lock(mutex);
+            if (!areaFillRunning) return false;
+            if (minecraftUiBlocked.load(std::memory_order_relaxed)) return true;
+
+            if (areaFillPlacementPending) {
+                if (areaFillPendingCell >= areaFillCells.size()) {
+                    areaFillPlacementPending = false;
+                } else if (areaFillCells[areaFillPendingCell].complete ||
+                           !areaFillCells[areaFillPendingCell].worldAir) {
+                    areaFillCells[areaFillPendingCell].complete = true;
+                    areaFillPlacementPending = false;
+                    areaFillStatus = "Установка подтверждена сервером";
+                    ++areaFillRevision;
+                } else if (now - areaFillPlacementStartedAtMs < 1'400) {
+                    return true;
+                } else {
+                    auto& failed = areaFillCells[areaFillPendingCell];
+                    failed.failures = static_cast<uint8_t>(std::min<int>(
+                        255,
+                        failed.failures + 1
+                    ));
+                    areaFillPlacementPending = false;
+                    areaFillStatus = failed.failures >= 3
+                        ? "Сервер трижды отклонил блок — ищу следующий"
+                        : "Сервер не подтвердил блок — повторяю";
+                    ++areaFillRevision;
+                }
+            }
+
+            std::size_t complete = 0;
+            for (const auto& cell : areaFillCells) complete += cell.complete ? 1u : 0u;
+            if (complete == areaFillCells.size()) {
+                areaFillRunning = false;
+                areaFillSyntheticPositionKnown = false;
+                areaFillStatus = "Готово: заполнено " +
+                    std::to_string(complete) + " блоков";
+                ++areaFillRevision;
+                return true;
+            }
+
+            if (selectedHotbarSlot < 0 ||
+                static_cast<std::size_t>(selectedHotbarSlot) >=
+                    playerInventory.size()) {
+                areaFillRunning = false;
+                areaFillStatus = "Выбранный слот хотбара неизвестен";
+                ++areaFillRevision;
+                return true;
+            }
+            const auto destinationSlot = static_cast<std::size_t>(
+                selectedHotbarSlot
+            );
+            const auto& held = playerInventory[destinationSlot];
+            if (areaFillRefillPending) {
+                if (held.present && held.networkId == areaFillItemNetworkId &&
+                    held.count > 0) {
+                    areaFillRefillPending = false;
+                    areaFillStatus = "Хотбар пополнен — продолжаю";
+                    ++areaFillRevision;
+                } else if (now - areaFillRefillStartedAtMs < 2'500) {
+                    return true;
+                } else {
+                    areaFillRefillPending = false;
+                    areaFillRunning = false;
+                    areaFillStatus = "Сервер не подтвердил пополнение хотбара";
+                    ++areaFillRevision;
+                    return true;
+                }
+            }
+            if (!held.present || held.count <= 0) {
+                for (std::size_t slot = 0; slot < playerInventory.size(); ++slot) {
+                    if (slot == destinationSlot) continue;
+                    const auto& candidate = playerInventory[slot];
+                    if (!candidate.present || candidate.count <= 0 ||
+                        candidate.networkId != areaFillItemNetworkId ||
+                        candidate.transactionItem.kind !=
+                            bedrock::ProtoDefValue::Kind::Object) {
+                        continue;
+                    }
+                    refill.valid = true;
+                    refill.sourceSlot = slot;
+                    refill.destinationSlot = destinationSlot;
+                    refill.source = candidate;
+                    refill.destination = held;
+                    areaFillRefillPending = true;
+                    areaFillRefillSourceSlot = slot;
+                    areaFillRefillDestinationSlot = destinationSlot;
+                    areaFillRefillStartedAtMs = now;
+                    areaFillStatus = "Перекладываю " + areaFillItemName +
+                        " из слота " + std::to_string(slot);
+                    ++areaFillRevision;
+                    break;
+                }
+                if (!refill.valid) {
+                    areaFillRunning = false;
+                    areaFillWaitingForBlocks = true;
+                    areaFillSyntheticPositionKnown = false;
+                    areaFillStatus = "Блоки закончились. Возьмите ещё и нажмите кнопку снова";
+                    ++areaFillRevision;
+                    return true;
+                }
+            } else if (held.networkId != areaFillItemNetworkId) {
+                areaFillRunning = false;
+                areaFillSyntheticPositionKnown = false;
+                areaFillStatus = "Выбран другой слот. Возьмите " +
+                    areaFillItemName + " и запустите снова";
+                ++areaFillRevision;
+                return true;
+            }
+
+            if (refill.valid) {
+                // Encoding happens outside the state lock.
+            } else if (now - areaFillLastPlacementAtMs >= 180) {
+                const float currentX = areaFillSyntheticPositionKnown
+                    ? areaFillSyntheticX
+                    : packetX;
+                const float currentY = areaFillSyntheticPositionKnown
+                    ? areaFillSyntheticY
+                    : packetY;
+                const float currentZ = areaFillSyntheticPositionKnown
+                    ? areaFillSyntheticZ
+                    : packetZ;
+                double bestDistance = std::numeric_limits<double>::infinity();
+                std::size_t bestIndex = areaFillCells.size();
+                for (std::size_t index = 0; index < areaFillCells.size(); ++index) {
+                    const auto& cell = areaFillCells[index];
+                    if (cell.complete || !cell.worldKnown || !cell.worldAir ||
+                        cell.failures >= 3) continue;
+                    const double dx = cell.x + 0.5 - currentX;
+                    const double dy = cell.y + 0.5 - currentY;
+                    const double dz = cell.z + 0.5 - currentZ;
+                    const double distance = dx * dx + dy * dy + dz * dz;
+                    if (distance <= 4.75 * 4.75 && distance < bestDistance) {
+                        bestDistance = distance;
+                        bestIndex = index;
+                    }
+                }
+                if (bestIndex < areaFillCells.size()) {
+                    const auto& cell = areaFillCells[bestIndex];
+                    placement.valid = true;
+                    placement.cellIndex = bestIndex;
+                    placement.target = {cell.x, cell.y, cell.z};
+                    placement.hotbarSlot = selectedHotbarSlot;
+                    placement.held = held;
+                    placement.playerX = currentX;
+                    placement.playerY = currentY;
+                    placement.playerZ = currentZ;
+                }
+            }
+
+            if (!refill.valid && !placement.valid) {
+                const float currentX = areaFillSyntheticPositionKnown
+                    ? areaFillSyntheticX
+                    : packetX;
+                const float currentY = areaFillSyntheticPositionKnown
+                    ? areaFillSyntheticY
+                    : packetY;
+                const float currentZ = areaFillSyntheticPositionKnown
+                    ? areaFillSyntheticZ
+                    : packetZ;
+                double bestDistance = std::numeric_limits<double>::infinity();
+                std::size_t bestIndex = areaFillCells.size();
+                for (std::size_t index = 0; index < areaFillCells.size(); ++index) {
+                    const auto& cell = areaFillCells[index];
+                    if (cell.complete || !cell.worldKnown || !cell.worldAir ||
+                        cell.failures >= 3) continue;
+                    const double dx = cell.x + 0.5 - currentX;
+                    const double dz = cell.z + 0.5 - currentZ;
+                    const double distance = dx * dx + dz * dz;
+                    if (distance < bestDistance) {
+                        bestDistance = distance;
+                        bestIndex = index;
+                    }
+                }
+                if (bestIndex == areaFillCells.size()) {
+                    const bool unknown = std::any_of(
+                        areaFillCells.begin(),
+                        areaFillCells.end(),
+                        [](const auto& cell) {
+                            return !cell.complete && !cell.worldKnown;
+                        }
+                    );
+                    areaFillRunning = false;
+                    areaFillSyntheticPositionKnown = false;
+                    areaFillStatus = unknown
+                        ? "Часть области не загружена — подойдите ближе и запустите снова"
+                        : "Не удалось установить оставшиеся блоки: нет опоры";
+                    ++areaFillRevision;
+                    return true;
+                }
+                if (areaFillRouteCell != bestIndex) {
+                    areaFillRouteCell = bestIndex;
+                    ++areaFillRevision;
+                }
+                const auto& target = areaFillCells[bestIndex];
+                const double dx = target.x + 0.5 - currentX;
+                const double dz = target.z + 0.5 - currentZ;
+                const double distance = std::hypot(dx, dz);
+                if (distance > 0.08) {
+                    const double step = std::min(0.08, distance);
+                    deltaX = static_cast<float>(dx / distance * step);
+                    deltaZ = static_cast<float>(dz / distance * step);
+                    nextX = currentX + deltaX;
+                    nextY = currentY;
+                    nextZ = currentZ + deltaZ;
+                    nextYaw = static_cast<float>(
+                        std::atan2(-dx, dz) * 57.29577951308232
+                    );
+                    movementFloor = {
+                        static_cast<int32_t>(std::floor(nextX)),
+                        target.y,
+                        static_cast<int32_t>(std::floor(nextZ))
+                    };
+                    planMovement = true;
+                }
+            }
+        }
+
+        try {
+            std::lock_guard decodeLock(itemDecodeMutex);
+            if (refill.valid) {
+                auto packet = makeAreaFillRefillPacket(version, refill);
+                event.replace(std::vector<bedrock::VersionedGamePacket> {
+                    event.packet,
+                    std::move(packet)
+                });
+                return true;
+            }
+            if (placement.valid) {
+                const auto support = areaFillSupportFor(placement.target);
+                if (!support.has_value()) {
+                    std::lock_guard lock(mutex);
+                    if (placement.cellIndex < areaFillCells.size()) {
+                        auto& cell = areaFillCells[placement.cellIndex];
+                        cell.failures = static_cast<uint8_t>(std::min<int>(
+                            255,
+                            cell.failures + 1
+                        ));
+                    }
+                    areaFillStatus = "Для выбранного блока нет известной опоры";
+                    ++areaFillRevision;
+                    return true;
+                }
+                placement.against = std::get<0>(*support);
+                placement.face = std::get<1>(*support);
+                placement.supportRuntimeId = std::get<2>(*support);
+                auto packets = makeAreaFillPlacementPackets(version, placement);
+                std::vector<bedrock::VersionedGamePacket> replacement;
+                replacement.reserve(packets.size() + 1);
+                replacement.push_back(event.packet);
+                for (auto& packet : packets) replacement.push_back(std::move(packet));
+                {
+                    std::lock_guard lock(mutex);
+                    if (!areaFillRunning ||
+                        placement.cellIndex >= areaFillCells.size()) {
+                        return false;
+                    }
+                    areaFillPlacementPending = true;
+                    areaFillPendingCell = placement.cellIndex;
+                    areaFillPlacementStartedAtMs = now;
+                    areaFillLastPlacementAtMs = now;
+                    areaFillStatus = "Ставлю блок " +
+                        std::to_string(placement.cellIndex + 1) + "/" +
+                        std::to_string(areaFillCells.size());
+                    ++areaFillRevision;
+                }
+                event.replace(std::move(replacement));
+                return true;
+            }
+            if (planMovement) {
+                const auto floor = worldBlockSample(
+                    movementFloor.x,
+                    movementFloor.y,
+                    movementFloor.z
+                );
+                const auto body = worldBlockSample(
+                    movementFloor.x,
+                    movementFloor.y + 1,
+                    movementFloor.z
+                );
+                const auto head = worldBlockSample(
+                    movementFloor.x,
+                    movementFloor.y + 2,
+                    movementFloor.z
+                );
+                if (!floor.known || floor.air || !body.known || !body.air ||
+                    !head.known || !head.air) {
+                    std::lock_guard lock(mutex);
+                    areaFillRunning = false;
+                    areaFillSyntheticPositionKnown = false;
+                    areaFillStatus = "Автопроход остановлен: впереди нет безопасного пути";
+                    ++areaFillRevision;
+                    return true;
+                }
+                auto packet = makeAreaFillMovementPacket(
+                    version,
+                    event,
+                    nextX,
+                    nextY,
+                    nextZ,
+                    deltaX,
+                    deltaZ,
+                    nextYaw
+                );
+                {
+                    std::lock_guard lock(mutex);
+                    areaFillSyntheticPositionKnown = true;
+                    areaFillSyntheticX = nextX;
+                    areaFillSyntheticY = nextY;
+                    areaFillSyntheticZ = nextZ;
+                    const auto camera = entityPositions.cameraSnapshot();
+                    areaFillMovementRuntimeId = camera.runtimeId;
+                    areaFillMovementTick = packetTick;
+                    areaFillMovementPitch = packetPitch;
+                    areaFillMovementYaw = nextYaw;
+                    ++areaFillMovementRevision;
+                    areaFillStatus = "Иду к следующему незаполненному участку";
+                }
+                event.replace(std::move(packet));
+                return true;
+            }
+        } catch (const std::exception& error) {
+            std::lock_guard lock(mutex);
+            areaFillRunning = false;
+            areaFillSyntheticPositionKnown = false;
+            areaFillStatus = "Ошибка пакета автозаполнения: " +
+                safeMessage(error.what());
+            ++areaFillRevision;
+            return true;
+        }
+        return true;
+    }
+
     void clearPendingAutomationLocked() noexcept {
         pendingAutomationRequestId = 0;
         pendingAutomationNetworkId = 0;
         pendingAutomationStackId = 0;
         pendingAutomationEquipmentIndex = 0;
         pendingAutomationInventorySlot = 0;
+        pendingAutomationVariant = 0;
+        pendingAutomationSource = {};
+        pendingAutomationDestination = {};
         pendingAutomationStartedAtMs = 0;
+    }
+
+    static const char* automationVariantName(uint8_t variant) noexcept {
+        switch (variant) {
+            case AutomationPlan::DirectHotbarRequest:
+                return "stack swap hotbar_and_inventory";
+            case AutomationPlan::DirectInventoryRequest:
+                return "stack swap inventory";
+            case AutomationPlan::CursorHotbarRequest:
+                return "cursor hotbar_and_inventory";
+            case AutomationPlan::CursorInventoryRequest:
+                return "cursor inventory";
+            case AutomationPlan::ProtocolLegacyTransaction:
+                return "protocol legacy";
+            case AutomationPlan::WeathertopLegacyTransaction:
+                return "weathertop legacy";
+            default:
+                return "unknown";
+        }
+    }
+
+    void resetAutomationVariantsLocked() noexcept {
+        nextAutomationVariant = AutomationPlan::DirectHotbarRequest;
+        automationVariantNetworkId = 0;
+        automationVariantStackId = 0;
+        automationVariantEquipmentIndex = 0;
+    }
+
+    void failAutomationVariantLocked(
+        uint8_t failedVariant,
+        uint64_t now,
+        std::string reason
+    ) {
+        clearPendingAutomationLocked();
+        ++automationRejected;
+        if (failedVariant + 1 < AutomationPlan::VariantCount) {
+            nextAutomationVariant = static_cast<uint8_t>(failedVariant + 1);
+            automationRetryAfterMs = now + 75;
+            automationStatus = std::move(reason) + "; пробую " +
+                automationVariantName(nextAutomationVariant);
+            return;
+        }
+        resetAutomationVariantsLocked();
+        ++consecutiveAutomationFailures;
+        const auto retryDelay = automationRetryDelayLocked();
+        automationRetryAfterMs = now + retryDelay;
+        automationStatus = std::move(reason) + "; полный повтор через " +
+            std::to_string((retryDelay + 999) / 1'000) + " с";
     }
 
     uint64_t automationRetryDelayLocked() const noexcept {
@@ -3622,6 +5213,7 @@ struct RelayState {
         if (!accepted) return;
 
         clearPendingAutomationLocked();
+        resetAutomationVariantsLocked();
         consecutiveAutomationFailures = 0;
         automationRetryAfterMs = steadyMilliseconds() + 750;
         ++automationAccepted;
@@ -3636,47 +5228,92 @@ struct RelayState {
             event.packet.name != "move_player") {
             return;
         }
-        if ((!autoArmorEnabled.load(std::memory_order_relaxed) &&
-             !autoTotemEnabled.load(std::memory_order_relaxed)) ||
-            minecraftUiBlocked.load(std::memory_order_relaxed)) {
+        if (!autoArmorEnabled.load(std::memory_order_relaxed) &&
+            !autoTotemEnabled.load(std::memory_order_relaxed)) {
             return;
         }
 
         const uint64_t now = steadyMilliseconds();
         AutomationPlan plan;
-        bool timedOut = false;
         {
             std::lock_guard lock(mutex);
             if (pendingAutomationRequestId != 0) {
-                if (now - pendingAutomationStartedAtMs < 2'500) return;
-                clearPendingAutomationLocked();
-                ++automationRejected;
-                ++consecutiveAutomationFailures;
-                const auto retryDelay = automationRetryDelayLocked();
-                automationRetryAfterMs = now + retryDelay;
-                automationStatus = "Сервер не подтвердил перемещение; повтор через " +
-                    std::to_string((retryDelay + 999) / 1'000) + " с";
-                timedOut = true;
+                const auto timeout = pendingAutomationVariant <
+                        AutomationPlan::ProtocolLegacyTransaction
+                    ? 1'800ull
+                    : 2'500ull;
+                if (now - pendingAutomationStartedAtMs < timeout) return;
+                const auto failedVariant = pendingAutomationVariant;
+                failAutomationVariantLocked(
+                    failedVariant,
+                    now,
+                    "Сервер не ответил на " + std::string(
+                        automationVariantName(failedVariant)
+                    )
+                );
+                return;
             }
-            if (timedOut) return;
             if (now < automationRetryAfterMs) return;
             if (now - lastAutomationAttemptAtMs < 500) return;
             plan = chooseAutomationPlanLocked();
             if (!plan.valid) return;
-            plan.requestId = nextAutomationRequestId++;
+            if (automationVariantNetworkId != plan.source.networkId ||
+                automationVariantStackId != plan.source.stackId ||
+                automationVariantEquipmentIndex != plan.equipmentIndex) {
+                resetAutomationVariantsLocked();
+                automationVariantNetworkId = plan.source.networkId;
+                automationVariantStackId = plan.source.stackId;
+                automationVariantEquipmentIndex = plan.equipmentIndex;
+            }
+            plan.variant = nextAutomationVariant;
+            // Stack requests cannot identify an item without its server stack
+            // id. Go straight to the two exact legacy encodings in that case.
+            if (plan.source.stackId == 0 &&
+                plan.variant < AutomationPlan::ProtocolLegacyTransaction) {
+                plan.variant = AutomationPlan::ProtocolLegacyTransaction;
+                nextAutomationVariant = plan.variant;
+            }
+            plan.requestId = plan.variant <
+                    AutomationPlan::ProtocolLegacyTransaction
+                ? nextAutomationStackRequestId--
+                : nextAutomationLegacyTicket++;
+            if (minecraftUiBlocked.load(std::memory_order_relaxed)) {
+                if (!plan.totem ||
+                    openContainerWindowId.kind ==
+                        bedrock::ProtoDefValue::Kind::Null ||
+                    openContainerWindowType.kind ==
+                        bedrock::ProtoDefValue::Kind::Null) {
+                    return;
+                }
+                plan.closeContainer = true;
+                plan.closeWindowId = openContainerWindowId;
+                plan.closeWindowType = openContainerWindowType;
+            }
         }
 
         bedrock::VersionedGamePacket injected;
+        std::optional<bedrock::VersionedGamePacket> closeContainer;
         try {
             std::lock_guard decodeLock(itemDecodeMutex);
+            if (plan.closeContainer) {
+                closeContainer = makeAutomationContainerClosePacket(
+                    version,
+                    plan.closeWindowId,
+                    plan.closeWindowType
+                );
+            }
             injected = makeAutomationPacket(version, plan);
         } catch (const std::exception& error) {
             {
                 std::lock_guard lock(mutex);
                 lastAutomationAttemptAtMs = now;
-                automationRetryAfterMs = now + 30'000;
-                automationStatus =
-                    "Пакет автоматизации не поддержан этой версией";
+                failAutomationVariantLocked(
+                    plan.variant,
+                    now,
+                    "Не удалось собрать " + std::string(
+                        automationVariantName(plan.variant)
+                    )
+                );
             }
             push(
                 "automation_encode_failed",
@@ -3711,19 +5348,33 @@ struct RelayState {
             pendingAutomationEquipmentIndex = plan.equipmentIndex;
             pendingAutomationInventorySlot = plan.inventorySlot;
             pendingAutomationStartedAtMs = now;
+            pendingAutomationVariant = plan.variant;
+            pendingAutomationSource = plan.source;
+            pendingAutomationDestination = plan.destination;
             lastAutomationAttemptAtMs = now;
             automationStatus = plan.totem
                 ? "Тотем найден в слоте " +
                     std::to_string(plan.inventorySlot) +
-                    " — перемещается в левую руку"
+                    " — отправлен через " +
+                    automationVariantName(plan.variant)
                 : "Найдена броня в слоте " +
                     std::to_string(plan.inventorySlot) + ": " +
-                    plan.source.name;
+                    plan.source.name + " (" +
+                    automationVariantName(plan.variant) + ")";
+            if (plan.closeContainer) {
+                minecraftUiBlocked.store(false, std::memory_order_relaxed);
+                openContainerWindowId = bedrock::ProtoDefValue::null();
+                openContainerWindowType = bedrock::ProtoDefValue::null();
+            }
         }
-        event.replace(std::vector<bedrock::VersionedGamePacket> {
-            event.packet,
-            std::move(injected)
-        });
+        std::vector<bedrock::VersionedGamePacket> replacement;
+        replacement.reserve(closeContainer.has_value() ? 3 : 2);
+        replacement.push_back(event.packet);
+        if (closeContainer.has_value()) {
+            replacement.push_back(std::move(*closeContainer));
+        }
+        replacement.push_back(std::move(injected));
+        event.replace(std::move(replacement));
     }
 
     void observeDecodedGameplayPacket(
@@ -3737,9 +5388,32 @@ struct RelayState {
             minecraftUiBlocked.store(true, std::memory_order_relaxed);
         } else if (name == "container_close") {
             minecraftUiBlocked.store(false, std::memory_order_relaxed);
+            std::lock_guard lock(mutex);
+            openContainerWindowId = bedrock::ProtoDefValue::null();
+            openContainerWindowType = bedrock::ProtoDefValue::null();
         }
         if (!serverbound && name == "item_registry") {
             observeItemRegistry(version, event.packet);
+            return;
+        }
+        if (!serverbound && name == "container_open") {
+            try {
+                std::lock_guard decodeLock(itemDecodeMutex);
+                bedrock::RelayPacketEvent decoded(
+                    version,
+                    event,
+                    itemProtocolVariables,
+                    true
+                );
+                const auto* windowId = decoded.value("window_id");
+                const auto* windowType = decoded.value("window_type");
+                if (windowId != nullptr && windowType != nullptr) {
+                    std::lock_guard lock(mutex);
+                    openContainerWindowId = *windowId;
+                    openContainerWindowType = *windowType;
+                }
+            } catch (...) {
+            }
             return;
         }
         if (!serverbound && name == "start_game") {
@@ -3763,14 +5437,32 @@ struct RelayState {
             equipment = {};
             playerInventory.clear();
             playerInventoryReady = false;
+            selectedHotbarSlot = -1;
             pendingAutomationRequestId = 0;
             pendingAutomationNetworkId = 0;
             pendingAutomationStackId = 0;
             pendingAutomationEquipmentIndex = 0;
             pendingAutomationInventorySlot = 0;
+            pendingAutomationVariant = 0;
+            pendingAutomationSource = {};
+            pendingAutomationDestination = {};
+            resetAutomationVariantsLocked();
+            nextAutomationStackRequestId = -1;
+            nextAutomationLegacyTicket = 1'000'000;
+            openContainerWindowId = bedrock::ProtoDefValue::null();
+            openContainerWindowType = bedrock::ProtoDefValue::null();
             automationRetryAfterMs = 0;
             consecutiveAutomationFailures = 0;
             automationStatus = "Ожидание инвентаря";
+            areaFillRunning = false;
+            areaFillWaitingForBlocks = false;
+            areaFillRefillPending = false;
+            areaFillPlacementPending = false;
+            areaFillSyntheticPositionKnown = false;
+            areaFillStatus = areaFillCells.empty()
+                ? "Добавьте точки области"
+                : "Мир сменился — проверьте точки и запустите снова";
+            ++areaFillRevision;
             playerHealth = 20.0;
             playerMaximumHealth = 20.0;
             playerHunger = 20.0;
@@ -3833,12 +5525,20 @@ struct RelayState {
                 int32_t runtimeId = 0;
                 static_assert(sizeof(runtimeId) == sizeof(rawRuntimeId));
                 std::memcpy(&runtimeId, &rawRuntimeId, sizeof(runtimeId));
-                observeSchematicBlockUpdate(
-                    static_cast<int32_t>(decoded.getInt("position.x", 0)),
-                    static_cast<int32_t>(decoded.getInt("position.y", 0)),
-                    static_cast<int32_t>(decoded.getInt("position.z", 0)),
-                    runtimeId
-                );
+                const auto blockX = static_cast<int32_t>(decoded.getInt(
+                    "position.x",
+                    0
+                ));
+                const auto blockY = static_cast<int32_t>(decoded.getInt(
+                    "position.y",
+                    0
+                ));
+                const auto blockZ = static_cast<int32_t>(decoded.getInt(
+                    "position.z",
+                    0
+                ));
+                observeSchematicBlockUpdate(blockX, blockY, blockZ, runtimeId);
+                observeAreaFillWorldUpdate(blockX, blockY, blockZ);
             } catch (...) {
             }
             // Keep both the exact block cache and a visible minimap tile in
@@ -3927,6 +5627,7 @@ struct RelayState {
             name == "mob_armor_equipment" ||
             name == "inventory_content" ||
             name == "inventory_slot" ||
+            name == "item_stack_response" ||
             name == "player_armor_damage" ||
             name == "set_health" ||
             name == "update_attributes" ||
@@ -3941,6 +5642,81 @@ struct RelayState {
                 itemProtocolVariables,
                 true
             );
+            if (!serverbound && name == "item_stack_response") {
+                const auto* responses = decoded.value("responses");
+                if (responses == nullptr ||
+                    responses->kind != bedrock::PacketValue::Kind::Array) {
+                    return;
+                }
+                const auto numericValue = [](const auto* value) -> int64_t {
+                    if (value == nullptr) return 0;
+                    if (value->kind == bedrock::PacketValue::Kind::Int) {
+                        return value->intValue;
+                    }
+                    if (value->kind == bedrock::PacketValue::Kind::UInt) {
+                        return static_cast<int64_t>(value->uintValue);
+                    }
+                    return 0;
+                };
+                for (const auto& response : responses->arrayValue) {
+                    if (response.kind !=
+                        bedrock::PacketValue::Kind::Object) {
+                        continue;
+                    }
+                    const auto requestId = static_cast<int32_t>(numericValue(
+                        response.get("request_id")
+                    ));
+                    const auto* status = response.get("status");
+                    const bool numericStatus = status != nullptr &&
+                        (status->kind == bedrock::PacketValue::Kind::Int ||
+                         status->kind == bedrock::PacketValue::Kind::UInt);
+                    const bool accepted = status != nullptr &&
+                        ((status->kind ==
+                              bedrock::PacketValue::Kind::String &&
+                          status->stringValue == "ok") ||
+                         (numericStatus && numericValue(status) == 0));
+                    std::lock_guard lock(mutex);
+                    if (pendingAutomationRequestId != requestId ||
+                        pendingAutomationVariant >=
+                            AutomationPlan::ProtocolLegacyTransaction) {
+                        continue;
+                    }
+                    if (!accepted) {
+                        const auto failedVariant = pendingAutomationVariant;
+                        failAutomationVariantLocked(
+                            failedVariant,
+                            steadyMilliseconds(),
+                            "Сервер отклонил " + std::string(
+                                automationVariantName(failedVariant)
+                            )
+                        );
+                        continue;
+                    }
+
+                    // ItemStackResponse is the authoritative acknowledgement
+                    // used by weathertop's confirmed path. Apply the accepted
+                    // swap to the local cache even on servers that omit a
+                    // separate InventorySlot/MobEquipment broadcast.
+                    if (pendingAutomationEquipmentIndex < equipment.size()) {
+                        equipment[pendingAutomationEquipmentIndex] =
+                            pendingAutomationSource;
+                    }
+                    if (pendingAutomationInventorySlot <
+                        playerInventory.size()) {
+                        playerInventory[pendingAutomationInventorySlot] =
+                            pendingAutomationDestination;
+                    }
+                    clearPendingAutomationLocked();
+                    resetAutomationVariantsLocked();
+                    consecutiveAutomationFailures = 0;
+                    automationRetryAfterMs = steadyMilliseconds() + 250;
+                    ++automationAccepted;
+                    ++equipmentRevision;
+                    automationStatus =
+                        "ItemStackRequest подтверждён сервером";
+                }
+                return;
+            }
             if (!serverbound && name == "set_health") {
                 std::lock_guard lock(mutex);
                 playerHealth = std::max(
@@ -4079,6 +5855,12 @@ struct RelayState {
                         : std::size_t {0};
                 std::lock_guard lock(mutex);
                 equipment[equipmentIndex] = std::move(hand);
+                if (equipmentIndex == 0) {
+                    selectedHotbarSlot = static_cast<int32_t>(decoded.getInt(
+                        "selected_slot",
+                        decoded.getInt("slot", selectedHotbarSlot)
+                    ));
+                }
                 if (!serverbound) {
                     resolveLegacyAutomationLocked(equipmentIndex);
                 }
@@ -4259,14 +6041,32 @@ struct RelayState {
         equipment = {};
         playerInventory.clear();
         playerInventoryReady = false;
+        selectedHotbarSlot = -1;
         pendingAutomationRequestId = 0;
         pendingAutomationNetworkId = 0;
         pendingAutomationStackId = 0;
         pendingAutomationEquipmentIndex = 0;
         pendingAutomationInventorySlot = 0;
+        pendingAutomationVariant = 0;
+        pendingAutomationSource = {};
+        pendingAutomationDestination = {};
+        resetAutomationVariantsLocked();
+        nextAutomationStackRequestId = -1;
+        nextAutomationLegacyTicket = 1'000'000;
+        openContainerWindowId = bedrock::ProtoDefValue::null();
+        openContainerWindowType = bedrock::ProtoDefValue::null();
         automationRetryAfterMs = 0;
         consecutiveAutomationFailures = 0;
         automationStatus = "Ожидание инвентаря";
+        areaFillRunning = false;
+        areaFillWaitingForBlocks = false;
+        areaFillRefillPending = false;
+        areaFillPlacementPending = false;
+        areaFillSyntheticPositionKnown = false;
+        areaFillStatus = areaFillCells.empty()
+            ? "Добавьте точки области"
+            : "Сессия завершена — запустите заполнение снова";
+        ++areaFillRevision;
         playerHealth = 20.0;
         playerMaximumHealth = 20.0;
         playerHunger = 20.0;
@@ -4298,18 +6098,20 @@ struct RelayState {
             miniMap,
             std::memory_order_relaxed
         );
+        const bool tracking = schematic ||
+            areaFillEnabled.load(std::memory_order_relaxed);
         const bool wasTracking = schematicWorldTrackingActive.exchange(
-            schematic,
+            tracking,
             std::memory_order_relaxed
         );
         const bool wasSchematic = schematicEnabled.exchange(
             schematic,
             std::memory_order_relaxed
         );
-        if (wasSchematic != schematic || wasTracking != schematic ||
+        if (wasSchematic != schematic || wasTracking != tracking ||
             wasMiniMap != miniMap) {
             std::lock_guard worldLock(miniMapMutex);
-            if (!schematic && !miniMap) {
+            if (!tracking && !miniMap) {
                 invalidateMiniMapQueueGapLocked(
                     std::numeric_limits<uint64_t>::max()
                 );
@@ -4320,12 +6122,14 @@ struct RelayState {
         if (!armor && !totem) {
             std::lock_guard lock(mutex);
             clearPendingAutomationLocked();
+            resetAutomationVariantsLocked();
             automationRetryAfterMs = 0;
             consecutiveAutomationFailures = 0;
             automationStatus = "Автоматизация выключена";
         } else if ((!wasArmor && armor) || (!wasTotem && totem)) {
             std::lock_guard lock(mutex);
             clearPendingAutomationLocked();
+            resetAutomationVariantsLocked();
             automationRetryAfterMs = 0;
             consecutiveAutomationFailures = 0;
             automationStatus = playerInventoryReady
@@ -4811,6 +6615,7 @@ bedrock::JsRuntimeValue snapshotValue(
         {"automationStatus", bedrock::JsRuntimeValue::string(
             state->automationStatus
         )},
+        {"areaFill", state->areaFillSnapshotValueLocked()},
         {"playerHealthKnown", bedrock::JsRuntimeValue::boolean(
             state->playerHealthKnown
         )},
@@ -4985,7 +6790,11 @@ struct ActiveSchematicDebugShape {
     uint64_t networkId = 0;
 };
 
-constexpr std::size_t MaximumSchematicDebugShapes = 3'600;
+// Retail clients keep every persistent ServerScriptDebugDrawer shape in an
+// internal registry. A large moving schematic used to grow that registry by
+// thousands of IDs during a long session even when removal packets were
+// delayed. Keep a small nearest-first window and renew it with a finite TTL.
+constexpr std::size_t MaximumSchematicDebugShapes = 512;
 // Keep only one slightly expanded shell. The previous exact+expanded pair
 // produced doubled edges and visible inner seams on multipart blocks.
 constexpr std::size_t SchematicOutlineLayers = 1;
@@ -5099,7 +6908,12 @@ constexpr uint64_t SchematicDebugNetworkIdBase = 0x4350450000000000ULL;
 // transformed Bedrock runtime state. They never enter the authoritative chunk
 // and use a separate ID range from debug shapes.
 constexpr uint64_t SchematicTextureActorIdBase = 0x4350451000000000ULL;
+constexpr uint64_t AreaFillDebugNetworkIdBase = 0x4350452000000000ULL;
 constexpr std::size_t MaximumSchematicTextureActors = 1'800;
+constexpr std::size_t MaximumAreaFillDebugShapes = 384;
+constexpr uint64_t DebugShapeRenewIntervalMilliseconds = 4'000;
+constexpr uint64_t AreaFillWindowRefreshMilliseconds = 750;
+constexpr double DebugShapeLifetimeSeconds = 8.0;
 // Keep each clientbound operation comfortably bounded for RakNet queueing and
 // as a defence-in-depth limit against oversized schematic allocations, while
 // retaining stable keyed IDs across every batch.
@@ -5257,7 +7071,12 @@ bedrock::VersionedGamePacket makeSchematicScriptDebugDrawerPacket(
             )},
             {"scale", bedrock::ProtoDefValue::floating(1.0)},
             {"rotation", bedrock::ProtoDefValue::null()},
-            {"time_left", bedrock::ProtoDefValue::null()},
+            // A finite lifetime is a safety net for a dropped removal packet:
+            // stale client-side shapes disappear without requiring a global
+            // debug-drawer clear. Active plans are renewed before expiry.
+            {"time_left", bedrock::ProtoDefValue::floating(
+                DebugShapeLifetimeSeconds
+            )},
             {"color", bedrock::ProtoDefValue::integer(
                 schematicDebugArgb(
                     shape.status,
@@ -5839,7 +7658,7 @@ public:
             );
             state->flushFlight("relay_parse_error");
         });
-        relay->live().onServerbound([state, version](
+        relay->live().onServerbound([this, state, version](
             bedrock::BedrockRelayPacketEvent& event
         ) {
             bool positionObserved = false;
@@ -5906,7 +7725,16 @@ public:
                 state->entityPositions.observeServerbound(event.packet);
             }
             state->observeDecodedGameplayPacket(version, event, true);
-            state->maybeInjectAutomation(version, event);
+            const bool areaFillOwnedPacket = state->maybeInjectAreaFill(
+                version,
+                event
+            );
+            if (areaFillOwnedPacket) {
+                refreshAreaFillDebugMarkers();
+                syncAreaFillDownstreamMovement();
+            } else {
+                state->maybeInjectAutomation(version, event);
+            }
             if (isResourcePackTransportPacket(event.packet.name)) {
                 const auto sampleIndex =
                     state->resourcePackPacketsSeen.fetch_add(
@@ -5947,6 +7775,10 @@ public:
             state->entityPositions.observeClientbound(event.packet);
             state->observeDecodedGameplayPacket(version, event, false);
             state->enqueueMiniMapChunk(version, event.packet);
+            if (event.packet.name == "update_block" ||
+                event.packet.name == "update_block_synced") {
+                refreshAreaFillDebugMarkers();
+            }
             if (event.packet.name == "start_game" ||
                 event.packet.name == "change_dimension") {
                 if (auto clearPackets = takeSchematicLifecycleClear(version);
@@ -6438,6 +8270,7 @@ public:
     ) noexcept {
         try {
             std::lock_guard sendLock(schematicSendMutex_);
+            const uint64_t publishNow = steadyMilliseconds();
             if (!state_->schematicSnapshotMatches(
                     expectedWorldRevision,
                     expectedDimension
@@ -6569,6 +8402,7 @@ public:
             int32_t previousCorrectColor = 0;
             int32_t previousWrongColor = 0;
             int32_t previousMissingColor = 0;
+            uint64_t previousDebugPublishedAtMs = 0;
             {
                 std::lock_guard markerLock(schematicMarkerMutex_);
                 if (!state_->schematicSnapshotMatches(
@@ -6606,18 +8440,25 @@ public:
                             return desired == active.shape;
                         }
                     );
+                const bool debugRenewalDue = scriptDebug &&
+                    !debugShapes.empty() &&
+                    (lastSchematicDebugPublishAtMs_ == 0 ||
+                     publishNow - lastSchematicDebugPublishAtMs_ >=
+                        DebugShapeRenewIntervalMilliseconds);
                 if (debugShapesUnchanged &&
                     textureActorsUnchanged &&
                     (debugShapes.empty() ||
                      (outlineOpacityPercent == activeSchematicOpacity_ &&
                       correctOutlineColor == activeSchematicCorrectColor_ &&
                       wrongOutlineColor == activeSchematicWrongColor_ &&
-                      missingOutlineColor == activeSchematicMissingColor_))) {
+                      missingOutlineColor == activeSchematicMissingColor_)) &&
+                    !debugRenewalDue) {
                     return true;
                 }
                 if (!schematicDownstream_.has_value()) {
                     activeSchematicDebugShapes_.clear();
                     activeSchematicTextureActors_.clear();
+                    lastSchematicDebugPublishAtMs_ = 0;
                     activeSchematicOpacity_ = outlineOpacityPercent;
                     activeSchematicCorrectColor_ = correctOutlineColor;
                     activeSchematicWrongColor_ = wrongOutlineColor;
@@ -6639,6 +8480,8 @@ public:
                 previousCorrectColor = activeSchematicCorrectColor_;
                 previousWrongColor = activeSchematicWrongColor_;
                 previousMissingColor = activeSchematicMissingColor_;
+                previousDebugPublishedAtMs =
+                    lastSchematicDebugPublishAtMs_;
             }
 
             std::vector<ActiveSchematicTextureActor> nextTextureActors;
@@ -6687,9 +8530,26 @@ public:
             std::vector<ActiveSchematicDebugShape> nextDebugShapes;
             std::vector<ActiveSchematicDebugShape> changedDebugShapes;
             std::vector<uint64_t> removedDebugShapeIds;
+            std::vector<uint64_t> reusableDebugShapeIds;
             nextDebugShapes.reserve(debugShapes.size());
             changedDebugShapes.reserve(debugShapes.size());
             removedDebugShapeIds.reserve(previousDebugShapes.size());
+            reusableDebugShapeIds.reserve(previousDebugShapes.size());
+            for (const auto& previous : previousDebugShapes) {
+                const auto found = std::lower_bound(
+                    debugShapes.begin(),
+                    debugShapes.end(),
+                    previous.shape.key,
+                    [](const auto& shape, const auto& key) {
+                        return shape.key < key;
+                    }
+                );
+                if (found == debugShapes.end() ||
+                    found->key != previous.shape.key) {
+                    reusableDebugShapeIds.push_back(previous.networkId);
+                }
+            }
+            std::size_t reusableDebugShapeIndex = 0;
             previousIndex = 0;
             desiredIndex = 0;
             while (previousIndex < previousDebugShapes.size() ||
@@ -6706,14 +8566,21 @@ public:
                 if (previousIndex >= previousDebugShapes.size() ||
                     debugShapes[desiredIndex].key <
                         previousDebugShapes[previousIndex].shape.key) {
-                    if (nextDebugShapeId >= SchematicTextureActorIdBase) {
+                    if (reusableDebugShapeIndex >=
+                            reusableDebugShapeIds.size() &&
+                        nextDebugShapeId >= SchematicTextureActorIdBase) {
                         throw std::overflow_error(
                             "schematic debug shape id space exhausted"
                         );
                     }
                     ActiveSchematicDebugShape added {
                         debugShapes[desiredIndex++],
-                        nextDebugShapeId++
+                        reusableDebugShapeIndex <
+                                reusableDebugShapeIds.size()
+                            ? reusableDebugShapeIds[
+                                reusableDebugShapeIndex++
+                            ]
+                            : nextDebugShapeId++
                     };
                     nextDebugShapes.push_back(added);
                     changedDebugShapes.push_back(std::move(added));
@@ -6725,6 +8592,9 @@ public:
                 };
                 if (retained.shape !=
                         previousDebugShapes[previousIndex].shape ||
+                    (scriptDebug &&
+                     publishNow - previousDebugPublishedAtMs >=
+                        DebugShapeRenewIntervalMilliseconds) ||
                     outlineOpacityPercent != previousOpacity ||
                     correctOutlineColor != previousCorrectColor ||
                     wrongOutlineColor != previousWrongColor ||
@@ -6781,9 +8651,24 @@ public:
                     }
                 }
 
-                // Stable keys retain the same network ID when status or
-                // geometry changes. Publish replacements first, then remove
-                // only the exact IDs whose block/part disappeared.
+                // Remove vanished/recycled IDs before publishing their
+                // replacements. This bounds the retail client's live shape
+                // registry even while several RakNet batches are queued.
+                for (std::size_t offset = 0;
+                     offset < removedDebugShapeIds.size();
+                     offset += SchematicDebugShapesPerPacket) {
+                    const auto count = std::min(
+                        SchematicDebugShapesPerPacket,
+                        removedDebugShapeIds.size() - offset
+                    );
+                    packets.push_back(makeSchematicScriptDebugRemovalPacket(
+                        debugEncoder,
+                        debugCodec.packetCodec(),
+                        removedDebugShapeIds,
+                        offset,
+                        count
+                    ));
+                }
                 for (std::size_t offset = 0;
                      offset < changedDebugShapes.size();
                      offset += SchematicDebugShapesPerPacket) {
@@ -6800,21 +8685,6 @@ public:
                         correctOutlineColor,
                         wrongOutlineColor,
                         missingOutlineColor,
-                        offset,
-                        count
-                    ));
-                }
-                for (std::size_t offset = 0;
-                     offset < removedDebugShapeIds.size();
-                     offset += SchematicDebugShapesPerPacket) {
-                    const auto count = std::min(
-                        SchematicDebugShapesPerPacket,
-                        removedDebugShapeIds.size() - offset
-                    );
-                    packets.push_back(makeSchematicScriptDebugRemovalPacket(
-                        debugEncoder,
-                        debugCodec.packetCodec(),
-                        removedDebugShapeIds,
                         offset,
                         count
                     ));
@@ -6867,6 +8737,9 @@ public:
                     activeSchematicMissingColor_ = missingOutlineColor;
                     nextSchematicDebugShapeId_ = nextDebugShapeId;
                     nextSchematicTextureActorId_ = nextTextureActorId;
+                    lastSchematicDebugPublishAtMs_ = debugShapes.empty()
+                        ? 0
+                        : publishNow;
                 }
             }
             if (!queued || staleLifecycle || staleDimension) {
@@ -6903,6 +8776,7 @@ public:
                     activeSchematicDebugShapes_.clear();
                     activeSchematicTextureActors_.clear();
                     activeSchematicOpacity_ = 0;
+                    lastSchematicDebugPublishAtMs_ = 0;
                     ++schematicMarkerGeneration_;
                 }
                 resetSchematicCounters();
@@ -6961,6 +8835,288 @@ public:
         }
     }
 
+    void refreshAreaFillDebugMarkers() noexcept {
+        uint64_t attemptedRevision = 0;
+        try {
+            const uint64_t refreshNow = steadyMilliseconds();
+            uint64_t publishedRevision = 0;
+            bool refreshMovingWindow = false;
+            bool renewActiveShapes = false;
+            {
+                std::lock_guard markerLock(schematicMarkerMutex_);
+                if (areaFillRendererDisabledForSession_) return;
+                publishedRevision = publishedAreaFillRevision_;
+                refreshMovingWindow =
+                    lastAreaFillWindowRefreshAtMs_ == 0 ||
+                    refreshNow - lastAreaFillWindowRefreshAtMs_ >=
+                        AreaFillWindowRefreshMilliseconds;
+                renewActiveShapes = !activeAreaFillDebugShapes_.empty() &&
+                    (lastAreaFillDebugPublishAtMs_ == 0 ||
+                     refreshNow - lastAreaFillDebugPublishAtMs_ >=
+                        DebugShapeRenewIntervalMilliseconds);
+            }
+            const auto [revision, markers] = state_->areaFillMarkersSnapshot(
+                refreshMovingWindow || renewActiveShapes
+                    ? std::numeric_limits<uint64_t>::max()
+                    : publishedRevision
+            );
+            attemptedRevision = revision;
+            if (revision == publishedRevision && !refreshMovingWindow &&
+                !renewActiveShapes) return;
+            std::lock_guard sendLock(schematicSendMutex_);
+            std::optional<bedrock::BedrockServerConnection> downstream;
+            std::string downstreamSessionId;
+            uint64_t markerGeneration = 0;
+            std::vector<ActiveSchematicDebugShape> previousShapes;
+            uint64_t nextShapeId = AreaFillDebugNetworkIdBase;
+            uint64_t previousPublishAtMs = 0;
+            {
+                std::lock_guard markerLock(schematicMarkerMutex_);
+                if (revision == publishedAreaFillRevision_ &&
+                    !refreshMovingWindow && !renewActiveShapes) return;
+                downstream = schematicDownstream_;
+                downstreamSessionId = schematicDownstreamSessionId_;
+                markerGeneration = schematicMarkerGeneration_;
+                previousShapes = activeAreaFillDebugShapes_;
+                nextShapeId = nextAreaFillDebugShapeId_;
+                previousPublishAtMs = lastAreaFillDebugPublishAtMs_;
+            }
+            if (!downstream.has_value() ||
+                !supportsSchematicScriptDebugDrawer(state_->version)) {
+                return;
+            }
+
+            std::vector<SchematicDebugShape> desired;
+            desired.reserve(markers.size());
+            for (const auto& marker : markers) {
+                desired.push_back({
+                    {marker.x, marker.y, marker.z, 0},
+                    marker.status,
+                    bedrock::BlockShape {
+                        -0.035, -0.035, -0.035,
+                        1.035, 1.035, 1.035
+                    }
+                });
+            }
+            std::sort(desired.begin(), desired.end(), [](const auto& a, const auto& b) {
+                return a.key < b.key;
+            });
+            if (desired.size() > MaximumAreaFillDebugShapes) {
+                desired.resize(MaximumAreaFillDebugShapes);
+            }
+
+            std::vector<ActiveSchematicDebugShape> nextShapes;
+            std::vector<ActiveSchematicDebugShape> changedShapes;
+            std::vector<uint64_t> removedIds;
+            std::vector<uint64_t> reusableIds;
+            nextShapes.reserve(desired.size());
+            changedShapes.reserve(desired.size());
+            removedIds.reserve(previousShapes.size());
+            reusableIds.reserve(previousShapes.size());
+            for (const auto& previous : previousShapes) {
+                const auto found = std::lower_bound(
+                    desired.begin(),
+                    desired.end(),
+                    previous.shape.key,
+                    [](const auto& shape, const auto& key) {
+                        return shape.key < key;
+                    }
+                );
+                if (found == desired.end() ||
+                    found->key != previous.shape.key) {
+                    reusableIds.push_back(previous.networkId);
+                }
+            }
+            std::size_t reusableIndex = 0;
+            std::size_t previousIndex = 0;
+            std::size_t desiredIndex = 0;
+            while (previousIndex < previousShapes.size() ||
+                   desiredIndex < desired.size()) {
+                if (desiredIndex >= desired.size() ||
+                    (previousIndex < previousShapes.size() &&
+                     previousShapes[previousIndex].shape.key <
+                        desired[desiredIndex].key)) {
+                    removedIds.push_back(previousShapes[previousIndex++].networkId);
+                    continue;
+                }
+                if (previousIndex >= previousShapes.size() ||
+                    desired[desiredIndex].key <
+                        previousShapes[previousIndex].shape.key) {
+                    ActiveSchematicDebugShape added {
+                        desired[desiredIndex++],
+                        reusableIndex < reusableIds.size()
+                            ? reusableIds[reusableIndex++]
+                            : nextShapeId++
+                    };
+                    nextShapes.push_back(added);
+                    changedShapes.push_back(std::move(added));
+                    continue;
+                }
+                ActiveSchematicDebugShape retained {
+                    desired[desiredIndex],
+                    previousShapes[previousIndex].networkId
+                };
+                if (retained.shape != previousShapes[previousIndex].shape ||
+                    renewActiveShapes ||
+                    previousPublishAtMs == 0 ||
+                    refreshNow - previousPublishAtMs >=
+                        DebugShapeRenewIntervalMilliseconds) {
+                    changedShapes.push_back(retained);
+                }
+                nextShapes.push_back(std::move(retained));
+                ++previousIndex;
+                ++desiredIndex;
+            }
+
+            bedrock::ProtoDefPacketEncoder encoder(state_->version);
+            const auto codec = bedrock::VersionedMcpeCodec::forVersion(
+                state_->version
+            );
+            std::vector<bedrock::VersionedGamePacket> packets;
+            packets.reserve(
+                schematicDebugBatchCount(changedShapes.size()) +
+                schematicDebugBatchCount(removedIds.size())
+            );
+            for (std::size_t offset = 0;
+                 offset < removedIds.size();
+                 offset += SchematicDebugShapesPerPacket) {
+                const auto count = std::min(
+                    SchematicDebugShapesPerPacket,
+                    removedIds.size() - offset
+                );
+                packets.push_back(makeSchematicScriptDebugRemovalPacket(
+                    encoder,
+                    codec.packetCodec(),
+                    removedIds,
+                    offset,
+                    count
+                ));
+            }
+            for (std::size_t offset = 0;
+                 offset < changedShapes.size();
+                 offset += SchematicDebugShapesPerPacket) {
+                const auto count = std::min(
+                    SchematicDebugShapesPerPacket,
+                    changedShapes.size() - offset
+                );
+                packets.push_back(makeSchematicScriptDebugDrawerPacket(
+                    encoder,
+                    codec.packetCodec(),
+                    state_->version,
+                    changedShapes,
+                    76,
+                    0xff36d67e,
+                    0xff4fd5ff,
+                    0xffffb52e,
+                    offset,
+                    count
+                ));
+            }
+            const bool queued = queueSchematicPacketsBatched(
+                *downstream,
+                packets
+            );
+            const bool publishedShapes = !changedShapes.empty();
+            const bool hasNextShapes = !nextShapes.empty();
+            std::lock_guard markerLock(schematicMarkerMutex_);
+            if (queued && markerGeneration == schematicMarkerGeneration_ &&
+                downstreamSessionId == schematicDownstreamSessionId_) {
+                activeAreaFillDebugShapes_ = std::move(nextShapes);
+                nextAreaFillDebugShapeId_ = nextShapeId;
+                publishedAreaFillRevision_ = revision;
+                lastAreaFillWindowRefreshAtMs_ = refreshNow;
+                if (!hasNextShapes) {
+                    lastAreaFillDebugPublishAtMs_ = 0;
+                } else if (publishedShapes) {
+                    lastAreaFillDebugPublishAtMs_ = refreshNow;
+                }
+            }
+        } catch (const std::exception& error) {
+            {
+                std::lock_guard markerLock(schematicMarkerMutex_);
+                areaFillRendererDisabledForSession_ = true;
+                if (attemptedRevision != 0) {
+                    publishedAreaFillRevision_ = attemptedRevision;
+                }
+            }
+            state_->push(
+                "area_fill_renderer_failed",
+                safeMessage(error.what()) +
+                    "; подсветка отключена до следующего подключения",
+                "WARN",
+                "area_fill"
+            );
+        } catch (...) {
+            std::lock_guard markerLock(schematicMarkerMutex_);
+            areaFillRendererDisabledForSession_ = true;
+            if (attemptedRevision != 0) {
+                publishedAreaFillRevision_ = attemptedRevision;
+            }
+        }
+    }
+
+    void syncAreaFillDownstreamMovement() noexcept {
+        try {
+            std::optional<bedrock::BedrockServerConnection> downstream;
+            std::string downstreamSessionId;
+            uint64_t publishedRevision = 0;
+            {
+                std::lock_guard markerLock(schematicMarkerMutex_);
+                downstream = schematicDownstream_;
+                downstreamSessionId = schematicDownstreamSessionId_;
+                publishedRevision = publishedAreaFillMovementRevision_;
+            }
+            if (!downstream.has_value()) return;
+            auto update = state_->areaFillMovementSyncPacket(
+                state_->version,
+                publishedRevision
+            );
+            if (!update.has_value()) return;
+            const std::vector<bedrock::VersionedGamePacket> packets {
+                update->second
+            };
+            if (!queueSchematicPacketsBatched(*downstream, packets)) {
+                state_->stopAreaFill(
+                    "Автопроход остановлен: Minecraft не принял перемещение"
+                );
+                return;
+            }
+            std::lock_guard markerLock(schematicMarkerMutex_);
+            if (schematicDownstream_.has_value() &&
+                schematicDownstreamSessionId_ == downstreamSessionId) {
+                publishedAreaFillMovementRevision_ = update->first;
+            }
+        } catch (...) {
+            state_->stopAreaFill(
+                "Автопроход остановлен: ошибка синхронизации Minecraft"
+            );
+        }
+    }
+
+    void clearAreaFillDebugMarkers() noexcept {
+        try {
+            std::lock_guard sendLock(schematicSendMutex_);
+            std::optional<bedrock::BedrockServerConnection> downstream;
+            std::vector<ActiveSchematicDebugShape> shapes;
+            {
+                std::lock_guard markerLock(schematicMarkerMutex_);
+                downstream = schematicDownstream_;
+                shapes = activeAreaFillDebugShapes_;
+                activeAreaFillDebugShapes_.clear();
+                publishedAreaFillRevision_ = 0;
+                lastAreaFillWindowRefreshAtMs_ = 0;
+                lastAreaFillDebugPublishAtMs_ = 0;
+                ++schematicMarkerGeneration_;
+            }
+            if (!downstream.has_value() || shapes.empty()) return;
+            queueSchematicPacketsBatched(
+                *downstream,
+                makeSchematicDebugClearPackets(state_->version, shapes)
+            );
+        } catch (...) {
+        }
+    }
+
     void clearSchematicDebugMarkers(bool resetCounters = true) noexcept {
         try {
             std::lock_guard sendLock(schematicSendMutex_);
@@ -6981,6 +9137,7 @@ public:
                     activeSchematicDebugShapes_.clear();
                     activeSchematicTextureActors_.clear();
                     activeSchematicOpacity_ = 0;
+                    lastSchematicDebugPublishAtMs_ = 0;
                     return;
                 }
             }
@@ -7011,6 +9168,7 @@ public:
                         activeSchematicDebugShapes_.clear();
                         activeSchematicTextureActors_.clear();
                         activeSchematicOpacity_ = 0;
+                        lastSchematicDebugPublishAtMs_ = 0;
                     }
                 }
                 state_->schematicMarkerPackets.fetch_add(
@@ -7060,8 +9218,16 @@ private:
     std::string schematicDownstreamSessionId_;
     std::vector<ActiveSchematicDebugShape> activeSchematicDebugShapes_;
     std::vector<ActiveSchematicTextureActor> activeSchematicTextureActors_;
+    std::vector<ActiveSchematicDebugShape> activeAreaFillDebugShapes_;
     uint64_t nextSchematicDebugShapeId_ = SchematicDebugNetworkIdBase;
     uint64_t nextSchematicTextureActorId_ = SchematicTextureActorIdBase;
+    uint64_t nextAreaFillDebugShapeId_ = AreaFillDebugNetworkIdBase;
+    uint64_t publishedAreaFillRevision_ = 0;
+    uint64_t publishedAreaFillMovementRevision_ = 0;
+    uint64_t lastSchematicDebugPublishAtMs_ = 0;
+    uint64_t lastAreaFillWindowRefreshAtMs_ = 0;
+    uint64_t lastAreaFillDebugPublishAtMs_ = 0;
+    bool areaFillRendererDisabledForSession_ = false;
     int activeSchematicOpacity_ = 0;
     int32_t activeSchematicCorrectColor_ = 0;
     int32_t activeSchematicWrongColor_ = 0;
@@ -7129,8 +9295,16 @@ private:
         schematicDownstreamSessionId_ = std::move(sessionId);
         activeSchematicDebugShapes_.clear();
         activeSchematicTextureActors_.clear();
+        activeAreaFillDebugShapes_.clear();
         nextSchematicDebugShapeId_ = SchematicDebugNetworkIdBase;
         nextSchematicTextureActorId_ = SchematicTextureActorIdBase;
+        nextAreaFillDebugShapeId_ = AreaFillDebugNetworkIdBase;
+        publishedAreaFillRevision_ = 0;
+        publishedAreaFillMovementRevision_ = 0;
+        lastSchematicDebugPublishAtMs_ = 0;
+        lastAreaFillWindowRefreshAtMs_ = 0;
+        lastAreaFillDebugPublishAtMs_ = 0;
+        areaFillRendererDisabledForSession_ = false;
         activeSchematicOpacity_ = 0;
         resetSchematicCounters();
     }
@@ -7143,8 +9317,16 @@ private:
         schematicDownstreamSessionId_.clear();
         activeSchematicDebugShapes_.clear();
         activeSchematicTextureActors_.clear();
+        activeAreaFillDebugShapes_.clear();
         nextSchematicDebugShapeId_ = SchematicDebugNetworkIdBase;
         nextSchematicTextureActorId_ = SchematicTextureActorIdBase;
+        nextAreaFillDebugShapeId_ = AreaFillDebugNetworkIdBase;
+        publishedAreaFillRevision_ = 0;
+        publishedAreaFillMovementRevision_ = 0;
+        lastSchematicDebugPublishAtMs_ = 0;
+        lastAreaFillWindowRefreshAtMs_ = 0;
+        lastAreaFillDebugPublishAtMs_ = 0;
+        areaFillRendererDisabledForSession_ = false;
         activeSchematicOpacity_ = 0;
         resetSchematicCounters();
     }
@@ -7158,11 +9340,18 @@ private:
             // can still race an in-flight first publication.
             ++schematicMarkerGeneration_;
             if (activeSchematicDebugShapes_.empty() &&
-                activeSchematicTextureActors_.empty()) return std::nullopt;
+                activeSchematicTextureActors_.empty() &&
+                activeAreaFillDebugShapes_.empty()) return std::nullopt;
             const auto debugShapes = activeSchematicDebugShapes_;
             const auto textureActors = activeSchematicTextureActors_;
+            const auto areaShapes = activeAreaFillDebugShapes_;
             activeSchematicDebugShapes_.clear();
             activeSchematicTextureActors_.clear();
+            activeAreaFillDebugShapes_.clear();
+            publishedAreaFillRevision_ = 0;
+            lastSchematicDebugPublishAtMs_ = 0;
+            lastAreaFillWindowRefreshAtMs_ = 0;
+            lastAreaFillDebugPublishAtMs_ = 0;
             activeSchematicOpacity_ = 0;
             state_->schematicDisplayedMarkers.store(0, std::memory_order_relaxed);
             state_->schematicCorrectBlocks.store(0, std::memory_order_relaxed);
@@ -7172,6 +9361,15 @@ private:
             auto packets = makeSchematicDebugClearPackets(
                 version,
                 debugShapes
+            );
+            auto areaPackets = makeSchematicDebugClearPackets(
+                version,
+                areaShapes
+            );
+            packets.insert(
+                packets.end(),
+                std::make_move_iterator(areaPackets.begin()),
+                std::make_move_iterator(areaPackets.end())
             );
             bedrock::ProtoDefPacketEncoder encoder(version);
             const auto codec = bedrock::VersionedMcpeCodec::forVersion(
@@ -7402,6 +9600,10 @@ Java_com_m9chko_bedrockrelay_NativeBridge_startRelay(
         configuredMiniMap.load(std::memory_order_relaxed),
         configuredSchematic.load(std::memory_order_relaxed)
     );
+    state->configureAreaFill(
+        configuredAreaFill.load(std::memory_order_relaxed),
+        configuredAreaFillPoints.load(std::memory_order_relaxed)
+    );
     try {
         initializeJavaBridge(environment, bridgeClass);
         const auto destinationHost = fromJavaString(
@@ -7613,6 +9815,109 @@ Java_com_m9chko_bedrockrelay_NativeBridge_configureGameplayFeatures(
     if (activeController && !schematic) {
         activeController->clearSchematicDebugMarkers();
     }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_m9chko_bedrockrelay_NativeBridge_configureAreaFill(
+    JNIEnv*,
+    jclass,
+    jboolean enabledValue,
+    jint requiredPointsValue
+) {
+    const bool enabled = enabledValue == JNI_TRUE;
+    const int requiredPoints = std::clamp(
+        static_cast<int>(requiredPointsValue),
+        2,
+        8
+    );
+    configuredAreaFill.store(enabled, std::memory_order_relaxed);
+    configuredAreaFillPoints.store(requiredPoints, std::memory_order_relaxed);
+
+    std::shared_ptr<RelayState> state;
+    std::shared_ptr<RelayController> activeController;
+    {
+        std::lock_guard lock(controllerMutex);
+        state = currentState;
+        activeController = controller;
+    }
+    if (state) state->configureAreaFill(enabled, requiredPoints);
+    if (activeController) {
+        if (enabled) activeController->refreshAreaFillDebugMarkers();
+        else activeController->clearAreaFillDebugMarkers();
+    }
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_m9chko_bedrockrelay_NativeBridge_areaFillSnapshot(
+    JNIEnv* environment,
+    jclass
+) {
+    std::shared_ptr<RelayState> state;
+    {
+        std::lock_guard lock(controllerMutex);
+        state = currentState;
+    }
+    const auto value = state
+        ? state->areaFillSnapshotValue()
+        : bedrock::JsRuntimeValue::object({});
+    return toJavaString(environment, jsonString(value));
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_m9chko_bedrockrelay_NativeBridge_captureAreaFillPoint(
+    JNIEnv* environment,
+    jclass
+) {
+    std::shared_ptr<RelayState> state;
+    std::shared_ptr<RelayController> activeController;
+    {
+        std::lock_guard lock(controllerMutex);
+        state = currentState;
+        activeController = controller;
+    }
+    const auto value = state
+        ? state->captureAreaFillPoint()
+        : bedrock::JsRuntimeValue::object({});
+    if (activeController) activeController->refreshAreaFillDebugMarkers();
+    return toJavaString(environment, jsonString(value));
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_m9chko_bedrockrelay_NativeBridge_clearAreaFill(
+    JNIEnv* environment,
+    jclass
+) {
+    std::shared_ptr<RelayState> state;
+    std::shared_ptr<RelayController> activeController;
+    {
+        std::lock_guard lock(controllerMutex);
+        state = currentState;
+        activeController = controller;
+    }
+    const auto value = state
+        ? state->clearAreaFill()
+        : bedrock::JsRuntimeValue::object({});
+    if (activeController) activeController->refreshAreaFillDebugMarkers();
+    return toJavaString(environment, jsonString(value));
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_m9chko_bedrockrelay_NativeBridge_toggleAreaFill(
+    JNIEnv* environment,
+    jclass
+) {
+    std::shared_ptr<RelayState> state;
+    std::shared_ptr<RelayController> activeController;
+    {
+        std::lock_guard lock(controllerMutex);
+        state = currentState;
+        activeController = controller;
+    }
+    const auto value = state
+        ? state->toggleAreaFill()
+        : bedrock::JsRuntimeValue::object({});
+    if (activeController) activeController->refreshAreaFillDebugMarkers();
+    return toJavaString(environment, jsonString(value));
 }
 
 extern "C" JNIEXPORT void JNICALL

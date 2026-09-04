@@ -43,6 +43,10 @@ final class SchematicOverlayController {
     private static final long PLACEMENT_SETTLE_MILLIS = 350L;
     private static final long DEBUG_MARKER_RETRY_INITIAL_MILLIS = 1_000L;
     private static final long DEBUG_MARKER_RETRY_MAX_MILLIS = 30_000L;
+    // Native debug shapes have a finite lifetime so a lost remove packet
+    // cannot leak them for the rest of a long Minecraft session. Republish
+    // the unchanged outline plan before that lifetime expires.
+    private static final long DEBUG_MARKER_RENEW_MILLIS = 4_000L;
     private static final long FORCE_BLOCK_SNAPSHOT = Long.MIN_VALUE;
     private static final byte BLOCK_UNKNOWN = 0;
     private static final byte BLOCK_MISSING = 1;
@@ -96,6 +100,7 @@ final class SchematicOverlayController {
     private volatile boolean debugMarkerPlanPublished;
     private volatile long debugMarkerRetryAfterMs;
     private volatile long debugMarkerRetryDelayMs;
+    private volatile long debugMarkerLastPublishedAtMs;
     private volatile int publishedCameraChunkX = Integer.MIN_VALUE;
     private volatile int publishedCameraChunkY = Integer.MIN_VALUE;
     private volatile int publishedCameraChunkZ = Integer.MIN_VALUE;
@@ -644,6 +649,11 @@ final class SchematicOverlayController {
 
     private boolean shouldRefreshMarkersForCamera() {
         if (debugMarkersDirty) return true;
+        if (outlinesEnabled && debugMarkerPlanPublished &&
+            SystemClock.uptimeMillis() - debugMarkerLastPublishedAtMs >=
+                DEBUG_MARKER_RENEW_MILLIS) {
+            return true;
+        }
         EntityOutlineOverlayController.CameraSample camera = latestCamera;
         if (camera == null || !camera.known) return false;
         return blockCoordinate(camera.x) != publishedCameraChunkX ||
@@ -747,6 +757,7 @@ final class SchematicOverlayController {
             }
             debugMarkerPlanPublished = true;
             debugMarkersDirty = false;
+            debugMarkerLastPublishedAtMs = SystemClock.uptimeMillis();
             debugMarkerRetryAfterMs = 0L;
             debugMarkerRetryDelayMs = 0L;
             if (cameraKnown) {
@@ -774,6 +785,7 @@ final class SchematicOverlayController {
             }
             debugMarkerPlanPublished = false;
             debugMarkersDirty = true;
+            debugMarkerLastPublishedAtMs = 0L;
             saveProgress(null);
         }
     }

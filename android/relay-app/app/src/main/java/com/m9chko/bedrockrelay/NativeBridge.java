@@ -33,6 +33,19 @@ public final class NativeBridge {
         boolean schematicEnabled
     );
 
+    public static native void configureAreaFill(
+        boolean enabled,
+        int requiredPoints
+    );
+
+    public static native String areaFillSnapshot();
+
+    public static native String captureAreaFillPoint();
+
+    public static native String clearAreaFill();
+
+    public static native String toggleAreaFill();
+
     /** Releases optional world caches when Android reports memory pressure. */
     public static native void trimMemory(int level);
 

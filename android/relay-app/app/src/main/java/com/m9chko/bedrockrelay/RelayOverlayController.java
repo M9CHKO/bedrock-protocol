@@ -26,6 +26,8 @@ import android.widget.TextView;
 import com.m9chko.bedrockrelay.schematic.SchematicRepository;
 import com.m9chko.bedrockrelay.schematic.SchematicSourceFolder;
 
+import org.json.JSONObject;
+
 import java.util.List;
 import java.util.Locale;
 
@@ -48,6 +50,7 @@ final class RelayOverlayController {
     private TextView chunkStatus;
     private TextView miniMapStatus;
     private TextView automationStatus;
+    private TextView areaFillStatus;
     private TextView pageTitle;
     private TextView backButton;
     private LinearLayout pageContent;
@@ -77,6 +80,15 @@ final class RelayOverlayController {
     private boolean statusAutomationPending;
     private long statusAutomationAccepted;
     private long statusAutomationRejected;
+    private boolean statusAreaFillEnabled;
+    private boolean statusAreaFillRunning;
+    private boolean statusAreaFillWaiting;
+    private int statusAreaFillPointCount;
+    private int statusAreaFillRequiredPoints = 2;
+    private int statusAreaFillCellCount;
+    private int statusAreaFillCompleted;
+    private String statusAreaFillItem = "";
+    private String statusAreaFillText = "Добавьте точки области";
     private String schematicImportStatus = "";
     private boolean schematicImportError;
 
@@ -192,6 +204,7 @@ final class RelayOverlayController {
         chunkStatus = null;
         miniMapStatus = null;
         automationStatus = null;
+        areaFillStatus = null;
         pageTitle = null;
         backButton = null;
         pageContent = null;
@@ -298,6 +311,7 @@ final class RelayOverlayController {
         chunkStatus = null;
         miniMapStatus = null;
         automationStatus = null;
+        areaFillStatus = null;
         logText = null;
         backButton.setVisibility("home".equals(page) ? View.INVISIBLE : View.VISIBLE);
         switch (page) {
@@ -320,6 +334,10 @@ final class RelayOverlayController {
             case "automation":
                 pageTitle.setText("АВТОМАТИЗАЦИЯ");
                 buildAutomationPage(pageContent);
+                break;
+            case "area_fill":
+                pageTitle.setText("АВТОЗАПОЛНЕНИЕ");
+                buildAreaFillPage(pageContent);
                 break;
             case "threats":
                 pageTitle.setText("АНАЛИЗ УГРОЗ");
@@ -387,6 +405,11 @@ final class RelayOverlayController {
             "⇄  АВТО-ЭКИПИРОВКА",
             "Тотем в левую руку и лучшая броня",
             "automation"
+        ));
+        root.addView(menuCard(
+            "▧  АВТОЗАПОЛНЕНИЕ",
+            "Область по точкам • блок из руки • автопроход",
+            "area_fill"
         ));
         root.addView(sectionHeader("ДИАГНОСТИКА"));
         root.addView(menuCard(
@@ -1464,6 +1487,113 @@ final class RelayOverlayController {
         root.addView(note);
     }
 
+    private void buildAreaFillPage(LinearLayout root) {
+        root.addView(toggle(
+            "Включить модуль и плавающую кнопку",
+            RelayService.KEY_AREA_FILL_ENABLED,
+            false
+        ));
+
+        int points = RelayService.clampAreaFillPoints(preferences.getInt(
+            RelayService.KEY_AREA_FILL_POINTS,
+            2
+        ));
+        TextView pointsLabel = settingLabel(
+            "Точек области: " + points + (points == 2
+                ? " (прямоугольник)"
+                : " (полигон)")
+        );
+        root.addView(pointsLabel);
+        SeekBar pointsSlider = slider(
+            RelayService.MIN_AREA_FILL_POINTS,
+            RelayService.MAX_AREA_FILL_POINTS,
+            points
+        );
+        pointsSlider.setOnSeekBarChangeListener(seekListener(
+            value -> pointsLabel.setText(
+                "Точек области: " + value + (value == 2
+                    ? " (прямоугольник)"
+                    : " (полигон)")
+            ),
+            value -> saveInt(RelayService.KEY_AREA_FILL_POINTS, value)
+        ));
+        root.addView(pointsSlider);
+
+        int scale = RelayService.clampOverlayScale(preferences.getInt(
+            RelayService.KEY_AREA_FILL_BUTTON_SCALE,
+            90
+        ));
+        TextView scaleLabel = settingLabel("Размер кнопки: " + scale + "%");
+        root.addView(scaleLabel);
+        SeekBar scaleSlider = slider(70, 150, scale);
+        scaleSlider.setOnSeekBarChangeListener(seekListener(
+            value -> scaleLabel.setText("Размер кнопки: " + value + "%"),
+            value -> saveInt(RelayService.KEY_AREA_FILL_BUTTON_SCALE, value)
+        ));
+        root.addView(scaleSlider);
+
+        areaFillStatus = text("", 10, true);
+        areaFillStatus.setPadding(dp(10), dp(8), dp(10), dp(8));
+        areaFillStatus.setBackground(statusBackground());
+        root.addView(areaFillStatus, margins(-1, -2, 0, dp(5), 0, dp(7)));
+        refreshAreaFillStatus();
+
+        root.addView(schematicAction(
+            "ДОБАВИТЬ ТОЧКУ ПОД ИГРОКОМ",
+            () -> invokeAreaFillAction("capture")
+        ));
+        root.addView(schematicAction(
+            "ОЧИСТИТЬ ОБЛАСТЬ",
+            () -> invokeAreaFillAction("clear")
+        ));
+        root.addView(schematicAction(
+            statusAreaFillRunning ? "ОСТАНОВИТЬ" : "ЗАПУСТИТЬ",
+            () -> invokeAreaFillAction("toggle")
+        ));
+
+        TextView note = text(
+            "Точки берутся из позиции игрока на одном горизонтальном уровне. " +
+                "Две точки задают прямоугольник, 3–8 — полигон. Перед запуском " +
+                "возьмите нужный строительный блок в основную руку. Модуль не " +
+                "заменяет уже стоящие блоки, проверяет безопасный проход и " +
+                "останавливается, когда запасы закончились. Ручное движение " +
+                "временно имеет приоритет.",
+            10,
+            false
+        );
+        note.setTextColor(0xff98a7b8);
+        root.addView(note);
+    }
+
+    private void invokeAreaFillAction(String action) {
+        try {
+            String value;
+            switch (action) {
+                case "capture":
+                    value = NativeBridge.captureAreaFillPoint();
+                    break;
+                case "clear":
+                    value = NativeBridge.clearAreaFill();
+                    break;
+                default:
+                    value = NativeBridge.toggleAreaFill();
+                    break;
+            }
+            updateAreaFillStatus(new JSONObject(value));
+            if ("area_fill".equals(currentPage)) showPage("area_fill");
+        } catch (Throwable error) {
+            statusAreaFillRunning = false;
+            statusAreaFillText = "Ошибка управления: " + safeMessage(error);
+            refreshAreaFillStatus();
+            DiagnosticsLog.appendError(
+                context,
+                "area_fill",
+                "Area-fill menu action failed",
+                error
+            );
+        }
+    }
+
     private void buildThreatsPage(LinearLayout root) {
         root.addView(toggle(
             "Умный анализ враждебных мобов",
@@ -1691,6 +1821,23 @@ final class RelayOverlayController {
         refreshAutomationStatus();
     }
 
+    void updateAreaFillStatus(JSONObject value) {
+        if (value == null) return;
+        statusAreaFillEnabled = value.optBoolean("enabled", false);
+        statusAreaFillRunning = value.optBoolean("running", false);
+        statusAreaFillWaiting = value.optBoolean("waitingForBlocks", false);
+        statusAreaFillPointCount = value.optInt("pointCount", 0);
+        statusAreaFillRequiredPoints = value.optInt("requiredPoints", 2);
+        statusAreaFillCellCount = value.optInt("cellCount", 0);
+        statusAreaFillCompleted = value.optInt("completed", 0);
+        statusAreaFillItem = value.optString("item", "");
+        statusAreaFillText = value.optString(
+            "status",
+            "Добавьте точки области"
+        );
+        refreshAreaFillStatus();
+    }
+
     private void refreshMiniMapStatus() {
         if (miniMapStatus == null) return;
         boolean enabled = preferences.getBoolean(RelayService.KEY_MINIMAP, true);
@@ -1734,6 +1881,32 @@ final class RelayOverlayController {
         ));
         automationStatus.setTextColor(
             statusAutomationRejected > 0 ? 0xffffd27a : 0xff9ee493
+        );
+    }
+
+    private void refreshAreaFillStatus() {
+        if (areaFillStatus == null) return;
+        if (!statusAreaFillEnabled && !preferences.getBoolean(
+                RelayService.KEY_AREA_FILL_ENABLED,
+                false
+            )) {
+            areaFillStatus.setText("Модуль выключен");
+            areaFillStatus.setTextColor(0xffc4cad3);
+            return;
+        }
+        String progress = statusAreaFillCellCount == 0
+            ? "Точки: " + statusAreaFillPointCount + "/" +
+                statusAreaFillRequiredPoints
+            : "Готово: " + statusAreaFillCompleted + "/" +
+                statusAreaFillCellCount;
+        String item = statusAreaFillItem.isEmpty()
+            ? ""
+            : "\nБлок: " + statusAreaFillItem;
+        areaFillStatus.setText(statusAreaFillText + "\n" + progress + item);
+        areaFillStatus.setTextColor(
+            statusAreaFillWaiting
+                ? 0xffffd27a
+                : statusAreaFillRunning ? 0xff9ee493 : 0xffdce6f5
         );
     }
 
@@ -1839,6 +2012,13 @@ final class RelayOverlayController {
             "%.1f МБ",
             bytes / (1024.0 * 1024.0)
         );
+    }
+
+    private static String safeMessage(Throwable error) {
+        String message = error == null ? null : error.getMessage();
+        return message == null || message.isEmpty()
+            ? "неизвестная ошибка"
+            : message;
     }
 
     private void saveRadius(int radius) {

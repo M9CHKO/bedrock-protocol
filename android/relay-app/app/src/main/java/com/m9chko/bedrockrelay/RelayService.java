@@ -78,6 +78,12 @@ public final class RelayService extends Service {
     public static final String KEY_MINIMAP_Y = "mini_map_y";
     public static final String KEY_AUTO_ARMOR = "auto_armor";
     public static final String KEY_AUTO_TOTEM = "auto_totem";
+    public static final String KEY_AREA_FILL_ENABLED = "area_fill_enabled";
+    public static final String KEY_AREA_FILL_POINTS = "area_fill_points";
+    public static final String KEY_AREA_FILL_BUTTON_SCALE =
+        "area_fill_button_scale";
+    public static final String KEY_AREA_FILL_BUTTON_X = "area_fill_button_x";
+    public static final String KEY_AREA_FILL_BUTTON_Y = "area_fill_button_y";
     public static final String KEY_THREAT_ANALYSIS = "threat_analysis";
     public static final String KEY_THREAT_WARNING = "threat_warning";
     public static final String KEY_THREAT_DISTANCE = "threat_distance";
@@ -135,6 +141,8 @@ public final class RelayService extends Service {
     public static final int MAX_MINIMAP_RADIUS_CHUNKS = 10;
     public static final int MIN_THREAT_DISTANCE = 3;
     public static final int MAX_THREAT_DISTANCE = 32;
+    public static final int MIN_AREA_FILL_POINTS = 2;
+    public static final int MAX_AREA_FILL_POINTS = 8;
 
     public static final String ACTION_START =
         "com.m9chko.bedrockrelay.action.START";
@@ -178,6 +186,7 @@ public final class RelayService extends Service {
     private MiniMapOverlayController miniMapOverlayController;
     private ThreatAnalysisOverlayController threatOverlayController;
     private SchematicOverlayController schematicOverlayController;
+    private AreaFillOverlayController areaFillOverlayController;
     private SchematicRepository schematicRepository;
     private volatile boolean serviceStopping;
     private volatile boolean overlayShouldBeVisible;
@@ -233,6 +242,10 @@ public final class RelayService extends Service {
         );
         schematicRepository = new SchematicRepository(this);
         schematicOverlayController = new SchematicOverlayController(
+            this,
+            preferences
+        );
+        areaFillOverlayController = new AreaFillOverlayController(
             this,
             preferences
         );
@@ -359,6 +372,9 @@ public final class RelayService extends Service {
         }
         if (schematicOverlayController != null) {
             schematicOverlayController.hideImmediately();
+        }
+        if (areaFillOverlayController != null) {
+            areaFillOverlayController.destroy();
         }
         DiagnosticsLog.append(this, "INFO", "service", "Service destroying");
         try {
@@ -1006,6 +1022,7 @@ public final class RelayService extends Service {
         final long rejected = state.optLong("automationRejected", 0);
         final long mapDecoded = state.optLong("miniMapDecodedChunks", 0);
         final long mapFailures = state.optLong("miniMapDecodeFailures", 0);
+        final JSONObject areaFill = state.optJSONObject("areaFill");
         mainHandler.post(() -> {
             overlayController.updateAutomationStatus(
                 automationStatus,
@@ -1015,6 +1032,10 @@ public final class RelayService extends Service {
                 rejected
             );
             overlayController.updateMiniMapStatus(mapDecoded, mapFailures);
+            overlayController.updateAreaFillStatus(areaFill);
+            if (areaFillOverlayController != null) {
+                areaFillOverlayController.update(areaFill);
+            }
         });
     }
 
@@ -1247,6 +1268,18 @@ public final class RelayService extends Service {
         boolean miniMapRound = preferences.getBoolean(KEY_MINIMAP_ROUND, true);
         boolean autoArmor = preferences.getBoolean(KEY_AUTO_ARMOR, false);
         boolean autoTotem = preferences.getBoolean(KEY_AUTO_TOTEM, false);
+        boolean areaFillEnabled = preferences.getBoolean(
+            KEY_AREA_FILL_ENABLED,
+            false
+        );
+        int areaFillPoints = clampAreaFillPoints(preferences.getInt(
+            KEY_AREA_FILL_POINTS,
+            2
+        ));
+        int areaFillButtonScale = clampOverlayScale(preferences.getInt(
+            KEY_AREA_FILL_BUTTON_SCALE,
+            90
+        ));
         boolean threatAnalysis = preferences.getBoolean(
             KEY_THREAT_ANALYSIS,
             true
@@ -1321,6 +1354,8 @@ public final class RelayService extends Service {
             .putInt(KEY_EQUIPMENT_HUD_SCALE, equipmentScale)
             .putInt(KEY_MINIMAP_RADIUS, miniMapRadius)
             .putInt(KEY_MINIMAP_SCALE, miniMapScale)
+            .putInt(KEY_AREA_FILL_POINTS, areaFillPoints)
+            .putInt(KEY_AREA_FILL_BUTTON_SCALE, areaFillButtonScale)
             .putInt(KEY_THREAT_DISTANCE, threatDistance)
             .putInt(KEY_THREAT_WARNING_SCALE, threatWarningScale)
             .putInt(KEY_SCHEMATIC_OPACITY, schematicOpacity)
@@ -1389,6 +1424,12 @@ public final class RelayService extends Service {
                     schematicLayer
                 );
             }
+            if (areaFillOverlayController != null) {
+                areaFillOverlayController.configure(
+                    areaFillEnabled,
+                    areaFillButtonScale
+                );
+            }
         });
         try {
             boolean schematicWorldTracking = schematicEnabled;
@@ -1403,6 +1444,7 @@ public final class RelayService extends Service {
                 miniMap,
                 schematicWorldTracking
             );
+            NativeBridge.configureAreaFill(areaFillEnabled, areaFillPoints);
             if (logChange) {
                 DiagnosticsLog.append(
                     this,
@@ -1424,6 +1466,8 @@ public final class RelayService extends Service {
                         " miniMapRadius=" + miniMapRadius +
                         " autoArmor=" + autoArmor +
                         " autoTotem=" + autoTotem +
+                        " areaFill=" + areaFillEnabled +
+                        " areaFillPoints=" + areaFillPoints +
                         " threatAnalysis=" + threatAnalysis +
                         " threatDistance=" + threatDistance +
                         " schematic=" + schematicEnabled +
@@ -1492,6 +1536,9 @@ public final class RelayService extends Service {
             if (schematicOverlayController != null) {
                 schematicOverlayController.setUiBlocked(minecraftUiBlocked);
             }
+            if (areaFillOverlayController != null) {
+                areaFillOverlayController.setUiBlocked(minecraftUiBlocked);
+            }
             if (showNow) {
                 if (entityOverlayController != null) {
                     entityOverlayController.setSessionVisible(true);
@@ -1510,6 +1557,9 @@ public final class RelayService extends Service {
                 }
                 if (schematicOverlayController != null) {
                     schematicOverlayController.setSessionVisible(true);
+                }
+                if (areaFillOverlayController != null) {
+                    areaFillOverlayController.setSessionVisible(true);
                 }
                 if (overlayController != null) overlayController.show();
             } else {
@@ -1531,6 +1581,9 @@ public final class RelayService extends Service {
                 }
                 if (schematicOverlayController != null) {
                     schematicOverlayController.setSessionVisible(false);
+                }
+                if (areaFillOverlayController != null) {
+                    areaFillOverlayController.setSessionVisible(false);
                 }
             }
         });
@@ -1571,6 +1624,13 @@ public final class RelayService extends Service {
 
     public static int clampOverlayScale(int value) {
         return Math.max(70, Math.min(150, value));
+    }
+
+    public static int clampAreaFillPoints(int value) {
+        return Math.max(
+            MIN_AREA_FILL_POINTS,
+            Math.min(MAX_AREA_FILL_POINTS, value)
+        );
     }
 
     public static int clampMiniMapRadius(int value) {

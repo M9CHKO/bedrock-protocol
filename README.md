@@ -6,12 +6,12 @@ Standalone Android 8+ relay app (no Termux), including a directly
 installable arm64 APK: [Android relay app](android/relay-app/README.md).
 
 Current Android build:
-[CPE Relay 1.2.17](android/relay-app/apk/CPE-Relay-v1.2.17-arm64-v8a-release-debug-signed.apk)
-([SHA-256](android/relay-app/apk/CPE-Relay-v1.2.17-arm64-v8a-release-debug-signed.apk.sha256)).
+[CPE Relay 1.2.18](android/relay-app/apk/CPE-Relay-v1.2.18-arm64-v8a-release-debug-signed.apk)
+([SHA-256](android/relay-app/apk/CPE-Relay-v1.2.18-arm64-v8a-release-debug-signed.apk.sha256)).
 The Android frontend transparently carries server-required resource packs and
 adds an optional packet-derived HUD: entity projection, retained-chunk status,
-equipment and durability, mini-map, threat analysis, auto-equipment, and a
-client-only phantom schematic guide for `.mcstructure`, vanilla structure `.nbt`, `.litematic`,
+equipment and durability, mini-map, threat analysis, auto-equipment, polygonal
+area auto-fill, and a client-only phantom schematic guide for `.mcstructure`, vanilla structure `.nbt`, `.litematic`,
 `.schem`, and `.schematic` files. The HUD does not capture the screen, inject
 code into Minecraft, or read Minecraft process memory. See the
 [Android architecture map](android/relay-app/ARCHITECTURE.md) for module and
