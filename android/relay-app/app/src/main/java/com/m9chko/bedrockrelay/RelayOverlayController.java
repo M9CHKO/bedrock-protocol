@@ -1063,7 +1063,7 @@ final class RelayOverlayController {
 
         root.addView(sectionHeader("ОТОБРАЖЕНИЕ"));
         root.addView(toggle(
-            "Текстуры блоков схемы",
+            "Цветная заливка ячеек схемы",
             RelayService.KEY_SCHEMATIC_TEXTURES,
             true
         ));
@@ -1071,13 +1071,15 @@ final class RelayOverlayController {
             RelayService.KEY_SCHEMATIC_OPACITY,
             42
         ));
-        TextView opacityLabel = settingLabel("Прозрачность текстур: " +
+        TextView opacityLabel = settingLabel("Плотность цветной заливки: " +
             opacity + "%");
         root.addView(opacityLabel);
         SeekBar opacitySlider = slider(10, 100, opacity);
         root.addView(opacitySlider);
         opacitySlider.setOnSeekBarChangeListener(seekListener(
-            value -> opacityLabel.setText("Прозрачность текстур: " + value + "%"),
+            value -> opacityLabel.setText(
+                "Плотность цветной заливки: " + value + "%"
+            ),
             value -> saveInt(
                 RelayService.KEY_SCHEMATIC_OPACITY,
                 RelayService.clampSchematicOpacity(value)
@@ -1267,11 +1269,12 @@ final class RelayOverlayController {
         TextView note = text(
             "После размещения якорь остаётся неподвижным в координатах мира и " +
                 "меняется только кнопками X/Y/Z, поворота и зеркала. " +
-                "кнопки X/Y/Z можно нажимать сразу после размещения — смещение " +
+                "Кнопки X/Y/Z можно нажимать сразу после размещения — смещение " +
                 "применится, как только будет найдена поверхность. " +
-                "Ближайшие отсутствующие блоки показаны уменьшенными текстурными " +
-                "фантомами, красная рамка отмечает только неправильный блок. " +
-                "Фантомы не имеют коллизии и не меняют настоящий чанк.",
+                "Отсутствующие блоки показаны полупрозрачной цветной заливкой " +
+                "без ошибочной ориентации текстур. Двойная рамка повторяет " +
+                "точную форму ступеней, плит и других неполных блоков. " +
+                "Заливка не имеет коллизии и не меняет настоящий чанк.",
             9,
             false
         );

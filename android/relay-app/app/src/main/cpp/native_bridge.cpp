@@ -4767,7 +4767,7 @@ struct SchematicDebugShapeKey {
     int32_t x = 0;
     int32_t y = 0;
     int32_t z = 0;
-    uint8_t part = 0;
+    uint16_t part = 0;
 
     auto operator<=>(const SchematicDebugShapeKey&) const = default;
 };
@@ -4786,6 +4786,10 @@ struct ActiveSchematicDebugShape {
 };
 
 constexpr std::size_t MaximumSchematicDebugShapes = 3'600;
+constexpr std::size_t SchematicOutlineLayers = 2;
+constexpr std::size_t MaximumSchematicBaseShapes =
+    MaximumSchematicDebugShapes / SchematicOutlineLayers;
+constexpr double SchematicOutlineExpansion = 0.025;
 
 bedrock::BlockShape unionSchematicDebugBounds(
     const std::vector<bedrock::BlockShape>& bounds
@@ -4821,14 +4825,6 @@ std::vector<SchematicDebugShape> planSchematicDebugShapes(
         auto bounds = state.schematicCollisionShapes(
             marker.expectedBlockState
         );
-        // A textured falling-block actor already identifies an ordinary
-        // missing full block. Keep a subtle orientation frame only when the
-        // expected collision is non-full or multipart (stairs, slabs, etc.),
-        // avoiding the dense grid that was the main source of visual noise.
-        if (marker.status == 1 && bounds.size() == 1 &&
-            bounds.front() == bedrock::FullBlockShape) {
-            continue;
-        }
         totalParts += bounds.size();
         groups.push_back({marker, std::move(bounds)});
     }
@@ -4838,32 +4834,50 @@ std::vector<SchematicDebugShape> planSchematicDebugShapes(
     // union box until the hard shape budget fits; each selected marker keeps
     // at least one useful outline.
     for (auto group = groups.rbegin();
-         totalParts > MaximumSchematicDebugShapes && group != groups.rend();
+         totalParts > MaximumSchematicBaseShapes && group != groups.rend();
          ++group) {
         if (group->bounds.size() <= 1) continue;
         totalParts -= group->bounds.size() - 1;
         group->bounds.assign(1, unionSchematicDebugBounds(group->bounds));
     }
-    if (groups.size() > MaximumSchematicDebugShapes) {
-        groups.resize(MaximumSchematicDebugShapes);
+    if (groups.size() > MaximumSchematicBaseShapes) {
+        groups.resize(MaximumSchematicBaseShapes);
         totalParts = groups.size();
     }
 
     std::vector<SchematicDebugShape> result;
-    result.reserve(std::min(totalParts, MaximumSchematicDebugShapes));
+    result.reserve(std::min(
+        totalParts * SchematicOutlineLayers,
+        MaximumSchematicDebugShapes
+    ));
     for (const auto& group : groups) {
         for (std::size_t part = 0; part < group.bounds.size(); ++part) {
-            if (result.size() >= MaximumSchematicDebugShapes) break;
-            result.push_back({
-                {
-                    group.marker.x,
-                    group.marker.y,
-                    group.marker.z,
-                    static_cast<uint8_t>(part)
-                },
-                group.marker.status,
-                group.bounds[part]
-            });
+            for (std::size_t layer = 0;
+                 layer < SchematicOutlineLayers;
+                 ++layer) {
+                if (result.size() >= MaximumSchematicDebugShapes) break;
+                auto bounds = group.bounds[part];
+                const double expansion =
+                    SchematicOutlineExpansion * static_cast<double>(layer);
+                bounds[0] -= expansion;
+                bounds[1] -= expansion;
+                bounds[2] -= expansion;
+                bounds[3] += expansion;
+                bounds[4] += expansion;
+                bounds[5] += expansion;
+                result.push_back({
+                    {
+                        group.marker.x,
+                        group.marker.y,
+                        group.marker.z,
+                        static_cast<uint16_t>(
+                            part * SchematicOutlineLayers + layer
+                        )
+                    },
+                    group.marker.status,
+                    bounds
+                });
+            }
         }
     }
     std::sort(
@@ -4880,8 +4894,10 @@ std::vector<SchematicDebugShape> planSchematicDebugShapes(
 // by server scripts. The ASCII prefix "CPE" makes accidental overlap with a
 // destination server's debug drawer registry practically impossible.
 constexpr uint64_t SchematicDebugNetworkIdBase = 0x4350450000000000ULL;
-// Textured previews are relay-owned falling-block actors. They never enter
-// the authoritative chunk and use a separate ID range from debug shapes.
+// Filled previews are relay-owned stained-glass falling-block actors. They
+// never enter the authoritative chunk and use a separate ID range from debug
+// shapes. A neutral full-cell fill avoids presenting a misleading orientation
+// when Bedrock ignores directional runtime state on a falling-block entity.
 constexpr uint64_t SchematicTextureActorIdBase = 0x4350451000000000ULL;
 constexpr std::size_t MaximumSchematicTextureActors = 1'800;
 // Keep each clientbound operation comfortably bounded for RakNet queueing and
@@ -4932,6 +4948,58 @@ int32_t schematicDebugArgb(
     const uint32_t argb =
         (alpha << 24u) | (red << 16u) | (green << 8u) | blue;
     return static_cast<int32_t>(argb);
+}
+
+std::string_view schematicNearestDyeName(int32_t argb) noexcept {
+    struct DyeColor {
+        std::string_view name;
+        uint32_t rgb;
+    };
+    static constexpr std::array<DyeColor, 16> Colors {{
+        {"white", 0xf9ffffu},
+        {"orange", 0xf9801du},
+        {"magenta", 0xc74ebdu},
+        {"light_blue", 0x3ab3dau},
+        {"yellow", 0xfed83du},
+        {"lime", 0x80c71fu},
+        {"pink", 0xf38baau},
+        {"gray", 0x474f52u},
+        {"light_gray", 0x9d9d97u},
+        {"cyan", 0x169c9cu},
+        {"purple", 0x8932b8u},
+        {"blue", 0x3c44aau},
+        {"brown", 0x835432u},
+        {"green", 0x5e7c16u},
+        {"red", 0xb02e26u},
+        {"black", 0x1d1d21u}
+    }};
+    const uint32_t rgb = static_cast<uint32_t>(argb) & 0x00ffffffu;
+    const int red = static_cast<int>((rgb >> 16u) & 0xffu);
+    const int green = static_cast<int>((rgb >> 8u) & 0xffu);
+    const int blue = static_cast<int>(rgb & 0xffu);
+    const DyeColor* nearest = &Colors.front();
+    uint32_t nearestDistance = std::numeric_limits<uint32_t>::max();
+    for (const auto& candidate : Colors) {
+        const int candidateRed = static_cast<int>(
+            (candidate.rgb >> 16u) & 0xffu
+        );
+        const int candidateGreen = static_cast<int>(
+            (candidate.rgb >> 8u) & 0xffu
+        );
+        const int candidateBlue = static_cast<int>(candidate.rgb & 0xffu);
+        const int deltaRed = red - candidateRed;
+        const int deltaGreen = green - candidateGreen;
+        const int deltaBlue = blue - candidateBlue;
+        const uint32_t distance = static_cast<uint32_t>(
+            deltaRed * deltaRed + deltaGreen * deltaGreen +
+            deltaBlue * deltaBlue
+        );
+        if (distance < nearestDistance) {
+            nearestDistance = distance;
+            nearest = &candidate;
+        }
+    }
+    return nearest->name;
 }
 
 bedrock::VersionedGamePacket makeLegacySchematicDebugClearPacket(
@@ -5218,10 +5286,9 @@ bedrock::VersionedGamePacket makeSchematicTextureActorPacket(
     metadata.push_back(schematicEntityMetadataEntry(
         "scale",
         "float",
-        // Keep the preview inside the authoritative one-block grid. Bedrock's
-        // falling-block renderer has no protocol alpha field, so the intensity
-        // setting is represented by a deliberately small inset rather than by
-        // dropping whole blocks from the schematic.
+        // Keep the translucent fill inside the authoritative one-block grid.
+        // Bedrock exposes no alpha metadata for a falling-block actor, so the
+        // density setting is represented by a small inset.
         bedrock::ProtoDefValue::floating(
             0.94 + std::clamp(actor.textureOpacityPercent, 10, 100) * 0.0004
         )
@@ -6280,31 +6347,31 @@ public:
             std::vector<SchematicDebugShape> debugShapes;
             if (scriptDebug && texturesEnabled) {
                 textureActors.reserve(MaximumSchematicTextureActors);
-                std::unordered_map<std::string, std::optional<int32_t>>
-                    runtimeIds;
+                const std::string dyeName(schematicNearestDyeName(
+                    missingOutlineColor
+                ));
+                auto fillRuntimeId = state_->schematicRuntimeId(
+                    "minecraft:" + dyeName + "_stained_glass[]"
+                );
+                if (!fillRuntimeId.has_value()) {
+                    fillRuntimeId = state_->schematicRuntimeId(
+                        "minecraft:stained_glass[color=" + dyeName + "]"
+                    );
+                }
                 for (auto marker : markers) {
                     if ((marker.status != 0 && marker.status != 1) ||
                         textureActors.size() >= MaximumSchematicTextureActors) {
                         continue;
                     }
-                    auto [found, inserted] = runtimeIds.try_emplace(
-                        marker.expectedBlockState,
-                        std::nullopt
-                    );
-                    if (inserted) {
-                        found->second = state_->schematicRuntimeId(
-                            marker.expectedBlockState
-                        );
-                    }
-                    if (!found->second.has_value()) continue;
-                    // UNKNOWN and MISSING render identically. Normalizing the
-                    // status and state string makes a newly decoded chunk a
-                    // no-op when the expected block itself did not change.
+                    if (!fillRuntimeId.has_value()) continue;
+                    // UNKNOWN and MISSING render identically. The fill is a
+                    // colored cell marker, while the double collision outline
+                    // carries the exact state geometry and orientation.
                     marker.status = 1;
                     marker.expectedBlockState.clear();
                     textureActors.push_back({
                         std::move(marker),
-                        *found->second,
+                        *fillRuntimeId,
                         textureOpacityPercent
                     });
                 }
@@ -6604,9 +6671,9 @@ public:
                     ));
                 }
                 backend = texturesEnabled && outlinesEnabled
-                    ? "server_script_debug_drawer+falling_block_texture"
+                    ? "server_script_debug_drawer+stained_glass_fill"
                     : texturesEnabled
-                        ? "falling_block_texture"
+                        ? "stained_glass_fill"
                         : "server_script_debug_drawer";
             } else {
                 packets.reserve(legacyWrongMarkers.size() + 1);
