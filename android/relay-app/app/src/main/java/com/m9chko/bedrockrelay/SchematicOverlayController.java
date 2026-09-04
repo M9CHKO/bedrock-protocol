@@ -89,7 +89,7 @@ final class SchematicOverlayController {
     private int pendingPlacementShiftY;
     private int pendingPlacementShiftZ;
     private boolean missingPermissionLogged;
-    private SchematicTextureOverlayView view;
+    private SchematicView view;
     private final Object blockQueryLock = new Object();
     private volatile BlockQuery blockQuery;
     private volatile boolean debugMarkersDirty = true;
@@ -188,7 +188,7 @@ final class SchematicOverlayController {
             debugMarkerRetryDelayMs = 0L;
         }
         refreshPlacementRequest();
-        SchematicTextureOverlayView current = view;
+        SchematicView current = view;
         if (current != null) {
             current.configure(
                 fieldOfView,
@@ -215,7 +215,7 @@ final class SchematicOverlayController {
         // plan. Clear it explicitly; anchor moves keep using the seamless
         // keyed replacement path instead.
         if (debugMarkerPlanPublished) clearDebugMarkers();
-        SchematicTextureOverlayView current = view;
+        SchematicView current = view;
         if (current != null) current.setModel(value);
         reconcileWindow();
     }
@@ -225,7 +225,7 @@ final class SchematicOverlayController {
     }
 
     boolean wantsFrames() {
-        return sessionVisible && !uiBlocked && enabled && model != null &&
+        return sessionVisible && enabled && model != null &&
             (placementPending || preferences.getBoolean(
                 RelayService.KEY_SCHEMATIC_PLACED,
                 false
@@ -414,7 +414,7 @@ final class SchematicOverlayController {
         editor.apply();
         placementPending = false;
         placementTargetCaptured = false;
-        SchematicTextureOverlayView current = view;
+        SchematicView current = view;
         if (current != null) current.setAnchor(x, y, z);
         reconcileWindow();
     }
@@ -470,11 +470,8 @@ final class SchematicOverlayController {
                     cachedStates = query.states;
                 }
             }
-            if (cachedStates != null) {
-                publishViewStates(query, cachedStates);
-                if (shouldRefreshMarkersForCamera()) {
-                    publishDebugMarkers(query, cachedStates, revision, snapshot[4]);
-                }
+            if (cachedStates != null && shouldRefreshMarkersForCamera()) {
+                publishDebugMarkers(query, cachedStates, revision, snapshot[4]);
             }
             return;
         }
@@ -542,7 +539,6 @@ final class SchematicOverlayController {
             }
         }
         if (completedStates == null) return;
-        publishViewStates(query, completedStates);
         if (!query.lastCycleStatesChanged &&
             !shouldRefreshMarkersForCamera()) return;
         publishDebugMarkers(query, completedStates, revision, snapshot[4]);
@@ -642,7 +638,7 @@ final class SchematicOverlayController {
         // Native replacement is now a keyed delta. Keep the last coherent
         // plan on screen while a new anchor/window/model is scanned, then let
         // the accepted replacement remove only cells that really changed.
-        SchematicTextureOverlayView current = view;
+        SchematicView current = view;
         if (current != null) current.clearWorldStates();
     }
 
@@ -698,7 +694,7 @@ final class SchematicOverlayController {
                 texturesEnabled || outlinesEnabled
                     ? Math.max(opacityPercent, outlineOpacityPercent)
                     : 0,
-                outlinesEnabled,
+                texturesEnabled || outlinesEnabled,
                 query.transformedBedrockPalette
             );
         synchronized (blockQueryLock) {
@@ -722,7 +718,7 @@ final class SchematicOverlayController {
             boolean accepted = NativeBridge.replaceSchematicDebugMarkers(
                 result.records(),
                 result.expectedBlockStates(),
-                false,
+                texturesEnabled,
                 opacityPercent,
                 outlinesEnabled,
                 outlineOpacityPercent,
@@ -1067,26 +1063,16 @@ final class SchematicOverlayController {
             if (camera != null && camera.known && placementPending) {
                 tryPlaceNearCamera(camera);
             }
-            SchematicTextureOverlayView current = view;
-            if (camera != null && current != null) {
-                current.submitCamera(camera);
-            }
             deliveryPosted.set(false);
             if (pendingCamera.get() != null) postDelivery();
         });
     }
 
     private void reconcileWindow() {
-        boolean placed = preferences.getBoolean(
-            RelayService.KEY_SCHEMATIC_PLACED,
-            false
-        );
-        if (sessionVisible && !uiBlocked && enabled && texturesEnabled &&
-            model != null && placed && !placementPending) {
-            addWindow();
-        } else {
-            removeWindow();
-        }
+        // Schematics are rendered inside Minecraft with DebugRenderer
+        // packets. The old Android full-screen camera projection must never
+        // be attached: it caused view-dependent drift and could cover input.
+        removeWindow();
     }
 
     private void addWindow() {
@@ -1104,8 +1090,7 @@ final class SchematicOverlayController {
             return;
         }
         missingPermissionLogged = false;
-        SchematicTextureOverlayView added =
-            new SchematicTextureOverlayView(context);
+        SchematicView added = new SchematicView(context);
         added.setModel(model);
         added.configure(
             fieldOfView,
@@ -1187,18 +1172,17 @@ final class SchematicOverlayController {
                     cachedQuery.blockIndices,
                     cachedStates,
                     cachedCorrect,
-                    cachedWrong,
-                    cachedQuery.transformedBedrockPalette
+                    cachedWrong
                 );
             }
             EntityOutlineOverlayController.CameraSample camera =
-                latestCamera;
+                pendingCamera.get();
             if (camera != null) added.submitCamera(camera);
             DiagnosticsLog.append(
                 context,
                 "INFO",
                 "schematics",
-                "Schematic texture overlay opened; renderer=collision_shape_projection"
+                "Schematic 3D overlay opened; renderer=packet_world_projection"
             );
         } catch (Throwable error) {
             view = null;
@@ -1212,7 +1196,7 @@ final class SchematicOverlayController {
     }
 
     private void removeWindow() {
-        SchematicTextureOverlayView removed = view;
+        SchematicView removed = view;
         view = null;
         pendingCamera.set(null);
         if (removed == null) return;
@@ -1226,22 +1210,6 @@ final class SchematicOverlayController {
                 error
             );
         }
-    }
-
-    private void publishViewStates(BlockQuery query, byte[] states) {
-        mainHandler.post(() -> {
-            if (blockQuery != query) return;
-            SchematicTextureOverlayView current = view;
-            if (current == null) return;
-            current.setWorldStates(
-                query.model,
-                query.blockIndices,
-                states,
-                query.correctBlocks,
-                query.wrongBlocks,
-                query.transformedBedrockPalette
-            );
-        });
     }
 
     private static final class SchematicView extends View {

@@ -56,7 +56,7 @@ public final class NativeBridge {
      * Replaces the client-only schematic preview. Records are flat
      * [x, y, z, status] tuples where 0 is unknown, 1 is missing, 2 is correct,
      * and 3 is wrong. expectedBlockStates contains the exact Bedrock palette
-     * state used by geometry-aware outlines; a null
+     * state used by textured previews and geometry-aware outlines; a null
      * entry falls back to a full-block outline where one is required.
      */
     public static native boolean replaceSchematicDebugMarkers(
@@ -83,12 +83,6 @@ public final class NativeBridge {
      * clear action, so the controller immediately rebuilds its retained set.
      */
     public static native void clearSchematicDebugMarkers();
-
-    /**
-     * Collision boxes for one exact Bedrock block state, flattened as
-     * [minX, minY, minZ, maxX, maxY, maxZ] tuples in block-local coordinates.
-     */
-    public static native float[] schematicCollisionBoxes(String blockState);
 
     /** Exact top of the highest collision shape, or NaN when unavailable. */
     public static native float worldSurfaceY(int worldX, int worldZ);

@@ -7666,54 +7666,6 @@ Java_com_m9chko_bedrockrelay_NativeBridge_clearSchematicDebugMarkers(
     if (activeController) activeController->clearSchematicDebugMarkers();
 }
 
-extern "C" JNIEXPORT jfloatArray JNICALL
-Java_com_m9chko_bedrockrelay_NativeBridge_schematicCollisionBoxes(
-    JNIEnv* environment,
-    jclass,
-    jstring blockState
-) {
-    try {
-        std::shared_ptr<RelayState> state;
-        {
-            std::lock_guard lock(controllerMutex);
-            state = currentState;
-        }
-        const auto value = blockState == nullptr
-            ? std::string {}
-            : fromJavaString(environment, blockState);
-        const auto shapes = state
-            ? state->schematicCollisionShapes(value)
-            : std::vector<bedrock::BlockShape> {bedrock::FullBlockShape};
-        std::vector<jfloat> values;
-        values.reserve(shapes.size() * 6);
-        for (const auto& shape : shapes) {
-            for (double coordinate : shape) {
-                values.push_back(static_cast<jfloat>(coordinate));
-            }
-        }
-        auto result = environment->NewFloatArray(
-            static_cast<jsize>(values.size())
-        );
-        if (result == nullptr || values.empty()) return result;
-        environment->SetFloatArrayRegion(
-            result,
-            0,
-            static_cast<jsize>(values.size()),
-            values.data()
-        );
-        return result;
-    } catch (const std::exception& error) {
-        const auto exception = environment->FindClass(
-            "java/lang/RuntimeException"
-        );
-        if (exception != nullptr) {
-            environment->ThrowNew(exception, error.what());
-            environment->DeleteLocalRef(exception);
-        }
-        return nullptr;
-    }
-}
-
 extern "C" JNIEXPORT jfloat JNICALL
 Java_com_m9chko_bedrockrelay_NativeBridge_worldSurfaceY(
     JNIEnv*,
