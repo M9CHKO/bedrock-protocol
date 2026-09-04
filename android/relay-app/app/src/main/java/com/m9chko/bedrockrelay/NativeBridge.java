@@ -33,6 +33,9 @@ public final class NativeBridge {
         boolean schematicEnabled
     );
 
+    /** Releases optional world caches when Android reports memory pressure. */
+    public static native void trimMemory(int level);
+
     public static native String snapshot();
 
     public static native boolean minecraftUiBlocked();

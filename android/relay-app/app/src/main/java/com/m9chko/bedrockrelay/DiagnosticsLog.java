@@ -19,8 +19,26 @@ final class DiagnosticsLog {
     private static final Object LOCK = new Object();
     private static final String CURRENT = "relay-diagnostics.log";
     private static final String PREVIOUS = "relay-diagnostics.previous.log";
-    private static final long MAX_FILE_BYTES = 768L * 1024L;
+    // Keep at most two small segments. Detailed packet diagnostics must never
+    // be allowed to compete with the relay and Minecraft for phone storage or
+    // spend minutes rewriting an ever-growing file.
+    private static final long MAX_FILE_BYTES = 256L * 1024L;
+    private static final long MAX_LOG_AGE_MILLIS = 24L * 60L * 60L * 1000L;
     private static final int MAX_MESSAGE_CHARS = 32 * 1024;
+    private static final long DUPLICATE_WINDOW_MILLIS = 5_000L;
+    private static final long DEBUG_WINDOW_MILLIS = 10_000L;
+    private static final int MAX_DEBUG_LINES_PER_WINDOW = 120;
+
+    private static final SimpleDateFormat TIMESTAMP_FORMAT =
+        new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSXXX", Locale.US);
+    private static String duplicateFingerprint = "";
+    private static String duplicateLevel = "INFO";
+    private static String duplicateComponent = "app";
+    private static long duplicateWindowStartedAt;
+    private static int duplicateCount;
+    private static long debugWindowStartedAt;
+    private static int debugLinesInWindow;
+    private static int suppressedDebugLines;
 
     private static final Pattern JSON_SECRET = Pattern.compile(
         "(?i)(\\\"(?:access_token|refresh_token|identitytoken|token|" +
@@ -74,31 +92,37 @@ final class DiagnosticsLog {
         }
         synchronized (LOCK) {
             try {
-                File current = file(context, CURRENT);
-                rotateIfNeeded(context, current);
-                String timestamp = new SimpleDateFormat(
-                    "yyyy-MM-dd'T'HH:mm:ss.SSSXXX",
-                    Locale.US
-                ).format(new Date(
-                    timestampMillis > 0
-                        ? timestampMillis
-                        : System.currentTimeMillis()
-                ));
+                long now = System.currentTimeMillis();
                 String normalizedLevel = cleanTag(level, "INFO");
-                String line = timestamp + " [" + normalizedLevel +
-                    "] [" + cleanTag(component, "app") + "] " +
-                    redact(message) + "\n";
-                try (FileOutputStream output = new FileOutputStream(current, true)) {
-                    output.write(line.getBytes(StandardCharsets.UTF_8));
-                    // Closing the stream flushes ordinary high-volume packet
-                    // breadcrumbs. Force durable storage only for failures;
-                    // an fsync for every inventory packet can itself stall a
-                    // low-end phone during world join.
-                    if ("ERROR".equalsIgnoreCase(normalizedLevel) ||
-                        "FATAL".equalsIgnoreCase(normalizedLevel)) {
-                        output.getFD().sync();
-                    }
+                String normalizedComponent = cleanTag(component, "app");
+                String normalizedMessage = redact(message);
+                pruneExpired(context, now);
+
+                if (rollDebugWindow(context, normalizedLevel, now)) {
+                    return;
                 }
+                String fingerprint = normalizedLevel + '\u0000' +
+                    normalizedComponent + '\u0000' + normalizedMessage;
+                if (fingerprint.equals(duplicateFingerprint) &&
+                    now - duplicateWindowStartedAt <
+                        DUPLICATE_WINDOW_MILLIS) {
+                    ++duplicateCount;
+                    return;
+                }
+                flushDuplicateSummary(context, now);
+                duplicateFingerprint = fingerprint;
+                duplicateLevel = normalizedLevel;
+                duplicateComponent = normalizedComponent;
+                duplicateWindowStartedAt = now;
+                duplicateCount = 0;
+                writeLine(
+                    context,
+                    normalizedLevel,
+                    normalizedComponent,
+                    normalizedMessage,
+                    timestampMillis > 0 ? timestampMillis : now,
+                    shouldSync(normalizedLevel, normalizedComponent)
+                );
             } catch (Throwable ignored) {
                 // Diagnostics must never terminate the foreground relay.
             }
@@ -118,6 +142,7 @@ final class DiagnosticsLog {
 
     static String readAll(Context context) {
         synchronized (LOCK) {
+            pruneExpired(context, System.currentTimeMillis());
             StringBuilder result = new StringBuilder();
             File previous = file(context, PREVIOUS);
             if (previous.isFile()) {
@@ -138,6 +163,7 @@ final class DiagnosticsLog {
 
     static String readTail(Context context, int maximumBytes) {
         synchronized (LOCK) {
+            pruneExpired(context, System.currentTimeMillis());
             File current = file(context, CURRENT);
             if (!current.isFile()) return "Журнал пока пуст.";
             byte[] bytes = readBytes(current);
@@ -159,6 +185,12 @@ final class DiagnosticsLog {
         synchronized (LOCK) {
             deleteQuietly(file(context, CURRENT));
             deleteQuietly(file(context, PREVIOUS));
+            duplicateFingerprint = "";
+            duplicateWindowStartedAt = 0L;
+            duplicateCount = 0;
+            debugWindowStartedAt = 0L;
+            debugLinesInWindow = 0;
+            suppressedDebugLines = 0;
         }
     }
 
@@ -173,6 +205,99 @@ final class DiagnosticsLog {
         if (!current.renameTo(previous)) {
             deleteQuietly(current);
         }
+    }
+
+    private static void pruneExpired(Context context, long now) {
+        File current = file(context, CURRENT);
+        File previous = file(context, PREVIOUS);
+        if (isExpired(current, now)) deleteQuietly(current);
+        if (isExpired(previous, now)) deleteQuietly(previous);
+    }
+
+    private static boolean isExpired(File file, long now) {
+        return file.isFile() && file.lastModified() > 0L &&
+            now - file.lastModified() > MAX_LOG_AGE_MILLIS;
+    }
+
+    /** Returns true when this DEBUG line was intentionally dropped. */
+    private static boolean rollDebugWindow(
+        Context context,
+        String level,
+        long now
+    ) throws Exception {
+        if (debugWindowStartedAt == 0L ||
+            now - debugWindowStartedAt >= DEBUG_WINDOW_MILLIS) {
+            flushDebugSummary(context, now);
+            debugWindowStartedAt = now;
+            debugLinesInWindow = 0;
+        } else if (!"DEBUG".equalsIgnoreCase(level) &&
+            suppressedDebugLines != 0) {
+            flushDebugSummary(context, now);
+        }
+        if (!"DEBUG".equalsIgnoreCase(level)) return false;
+        if (debugLinesInWindow >= MAX_DEBUG_LINES_PER_WINDOW) {
+            ++suppressedDebugLines;
+            return true;
+        }
+        ++debugLinesInWindow;
+        return false;
+    }
+
+    private static void flushDebugSummary(Context context, long now)
+        throws Exception {
+        if (suppressedDebugLines == 0) return;
+        writeLine(
+            context,
+            "WARN",
+            "log",
+            "Suppressed " + suppressedDebugLines +
+                " high-frequency DEBUG entries",
+            now,
+            false
+        );
+        suppressedDebugLines = 0;
+    }
+
+    private static void flushDuplicateSummary(Context context, long now)
+        throws Exception {
+        if (duplicateCount == 0) return;
+        writeLine(
+            context,
+            duplicateLevel,
+            duplicateComponent,
+            "Previous identical entry repeated " + duplicateCount +
+                " times",
+            now,
+            false
+        );
+        duplicateCount = 0;
+    }
+
+    private static void writeLine(
+        Context context,
+        String level,
+        String component,
+        String message,
+        long timestampMillis,
+        boolean forceSync
+    ) throws Exception {
+        File current = file(context, CURRENT);
+        rotateIfNeeded(context, current);
+        String timestamp = TIMESTAMP_FORMAT.format(new Date(timestampMillis));
+        String line = timestamp + " [" + level + "] [" + component + "] " +
+            message + "\n";
+        try (FileOutputStream output = new FileOutputStream(current, true)) {
+            output.write(line.getBytes(StandardCharsets.UTF_8));
+            // Ordinary ERROR events are flushed by close. Only an actual
+            // process crash needs an expensive durable sync before Android
+            // terminates the process.
+            if (forceSync) output.getFD().sync();
+        }
+    }
+
+    private static boolean shouldSync(String level, String component) {
+        return "FATAL".equalsIgnoreCase(level) ||
+            "crash".equalsIgnoreCase(component);
     }
 
     private static File file(Context context, String name) {

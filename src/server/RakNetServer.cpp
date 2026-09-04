@@ -303,6 +303,14 @@ RakNetServerPeerStatistics RakNetServer::peerStatistics(
         statistics.runningTotal[RakNet::USER_MESSAGE_BYTES_SENT];
     result.userMessageBytesResent =
         statistics.runningTotal[RakNet::USER_MESSAGE_BYTES_RESENT];
+    result.userMessageBytesReceivedProcessed =
+        statistics.runningTotal[
+            RakNet::USER_MESSAGE_BYTES_RECEIVED_PROCESSED
+        ];
+    result.userMessageBytesReceivedIgnored =
+        statistics.runningTotal[
+            RakNet::USER_MESSAGE_BYTES_RECEIVED_IGNORED
+        ];
     result.actualBytesSent =
         statistics.runningTotal[RakNet::ACTUAL_BYTES_SENT];
     result.actualBytesReceived =
@@ -315,6 +323,8 @@ RakNetServerPeerStatistics RakNetServer::peerStatistics(
     }
     result.resendBufferMessages = statistics.messagesInResendBuffer;
     result.resendBufferBytes = statistics.bytesInResendBuffer;
+    result.packetLossLastSecond = statistics.packetlossLastSecond;
+    result.packetLossTotal = statistics.packetlossTotal;
     return result;
 }
 

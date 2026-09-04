@@ -23,8 +23,8 @@
 void RNS2_Berkley::SetSocketOptions(void)
 {
 	int r;
-	// This doubles the max throughput rate
-	int sock_opt=1024*256;
+	// Large Bedrock login messages arrive as short bursts of UDP fragments.
+	int sock_opt=RAKNET_SOCKET_RECEIVE_BUFFER_BYTES;
 	r = setsockopt__( rns2Socket, SOL_SOCKET, SO_RCVBUF, ( char * ) & sock_opt, sizeof ( sock_opt ) );
 	RakAssert(r==0);
 
@@ -39,7 +39,7 @@ void RNS2_Berkley::SetSocketOptions(void)
 
 	// This doesn't make much difference: 10% maybe
 	// Not supported on console 2
-	sock_opt=1024*16;
+	sock_opt=RAKNET_SOCKET_SEND_BUFFER_BYTES;
 	r = setsockopt__( rns2Socket, SOL_SOCKET, SO_SNDBUF, ( char * ) & sock_opt, sizeof ( sock_opt ) );
 	RakAssert(r==0);
 

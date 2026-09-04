@@ -163,6 +163,7 @@ public final class RelayApplication extends Application {
 
     @Override
     public void onLowMemory() {
+        trimNativeMemory(80);
         DiagnosticsLog.append(
             applicationContext,
             "WARN",
@@ -174,6 +175,7 @@ public final class RelayApplication extends Application {
 
     @Override
     public void onTrimMemory(int level) {
+        trimNativeMemory(level);
         DiagnosticsLog.append(
             applicationContext,
             "DEBUG",
@@ -181,5 +183,24 @@ public final class RelayApplication extends Application {
             "Android trim-memory level=" + level
         );
         super.onTrimMemory(level);
+    }
+
+    private static void trimNativeMemory(int level) {
+        Context context = applicationContext;
+        if (context == null || !context.getSharedPreferences(
+                RelayService.PREFERENCES,
+                MODE_PRIVATE
+            ).getBoolean(RelayService.KEY_RELAY_ACTIVE, false)) {
+            // Do not load the large native library for the first time while an
+            // idle application process is already short on memory.
+            return;
+        }
+        try {
+            NativeBridge.trimMemory(level);
+        } catch (Throwable ignored) {
+            // Android can deliver this callback while the process is already
+            // under severe pressure. Cleanup must stay allocation-free and
+            // must not create another failure path.
+        }
     }
 }

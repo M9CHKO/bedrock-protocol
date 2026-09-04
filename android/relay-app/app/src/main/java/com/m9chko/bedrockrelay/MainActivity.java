@@ -409,7 +409,8 @@ public final class MainActivity extends Activity {
         controls.addView(enabled);
         TextView note = text(
             enabled.isChecked()
-                ? "Запись включена."
+                ? "Запись включена: повторы сжимаются, хранится не более " +
+                    "512 КБ; неактивные файлы старше суток удаляются."
                 : "Запись полностью выключена — новые строки не создаются.",
             10,
             true
@@ -421,7 +422,8 @@ public final class MainActivity extends Activity {
                 .putBoolean(RelayService.KEY_DETAILED_LOGS, checked)
                 .apply();
             note.setText(checked
-                ? "Запись включена."
+                ? "Запись включена: повторы сжимаются, хранится не более " +
+                    "512 КБ; неактивные файлы старше суток удаляются."
                 : "Запись полностью выключена — новые строки не создаются.");
             note.setTextColor(checked ? 0xff74df9c : 0xffffc76c);
             applyLoggingPreferenceToNative(checked);

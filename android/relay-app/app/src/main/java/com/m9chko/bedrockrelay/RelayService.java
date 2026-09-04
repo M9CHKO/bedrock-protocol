@@ -769,6 +769,16 @@ public final class RelayService extends Service {
             "event=" + type + (message.isEmpty() ? "" : " " + message),
             event.optLong("timestampMs", 0)
         );
+        if ("local_login_timeout".equals(type)) {
+            notificationStatus =
+                "Вход Minecraft завис — подключитесь к relay ещё раз";
+            refreshNotification();
+            mainHandler.post(() -> Toast.makeText(
+                this,
+                "Minecraft не завершил вход в relay. Подключитесь ещё раз.",
+                Toast.LENGTH_LONG
+            ).show());
+        }
         boolean sessionEnded = "disconnect".equals(type) ||
             "local_login_timeout".equals(type) ||
             "transport_error".equals(type) ||
@@ -918,7 +928,7 @@ public final class RelayService extends Service {
         );
         final long maximumBytes = state.optLong(
             "retainedLevelChunkMaximumBytes",
-            256L * 1024L * 1024L
+            48L * 1024L * 1024L
         );
         final long evictedRadius = state.optLong(
             "retainedLevelChunksEvictedRadius",

@@ -170,6 +170,28 @@
 #define BUFFERED_PACKETS_PAGE_SIZE 8
 #endif
 
+// Minecraft Bedrock Login commonly exceeds 600 KiB once the skin and persona
+// data are included.  Android may briefly deprioritize the foreground-service
+// receive thread while switching from the relay UI to Minecraft, so the
+// original 256 KiB UDP receive buffer can overflow before RakNet reassembles
+// that first reliable split message.  Keep the legacy desktop defaults while
+// giving the mobile loopback transport enough room for the complete burst.
+#ifndef RAKNET_SOCKET_RECEIVE_BUFFER_BYTES
+#if defined(ANDROID) || defined(__ANDROID__)
+#define RAKNET_SOCKET_RECEIVE_BUFFER_BYTES (2 * 1024 * 1024)
+#else
+#define RAKNET_SOCKET_RECEIVE_BUFFER_BYTES (256 * 1024)
+#endif
+#endif
+
+#ifndef RAKNET_SOCKET_SEND_BUFFER_BYTES
+#if defined(ANDROID) || defined(__ANDROID__)
+#define RAKNET_SOCKET_SEND_BUFFER_BYTES (256 * 1024)
+#else
+#define RAKNET_SOCKET_SEND_BUFFER_BYTES (16 * 1024)
+#endif
+#endif
+
 // Controls how many allocations occur at once for the memory pool of incoming or outgoing datagrams.
 // Has small effect on memory usage per connection. Uses about 256 bytes*INTERNAL_PACKET_PAGE_SIZE per connection
 #ifndef INTERNAL_PACKET_PAGE_SIZE

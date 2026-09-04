@@ -52,7 +52,10 @@ constexpr char LogTag[] = "CpeRelayNative";
 constexpr int MinimumRetainedRadiusChunks = 10;
 constexpr int MaximumRetainedRadiusChunks = 64;
 constexpr std::size_t AndroidLevelChunkRetentionMaximumBytes =
-    96u * 1024u * 1024u;
+    48u * 1024u * 1024u;
+constexpr std::size_t MaximumDecodedWorldColumns = 320;
+constexpr std::size_t MaximumQueuedWorldPackets = 128;
+constexpr std::size_t MaximumMiniMapTiles = 768;
 
 std::atomic<bool> configuredDetailedLogging {true};
 std::atomic<bool> configuredChunkRetention {false};
@@ -454,12 +457,18 @@ std::string rakNetStatisticsBreadcrumb(
            << " userPushed=" << statistics.userMessageBytesPushed
            << " userSent=" << statistics.userMessageBytesSent
            << " userResent=" << statistics.userMessageBytesResent
+           << " userReceived="
+           << statistics.userMessageBytesReceivedProcessed
+           << " userIgnored="
+           << statistics.userMessageBytesReceivedIgnored
            << " actualSent=" << statistics.actualBytesSent
            << " actualReceived=" << statistics.actualBytesReceived
            << " sendQueueMessages=" << statistics.sendBufferMessages
            << " sendQueueBytes=" << statistics.sendBufferBytes
            << " resendMessages=" << statistics.resendBufferMessages
-           << " resendBytes=" << statistics.resendBufferBytes;
+           << " resendBytes=" << statistics.resendBufferBytes
+           << " packetLossLastSecond=" << statistics.packetLossLastSecond
+           << " packetLossTotal=" << statistics.packetLossTotal;
     return detail.str();
 }
 
@@ -879,8 +888,11 @@ struct RelayState {
     int64_t pendingAutomationNetworkId = 0;
     int32_t pendingAutomationStackId = 0;
     std::size_t pendingAutomationEquipmentIndex = 0;
+    std::size_t pendingAutomationInventorySlot = 0;
     uint64_t pendingAutomationStartedAtMs = 0;
     uint64_t lastAutomationAttemptAtMs = 0;
+    uint64_t automationRetryAfterMs = 0;
+    uint32_t consecutiveAutomationFailures = 0;
     uint64_t automationAccepted = 0;
     uint64_t automationRejected = 0;
     std::string automationStatus = "Ожидание инвентаря";
@@ -1543,6 +1555,120 @@ struct RelayState {
         miniMapCondition.notify_all();
     }
 
+    void trimMemory(int level) noexcept {
+        // Android's foreground-process pressure levels are 10/15. Levels
+        // 20-40 merely mean that our Activity is hidden behind Minecraft and
+        // must not discard the live world. Background critical levels start
+        // at 60.
+        const bool runningLow = level == 10;
+        const bool critical = level == 15 || level >= 60;
+        if (!runningLow && !critical) return;
+
+        const auto camera = entityPositions.cameraSnapshot();
+        const int32_t cameraChunkX = camera.known
+            ? blockToChunkCoordinate(static_cast<int32_t>(
+                std::floor(camera.x)
+            ))
+            : 0;
+        const int32_t cameraChunkZ = camera.known
+            ? blockToChunkCoordinate(static_cast<int32_t>(
+                std::floor(camera.z)
+            ))
+            : 0;
+        const int32_t dimension = miniMapDimension.load(
+            std::memory_order_relaxed
+        );
+        const std::size_t columnTarget = critical ? 64u : 160u;
+        const std::size_t tileTarget = critical ? 192u : 512u;
+        std::size_t columnsBefore = 0;
+        std::size_t columnsAfter = 0;
+        std::size_t tilesBefore = 0;
+        std::size_t tilesAfter = 0;
+        try {
+            {
+                std::lock_guard lock(miniMapMutex);
+                columnsBefore = schematicColumns.size();
+                tilesBefore = miniMapTiles.size();
+                ++miniMapGeneration;
+                miniMapJobs.clear();
+                miniMapDirtyTiles.clear();
+
+                while (schematicColumns.size() > columnTarget) {
+                    auto victim = schematicColumns.begin();
+                    int64_t victimDistance = -1;
+                    uint64_t oldestRevision =
+                        std::numeric_limits<uint64_t>::max();
+                    for (auto current = schematicColumns.begin();
+                         current != schematicColumns.end(); ++current) {
+                        int64_t distance = 0;
+                        if (camera.known) {
+                            const int64_t dx =
+                                static_cast<int64_t>(current->first.x) -
+                                cameraChunkX;
+                            const int64_t dz =
+                                static_cast<int64_t>(current->first.z) -
+                                cameraChunkZ;
+                            distance = dx * dx + dz * dz;
+                            if (current->first.dimension != dimension) {
+                                distance += int64_t {1} << 60;
+                            }
+                        }
+                        if (distance > victimDistance ||
+                            (distance == victimDistance &&
+                             current->second.revision < oldestRevision)) {
+                            victim = current;
+                            victimDistance = distance;
+                            oldestRevision = current->second.revision;
+                        }
+                    }
+                    schematicColumnHighWatermarks.erase(victim->first);
+                    schematicColumns.erase(victim);
+                }
+                while (miniMapTiles.size() > tileTarget) {
+                    auto oldest = miniMapTiles.begin();
+                    for (auto current = miniMapTiles.begin();
+                         current != miniMapTiles.end(); ++current) {
+                        if (current->second.revision <
+                            oldest->second.revision) {
+                            oldest = current;
+                        }
+                    }
+                    miniMapTiles.erase(oldest);
+                }
+                if (critical) {
+                    schematicBlockOverrides.clear();
+                    schematicBlockOverrideOrder.clear();
+                    schematicColumnHighWatermarks.clear();
+                }
+                ++miniMapRevision;
+                ++schematicRevision;
+                columnsAfter = schematicColumns.size();
+                tilesAfter = miniMapTiles.size();
+            }
+            if (critical) {
+                std::lock_guard registryLock(blockRegistryMutex);
+                miniMapAppearances.clear();
+                schematicBlockAppearances.clear();
+                schematicCollisionShapeCache.clear();
+            }
+            miniMapCondition.notify_all();
+            push(
+                "memory_trim",
+                "level=" + std::to_string(level) +
+                    " decodedColumns=" + std::to_string(columnsBefore) +
+                    "->" + std::to_string(columnsAfter) +
+                    " miniMapTiles=" + std::to_string(tilesBefore) +
+                    "->" + std::to_string(tilesAfter) +
+                    " queuedWorldPackets=0",
+                "WARN",
+                "memory"
+            );
+        } catch (...) {
+            // Memory-pressure cleanup must remain best-effort and must never
+            // turn an Android callback into a relay crash.
+        }
+    }
+
     void recordSchematicColumnSequenceLocked(
         const MiniMapKey& key,
         uint64_t packetSequence
@@ -1755,10 +1881,11 @@ struct RelayState {
         );
         recordSchematicColumnSequenceLocked(key, packetSequence);
 
-        // A 192-block schematic radius covers at most about 625 chunk columns;
-        // retain the nearest 640 while still bounding decoded mobile memory.
-        constexpr std::size_t MaximumSchematicColumns = 640;
-        while (schematicColumns.size() > MaximumSchematicColumns) {
+        // Decoded columns are much larger than their wire packets. Keeping a
+        // complete 192-block square could exhaust a mobile process during a
+        // long session, so retain the nearest working set and let compact
+        // minimap tiles preserve already-rendered surroundings.
+        while (schematicColumns.size() > MaximumDecodedWorldColumns) {
             auto farthest = schematicColumns.begin();
             int64_t farthestDistance = -1;
             uint64_t oldestRevision = std::numeric_limits<uint64_t>::max();
@@ -2262,8 +2389,7 @@ struct RelayState {
                 // IGN-style servers. Keep a bounded raw-payload queue, but thin
                 // it by camera distance without ever erasing unrelated world
                 // authority.
-                constexpr std::size_t MaximumQueuedChunks = 256;
-                if (miniMapJobs.size() < MaximumQueuedChunks) {
+                if (miniMapJobs.size() < MaximumQueuedWorldPackets) {
                     miniMapJobs.push_back(std::move(incoming));
                 } else {
                     auto farthest = std::max_element(
@@ -2479,7 +2605,7 @@ struct RelayState {
                 }
                 tile.revision = ++miniMapRevision;
                 miniMapTiles.insert_or_assign(key, std::move(tile));
-                while (miniMapTiles.size() > 2048) {
+                while (miniMapTiles.size() > MaximumMiniMapTiles) {
                     auto oldest = miniMapTiles.begin();
                     for (auto current = miniMapTiles.begin();
                          current != miniMapTiles.end(); ++current) {
@@ -3264,6 +3390,11 @@ struct RelayState {
         return -1;
     }
 
+    static bool isTotem(std::string_view name) noexcept {
+        return name == "minecraft:totem_of_undying" ||
+            name == "minecraft:totem";
+    }
+
     static int armorScore(const EquipmentItem& item) noexcept {
         if (!item.present) return -1;
         int material = -1;
@@ -3286,10 +3417,10 @@ struct RelayState {
         if (!playerInventoryReady || playerInventory.empty()) return plan;
 
         if (autoTotemEnabled.load(std::memory_order_relaxed) &&
-            equipment[1].name != "minecraft:totem_of_undying") {
+            !isTotem(equipment[1].name)) {
             for (std::size_t slot = 0; slot < playerInventory.size(); ++slot) {
                 const auto& item = playerInventory[slot];
-                if (item.name != "minecraft:totem_of_undying" ||
+                if (!isTotem(item.name) ||
                     item.transactionItem.kind !=
                         bedrock::ProtoDefValue::Kind::Object) {
                     continue;
@@ -3332,6 +3463,21 @@ struct RelayState {
                 plan.destination = equipment[equipmentIndex];
                 bestGain = gain;
                 bestScore = candidateScore;
+            }
+        }
+        if (!plan.valid) {
+            const bool wantsMissingTotem =
+                autoTotemEnabled.load(std::memory_order_relaxed) &&
+                !isTotem(equipment[1].name);
+            if (wantsMissingTotem) {
+                automationStatus = "Тотем не найден в " +
+                    std::to_string(playerInventory.size()) +
+                    " синхронизированных слотах";
+            } else if (autoArmorEnabled.load(std::memory_order_relaxed)) {
+                automationStatus =
+                    "Более подходящая броня в инвентаре не найдена";
+            } else if (autoTotemEnabled.load(std::memory_order_relaxed)) {
+                automationStatus = "Тотем уже находится в левой руке";
             }
         }
         return plan;
@@ -3443,6 +3589,23 @@ struct RelayState {
             .makePacketByName("inventory_transaction", payload);
     }
 
+    void clearPendingAutomationLocked() noexcept {
+        pendingAutomationRequestId = 0;
+        pendingAutomationNetworkId = 0;
+        pendingAutomationStackId = 0;
+        pendingAutomationEquipmentIndex = 0;
+        pendingAutomationInventorySlot = 0;
+        pendingAutomationStartedAtMs = 0;
+    }
+
+    uint64_t automationRetryDelayLocked() const noexcept {
+        // Back off repeated server timeouts without permanently disabling the
+        // already-valid inventory snapshot. The cap prevents packet spam on a
+        // server that rejects automated swaps.
+        const auto shift = std::min<uint32_t>(consecutiveAutomationFailures, 4);
+        return std::min<uint64_t>(30'000, 1'500ull << shift);
+    }
+
     void resolveLegacyAutomationLocked(std::size_t equipmentIndex) {
         if (pendingAutomationRequestId == 0 ||
             equipmentIndex != pendingAutomationEquipmentIndex) {
@@ -3453,19 +3616,16 @@ struct RelayState {
             equipment[equipmentIndex].networkId == pendingAutomationNetworkId &&
             (pendingAutomationStackId == 0 ||
              equipment[equipmentIndex].stackId == pendingAutomationStackId);
-        pendingAutomationRequestId = 0;
-        pendingAutomationNetworkId = 0;
-        pendingAutomationStackId = 0;
-        pendingAutomationEquipmentIndex = 0;
-        if (accepted) {
-            ++automationAccepted;
-            automationStatus = "Legacy-транзакция подтверждена сервером";
-        } else {
-            ++automationRejected;
-            playerInventoryReady = false;
-            automationStatus =
-                "Сервер отклонил legacy-транзакцию — ожидается синхронизация";
-        }
+        // Equipment packets are also broadcast for unrelated changes. An
+        // unchanged destination is not a rejection; keep waiting until either
+        // the requested item appears or the bounded timeout expires.
+        if (!accepted) return;
+
+        clearPendingAutomationLocked();
+        consecutiveAutomationFailures = 0;
+        automationRetryAfterMs = steadyMilliseconds() + 750;
+        ++automationAccepted;
+        automationStatus = "Перемещение подтверждено сервером";
     }
 
     void maybeInjectAutomation(
@@ -3484,18 +3644,22 @@ struct RelayState {
 
         const uint64_t now = steadyMilliseconds();
         AutomationPlan plan;
+        bool timedOut = false;
         {
             std::lock_guard lock(mutex);
             if (pendingAutomationRequestId != 0) {
-                if (now - pendingAutomationStartedAtMs < 1'500) return;
-                pendingAutomationRequestId = 0;
-                pendingAutomationNetworkId = 0;
-                pendingAutomationStackId = 0;
-                pendingAutomationEquipmentIndex = 0;
-                playerInventoryReady = false;
-                automationStatus = "Нет ответа сервера — ожидается синхронизация";
-                return;
+                if (now - pendingAutomationStartedAtMs < 2'500) return;
+                clearPendingAutomationLocked();
+                ++automationRejected;
+                ++consecutiveAutomationFailures;
+                const auto retryDelay = automationRetryDelayLocked();
+                automationRetryAfterMs = now + retryDelay;
+                automationStatus = "Сервер не подтвердил перемещение; повтор через " +
+                    std::to_string((retryDelay + 999) / 1'000) + " с";
+                timedOut = true;
             }
+            if (timedOut) return;
+            if (now < automationRetryAfterMs) return;
             if (now - lastAutomationAttemptAtMs < 500) return;
             plan = chooseAutomationPlanLocked();
             if (!plan.valid) return;
@@ -3510,6 +3674,7 @@ struct RelayState {
             {
                 std::lock_guard lock(mutex);
                 lastAutomationAttemptAtMs = now;
+                automationRetryAfterMs = now + 30'000;
                 automationStatus =
                     "Пакет автоматизации не поддержан этой версией";
             }
@@ -3536,18 +3701,24 @@ struct RelayState {
                  currentSource.damage != plan.source.damage)) {
                 return;
             }
-            playerInventory[plan.inventorySlot] = plan.destination;
-            equipment[plan.equipmentIndex] = plan.source;
-            ++equipmentRevision;
+            // Do not modify the cache optimistically. The server remains the
+            // source of truth and will update inventory/equipment on success.
+            // Keeping the source item cached also allows a safe retry after a
+            // timeout instead of losing an item that was already in inventory.
             pendingAutomationRequestId = plan.requestId;
             pendingAutomationNetworkId = plan.source.networkId;
             pendingAutomationStackId = plan.source.stackId;
             pendingAutomationEquipmentIndex = plan.equipmentIndex;
+            pendingAutomationInventorySlot = plan.inventorySlot;
             pendingAutomationStartedAtMs = now;
             lastAutomationAttemptAtMs = now;
             automationStatus = plan.totem
-                ? "Тотем перемещается в левую руку"
-                : "Надевается " + plan.source.name;
+                ? "Тотем найден в слоте " +
+                    std::to_string(plan.inventorySlot) +
+                    " — перемещается в левую руку"
+                : "Найдена броня в слоте " +
+                    std::to_string(plan.inventorySlot) + ": " +
+                    plan.source.name;
         }
         event.replace(std::vector<bedrock::VersionedGamePacket> {
             event.packet,
@@ -3596,6 +3767,9 @@ struct RelayState {
             pendingAutomationNetworkId = 0;
             pendingAutomationStackId = 0;
             pendingAutomationEquipmentIndex = 0;
+            pendingAutomationInventorySlot = 0;
+            automationRetryAfterMs = 0;
+            consecutiveAutomationFailures = 0;
             automationStatus = "Ожидание инвентаря";
             playerHealth = 20.0;
             playerMaximumHealth = 20.0;
@@ -3960,7 +4134,10 @@ struct RelayState {
                 playerInventory = std::move(inventory);
                 playerInventoryReady = true;
                 if (pendingAutomationRequestId == 0) {
-                    automationStatus = "Инвентарь синхронизирован";
+                    consecutiveAutomationFailures = 0;
+                    automationRetryAfterMs = 0;
+                    automationStatus = "Инвентарь синхронизирован: " +
+                        std::to_string(playerInventory.size()) + " слотов";
                 }
                 return;
             }
@@ -4013,12 +4190,15 @@ struct RelayState {
                 const auto slot = decoded.getUInt("slot", 999);
                 auto item = decodedItem(version, decoded, "item");
                 std::lock_guard lock(mutex);
+                // A single InventorySlot packet is only a delta. Never treat
+                // it as a complete inventory: automation must first observe a
+                // full InventoryContent snapshot from the server.
+                if (!playerInventoryReady || slot >= 256) return;
                 if (slot >= playerInventory.size()) {
                     playerInventory.resize(static_cast<std::size_t>(slot) + 1);
                 }
                 playerInventory[static_cast<std::size_t>(slot)] =
                     std::move(item);
-                playerInventoryReady = true;
                 return;
             }
             if (!serverbound && name == "inventory_slot" &&
@@ -4083,6 +4263,9 @@ struct RelayState {
         pendingAutomationNetworkId = 0;
         pendingAutomationStackId = 0;
         pendingAutomationEquipmentIndex = 0;
+        pendingAutomationInventorySlot = 0;
+        automationRetryAfterMs = 0;
+        consecutiveAutomationFailures = 0;
         automationStatus = "Ожидание инвентаря";
         playerHealth = 20.0;
         playerMaximumHealth = 20.0;
@@ -4103,8 +4286,14 @@ struct RelayState {
         bool miniMap,
         bool schematic
     ) {
-        autoArmorEnabled.store(armor, std::memory_order_relaxed);
-        autoTotemEnabled.store(totem, std::memory_order_relaxed);
+        const bool wasArmor = autoArmorEnabled.exchange(
+            armor,
+            std::memory_order_relaxed
+        );
+        const bool wasTotem = autoTotemEnabled.exchange(
+            totem,
+            std::memory_order_relaxed
+        );
         const bool wasMiniMap = miniMapEnabled.exchange(
             miniMap,
             std::memory_order_relaxed
@@ -4130,11 +4319,19 @@ struct RelayState {
         }
         if (!armor && !totem) {
             std::lock_guard lock(mutex);
-            pendingAutomationRequestId = 0;
-            pendingAutomationNetworkId = 0;
-            pendingAutomationStackId = 0;
-            pendingAutomationEquipmentIndex = 0;
+            clearPendingAutomationLocked();
+            automationRetryAfterMs = 0;
+            consecutiveAutomationFailures = 0;
             automationStatus = "Автоматизация выключена";
+        } else if ((!wasArmor && armor) || (!wasTotem && totem)) {
+            std::lock_guard lock(mutex);
+            clearPendingAutomationLocked();
+            automationRetryAfterMs = 0;
+            consecutiveAutomationFailures = 0;
+            automationStatus = playerInventoryReady
+                ? "Проверяется сохранённый инвентарь: " +
+                    std::to_string(playerInventory.size()) + " слотов"
+                : "Ожидание полной синхронизации инвентаря";
         }
     }
 
@@ -4598,6 +4795,9 @@ bedrock::JsRuntimeValue snapshotValue(
         {"equipment", bedrock::JsRuntimeValue::array(std::move(equipment))},
         {"playerInventoryReady", bedrock::JsRuntimeValue::boolean(
             state->playerInventoryReady
+        )},
+        {"playerInventorySlots", bedrock::JsRuntimeValue::number(
+            static_cast<double>(state->playerInventory.size())
         )},
         {"automationPending", bedrock::JsRuntimeValue::boolean(
             state->pendingAutomationRequestId != 0
@@ -5553,6 +5753,7 @@ public:
             {
                 std::lock_guard lock(state->mutex);
                 state->downstreamConnectedAt = unixMilliseconds();
+                state->lastError.clear();
                 relayElapsed = state->relayStartedAt == 0
                     ? 0
                     : state->downstreamConnectedAt - state->relayStartedAt;
@@ -7008,7 +7209,7 @@ private:
                 std::move(sessionId),
                 "raknet_open",
                 std::chrono::steady_clock::now() +
-                    std::chrono::seconds(60),
+                    std::chrono::seconds(20),
                 ++loginWatchdogGeneration_
             };
         }
@@ -7024,7 +7225,7 @@ private:
             !samePeer(pendingLogin_->connection.peer, peer)) return;
         pendingLogin_->stage = stage;
         pendingLogin_->deadline = std::chrono::steady_clock::now() +
-            std::chrono::seconds(60);
+            std::chrono::seconds(20);
         pendingLogin_->generation = ++loginWatchdogGeneration_;
         loginWatchdogCv_.notify_all();
     }
@@ -7084,17 +7285,33 @@ private:
                 }
             }
 
+            const auto visibleError =
+                "Minecraft did not finish the local relay login; reconnect "
+                "to 127.0.0.1:19132";
+            {
+                std::lock_guard stateLock(state_->mutex);
+                state_->lastError = visibleError;
+            }
             state_->push(
-                "local_login_slow",
+                "local_login_timeout",
                 "downstream_session=" + timedOut.sessionId +
                     " last_stage=" + timedOut.stage +
-                    " timeoutMs=60000 raknet={" + rakNetDetail +
-                    "}; preserving the active transport; a new Minecraft "
-                    "attempt can replace it",
-                "WARN",
+                    " timeoutMs=20000 raknet={" + rakNetDetail +
+                    "}; closing the stalled fragmented login so the next "
+                    "Minecraft attempt can connect immediately",
+                "ERROR",
                 "watchdog"
             );
-            state_->flushFlight("local_login_slow", 32);
+            state_->flushFlight("local_login_timeout", 48);
+            {
+                std::lock_guard relayLock(relayMutex_);
+                if (relay_) {
+                    relay_->live().disconnectDownstream(
+                        timedOut.connection,
+                        visibleError
+                    );
+                }
+            }
 
             lock.lock();
         }
@@ -7396,6 +7613,20 @@ Java_com_m9chko_bedrockrelay_NativeBridge_configureGameplayFeatures(
     if (activeController && !schematic) {
         activeController->clearSchematicDebugMarkers();
     }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_m9chko_bedrockrelay_NativeBridge_trimMemory(
+    JNIEnv*,
+    jclass,
+    jint level
+) {
+    std::shared_ptr<RelayState> state;
+    {
+        std::lock_guard lock(controllerMutex);
+        state = currentState;
+    }
+    if (state) state->trimMemory(static_cast<int>(level));
 }
 
 extern "C" JNIEXPORT jstring JNICALL

@@ -60,12 +60,16 @@ struct RakNetServerPeerStatistics {
     uint64_t userMessageBytesPushed = 0;
     uint64_t userMessageBytesSent = 0;
     uint64_t userMessageBytesResent = 0;
+    uint64_t userMessageBytesReceivedProcessed = 0;
+    uint64_t userMessageBytesReceivedIgnored = 0;
     uint64_t actualBytesSent = 0;
     uint64_t actualBytesReceived = 0;
     uint64_t sendBufferMessages = 0;
     uint64_t sendBufferBytes = 0;
     uint64_t resendBufferMessages = 0;
     uint64_t resendBufferBytes = 0;
+    float packetLossLastSecond = 0.0f;
+    float packetLossTotal = 0.0f;
 };
 
 class RakNetServer {

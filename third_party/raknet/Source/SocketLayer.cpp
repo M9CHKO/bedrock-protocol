@@ -118,8 +118,8 @@ void SocketLayer::SetSocketOptions( __UDPSOCKET__ listenSocket, bool blockingSoc
 #else
 	int sock_opt = 1;
 
-	// This doubles the max throughput rate
-	sock_opt=1024*256;
+	// Large Bedrock login messages arrive as short bursts of UDP fragments.
+	sock_opt=RAKNET_SOCKET_RECEIVE_BUFFER_BYTES;
 	setsockopt__(listenSocket, SOL_SOCKET, SO_RCVBUF, ( char * ) & sock_opt, sizeof ( sock_opt ) );
 
 	// Immediate hard close. Don't linger the socket, or recreating the socket quickly on Vista fails.
@@ -132,7 +132,7 @@ void SocketLayer::SetSocketOptions( __UDPSOCKET__ listenSocket, bool blockingSoc
 
 	// This doesn't make much difference: 10% maybe
 	// Not supported on console 2
-	sock_opt=1024*16;
+	sock_opt=RAKNET_SOCKET_SEND_BUFFER_BYTES;
 	setsockopt__(listenSocket, SOL_SOCKET, SO_SNDBUF, ( char * ) & sock_opt, sizeof ( sock_opt ) );
 
 

@@ -66,7 +66,7 @@ final class RelayOverlayController {
     private int statusEffectiveRadiusBlocks;
     private long statusRetainedChunks;
     private long statusRetainedBytes;
-    private long statusMaximumBytes = 256L * 1024L * 1024L;
+    private long statusMaximumBytes = 48L * 1024L * 1024L;
     private long statusEvictedRadius;
     private long statusEvictedMemory;
     private long statusParseFailures;
@@ -1453,9 +1453,10 @@ final class RelayOverlayController {
         root.addView(automationStatus, margins(-1, -2, 0, dp(5), 0, dp(7)));
         refreshAutomationStatus();
         TextView note = text(
-            "Действия отправляются штатным ItemStackRequest и только после " +
-                "синхронизации инвентаря. Во время сундука, шалкера, инвентаря " +
-                "или чата автоматизация приостанавливается.",
+            "Тотем и лучшая броня ищутся во всём уже синхронизированном " +
+                "инвентаре, а перемещение подтверждается сервером. Во время " +
+                "сундука, шалкера, инвентаря или чата автоматизация " +
+                "приостанавливается.",
             10,
             false
         );
@@ -1545,7 +1546,8 @@ final class RelayOverlayController {
         root.addView(logging);
         TextView rule = text(
             logging.isChecked()
-                ? "Запись включена: события и ошибки сохраняются."
+                ? "Запись включена: повторы сжимаются, хранится до 512 КБ; " +
+                    "неактивные файлы старше суток удаляются."
                 : "Запись выключена полностью: новые строки и аварийный буфер не пишутся.",
             10,
             true
