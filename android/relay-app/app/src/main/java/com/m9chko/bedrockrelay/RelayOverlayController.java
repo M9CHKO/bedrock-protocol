@@ -1063,7 +1063,7 @@ final class RelayOverlayController {
 
         root.addView(sectionHeader("ОТОБРАЖЕНИЕ"));
         root.addView(toggle(
-            "Цветная заливка ячеек схемы",
+            "Текстуры блоков схемы",
             RelayService.KEY_SCHEMATIC_TEXTURES,
             true
         ));
@@ -1071,14 +1071,14 @@ final class RelayOverlayController {
             RelayService.KEY_SCHEMATIC_OPACITY,
             42
         ));
-        TextView opacityLabel = settingLabel("Плотность цветной заливки: " +
+        TextView opacityLabel = settingLabel("Прозрачность текстур: " +
             opacity + "%");
         root.addView(opacityLabel);
         SeekBar opacitySlider = slider(10, 100, opacity);
         root.addView(opacitySlider);
         opacitySlider.setOnSeekBarChangeListener(seekListener(
             value -> opacityLabel.setText(
-                "Плотность цветной заливки: " + value + "%"
+                "Прозрачность текстур: " + value + "%"
             ),
             value -> saveInt(
                 RelayService.KEY_SCHEMATIC_OPACITY,
@@ -1271,10 +1271,11 @@ final class RelayOverlayController {
                 "меняется только кнопками X/Y/Z, поворота и зеркала. " +
                 "Кнопки X/Y/Z можно нажимать сразу после размещения — смещение " +
                 "применится, как только будет найдена поверхность. " +
-                "Отсутствующие блоки показаны полупрозрачной цветной заливкой " +
-                "без ошибочной ориентации текстур. Двойная рамка повторяет " +
-                "точную форму ступеней, плит и других неполных блоков. " +
-                "Заливка не имеет коллизии и не меняет настоящий чанк.",
+                "Текстуры отсутствующих блоков получают повёрнутое Bedrock-" +
+                "состояние. Для Java-схем facing/half/axis и другие свойства " +
+                "сначала точно переводятся в Bedrock. Двойная рамка повторяет " +
+                "форму ступеней, плит и других неполных блоков. Фантомы не " +
+                "имеют коллизии и не меняют настоящий чанк.",
             9,
             false
         );

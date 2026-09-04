@@ -35,9 +35,23 @@ tasks.register("generateMinecraftDataAssets") {
             }
         }
 
+        // Keep the exact Java -> Bedrock state table as a compact TSV asset.
+        // APK compression reduces it to roughly 160 KiB, while the runtime
+        // can stream it without constructing a multi-megabyte JSON tree.
+        def exactMappings = new File(destination, "block-state-j2b.tsv")
+        exactMappings.withWriter("UTF-8") { writer ->
+            def mapping = new JsonSlurper().parse(javaToBedrock)
+            mapping.each { javaState, bedrockState ->
+                writer.write(javaState.toString())
+                writer.write('\t')
+                writer.write(bedrockState.toString())
+                writer.write('\n')
+            }
+        }
+
         // blocksJ2B contains millions of state combinations. Textures only
-        // need registry names, so generate a compact one-to-many base-name
-        // index for the Java schematic -> Bedrock resource-pack bridge.
+        // used to need registry names. Keep the compact one-to-many base-name
+        // index too for texture lookup and graceful fallback of custom states.
         def aliases = new TreeMap<String, LinkedHashSet<String>>()
         def mapping = new JsonSlurper().parse(javaToBedrock)
         mapping.each { javaState, bedrockState ->
@@ -76,8 +90,8 @@ android {
         applicationId "com.m9chko.bedrockrelay"
         minSdk 26
         targetSdk 36
-        versionCode 40
-        versionName "1.2.13"
+        versionCode 41
+        versionName "1.2.14"
 
         ndk {
             abiFilters "arm64-v8a"

@@ -234,6 +234,49 @@ public final class SchematicDebugMarkerPlannerTest {
     }
 
     @Test
+    public void usesTranslatedBedrockPaletteWithoutTransformingItTwice() {
+        SchematicModel model = new SchematicModel(
+            "java-directional-palette",
+            "Sponge .schem",
+            1,
+            1,
+            1,
+            Arrays.asList(
+                "minecraft:air",
+                "minecraft:quartz_stairs[facing=north,half=bottom," +
+                    "shape=straight,waterlogged=false]"
+            ),
+            new int[] {1}
+        );
+
+        SchematicDebugMarkerPlanner.Result result =
+            SchematicDebugMarkerPlanner.plan(
+                model,
+                new SchematicPlacementTransform(4, 5, 6, 1, 1, false),
+                new int[] {0},
+                new byte[] {SchematicDebugMarkerPlanner.BLOCK_MISSING},
+                true,
+                3.5d,
+                5.5d,
+                6.5d,
+                -1,
+                16,
+                50,
+                true,
+                new String[] {
+                    "minecraft:air[]",
+                    "minecraft:quartz_stairs[upside_down_bit=false," +
+                        "weirdo_direction=0]"
+                }
+            );
+
+        assertArrayEquals(new String[] {
+            "minecraft:quartz_stairs[upside_down_bit=false," +
+                "weirdo_direction=0]"
+        }, result.expectedBlockStates());
+    }
+
+    @Test
     public void suppressesRecordsWithoutCameraOrWithZeroOpacity() {
         SchematicModel model = model(1, 1, 1, 1);
         int[] indices = {0};

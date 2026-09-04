@@ -694,7 +694,8 @@ final class SchematicOverlayController {
                 texturesEnabled || outlinesEnabled
                     ? Math.max(opacityPercent, outlineOpacityPercent)
                     : 0,
-                query.exactBedrockProperties
+                texturesEnabled || outlinesEnabled,
+                query.transformedBedrockPalette
             );
         synchronized (blockQueryLock) {
             // Serialize the last validity check, native publication and every
@@ -818,6 +819,7 @@ final class SchematicOverlayController {
         final boolean exactBedrockProperties;
         final SchematicPlacementTransform transform;
         final SchematicBlockMatcher.ExpectedBlock[] paletteExpectedBlocks;
+        final String[] transformedBedrockPalette;
         final int[] blockIndices;
         long completedRevision = FORCE_BLOCK_SNAPSHOT;
         long cycleRevision = FORCE_BLOCK_SNAPSHOT;
@@ -836,6 +838,7 @@ final class SchematicOverlayController {
             SchematicModel model,
             SchematicPlacementTransform transform,
             SchematicBlockMatcher.ExpectedBlock[] paletteExpectedBlocks,
+            String[] transformedBedrockPalette,
             int[] blockIndices,
             int cameraChunkX,
             int cameraChunkY,
@@ -865,6 +868,7 @@ final class SchematicOverlayController {
             );
             this.transform = transform;
             this.paletteExpectedBlocks = paletteExpectedBlocks;
+            this.transformedBedrockPalette = transformedBedrockPalette;
             this.blockIndices = blockIndices;
             if (blockIndices.length == 0) states = new byte[0];
         }
@@ -881,6 +885,10 @@ final class SchematicOverlayController {
         ) {
             SchematicBlockMatcher.ExpectedBlock[] palette =
                 new SchematicBlockMatcher.ExpectedBlock[model.paletteSize()];
+            String[] bedrockPalette = new String[model.paletteSize()];
+            boolean bedrockFormat = "Bedrock .mcstructure".equals(
+                model.format()
+            );
             // Palette size is capped at 65,536, while the boundary can contain
             // millions of cells. Build aliases once per palette entry so query
             // creation never scans the entire structure under blockQueryLock.
@@ -892,6 +900,9 @@ final class SchematicOverlayController {
                     transform.rotationQuarterTurns(),
                     transform.mirrored()
                 );
+                bedrockPalette[paletteIndex] = bedrockFormat
+                    ? state
+                    : translator.bedrockState(state);
                 palette[paletteIndex] = SchematicBlockMatcher.expected(
                     state,
                     translator.bedrockCandidates(state)
@@ -910,6 +921,7 @@ final class SchematicOverlayController {
                 model,
                 transform,
                 palette,
+                bedrockPalette,
                 blockIndices,
                 cameraChunkX,
                 cameraChunkY,

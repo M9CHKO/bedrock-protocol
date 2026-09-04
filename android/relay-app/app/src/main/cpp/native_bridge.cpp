@@ -4894,10 +4894,9 @@ std::vector<SchematicDebugShape> planSchematicDebugShapes(
 // by server scripts. The ASCII prefix "CPE" makes accidental overlap with a
 // destination server's debug drawer registry practically impossible.
 constexpr uint64_t SchematicDebugNetworkIdBase = 0x4350450000000000ULL;
-// Filled previews are relay-owned stained-glass falling-block actors. They
-// never enter the authoritative chunk and use a separate ID range from debug
-// shapes. A neutral full-cell fill avoids presenting a misleading orientation
-// when Bedrock ignores directional runtime state on a falling-block entity.
+// Textured previews are relay-owned falling-block actors carrying the exact
+// transformed Bedrock runtime state. They never enter the authoritative chunk
+// and use a separate ID range from debug shapes.
 constexpr uint64_t SchematicTextureActorIdBase = 0x4350451000000000ULL;
 constexpr std::size_t MaximumSchematicTextureActors = 1'800;
 // Keep each clientbound operation comfortably bounded for RakNet queueing and
@@ -4948,58 +4947,6 @@ int32_t schematicDebugArgb(
     const uint32_t argb =
         (alpha << 24u) | (red << 16u) | (green << 8u) | blue;
     return static_cast<int32_t>(argb);
-}
-
-std::string_view schematicNearestDyeName(int32_t argb) noexcept {
-    struct DyeColor {
-        std::string_view name;
-        uint32_t rgb;
-    };
-    static constexpr std::array<DyeColor, 16> Colors {{
-        {"white", 0xf9ffffu},
-        {"orange", 0xf9801du},
-        {"magenta", 0xc74ebdu},
-        {"light_blue", 0x3ab3dau},
-        {"yellow", 0xfed83du},
-        {"lime", 0x80c71fu},
-        {"pink", 0xf38baau},
-        {"gray", 0x474f52u},
-        {"light_gray", 0x9d9d97u},
-        {"cyan", 0x169c9cu},
-        {"purple", 0x8932b8u},
-        {"blue", 0x3c44aau},
-        {"brown", 0x835432u},
-        {"green", 0x5e7c16u},
-        {"red", 0xb02e26u},
-        {"black", 0x1d1d21u}
-    }};
-    const uint32_t rgb = static_cast<uint32_t>(argb) & 0x00ffffffu;
-    const int red = static_cast<int>((rgb >> 16u) & 0xffu);
-    const int green = static_cast<int>((rgb >> 8u) & 0xffu);
-    const int blue = static_cast<int>(rgb & 0xffu);
-    const DyeColor* nearest = &Colors.front();
-    uint32_t nearestDistance = std::numeric_limits<uint32_t>::max();
-    for (const auto& candidate : Colors) {
-        const int candidateRed = static_cast<int>(
-            (candidate.rgb >> 16u) & 0xffu
-        );
-        const int candidateGreen = static_cast<int>(
-            (candidate.rgb >> 8u) & 0xffu
-        );
-        const int candidateBlue = static_cast<int>(candidate.rgb & 0xffu);
-        const int deltaRed = red - candidateRed;
-        const int deltaGreen = green - candidateGreen;
-        const int deltaBlue = blue - candidateBlue;
-        const uint32_t distance = static_cast<uint32_t>(
-            deltaRed * deltaRed + deltaGreen * deltaGreen +
-            deltaBlue * deltaBlue
-        );
-        if (distance < nearestDistance) {
-            nearestDistance = distance;
-            nearest = &candidate;
-        }
-    }
-    return nearest->name;
 }
 
 bedrock::VersionedGamePacket makeLegacySchematicDebugClearPacket(
@@ -6347,31 +6294,31 @@ public:
             std::vector<SchematicDebugShape> debugShapes;
             if (scriptDebug && texturesEnabled) {
                 textureActors.reserve(MaximumSchematicTextureActors);
-                const std::string dyeName(schematicNearestDyeName(
-                    missingOutlineColor
-                ));
-                auto fillRuntimeId = state_->schematicRuntimeId(
-                    "minecraft:" + dyeName + "_stained_glass[]"
-                );
-                if (!fillRuntimeId.has_value()) {
-                    fillRuntimeId = state_->schematicRuntimeId(
-                        "minecraft:stained_glass[color=" + dyeName + "]"
-                    );
-                }
+                std::unordered_map<std::string, std::optional<int32_t>>
+                    runtimeIds;
                 for (auto marker : markers) {
                     if ((marker.status != 0 && marker.status != 1) ||
                         textureActors.size() >= MaximumSchematicTextureActors) {
                         continue;
                     }
-                    if (!fillRuntimeId.has_value()) continue;
-                    // UNKNOWN and MISSING render identically. The fill is a
-                    // colored cell marker, while the double collision outline
-                    // carries the exact state geometry and orientation.
+                    auto [found, inserted] = runtimeIds.try_emplace(
+                        marker.expectedBlockState,
+                        std::nullopt
+                    );
+                    if (inserted) {
+                        found->second = state_->schematicRuntimeId(
+                            marker.expectedBlockState
+                        );
+                    }
+                    if (!found->second.has_value()) continue;
+                    // UNKNOWN and MISSING render identically. The Java side
+                    // has already rotated/mirrored and, where necessary,
+                    // translated this state to Bedrock registry properties.
                     marker.status = 1;
                     marker.expectedBlockState.clear();
                     textureActors.push_back({
                         std::move(marker),
-                        *fillRuntimeId,
+                        *found->second,
                         textureOpacityPercent
                     });
                 }
@@ -6671,9 +6618,9 @@ public:
                     ));
                 }
                 backend = texturesEnabled && outlinesEnabled
-                    ? "server_script_debug_drawer+stained_glass_fill"
+                    ? "server_script_debug_drawer+exact_state_textures"
                     : texturesEnabled
-                        ? "stained_glass_fill"
+                        ? "exact_state_textures"
                         : "server_script_debug_drawer";
             } else {
                 packets.reserve(legacyWrongMarkers.size() + 1);

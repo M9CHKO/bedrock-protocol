@@ -85,6 +85,43 @@ public final class SchematicDebugMarkerPlanner {
         int opacityPercent,
         boolean includeTextureStates
     ) {
+        return plan(
+            model,
+            transform,
+            blockIndices,
+            blockStates,
+            cameraKnown,
+            cameraX,
+            cameraY,
+            cameraZ,
+            selectedLayer,
+            maximumDistance,
+            opacityPercent,
+            includeTextureStates,
+            null
+        );
+    }
+
+    /**
+     * Plans markers using optional already transformed Bedrock palette states.
+     * This lets Java schematics render the exact Bedrock state rather than a
+     * default full cube with only the translated base block name.
+     */
+    public static Result plan(
+        SchematicModel model,
+        SchematicPlacementTransform transform,
+        int[] blockIndices,
+        byte[] blockStates,
+        boolean cameraKnown,
+        double cameraX,
+        double cameraY,
+        double cameraZ,
+        int selectedLayer,
+        int maximumDistance,
+        int opacityPercent,
+        boolean includeTextureStates,
+        String[] transformedBedrockPalette
+    ) {
         Objects.requireNonNull(model, "model");
         Objects.requireNonNull(transform, "transform");
         Objects.requireNonNull(blockIndices, "blockIndices");
@@ -92,6 +129,12 @@ public final class SchematicDebugMarkerPlanner {
         if (blockIndices.length != blockStates.length) {
             throw new IllegalArgumentException(
                 "Block indices and states must have equal lengths"
+            );
+        }
+        if (transformedBedrockPalette != null &&
+            transformedBedrockPalette.length != model.paletteSize()) {
+            throw new IllegalArgumentException(
+                "Transformed palette must match the model palette size"
             );
         }
         if (selectedLayer < -1 || selectedLayer >= model.sizeY()) {
@@ -190,7 +233,12 @@ public final class SchematicDebugMarkerPlanner {
         }
         SortedMarkers sorted = markers == null
             ? new SortedMarkers(new int[0], new String[0])
-            : markers.sorted(model, transform, includeTextureStates);
+            : markers.sorted(
+                model,
+                transform,
+                includeTextureStates,
+                transformedBedrockPalette
+            );
         return new Result(
             sorted.records,
             sorted.expectedBlockStates,
@@ -351,7 +399,8 @@ public final class SchematicDebugMarkerPlanner {
         SortedMarkers sorted(
             SchematicModel model,
             SchematicPlacementTransform transform,
-            boolean includeTextureStates
+            boolean includeTextureStates,
+            String[] transformedBedrockPalette
         ) {
             Integer[] order = new Integer[size];
             for (int index = 0; index < size; ++index) order[index] = index;
@@ -376,11 +425,13 @@ public final class SchematicDebugMarkerPlanner {
                     );
                     String transformedState = transformedPalette[paletteIndex];
                     if (transformedState == null) {
-                        transformedState = SchematicBlockStateTransform.transform(
-                            model.paletteState(paletteIndex),
-                            transform.rotationQuarterTurns(),
-                            transform.mirrored()
-                        );
+                        transformedState = transformedBedrockPalette == null
+                            ? SchematicBlockStateTransform.transform(
+                                model.paletteState(paletteIndex),
+                                transform.rotationQuarterTurns(),
+                                transform.mirrored()
+                            )
+                            : transformedBedrockPalette[paletteIndex];
                         transformedPalette[paletteIndex] = transformedState;
                     }
                     expectedBlockStates[output] = transformedState;

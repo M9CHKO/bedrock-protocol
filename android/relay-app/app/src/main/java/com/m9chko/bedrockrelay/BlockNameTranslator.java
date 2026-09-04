@@ -6,7 +6,9 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.ByteArrayOutputStream;
+import java.io.BufferedReader;
 import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -22,9 +24,12 @@ import java.util.Set;
 final class BlockNameTranslator {
     private static final String ASSET =
         "minecraft-data/1.21.100/block-name-j2b.json";
+    private static final String EXACT_STATE_ASSET =
+        "minecraft-data/1.21.100/block-state-j2b.tsv";
 
     private final Context context;
     private volatile Map<String, List<String>> aliases;
+    private volatile Map<String, String> exactStates;
 
     BlockNameTranslator(Context context) {
         this.context = context.getApplicationContext();
@@ -39,6 +44,74 @@ final class BlockNameTranslator {
         if (mapped != null) result.addAll(mapped);
         addHeuristicAliases(javaName, result);
         return new ArrayList<>(result);
+    }
+
+    /**
+     * Returns the exact Bedrock registry state for a canonical Java state.
+     * The caller rotates/mirrors the Java properties first, so the mapped
+     * Bedrock direction is already the final world-facing direction.
+     */
+    String bedrockState(String javaState) {
+        String exact = loadExactStates().get(exactStateKey(javaState));
+        if (exact != null && !exact.isEmpty()) return exact;
+
+        List<String> candidates = bedrockCandidates(javaState);
+        String name = candidates.isEmpty()
+            ? TexturePackPaths.normalizedBlockName(javaState)
+            : candidates.get(0);
+        return name.isEmpty() ? javaState : "minecraft:" + name + "[]";
+    }
+
+    static String exactStateKey(String state) {
+        if (state == null) return "minecraft:air[]";
+        String value = state.trim();
+        if (value.isEmpty()) return "minecraft:air[]";
+        int properties = value.indexOf('[');
+        String name = properties < 0 ? value : value.substring(0, properties);
+        if (!name.contains(":")) name = "minecraft:" + name;
+        return properties < 0 ? name + "[]" : name + value.substring(properties);
+    }
+
+    static Map<String, String> readExactStates(BufferedReader reader)
+        throws Exception {
+        Map<String, String> result = new HashMap<>();
+        String line;
+        while ((line = reader.readLine()) != null) {
+            int separator = line.indexOf('\t');
+            if (separator <= 0 || separator + 1 >= line.length()) continue;
+            result.put(
+                line.substring(0, separator),
+                line.substring(separator + 1)
+            );
+        }
+        return result;
+    }
+
+    private Map<String, String> loadExactStates() {
+        Map<String, String> current = exactStates;
+        if (current != null) return current;
+        synchronized (this) {
+            if (exactStates != null) return exactStates;
+            Map<String, String> loaded = new HashMap<>();
+            try (BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(
+                        context.getAssets().open(EXACT_STATE_ASSET),
+                        StandardCharsets.UTF_8
+                    ),
+                    64 * 1024
+                )) {
+                loaded = readExactStates(reader);
+            } catch (Throwable error) {
+                DiagnosticsLog.appendError(
+                    context,
+                    "schematics",
+                    "Exact Java-to-Bedrock block-state table could not be loaded",
+                    error
+                );
+            }
+            exactStates = loaded;
+            return loaded;
+        }
     }
 
     private Map<String, List<String>> loadAliases() {
