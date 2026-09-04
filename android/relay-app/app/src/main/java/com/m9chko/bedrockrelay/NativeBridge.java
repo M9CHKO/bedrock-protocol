@@ -35,7 +35,8 @@ public final class NativeBridge {
 
     public static native void configureAreaFill(
         boolean enabled,
-        int requiredPoints
+        int requiredPoints,
+        int height
     );
 
     public static native String areaFillSnapshot();

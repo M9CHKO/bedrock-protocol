@@ -68,6 +68,8 @@ std::atomic<bool> configuredMiniMap {false};
 std::atomic<bool> configuredSchematic {false};
 std::atomic<bool> configuredAreaFill {false};
 std::atomic<int> configuredAreaFillPoints {2};
+std::atomic<int> configuredAreaFillHeight {1};
+std::atomic<bool> areaFillMarkerRefreshRequested {false};
 
 int clampRetainedRadiusChunks(int radius) {
     return std::max(
@@ -862,6 +864,7 @@ struct RelayState {
 
     struct AreaFillRefillPlan {
         bool valid = false;
+        int32_t requestId = 0;
         std::size_t sourceSlot = 0;
         std::size_t destinationSlot = 0;
         EquipmentItem source;
@@ -987,11 +990,14 @@ struct RelayState {
     uint64_t automationRejected = 0;
     std::string automationStatus = "Ожидание инвентаря";
     int32_t areaFillRequiredPoints = 2;
+    int32_t areaFillHeight = 1;
     std::vector<AreaFillPoint> areaFillPoints;
     std::vector<AreaFillCell> areaFillCells;
     bool areaFillRunning = false;
     bool areaFillWaitingForBlocks = false;
     bool areaFillRefillPending = false;
+    int32_t areaFillRefillRequestId = 0;
+    bool areaFillRefillLegacyFallback = false;
     std::size_t areaFillRefillSourceSlot = 0;
     std::size_t areaFillRefillDestinationSlot = 0;
     uint64_t areaFillRefillStartedAtMs = 0;
@@ -2377,28 +2383,34 @@ struct RelayState {
             error = "Область слишком широкая: максимум 96 блоков по стороне";
             return false;
         }
-        const int32_t y = areaFillPoints.front().y;
-        for (int32_t z = minimumZ; z <= maximumZ; ++z) {
-            const bool reverse = ((z - minimumZ) & 1) != 0;
-            for (int32_t offset = 0; offset <= maximumX - minimumX; ++offset) {
-                const int32_t x = reverse
-                    ? maximumX - offset
-                    : minimumX + offset;
-                bool include = areaFillPoints.size() == 2;
-                if (!include) {
-                    include = areaPolygonContains(
-                        x + 0.5,
-                        z + 0.5,
-                        areaFillPoints
-                    );
+        const int32_t baseY = areaFillPoints.front().y;
+        // Generate complete horizontal layers from the bottom upwards. This
+        // makes every completed lower layer available as support before the
+        // filler starts the next one.
+        for (int32_t layer = 0; layer < areaFillHeight; ++layer) {
+            const int32_t y = baseY + layer;
+            for (int32_t z = minimumZ; z <= maximumZ; ++z) {
+                const bool reverse = ((z - minimumZ) & 1) != 0;
+                for (int32_t offset = 0; offset <= maximumX - minimumX; ++offset) {
+                    const int32_t x = reverse
+                        ? maximumX - offset
+                        : minimumX + offset;
+                    bool include = areaFillPoints.size() == 2;
+                    if (!include) {
+                        include = areaPolygonContains(
+                            x + 0.5,
+                            z + 0.5,
+                            areaFillPoints
+                        );
+                    }
+                    if (!include) continue;
+                    if (areaFillCells.size() >= MaximumCells) {
+                        areaFillCells.clear();
+                        error = "Объём больше 1800 блоков — уменьшите контур или высоту";
+                        return false;
+                    }
+                    areaFillCells.push_back({x, y, z, false, false, true, 0});
                 }
-                if (!include) continue;
-                if (areaFillCells.size() >= MaximumCells) {
-                    areaFillCells.clear();
-                    error = "Область больше 1800 блоков — уменьшите контур";
-                    return false;
-                }
-                areaFillCells.push_back({x, y, z, false, false, true, 0});
             }
         }
         if (areaFillCells.empty()) {
@@ -2409,33 +2421,74 @@ struct RelayState {
         areaFillScanCursor = 0;
         areaFillSyntheticPositionKnown = false;
         areaFillStatus = "Область готова: " +
-            std::to_string(areaFillCells.size()) + " блоков";
+            std::to_string(areaFillCells.size()) + " блоков, высота " +
+            std::to_string(areaFillHeight);
         ++areaFillRevision;
         return true;
     }
 
-    void configureAreaFill(bool enabled, int requiredPoints) noexcept {
+    void configureAreaFill(
+        bool enabled,
+        int requiredPoints,
+        int height
+    ) noexcept {
         requiredPoints = std::clamp(requiredPoints, 2, 8);
-        areaFillEnabled.store(enabled, std::memory_order_relaxed);
+        height = std::clamp(height, 1, 5);
+        const bool enabledChanged = areaFillEnabled.exchange(
+            enabled,
+            std::memory_order_relaxed
+        ) != enabled;
         {
             std::lock_guard lock(mutex);
             if (areaFillRequiredPoints != requiredPoints) {
                 areaFillRequiredPoints = requiredPoints;
+                areaFillHeight = height;
                 areaFillPoints.clear();
                 areaFillCells.clear();
                 areaFillRunning = false;
                 areaFillWaitingForBlocks = false;
+                areaFillRefillPending = false;
+                areaFillRefillRequestId = 0;
+                areaFillRefillLegacyFallback = false;
+                areaFillPlacementPending = false;
+                areaFillSyntheticPositionKnown = false;
                 areaFillItemNetworkId = 0;
                 areaFillItemName.clear();
-                areaFillStatus = "Количество точек изменено — отметьте область заново";
+                areaFillStatus =
+                    "Количество точек изменено — отметьте область заново";
                 ++areaFillRevision;
+            } else if (areaFillHeight != height) {
+                areaFillHeight = height;
+                areaFillRunning = false;
+                areaFillWaitingForBlocks = false;
+                areaFillRefillPending = false;
+                areaFillRefillRequestId = 0;
+                areaFillRefillLegacyFallback = false;
+                areaFillPlacementPending = false;
+                areaFillSyntheticPositionKnown = false;
+                if (areaFillPoints.size() ==
+                    static_cast<std::size_t>(areaFillRequiredPoints)) {
+                    std::string error;
+                    if (!rebuildAreaFillCellsLocked(error)) {
+                        areaFillStatus = std::move(error);
+                        ++areaFillRevision;
+                    }
+                } else {
+                    areaFillStatus = "Высота изменена — добавьте точки области";
+                    ++areaFillRevision;
+                }
             }
             if (!enabled && areaFillRunning) {
                 areaFillRunning = false;
+                areaFillRefillPending = false;
+                areaFillRefillRequestId = 0;
+                areaFillRefillLegacyFallback = false;
+                areaFillPlacementPending = false;
                 areaFillSyntheticPositionKnown = false;
                 areaFillStatus = "Автозаполнение выключено";
                 ++areaFillRevision;
             }
+            if (enabledChanged) ++areaFillRevision;
         }
         const bool tracking = enabled ||
             schematicEnabled.load(std::memory_order_relaxed);
@@ -2459,6 +2512,8 @@ struct RelayState {
         areaFillRunning = false;
         areaFillWaitingForBlocks = false;
         areaFillRefillPending = false;
+        areaFillRefillRequestId = 0;
+        areaFillRefillLegacyFallback = false;
         areaFillPlacementPending = false;
         areaFillSyntheticPositionKnown = false;
         areaFillItemNetworkId = 0;
@@ -2477,6 +2532,8 @@ struct RelayState {
         areaFillRunning = false;
         areaFillWaitingForBlocks = false;
         areaFillRefillPending = false;
+        areaFillRefillRequestId = 0;
+        areaFillRefillLegacyFallback = false;
         areaFillPlacementPending = false;
         areaFillSyntheticPositionKnown = false;
         areaFillStatus = std::move(status);
@@ -2496,11 +2553,13 @@ struct RelayState {
             static_cast<std::size_t>(areaFillRequiredPoints)) {
             areaFillStatus = "Все точки уже заданы — сначала очистите область";
         } else {
-            // PlayerAuthInput reports eye height. A tiny epsilon selects the
-            // solid block immediately below feet when the player stands on an
-            // integer-height surface.
+            // PlayerAuthInput reports the Bedrock network eye position. The
+            // fill target is the empty cell occupied by the player's feet;
+            // its supporting floor is one block below. The old subtraction
+            // selected that support itself and made route validation demand a
+            // solid target where a new block was supposed to go.
             const int32_t fillY = areaFillPoints.empty()
-                ? static_cast<int32_t>(std::floor(camera.y - 1.62f - 0.01f))
+                ? static_cast<int32_t>(std::floor(camera.y - 1.62f + 0.01f))
                 : areaFillPoints.front().y;
             AreaFillPoint point {
                 static_cast<int32_t>(std::floor(camera.x)),
@@ -2579,6 +2638,8 @@ struct RelayState {
         areaFillRunning = true;
         areaFillWaitingForBlocks = false;
         areaFillRefillPending = false;
+        areaFillRefillRequestId = 0;
+        areaFillRefillLegacyFallback = false;
         areaFillPlacementPending = false;
         areaFillSyntheticPositionKnown = false;
         areaFillStatus = "Заполнение запущено: " + held.name;
@@ -2606,6 +2667,7 @@ struct RelayState {
                 areaFillWaitingForBlocks)},
             {"requiredPoints", bedrock::JsRuntimeValue::number(
                 areaFillRequiredPoints)},
+            {"height", bedrock::JsRuntimeValue::number(areaFillHeight)},
             {"pointCount", bedrock::JsRuntimeValue::number(
                 static_cast<double>(areaFillPoints.size()))},
             {"points", bedrock::JsRuntimeValue::array(std::move(points))},
@@ -2629,28 +2691,30 @@ struct RelayState {
     areaFillMarkersSnapshot(uint64_t afterRevision = 0) const {
         constexpr std::size_t MaximumDisplayedAreaFillMarkers = 384;
         const auto camera = entityPositions.cameraSnapshot();
-        std::lock_guard lock(mutex);
+        uint64_t revision = 0;
         std::vector<AreaFillMarker> markers;
-        if (afterRevision == areaFillRevision) {
-            return {areaFillRevision, std::move(markers)};
-        }
-        if (!areaFillEnabled.load(std::memory_order_relaxed)) {
-            return {areaFillRevision, std::move(markers)};
-        }
-        markers.reserve(areaFillCells.size());
-        for (std::size_t index = 0; index < areaFillCells.size(); ++index) {
-            const auto& cell = areaFillCells[index];
-            markers.push_back({
-                cell.x,
-                cell.y,
-                cell.z,
-                static_cast<int32_t>(
-                    (areaFillPlacementPending && index == areaFillPendingCell) ||
-                            (areaFillRunning && index == areaFillRouteCell)
-                        ? 3
-                        : cell.complete ? 2 : 1
-                )
-            });
+        {
+            std::lock_guard lock(mutex);
+            revision = areaFillRevision;
+            if (afterRevision == revision ||
+                !areaFillEnabled.load(std::memory_order_relaxed)) {
+                return {revision, std::move(markers)};
+            }
+            markers.reserve(areaFillCells.size());
+            for (std::size_t index = 0; index < areaFillCells.size(); ++index) {
+                const auto& cell = areaFillCells[index];
+                markers.push_back({
+                    cell.x,
+                    cell.y,
+                    cell.z,
+                    static_cast<int32_t>(
+                        (areaFillPlacementPending && index == areaFillPendingCell) ||
+                                (areaFillRunning && index == areaFillRouteCell)
+                            ? 3
+                            : cell.complete ? 2 : 1
+                    )
+                });
+            }
         }
         if (camera.known) {
             std::stable_sort(
@@ -2675,7 +2739,7 @@ struct RelayState {
         if (markers.size() > MaximumDisplayedAreaFillMarkers) {
             markers.resize(MaximumDisplayedAreaFillMarkers);
         }
-        return {areaFillRevision, std::move(markers)};
+        return {revision, std::move(markers)};
     }
 
     std::vector<int32_t> schematicBlockSnapshotValues(
@@ -4348,6 +4412,35 @@ struct RelayState {
         const AreaFillRefillPlan& plan
     ) {
         using Value = bedrock::ProtoDefValue;
+        if (plan.requestId != 0) {
+            // Weathertop dev uses one confirmed inventory-to-hotbar swap in
+            // the unified inventory container. Keep the request id negative
+            // and wait for ItemStackResponse before trusting the local cache.
+            return makeAreaProtocolPacket(
+                version,
+                "item_stack_request",
+                Value::object({
+                    {"requests", Value::array({Value::object({
+                        {"request_id", Value::integer(plan.requestId)},
+                        {"actions", Value::array({Value::object({
+                            {"type_id", Value::string("swap")},
+                            {"source", automationStackSlot(
+                                "hotbar_and_inventory",
+                                static_cast<uint8_t>(plan.sourceSlot),
+                                plan.source.stackId
+                            )},
+                            {"destination", automationStackSlot(
+                                "hotbar_and_inventory",
+                                static_cast<uint8_t>(plan.destinationSlot),
+                                plan.destination.stackId
+                            )}
+                        })})},
+                        {"custom_names", Value::array({})},
+                        {"cause", Value::string("chat_public")}
+                    })})}
+                })
+            );
+        }
         auto transaction = Value::object({
             {"legacy", Value::object({
                 {"legacy_request_id", Value::integer(0)}
@@ -4440,10 +4533,13 @@ struct RelayState {
         if (camera.runtimeId == 0) {
             throw std::runtime_error("player runtime id is unavailable");
         }
-        auto oldItem = legacyTransactionItem(plan.held);
+        // Block-use transactions identify the exact authoritative stack.
+        // Keep stack_id here (unlike the legacy inventory-swap fallback), as
+        // Weathertop's dev blockPlacer does for stateful block items.
+        auto oldItem = legacyTransactionItem(plan.held, true);
         auto newItem = oldItem;
         if (plan.held.count <= 1) {
-            newItem = Value::object({{"network_id", Value::integer(0)}});
+            newItem = legacyTransactionItem(EquipmentItem {}, true);
         } else {
             newItem.objectValue["count"] = Value::uinteger(
                 static_cast<uint64_t>(plan.held.count - 1)
@@ -4452,7 +4548,14 @@ struct RelayState {
 
         auto transaction = Value::object({
             {"legacy", Value::object({
-                {"legacy_request_id", Value::integer(0)}
+                {"legacy_request_id", Value::integer(0)},
+                {"legacy_transactions", Value::array({Value::object({
+                    {"container_id", Value::integer(29)},
+                    {"changed_slots", Value::array({Value::object({
+                        {"slot_id", Value::uinteger(
+                            static_cast<uint64_t>(plan.hotbarSlot))}
+                    })})}
+                })})}
             })},
             {"transaction_type", Value::string("item_use")},
             {"actions", Value::array({
@@ -4523,7 +4626,23 @@ struct RelayState {
         );
 
         std::vector<bedrock::VersionedGamePacket> packets;
-        packets.reserve(4);
+        packets.reserve(5);
+        // Reassert the selected authoritative stack before every placement.
+        // This mirrors the confirmed Weathertop dev order and is especially
+        // important immediately after refilling the selected hotbar slot.
+        packets.push_back(makeAreaProtocolPacket(
+            version,
+            "mob_equipment",
+            Value::object({
+                {"runtime_entity_id", Value::uinteger(camera.runtimeId)},
+                {"item", legacyTransactionItem(plan.held, true)},
+                {"slot", Value::uinteger(
+                    static_cast<uint64_t>(plan.hotbarSlot))},
+                {"selected_slot", Value::uinteger(
+                    static_cast<uint64_t>(plan.hotbarSlot))},
+                {"window_id", Value::string("inventory")}
+            })
+        ));
         packets.push_back(makeAreaProtocolPacket(
             version,
             "player_action",
@@ -4565,6 +4684,7 @@ struct RelayState {
         float y,
         float z,
         float deltaX,
+        float deltaY,
         float deltaZ,
         float yaw
     ) {
@@ -4578,6 +4698,7 @@ struct RelayState {
         decoded.set("position.y", static_cast<double>(y));
         decoded.set("position.z", static_cast<double>(z));
         decoded.set("delta.x", static_cast<double>(deltaX));
+        decoded.set("delta.y", static_cast<double>(deltaY));
         decoded.set("delta.z", static_cast<double>(deltaZ));
         decoded.set("yaw", static_cast<double>(yaw));
         decoded.set("head_yaw", static_cast<double>(yaw));
@@ -4666,20 +4787,31 @@ struct RelayState {
         }
     }
 
-    void refreshAreaFillWorldSamples(std::size_t maximumSamples = 48) noexcept {
+    void refreshAreaFillWorldSamples(std::size_t maximumSamples = 32) noexcept {
         std::vector<std::pair<std::size_t, AreaFillPoint>> requests;
         {
             std::lock_guard lock(mutex);
-            if (!areaFillRunning || areaFillCells.empty()) return;
+            if (!areaFillEnabled.load(std::memory_order_relaxed) ||
+                areaFillCells.empty()) return;
             requests.reserve(std::min(maximumSamples, areaFillCells.size()));
-            for (std::size_t count = 0;
-                 count < maximumSamples && count < areaFillCells.size();
-                 ++count) {
+            // Initial occupancy is resolved incrementally on the relay thread,
+            // including while the user is still looking at the preview. Do
+            // not re-read every known cell on every PlayerAuthInput tick: the
+            // normal block-update observer keeps known cells current.
+            for (std::size_t inspected = 0;
+                 inspected < areaFillCells.size() &&
+                    requests.size() < maximumSamples;
+                 ++inspected) {
                 const auto index = areaFillScanCursor++ % areaFillCells.size();
                 const auto& cell = areaFillCells[index];
+                if (cell.worldKnown &&
+                    (!areaFillPlacementPending || index != areaFillPendingCell)) {
+                    continue;
+                }
                 requests.push_back({index, {cell.x, cell.y, cell.z}});
             }
         }
+        if (requests.empty()) return;
         std::vector<WorldBlockSample> samples;
         samples.reserve(requests.size());
         for (const auto& request : requests) {
@@ -4696,6 +4828,11 @@ struct RelayState {
             const auto& sample = samples[index];
             if (!sample.known) continue;
             auto& cell = areaFillCells[requests[index].first];
+            const auto& requested = requests[index].second;
+            if (cell.x != requested.x || cell.y != requested.y ||
+                cell.z != requested.z) {
+                continue;
+            }
             if (!cell.worldKnown || cell.worldAir != sample.air) changed = true;
             cell.worldKnown = true;
             cell.worldAir = sample.air;
@@ -4769,6 +4906,82 @@ struct RelayState {
         return std::nullopt;
     }
 
+    std::optional<float> areaFillSafeStandingEyeY(
+        float centerX,
+        float centerZ,
+        float currentEyeY,
+        int32_t baseFillY
+    ) const noexcept {
+        constexpr float PlayerEyeHeight = 1.62f;
+        constexpr float PlayerHalfWidth = 0.3f;
+        constexpr float CollisionEpsilon = 0.001f;
+        const float currentFeetY = currentEyeY - PlayerEyeHeight;
+        const int32_t currentSupportY = static_cast<int32_t>(
+            std::floor(currentFeetY - 0.01f)
+        );
+        std::array<int32_t, 5> supportCandidates {{
+            currentSupportY + 1,
+            currentSupportY,
+            currentSupportY - 1,
+            baseFillY,
+            baseFillY - 1
+        }};
+        std::sort(supportCandidates.begin(), supportCandidates.end());
+        const auto uniqueEnd = std::unique(
+            supportCandidates.begin(),
+            supportCandidates.end()
+        );
+        // Prefer the highest surface the player can step onto, but never
+        // climb or drop more than one block in a synthetic walking step.
+        for (auto it = std::make_reverse_iterator(uniqueEnd);
+             it != supportCandidates.rend();
+             ++it) {
+            const int32_t supportY = *it;
+            const float feetY = static_cast<float>(supportY + 1);
+            if (std::abs(feetY - currentFeetY) > 1.05f) continue;
+
+            // Check every column touched by the real 0.6-wide player AABB,
+            // not just the block containing its centre. This prevents the
+            // synthetic walk from clipping a corner or walking with half the
+            // body over an unsupported/unknown cell.
+            const int32_t minimumX = static_cast<int32_t>(std::floor(
+                centerX - PlayerHalfWidth + CollisionEpsilon
+            ));
+            const int32_t maximumX = static_cast<int32_t>(std::floor(
+                centerX + PlayerHalfWidth - CollisionEpsilon
+            ));
+            const int32_t minimumZ = static_cast<int32_t>(std::floor(
+                centerZ - PlayerHalfWidth + CollisionEpsilon
+            ));
+            const int32_t maximumZ = static_cast<int32_t>(std::floor(
+                centerZ + PlayerHalfWidth - CollisionEpsilon
+            ));
+            bool safe = true;
+            bool hasSupport = false;
+            for (int32_t x = minimumX; x <= maximumX && safe; ++x) {
+                for (int32_t z = minimumZ; z <= maximumZ; ++z) {
+                    const auto support = worldBlockSample(x, supportY, z);
+                    const auto body = worldBlockSample(x, supportY + 1, z);
+                    const auto head = worldBlockSample(x, supportY + 2, z);
+                    if (!support.known || !body.known || !body.air ||
+                        !head.known || !head.air) {
+                        safe = false;
+                        break;
+                    }
+                    hasSupport = hasSupport || !support.air;
+                }
+            }
+            // AABB collision resolution permits part of the footprint to
+            // cross an edge while another part is still supported. Requiring
+            // every support column to be solid would make a legitimate
+            // one-block step impossible during the boundary transition.
+            if (safe && hasSupport) {
+                return feetY + PlayerEyeHeight;
+            }
+        }
+        return std::nullopt;
+    }
+
     bool maybeInjectAreaFill(
         const std::string& version,
         bedrock::BedrockRelayPacketEvent& event
@@ -4832,9 +5045,11 @@ struct RelayState {
         float nextY = packetY;
         float nextZ = packetZ;
         float deltaX = 0.0f;
+        float deltaY = 0.0f;
         float deltaZ = 0.0f;
         float nextYaw = 0.0f;
         AreaFillPoint movementFloor;
+        AreaFillPoint movementTarget;
         {
             std::lock_guard lock(mutex);
             if (!areaFillRunning) return false;
@@ -4892,14 +5107,28 @@ struct RelayState {
                 if (held.present && held.networkId == areaFillItemNetworkId &&
                     held.count > 0) {
                     areaFillRefillPending = false;
+                    areaFillRefillRequestId = 0;
+                    areaFillRefillLegacyFallback = false;
                     areaFillStatus = "Хотбар пополнен — продолжаю";
                     ++areaFillRevision;
                 } else if (now - areaFillRefillStartedAtMs < 2'500) {
                     return true;
                 } else {
                     areaFillRefillPending = false;
+                    if (areaFillRefillRequestId != 0 &&
+                        !areaFillRefillLegacyFallback) {
+                        areaFillRefillRequestId = 0;
+                        areaFillRefillLegacyFallback = true;
+                        areaFillStatus =
+                            "ItemStackRequest не подтверждён — пробую legacy swap";
+                        ++areaFillRevision;
+                        return true;
+                    }
+                    areaFillRefillRequestId = 0;
+                    areaFillRefillLegacyFallback = false;
                     areaFillRunning = false;
-                    areaFillStatus = "Сервер не подтвердил пополнение хотбара";
+                    areaFillStatus =
+                        "Сервер не подтвердил пополнение хотбара";
                     ++areaFillRevision;
                     return true;
                 }
@@ -4919,12 +5148,20 @@ struct RelayState {
                     refill.destinationSlot = destinationSlot;
                     refill.source = candidate;
                     refill.destination = held;
+                    if (!areaFillRefillLegacyFallback &&
+                        candidate.stackId != 0) {
+                        refill.requestId = nextAutomationStackRequestId--;
+                    }
                     areaFillRefillPending = true;
+                    areaFillRefillRequestId = refill.requestId;
                     areaFillRefillSourceSlot = slot;
                     areaFillRefillDestinationSlot = destinationSlot;
                     areaFillRefillStartedAtMs = now;
                     areaFillStatus = "Перекладываю " + areaFillItemName +
-                        " из слота " + std::to_string(slot);
+                        " из слота " + std::to_string(slot) +
+                        (refill.requestId != 0
+                            ? " (подтверждаемый swap)"
+                            : " (legacy swap)");
                     ++areaFillRevision;
                     break;
                 }
@@ -4957,17 +5194,32 @@ struct RelayState {
                 const float currentZ = areaFillSyntheticPositionKnown
                     ? areaFillSyntheticZ
                     : packetZ;
+                int32_t activeLayerY = std::numeric_limits<int32_t>::max();
+                for (const auto& cell : areaFillCells) {
+                    if (!cell.complete && cell.worldKnown && cell.worldAir &&
+                        cell.failures < 3) {
+                        activeLayerY = std::min(activeLayerY, cell.y);
+                    }
+                }
                 double bestDistance = std::numeric_limits<double>::infinity();
                 std::size_t bestIndex = areaFillCells.size();
                 for (std::size_t index = 0; index < areaFillCells.size(); ++index) {
                     const auto& cell = areaFillCells[index];
                     if (cell.complete || !cell.worldKnown || !cell.worldAir ||
-                        cell.failures >= 3) continue;
+                        cell.failures >= 3 || cell.y != activeLayerY) continue;
                     const double dx = cell.x + 0.5 - currentX;
                     const double dy = cell.y + 0.5 - currentY;
                     const double dz = cell.z + 0.5 - currentZ;
                     const double distance = dx * dx + dy * dy + dz * dz;
-                    if (distance <= 4.75 * 4.75 && distance < bestDistance) {
+                    // Never attempt to place a target through the player's
+                    // own collision box. Walk far enough away first.
+                    const bool occupiesTarget =
+                        static_cast<int32_t>(std::floor(currentX)) == cell.x &&
+                        static_cast<int32_t>(std::floor(currentZ)) == cell.z &&
+                        currentY - 1.62f < cell.y + 0.95f &&
+                        currentY - 1.62f + 1.8f > cell.y + 0.05f;
+                    if (!occupiesTarget && distance <= 4.75 * 4.75 &&
+                        distance < bestDistance) {
                         bestDistance = distance;
                         bestIndex = index;
                     }
@@ -4995,12 +5247,26 @@ struct RelayState {
                 const float currentZ = areaFillSyntheticPositionKnown
                     ? areaFillSyntheticZ
                     : packetZ;
+                int32_t activeLayerY = std::numeric_limits<int32_t>::max();
+                for (const auto& cell : areaFillCells) {
+                    if (!cell.complete && cell.worldKnown && cell.worldAir &&
+                        cell.failures < 3) {
+                        activeLayerY = std::min(activeLayerY, cell.y);
+                    }
+                }
                 double bestDistance = std::numeric_limits<double>::infinity();
                 std::size_t bestIndex = areaFillCells.size();
                 for (std::size_t index = 0; index < areaFillCells.size(); ++index) {
                     const auto& cell = areaFillCells[index];
                     if (cell.complete || !cell.worldKnown || !cell.worldAir ||
-                        cell.failures >= 3) continue;
+                        cell.failures >= 3 || cell.y != activeLayerY) continue;
+                    const float currentFeetY = currentY - 1.62f;
+                    const bool occupiesTarget =
+                        static_cast<int32_t>(std::floor(currentX)) == cell.x &&
+                        static_cast<int32_t>(std::floor(currentZ)) == cell.z &&
+                        currentFeetY < cell.y + 0.95f &&
+                        currentFeetY + 1.8f > cell.y + 0.05f;
+                    if (occupiesTarget) continue;
                     const double dx = cell.x + 0.5 - currentX;
                     const double dz = cell.z + 0.5 - currentZ;
                     const double distance = dx * dx + dz * dz;
@@ -5017,12 +5283,20 @@ struct RelayState {
                             return !cell.complete && !cell.worldKnown;
                         }
                     );
-                    areaFillRunning = false;
-                    areaFillSyntheticPositionKnown = false;
-                    areaFillStatus = unknown
-                        ? "Часть области не загружена — подойдите ближе и запустите снова"
-                        : "Не удалось установить оставшиеся блоки: нет опоры";
-                    ++areaFillRevision;
+                    if (unknown) {
+                        const std::string scanningStatus =
+                            "Проверяю область и пропускаю уже занятые блоки";
+                        if (areaFillStatus != scanningStatus) {
+                            areaFillStatus = scanningStatus;
+                            ++areaFillRevision;
+                        }
+                    } else {
+                        areaFillRunning = false;
+                        areaFillSyntheticPositionKnown = false;
+                        areaFillStatus =
+                            "Не удалось установить оставшиеся блоки: нет опоры";
+                        ++areaFillRevision;
+                    }
                     return true;
                 }
                 if (areaFillRouteCell != bestIndex) {
@@ -5045,9 +5319,10 @@ struct RelayState {
                     );
                     movementFloor = {
                         static_cast<int32_t>(std::floor(nextX)),
-                        target.y,
+                        areaFillPoints.empty() ? target.y : areaFillPoints.front().y,
                         static_cast<int32_t>(std::floor(nextZ))
                     };
+                    movementTarget = {target.x, target.y, target.z};
                     planMovement = true;
                 }
             }
@@ -5105,23 +5380,83 @@ struct RelayState {
                 return true;
             }
             if (planMovement) {
-                const auto floor = worldBlockSample(
-                    movementFloor.x,
-                    movementFloor.y,
-                    movementFloor.z
+                const float currentX = nextX - deltaX;
+                const float currentY = nextY;
+                const float currentZ = nextZ - deltaZ;
+                auto safeEyeY = areaFillSafeStandingEyeY(
+                    nextX,
+                    nextZ,
+                    currentY,
+                    movementFloor.y
                 );
-                const auto body = worldBlockSample(
-                    movementFloor.x,
-                    movementFloor.y + 1,
-                    movementFloor.z
-                );
-                const auto head = worldBlockSample(
-                    movementFloor.x,
-                    movementFloor.y + 2,
-                    movementFloor.z
-                );
-                if (!floor.known || floor.air || !body.known || !body.air ||
-                    !head.known || !head.air) {
+                if (!safeEyeY.has_value()) {
+                    // The straight cell is blocked. Pick a safe neighbouring
+                    // cell that gets closest to the target instead of stopping
+                    // at the first existing block in the route.
+                    static constexpr std::array<std::array<int32_t, 2>, 4>
+                        Neighbours {{
+                            {{1, 0}}, {{-1, 0}}, {{0, 1}}, {{0, -1}}
+                        }};
+                    const int32_t currentCellX = static_cast<int32_t>(
+                        std::floor(currentX)
+                    );
+                    const int32_t currentCellZ = static_cast<int32_t>(
+                        std::floor(currentZ)
+                    );
+                    double bestScore = std::numeric_limits<double>::infinity();
+                    int32_t bestX = currentCellX;
+                    int32_t bestZ = currentCellZ;
+                    std::optional<float> bestEyeY;
+                    for (const auto& neighbour : Neighbours) {
+                        const int32_t candidateX = currentCellX + neighbour[0];
+                        const int32_t candidateZ = currentCellZ + neighbour[1];
+                        auto candidateEyeY = areaFillSafeStandingEyeY(
+                            candidateX + 0.5f,
+                            candidateZ + 0.5f,
+                            currentY,
+                            movementFloor.y
+                        );
+                        if (!candidateEyeY.has_value()) continue;
+                        const double dx = movementTarget.x + 0.5 -
+                            (candidateX + 0.5);
+                        const double dz = movementTarget.z + 0.5 -
+                            (candidateZ + 0.5);
+                        const double score = dx * dx + dz * dz;
+                        if (score < bestScore) {
+                            bestScore = score;
+                            bestX = candidateX;
+                            bestZ = candidateZ;
+                            bestEyeY = candidateEyeY;
+                        }
+                    }
+                    if (bestEyeY.has_value()) {
+                        const double dx = bestX + 0.5 - currentX;
+                        const double dz = bestZ + 0.5 - currentZ;
+                        const double distance = std::hypot(dx, dz);
+                        const double step = std::min(0.08, distance);
+                        deltaX = distance > 0.0
+                            ? static_cast<float>(dx / distance * step)
+                            : 0.0f;
+                        deltaZ = distance > 0.0
+                            ? static_cast<float>(dz / distance * step)
+                            : 0.0f;
+                        nextX = currentX + deltaX;
+                        nextZ = currentZ + deltaZ;
+                        auto actualEyeY = areaFillSafeStandingEyeY(
+                            nextX,
+                            nextZ,
+                            currentY,
+                            movementFloor.y
+                        );
+                        safeEyeY = actualEyeY.has_value()
+                            ? actualEyeY
+                            : bestEyeY;
+                        nextYaw = static_cast<float>(
+                            std::atan2(-dx, dz) * 57.29577951308232
+                        );
+                    }
+                }
+                if (!safeEyeY.has_value()) {
                     std::lock_guard lock(mutex);
                     areaFillRunning = false;
                     areaFillSyntheticPositionKnown = false;
@@ -5129,6 +5464,8 @@ struct RelayState {
                     ++areaFillRevision;
                     return true;
                 }
+                nextY = *safeEyeY;
+                deltaY = nextY - currentY;
                 auto packet = makeAreaFillMovementPacket(
                     version,
                     event,
@@ -5136,6 +5473,7 @@ struct RelayState {
                     nextY,
                     nextZ,
                     deltaX,
+                    deltaY,
                     deltaZ,
                     nextYaw
                 );
@@ -5658,6 +5996,8 @@ struct RelayState {
             areaFillRunning = false;
             areaFillWaitingForBlocks = false;
             areaFillRefillPending = false;
+            areaFillRefillRequestId = 0;
+            areaFillRefillLegacyFallback = false;
             areaFillPlacementPending = false;
             areaFillSyntheticPositionKnown = false;
             areaFillStatus = areaFillCells.empty()
@@ -5877,6 +6217,37 @@ struct RelayState {
                           status->stringValue == "ok") ||
                          (numericStatus && numericValue(status) == 0));
                     std::lock_guard lock(mutex);
+                    if (areaFillRefillPending &&
+                        areaFillRefillRequestId == requestId) {
+                        if (!accepted) {
+                            areaFillRefillPending = false;
+                            areaFillRefillRequestId = 0;
+                            areaFillRefillLegacyFallback = true;
+                            areaFillStatus =
+                                "Сервер отклонил подтверждаемый swap — пробую legacy";
+                            ++areaFillRevision;
+                            continue;
+                        }
+                        // The accepted ItemStackResponse is authoritative.
+                        // Mirror Weathertop's confirmed inventory swap so the
+                        // next placement can immediately reassert MobEquipment
+                        // even if this server omits InventorySlot afterwards.
+                        if (areaFillRefillSourceSlot < playerInventory.size() &&
+                            areaFillRefillDestinationSlot <
+                                playerInventory.size()) {
+                            std::swap(
+                                playerInventory[areaFillRefillSourceSlot],
+                                playerInventory[areaFillRefillDestinationSlot]
+                            );
+                        }
+                        areaFillRefillPending = false;
+                        areaFillRefillRequestId = 0;
+                        areaFillRefillLegacyFallback = false;
+                        areaFillStatus =
+                            "Пополнение хотбара подтверждено сервером";
+                        ++areaFillRevision;
+                        continue;
+                    }
                     if (pendingAutomationRequestId != requestId ||
                         pendingAutomationVariant <
                             AutomationPlan::StackRequestStart) {
@@ -6269,6 +6640,8 @@ struct RelayState {
         areaFillRunning = false;
         areaFillWaitingForBlocks = false;
         areaFillRefillPending = false;
+        areaFillRefillRequestId = 0;
+        areaFillRefillLegacyFallback = false;
         areaFillPlacementPending = false;
         areaFillSyntheticPositionKnown = false;
         areaFillStatus = areaFillCells.empty()
@@ -7936,8 +8309,17 @@ public:
                 version,
                 event
             );
-            if (areaFillOwnedPacket) {
+            const bool areaFillRefreshRequested =
+                areaFillMarkerRefreshRequested.exchange(
+                    false,
+                    std::memory_order_relaxed
+                );
+            if (areaFillOwnedPacket ||
+                configuredAreaFill.load(std::memory_order_relaxed) ||
+                areaFillRefreshRequested) {
                 refreshAreaFillDebugMarkers();
+            }
+            if (areaFillOwnedPacket) {
                 syncAreaFillDownstreamMovement();
             } else {
                 state->maybeInjectAutomation(version, event);
@@ -9746,7 +10128,8 @@ Java_com_m9chko_bedrockrelay_NativeBridge_startRelay(
     );
     state->configureAreaFill(
         configuredAreaFill.load(std::memory_order_relaxed),
-        configuredAreaFillPoints.load(std::memory_order_relaxed)
+        configuredAreaFillPoints.load(std::memory_order_relaxed),
+        configuredAreaFillHeight.load(std::memory_order_relaxed)
     );
     try {
         initializeJavaBridge(environment, bridgeClass);
@@ -9947,18 +10330,16 @@ Java_com_m9chko_bedrockrelay_NativeBridge_configureGameplayFeatures(
     configuredSchematic.store(schematic, std::memory_order_relaxed);
 
     std::shared_ptr<RelayState> state;
-    std::shared_ptr<RelayController> activeController;
     {
         std::lock_guard lock(controllerMutex);
         state = currentState;
-        activeController = controller;
     }
     if (state) {
         state->configureGameplayFeatures(armor, totem, miniMap, schematic);
     }
-    if (activeController && !schematic) {
-        activeController->clearSchematicDebugMarkers();
-    }
+    // Marker publication/clearing is performed by the existing schematic
+    // worker or relay packet path. A settings callback may run on Android's
+    // main thread and must never wait on the native relay/send mutexes.
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -9966,7 +10347,8 @@ Java_com_m9chko_bedrockrelay_NativeBridge_configureAreaFill(
     JNIEnv*,
     jclass,
     jboolean enabledValue,
-    jint requiredPointsValue
+    jint requiredPointsValue,
+    jint heightValue
 ) {
     const bool enabled = enabledValue == JNI_TRUE;
     const int requiredPoints = std::clamp(
@@ -9974,21 +10356,18 @@ Java_com_m9chko_bedrockrelay_NativeBridge_configureAreaFill(
         2,
         8
     );
+    const int height = std::clamp(static_cast<int>(heightValue), 1, 5);
     configuredAreaFill.store(enabled, std::memory_order_relaxed);
     configuredAreaFillPoints.store(requiredPoints, std::memory_order_relaxed);
+    configuredAreaFillHeight.store(height, std::memory_order_relaxed);
+    areaFillMarkerRefreshRequested.store(true, std::memory_order_relaxed);
 
     std::shared_ptr<RelayState> state;
-    std::shared_ptr<RelayController> activeController;
     {
         std::lock_guard lock(controllerMutex);
         state = currentState;
-        activeController = controller;
     }
-    if (state) state->configureAreaFill(enabled, requiredPoints);
-    if (activeController) {
-        if (enabled) activeController->refreshAreaFillDebugMarkers();
-        else activeController->clearAreaFillDebugMarkers();
-    }
+    if (state) state->configureAreaFill(enabled, requiredPoints, height);
 }
 
 extern "C" JNIEXPORT jstring JNICALL
@@ -10013,16 +10392,14 @@ Java_com_m9chko_bedrockrelay_NativeBridge_captureAreaFillPoint(
     jclass
 ) {
     std::shared_ptr<RelayState> state;
-    std::shared_ptr<RelayController> activeController;
     {
         std::lock_guard lock(controllerMutex);
         state = currentState;
-        activeController = controller;
     }
     const auto value = state
         ? state->captureAreaFillPoint()
         : bedrock::JsRuntimeValue::object({});
-    if (activeController) activeController->refreshAreaFillDebugMarkers();
+    areaFillMarkerRefreshRequested.store(true, std::memory_order_relaxed);
     return toJavaString(environment, jsonString(value));
 }
 
@@ -10032,16 +10409,14 @@ Java_com_m9chko_bedrockrelay_NativeBridge_clearAreaFill(
     jclass
 ) {
     std::shared_ptr<RelayState> state;
-    std::shared_ptr<RelayController> activeController;
     {
         std::lock_guard lock(controllerMutex);
         state = currentState;
-        activeController = controller;
     }
     const auto value = state
         ? state->clearAreaFill()
         : bedrock::JsRuntimeValue::object({});
-    if (activeController) activeController->refreshAreaFillDebugMarkers();
+    areaFillMarkerRefreshRequested.store(true, std::memory_order_relaxed);
     return toJavaString(environment, jsonString(value));
 }
 
@@ -10051,16 +10426,14 @@ Java_com_m9chko_bedrockrelay_NativeBridge_toggleAreaFill(
     jclass
 ) {
     std::shared_ptr<RelayState> state;
-    std::shared_ptr<RelayController> activeController;
     {
         std::lock_guard lock(controllerMutex);
         state = currentState;
-        activeController = controller;
     }
     const auto value = state
         ? state->toggleAreaFill()
         : bedrock::JsRuntimeValue::object({});
-    if (activeController) activeController->refreshAreaFillDebugMarkers();
+    areaFillMarkerRefreshRequested.store(true, std::memory_order_relaxed);
     return toJavaString(environment, jsonString(value));
 }
 

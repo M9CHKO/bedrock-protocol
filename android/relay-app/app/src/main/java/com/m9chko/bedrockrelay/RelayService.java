@@ -80,6 +80,7 @@ public final class RelayService extends Service {
     public static final String KEY_AUTO_TOTEM = "auto_totem";
     public static final String KEY_AREA_FILL_ENABLED = "area_fill_enabled";
     public static final String KEY_AREA_FILL_POINTS = "area_fill_points";
+    public static final String KEY_AREA_FILL_HEIGHT = "area_fill_height";
     public static final String KEY_AREA_FILL_BUTTON_SCALE =
         "area_fill_button_scale";
     public static final String KEY_AREA_FILL_BUTTON_X = "area_fill_button_x";
@@ -143,6 +144,8 @@ public final class RelayService extends Service {
     public static final int MAX_THREAT_DISTANCE = 32;
     public static final int MIN_AREA_FILL_POINTS = 2;
     public static final int MAX_AREA_FILL_POINTS = 8;
+    public static final int MIN_AREA_FILL_HEIGHT = 1;
+    public static final int MAX_AREA_FILL_HEIGHT = 5;
 
     public static final String ACTION_START =
         "com.m9chko.bedrockrelay.action.START";
@@ -243,7 +246,8 @@ public final class RelayService extends Service {
         schematicRepository = new SchematicRepository(this);
         schematicOverlayController = new SchematicOverlayController(
             this,
-            preferences
+            preferences,
+            schematicExecutor
         );
         areaFillOverlayController = new AreaFillOverlayController(
             this,
@@ -1276,6 +1280,10 @@ public final class RelayService extends Service {
             KEY_AREA_FILL_POINTS,
             2
         ));
+        int areaFillHeight = clampAreaFillHeight(preferences.getInt(
+            KEY_AREA_FILL_HEIGHT,
+            1
+        ));
         int areaFillButtonScale = clampOverlayScale(preferences.getInt(
             KEY_AREA_FILL_BUTTON_SCALE,
             90
@@ -1355,6 +1363,7 @@ public final class RelayService extends Service {
             .putInt(KEY_MINIMAP_RADIUS, miniMapRadius)
             .putInt(KEY_MINIMAP_SCALE, miniMapScale)
             .putInt(KEY_AREA_FILL_POINTS, areaFillPoints)
+            .putInt(KEY_AREA_FILL_HEIGHT, areaFillHeight)
             .putInt(KEY_AREA_FILL_BUTTON_SCALE, areaFillButtonScale)
             .putInt(KEY_THREAT_DISTANCE, threatDistance)
             .putInt(KEY_THREAT_WARNING_SCALE, threatWarningScale)
@@ -1432,60 +1441,75 @@ public final class RelayService extends Service {
             }
         });
         try {
-            boolean schematicWorldTracking = schematicEnabled;
-            NativeBridge.configureRuntime(
-                detailedLogs,
-                retainChunks,
-                radiusChunks
-            );
-            NativeBridge.configureGameplayFeatures(
-                autoArmor,
-                autoTotem,
-                miniMap,
-                schematicWorldTracking
-            );
-            NativeBridge.configureAreaFill(areaFillEnabled, areaFillPoints);
-            if (logChange) {
-                DiagnosticsLog.append(
-                    this,
-                    "INFO",
-                    "settings",
-                    "Runtime settings changed: detailedLogs=" + detailedLogs +
-                        " chunkRetention=" + retainChunks +
-                        " retainedRadiusChunks=" + radiusChunks +
-                        " entityOutlines=" + entityOutlines +
-                        " entityFov=" + entityFov +
-                        " players=" + showPlayers +
-                        " mobs=" + showMobs +
-                        " items=" + showItems +
-                        " thickness=" + (thicknessTenths / 10.0f) +
-                        " maxDistance=" + maximumDistance +
-                        " chunkWidget=" + chunkWidget +
-                        " equipmentHud=" + equipmentHud +
-                        " miniMap=" + miniMap +
-                        " miniMapRadius=" + miniMapRadius +
-                        " autoArmor=" + autoArmor +
-                        " autoTotem=" + autoTotem +
-                        " areaFill=" + areaFillEnabled +
-                        " areaFillPoints=" + areaFillPoints +
-                        " threatAnalysis=" + threatAnalysis +
-                        " threatDistance=" + threatDistance +
-                        " schematic=" + schematicEnabled +
-                        " schematicTextures=" + schematicTextures +
-                        " schematicTextureOpacity=" + schematicOpacity +
-                        " schematicOutlines=" + schematicOutlines +
-                        " schematicOutlineOpacity=" + schematicOutlineOpacity +
-                        " schematicDistance=" + schematicDistance +
-                        " schematicRotation=" + schematicRotation +
-                        " schematicMirror=" + schematicMirror +
-                        " schematicLayer=" + schematicLayer
-                );
-            }
+            commandExecutor.execute(() -> {
+                try {
+                    NativeBridge.configureRuntime(
+                        detailedLogs,
+                        retainChunks,
+                        radiusChunks
+                    );
+                    NativeBridge.configureGameplayFeatures(
+                        autoArmor,
+                        autoTotem,
+                        miniMap,
+                        schematicEnabled
+                    );
+                    NativeBridge.configureAreaFill(
+                        areaFillEnabled,
+                        areaFillPoints,
+                        areaFillHeight
+                    );
+                    if (logChange) {
+                        DiagnosticsLog.append(
+                            this,
+                            "INFO",
+                            "settings",
+                            "Runtime settings changed: detailedLogs=" + detailedLogs +
+                                " chunkRetention=" + retainChunks +
+                                " retainedRadiusChunks=" + radiusChunks +
+                                " entityOutlines=" + entityOutlines +
+                                " entityFov=" + entityFov +
+                                " players=" + showPlayers +
+                                " mobs=" + showMobs +
+                                " items=" + showItems +
+                                " thickness=" + (thicknessTenths / 10.0f) +
+                                " maxDistance=" + maximumDistance +
+                                " chunkWidget=" + chunkWidget +
+                                " equipmentHud=" + equipmentHud +
+                                " miniMap=" + miniMap +
+                                " miniMapRadius=" + miniMapRadius +
+                                " autoArmor=" + autoArmor +
+                                " autoTotem=" + autoTotem +
+                                " areaFill=" + areaFillEnabled +
+                                " areaFillPoints=" + areaFillPoints +
+                                " areaFillHeight=" + areaFillHeight +
+                                " threatAnalysis=" + threatAnalysis +
+                                " threatDistance=" + threatDistance +
+                                " schematic=" + schematicEnabled +
+                                " schematicTextures=" + schematicTextures +
+                                " schematicTextureOpacity=" + schematicOpacity +
+                                " schematicOutlines=" + schematicOutlines +
+                                " schematicOutlineOpacity=" + schematicOutlineOpacity +
+                                " schematicDistance=" + schematicDistance +
+                                " schematicRotation=" + schematicRotation +
+                                " schematicMirror=" + schematicMirror +
+                                " schematicLayer=" + schematicLayer
+                        );
+                    }
+                } catch (Throwable error) {
+                    DiagnosticsLog.appendError(
+                        this,
+                        "settings",
+                        "Failed to apply runtime relay settings",
+                        error
+                    );
+                }
+            });
         } catch (Throwable error) {
             DiagnosticsLog.appendError(
                 this,
                 "settings",
-                "Failed to apply runtime relay settings",
+                "Failed to schedule runtime relay settings",
                 error
             );
         }
@@ -1630,6 +1654,13 @@ public final class RelayService extends Service {
         return Math.max(
             MIN_AREA_FILL_POINTS,
             Math.min(MAX_AREA_FILL_POINTS, value)
+        );
+    }
+
+    public static int clampAreaFillHeight(int value) {
+        return Math.max(
+            MIN_AREA_FILL_HEIGHT,
+            Math.min(MAX_AREA_FILL_HEIGHT, value)
         );
     }
 

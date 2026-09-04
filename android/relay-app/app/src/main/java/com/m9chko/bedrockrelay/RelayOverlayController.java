@@ -1519,6 +1519,29 @@ final class RelayOverlayController {
         ));
         root.addView(pointsSlider);
 
+        int height = RelayService.clampAreaFillHeight(preferences.getInt(
+            RelayService.KEY_AREA_FILL_HEIGHT,
+            1
+        ));
+        TextView heightLabel = settingLabel(
+            "Высота заполнения: " + height +
+                (height == 1 ? " блок" : " блоков")
+        );
+        root.addView(heightLabel);
+        SeekBar heightSlider = slider(
+            RelayService.MIN_AREA_FILL_HEIGHT,
+            RelayService.MAX_AREA_FILL_HEIGHT,
+            height
+        );
+        heightSlider.setOnSeekBarChangeListener(seekListener(
+            value -> heightLabel.setText(
+                "Высота заполнения: " + value +
+                    (value == 1 ? " блок" : " блоков")
+            ),
+            value -> saveInt(RelayService.KEY_AREA_FILL_HEIGHT, value)
+        ));
+        root.addView(heightSlider);
+
         int scale = RelayService.clampOverlayScale(preferences.getInt(
             RelayService.KEY_AREA_FILL_BUTTON_SCALE,
             90
@@ -1552,8 +1575,8 @@ final class RelayOverlayController {
         ));
 
         TextView note = text(
-            "Точки берутся из позиции игрока на одном горизонтальном уровне. " +
-                "Две точки задают прямоугольник, 3–8 — полигон. Перед запуском " +
+            "Точки задают нижний слой на уровне ног игрока, а высота добавляет " +
+                "слои вверх. Две точки задают прямоугольник, 3–8 — полигон. Перед запуском " +
                 "возьмите нужный строительный блок в основную руку. Модуль не " +
                 "заменяет уже стоящие блоки, проверяет безопасный проход и " +
                 "останавливается, когда запасы закончились. Ручное движение " +

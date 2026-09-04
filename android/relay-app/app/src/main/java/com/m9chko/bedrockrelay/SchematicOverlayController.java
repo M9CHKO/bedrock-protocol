@@ -26,6 +26,7 @@ import org.json.JSONObject;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.Locale;
+import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -52,6 +53,7 @@ final class SchematicOverlayController {
     private final SharedPreferences preferences;
     private final WindowManager windowManager;
     private final BlockNameTranslator blockNameTranslator;
+    private final Executor markerExecutor;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final AtomicReference<EntityOutlineOverlayController.CameraSample>
         pendingCamera = new AtomicReference<>();
@@ -102,10 +104,12 @@ final class SchematicOverlayController {
 
     SchematicOverlayController(
         Context context,
-        SharedPreferences preferences
+        SharedPreferences preferences,
+        Executor markerExecutor
     ) {
         this.context = context;
         this.preferences = preferences;
+        this.markerExecutor = markerExecutor;
         windowManager = (WindowManager) context.getSystemService(
             Context.WINDOW_SERVICE
         );
@@ -698,9 +702,6 @@ final class SchematicOverlayController {
                 query.transformedBedrockPalette
             );
         synchronized (blockQueryLock) {
-            // Serialize the last validity check, native publication and every
-            // clear. A concurrent hide/anchor/model change must either happen
-            // before this check or clear the plan immediately afterwards.
             EntityOutlineOverlayController.CameraSample currentCamera =
                 latestCamera;
             if (blockQuery != query || !wantsFrames() ||
@@ -715,24 +716,28 @@ final class SchematicOverlayController {
                 debugMarkersDirty = true;
                 return;
             }
-            boolean accepted = NativeBridge.replaceSchematicDebugMarkers(
-                result.records(),
-                result.expectedBlockStates(),
-                texturesEnabled,
-                opacityPercent,
-                outlinesEnabled,
-                outlineOpacityPercent,
-                correctOutlineColor,
-                wrongOutlineColor,
-                missingOutlineColor,
-                result.total(),
-                result.correct(),
-                result.missing(),
-                result.wrong(),
-                result.unknown(),
-                expectedWorldRevision,
-                expectedDimension
-            );
+        }
+        // This may encode and queue hundreds of native packets. Never hold a
+        // lock that Android's overlay/main thread needs while it runs.
+        boolean accepted = NativeBridge.replaceSchematicDebugMarkers(
+            result.records(),
+            result.expectedBlockStates(),
+            texturesEnabled,
+            opacityPercent,
+            outlinesEnabled,
+            outlineOpacityPercent,
+            correctOutlineColor,
+            wrongOutlineColor,
+            missingOutlineColor,
+            result.total(),
+            result.correct(),
+            result.missing(),
+            result.wrong(),
+            result.unknown(),
+            expectedWorldRevision,
+            expectedDimension
+        );
+        synchronized (blockQueryLock) {
             if (!accepted) {
                 debugMarkersDirty = true;
                 long nextDelay = debugMarkerRetryDelayMs <= 0L
@@ -743,6 +748,20 @@ final class SchematicOverlayController {
                     );
                 debugMarkerRetryDelayMs = nextDelay;
                 debugMarkerRetryAfterMs = SystemClock.uptimeMillis() + nextDelay;
+                return;
+            }
+            EntityOutlineOverlayController.CameraSample currentCamera =
+                latestCamera;
+            if (blockQuery != query || !wantsFrames() ||
+                currentCamera == null || !currentCamera.known ||
+                !query.matchesWindow(
+                    blockCoordinate(currentCamera.x),
+                    blockCoordinate(currentCamera.y),
+                    blockCoordinate(currentCamera.z),
+                    maximumDistance,
+                    selectedLayer
+                )) {
+                debugMarkersDirty = true;
                 return;
             }
             debugMarkerPlanPublished = true;
@@ -760,7 +779,12 @@ final class SchematicOverlayController {
 
     private void clearDebugMarkers() {
         synchronized (blockQueryLock) {
-            if (debugMarkerPlanPublished) {
+            debugMarkerPlanPublished = false;
+            debugMarkersDirty = true;
+            saveProgress(null);
+        }
+        try {
+            markerExecutor.execute(() -> {
                 try {
                     NativeBridge.clearSchematicDebugMarkers();
                 } catch (Throwable error) {
@@ -771,10 +795,14 @@ final class SchematicOverlayController {
                         error
                     );
                 }
-            }
-            debugMarkerPlanPublished = false;
-            debugMarkersDirty = true;
-            saveProgress(null);
+            });
+        } catch (Throwable error) {
+            DiagnosticsLog.appendError(
+                context,
+                "schematics",
+                "Failed to schedule client-only schematic marker clear",
+                error
+            );
         }
     }
 
