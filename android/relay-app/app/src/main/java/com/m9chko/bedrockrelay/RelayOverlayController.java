@@ -1,6 +1,7 @@
 package com.m9chko.bedrockrelay;
 
 import android.animation.ValueAnimator;
+import android.app.AlertDialog;
 import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
@@ -554,23 +555,114 @@ final class RelayOverlayController {
         int selected = preferences.getInt(key, defaultColor) | 0xff000000;
         int[] colors = {
             0xff4fd5ff, 0xff5df0a2, 0xffffcf4a, 0xffff8a4c,
-            0xffff5b62, 0xffd56cff, 0xffffffff, 0xff8094aa
+            0xffff5b62, 0xffd56cff, 0xffffffff, 0xff8094aa,
+            0xff14687a, 0xff287a46, 0xff8a6418, 0xff7a4428,
+            0xff842f38, 0xff64317d, 0xff2d477a, 0xff252a31
         };
-        LinearLayout row = new LinearLayout(context);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-        for (int color : colors) {
-            TextView swatch = text("", 1, false);
-            swatch.setBackground(colorBackground(color, color == selected));
-            swatch.setContentDescription("Выбрать цвет обводки");
-            swatch.setOnClickListener(view -> {
-                preferences.edit().putInt(key, color).apply();
+        LinearLayout picker = new LinearLayout(context);
+        picker.setOrientation(LinearLayout.VERTICAL);
+        for (int start = 0; start < colors.length; start += 8) {
+            LinearLayout row = new LinearLayout(context);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+            for (int index = start; index < Math.min(start + 8, colors.length);
+                ++index) {
+                int color = colors[index];
+                TextView swatch = text("", 1, false);
+                swatch.setBackground(colorBackground(color, color == selected));
+                swatch.setContentDescription("Выбрать цвет обводки");
+                swatch.setOnClickListener(view -> {
+                    preferences.edit().putInt(key, color).apply();
+                    settingsChanged.run();
+                    showPage(returnPage);
+                });
+                row.addView(
+                    swatch,
+                    margins(dp(28), dp(28), dp(2), dp(2), dp(3), dp(2))
+                );
+            }
+            picker.addView(row);
+        }
+        TextView custom = text(
+            String.format(Locale.ROOT, "СВОЙ ЦВЕТ  •  #%06X", selected & 0xffffff),
+            10,
+            true
+        );
+        custom.setGravity(Gravity.CENTER);
+        custom.setPadding(dp(8), dp(8), dp(8), dp(8));
+        custom.setBackground(actionBackground());
+        custom.setOnClickListener(view -> showColorDialog(
+            key,
+            selected,
+            returnPage
+        ));
+        picker.addView(custom, margins(-1, -2, 0, dp(4), 0, dp(2)));
+        return picker;
+    }
+
+    private void showColorDialog(String key, int initialColor, String returnPage) {
+        LinearLayout root = new LinearLayout(context);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setPadding(dp(18), dp(8), dp(18), 0);
+        int[] color = {
+            Color.red(initialColor),
+            Color.green(initialColor),
+            Color.blue(initialColor)
+        };
+        TextView preview = text("", 13, true);
+        preview.setGravity(Gravity.CENTER);
+        preview.setTextColor(Color.WHITE);
+        preview.setPadding(dp(8), dp(12), dp(8), dp(12));
+        root.addView(preview, margins(-1, -2, 0, 0, 0, dp(8)));
+        String[] names = {"Красный", "Зелёный", "Синий"};
+        for (int channel = 0; channel < color.length; ++channel) {
+            final int selectedChannel = channel;
+            TextView label = settingLabel(names[channel] + ": " + color[channel]);
+            SeekBar value = slider(0, 255, color[channel]);
+            value.setOnSeekBarChangeListener(seekListener(
+                progress -> {
+                    color[selectedChannel] = progress;
+                    label.setText(names[selectedChannel] + ": " + progress);
+                    updateColorPreview(preview, color);
+                },
+                progress -> color[selectedChannel] = progress
+            ));
+            root.addView(label);
+            root.addView(value);
+        }
+        updateColorPreview(preview, color);
+        AlertDialog dialog = new AlertDialog.Builder(context)
+            .setTitle("Свой цвет контура")
+            .setView(root)
+            .setNegativeButton("Отмена", null)
+            .setPositiveButton("Сохранить", (clickedDialog, which) -> {
+                int selected = Color.rgb(color[0], color[1], color[2]);
+                preferences.edit().putInt(key, selected).apply();
                 settingsChanged.run();
                 showPage(returnPage);
-            });
-            row.addView(swatch, margins(dp(28), dp(28), dp(2), 0, dp(3), 0));
+            })
+            .create();
+        if (dialog.getWindow() != null) {
+            dialog.getWindow().setType(
+                android.os.Build.VERSION.SDK_INT >= 26
+                    ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+                    : WindowManager.LayoutParams.TYPE_SYSTEM_ALERT
+            );
         }
-        return row;
+        dialog.show();
+    }
+
+    private static void updateColorPreview(TextView preview, int[] channels) {
+        int color = Color.rgb(channels[0], channels[1], channels[2]);
+        preview.setText(String.format(Locale.ROOT, "#%06X", color & 0xffffff));
+        GradientDrawable background = new GradientDrawable();
+        background.setColor(color);
+        background.setCornerRadius(18f);
+        background.setStroke(2, Color.WHITE);
+        preview.setBackground(background);
+        double brightness = channels[0] * 0.299 + channels[1] * 0.587 +
+            channels[2] * 0.114;
+        preview.setTextColor(brightness > 160.0 ? Color.BLACK : Color.WHITE);
     }
 
     private void buildChunksPage(LinearLayout root) {

@@ -327,10 +327,25 @@ final class OfficialTexturePack {
                     String normalized = TexturePackPaths.normalizedBlockName(
                         registryName
                     );
-                    String side = resolveTextureReference(
+                    String north = resolveTextureReference(
                         terrain,
                         blocksDirectory,
-                        textureReferenceForFace(textures, "side")
+                        textureReferenceForFace(textures, "north")
+                    );
+                    String south = resolveTextureReference(
+                        terrain,
+                        blocksDirectory,
+                        textureReferenceForFace(textures, "south")
+                    );
+                    String east = resolveTextureReference(
+                        terrain,
+                        blocksDirectory,
+                        textureReferenceForFace(textures, "east")
+                    );
+                    String west = resolveTextureReference(
+                        terrain,
+                        blocksDirectory,
+                        textureReferenceForFace(textures, "west")
                     );
                     String top = resolveTextureReference(
                         terrain,
@@ -342,12 +357,24 @@ final class OfficialTexturePack {
                         blocksDirectory,
                         textureReferenceForFace(textures, "bottom")
                     );
-                    putBlockFaces(output, normalized, side, top, bottom);
+                    putBlockFaces(
+                        output,
+                        normalized,
+                        north,
+                        south,
+                        east,
+                        west,
+                        top,
+                        bottom
+                    );
                     if ("grass".equals(normalized)) {
                         putBlockFaces(
                             output,
                             "grass_block",
-                            side,
+                            north,
+                            south,
+                            east,
+                            west,
                             top,
                             bottom
                         );
@@ -355,7 +382,10 @@ final class OfficialTexturePack {
                         putBlockFaces(
                             output,
                             "dirt_path",
-                            side,
+                            north,
+                            south,
+                            east,
+                            west,
                             top,
                             bottom
                         );
@@ -442,6 +472,18 @@ final class OfficialTexturePack {
         JSONObject object = (JSONObject) textures;
         String[] keys;
         switch (face) {
+            case "north":
+                keys = new String[] {"north", "side", "all", "south", "east", "west"};
+                break;
+            case "south":
+                keys = new String[] {"south", "side", "all", "north", "east", "west"};
+                break;
+            case "east":
+                keys = new String[] {"east", "side", "all", "west", "north", "south"};
+                break;
+            case "west":
+                keys = new String[] {"west", "side", "all", "east", "north", "south"};
+                break;
             case "top":
                 keys = new String[] {"up", "top", "all", "side", "north"};
                 break;
@@ -475,15 +517,30 @@ final class OfficialTexturePack {
     private static void putBlockFaces(
         JSONObject output,
         String blockName,
-        String side,
+        String north,
+        String south,
+        String east,
+        String west,
         String top,
         String bottom
     ) throws Exception {
         if (blockName == null || blockName.isEmpty()) return;
-        String fallback = side != null ? side : top != null ? top : bottom;
+        String fallback = north != null
+            ? north
+            : south != null
+                ? south
+                : east != null
+                    ? east
+                    : west != null
+                        ? west
+                        : top != null ? top : bottom;
         if (fallback == null) return;
         output.put(blockName, fallback);
-        output.put(blockName + "#side", side == null ? fallback : side);
+        output.put(blockName + "#side", fallback);
+        output.put(blockName + "#north", north == null ? fallback : north);
+        output.put(blockName + "#south", south == null ? fallback : south);
+        output.put(blockName + "#east", east == null ? fallback : east);
+        output.put(blockName + "#west", west == null ? fallback : west);
         output.put(blockName + "#top", top == null ? fallback : top);
         output.put(blockName + "#bottom", bottom == null ? fallback : bottom);
     }

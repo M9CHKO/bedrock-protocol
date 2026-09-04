@@ -58,7 +58,9 @@ storage and are not committed to the repository.
 - `ChunkStatusOverlayController.java` — retained-chunk status widget.
 - `SchematicOverlayController.java` — click-through world projection for the
   active construction schematic.
-- `SchematicTextureAtlas.java` — lazy top/side/bottom texture lookup for
+- `SchematicTextureOverlayView.java` — collision-shape-aware textured faces for
+  exact transformed Bedrock block states.
+- `SchematicTextureAtlas.java` — lazy per-face texture lookup for
   schematic blocks with diagnostic fallback colors.
 
 Each HUD owns only its small interactive window. Transparent screen areas do
