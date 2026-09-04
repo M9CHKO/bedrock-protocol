@@ -45,6 +45,8 @@ public final class NativeBridge {
 
     public static native String clearAreaFill();
 
+    public static native String shiftAreaFill(int deltaX, int deltaY, int deltaZ);
+
     public static native String toggleAreaFill();
 
     /** Releases optional world caches when Android reports memory pressure. */

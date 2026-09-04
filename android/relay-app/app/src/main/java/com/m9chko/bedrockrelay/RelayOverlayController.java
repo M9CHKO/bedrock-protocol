@@ -87,6 +87,9 @@ final class RelayOverlayController {
     private int statusAreaFillRequiredPoints = 2;
     private int statusAreaFillCellCount;
     private int statusAreaFillCompleted;
+    private int statusAreaFillOriginX;
+    private int statusAreaFillOriginY;
+    private int statusAreaFillOriginZ;
     private String statusAreaFillItem = "";
     private String statusAreaFillText = "Добавьте точки области";
     private String schematicImportStatus = "";
@@ -1561,6 +1564,14 @@ final class RelayOverlayController {
         root.addView(areaFillStatus, margins(-1, -2, 0, dp(5), 0, dp(7)));
         refreshAreaFillStatus();
 
+        TextView shiftLabel = settingLabel(
+            "Сдвиг отмеченной области по координатам"
+        );
+        root.addView(shiftLabel);
+        root.addView(areaFillMoveRow("X −", -1, 0, 0, "X +", 1, 0, 0));
+        root.addView(areaFillMoveRow("Y −", 0, -1, 0, "Y +", 0, 1, 0));
+        root.addView(areaFillMoveRow("Z −", 0, 0, -1, "Z +", 0, 0, 1));
+
         root.addView(schematicAction(
             "ДОБАВИТЬ ТОЧКУ ПОД ИГРОКОМ",
             () -> invokeAreaFillAction("capture")
@@ -1580,12 +1591,54 @@ final class RelayOverlayController {
                 "возьмите нужный строительный блок в основную руку. Модуль не " +
                 "заменяет уже стоящие блоки, проверяет безопасный проход и " +
                 "останавливается, когда запасы закончились. Ручное движение " +
-                "временно имеет приоритет.",
+                "временно имеет приоритет. Установка выполняется не дальше " +
+                "трёх блоков; при нехватке опоры сначала строится один " +
+                "стартовый блок, затем при необходимости минимальная колонна.",
             10,
             false
         );
         note.setTextColor(0xff98a7b8);
         root.addView(note);
+    }
+
+    private View areaFillMoveRow(
+        String firstLabel,
+        int firstX,
+        int firstY,
+        int firstZ,
+        String secondLabel,
+        int secondX,
+        int secondY,
+        int secondZ
+    ) {
+        LinearLayout row = new LinearLayout(context);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        TextView first = schematicAction(firstLabel, () ->
+            invokeAreaFillShift(firstX, firstY, firstZ));
+        TextView second = schematicAction(secondLabel, () ->
+            invokeAreaFillShift(secondX, secondY, secondZ));
+        row.addView(first, new LinearLayout.LayoutParams(0, dp(35), 1f));
+        row.addView(second, new LinearLayout.LayoutParams(0, dp(35), 1f));
+        row.setPadding(0, 0, 0, dp(4));
+        return row;
+    }
+
+    private void invokeAreaFillShift(int dx, int dy, int dz) {
+        try {
+            updateAreaFillStatus(new JSONObject(
+                NativeBridge.shiftAreaFill(dx, dy, dz)
+            ));
+            if ("area_fill".equals(currentPage)) showPage("area_fill");
+        } catch (Throwable error) {
+            statusAreaFillText = "Ошибка смещения: " + safeMessage(error);
+            refreshAreaFillStatus();
+            DiagnosticsLog.appendError(
+                context,
+                "area_fill",
+                "Area-fill shift failed",
+                error
+            );
+        }
     }
 
     private void invokeAreaFillAction(String action) {
@@ -1853,6 +1906,9 @@ final class RelayOverlayController {
         statusAreaFillRequiredPoints = value.optInt("requiredPoints", 2);
         statusAreaFillCellCount = value.optInt("cellCount", 0);
         statusAreaFillCompleted = value.optInt("completed", 0);
+        statusAreaFillOriginX = value.optInt("originX", 0);
+        statusAreaFillOriginY = value.optInt("originY", 0);
+        statusAreaFillOriginZ = value.optInt("originZ", 0);
         statusAreaFillItem = value.optString("item", "");
         statusAreaFillText = value.optString(
             "status",
@@ -1925,7 +1981,13 @@ final class RelayOverlayController {
         String item = statusAreaFillItem.isEmpty()
             ? ""
             : "\nБлок: " + statusAreaFillItem;
-        areaFillStatus.setText(statusAreaFillText + "\n" + progress + item);
+        String origin = statusAreaFillPointCount == 0
+            ? ""
+            : "\nНачало: X " + statusAreaFillOriginX + "  Y " +
+                statusAreaFillOriginY + "  Z " + statusAreaFillOriginZ;
+        areaFillStatus.setText(
+            statusAreaFillText + "\n" + progress + origin + item
+        );
         areaFillStatus.setTextColor(
             statusAreaFillWaiting
                 ? 0xffffd27a

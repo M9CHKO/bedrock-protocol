@@ -705,6 +705,7 @@ struct RelayState {
         int64_t networkId = 0;
         int32_t count = 0;
         int32_t stackId = 0;
+        int32_t blockRuntimeId = 0;
         bedrock::ProtoDefValue transactionItem;
         std::string name;
         int32_t damage = 0;
@@ -821,6 +822,9 @@ struct RelayState {
         bool known = false;
         bool air = false;
         int32_t runtimeId = 0;
+        bool solid = false;
+        float collisionTop = 0.0f;
+        bool hazardous = false;
     };
 
     struct AreaFillPoint {
@@ -831,6 +835,17 @@ struct RelayState {
         bool operator==(const AreaFillPoint&) const = default;
     };
 
+    struct AreaFillPointHash {
+        std::size_t operator()(const AreaFillPoint& point) const noexcept {
+            std::size_t seed = std::hash<int32_t> {}(point.x);
+            seed ^= std::hash<int32_t> {}(point.y) +
+                0x9e3779b9u + (seed << 6) + (seed >> 2);
+            seed ^= std::hash<int32_t> {}(point.z) +
+                0x9e3779b9u + (seed << 6) + (seed >> 2);
+            return seed;
+        }
+    };
+
     struct AreaFillCell {
         int32_t x = 0;
         int32_t y = 0;
@@ -838,7 +853,10 @@ struct RelayState {
         bool complete = false;
         bool worldKnown = false;
         bool worldAir = true;
+        bool scaffold = false;
+        int32_t runtimeId = 0;
         uint8_t failures = 0;
+        bool approachRequired = false;
     };
 
     struct AreaFillMarker {
@@ -863,8 +881,19 @@ struct RelayState {
     };
 
     struct AreaFillRefillPlan {
+        static constexpr uint8_t UnifiedSwap = 0;
+        static constexpr uint8_t ExactSwap = 1;
+        static constexpr uint8_t InventorySwap = 2;
+        static constexpr uint8_t UnifiedCursor = 3;
+        static constexpr uint8_t ExactCursor = 4;
+        static constexpr uint8_t InventoryCursor = 5;
+        static constexpr uint8_t LegacyPreserveStackId = 6;
+        static constexpr uint8_t LegacyWithoutStackId = 7;
+        static constexpr uint8_t VariantCount = 8;
+
         bool valid = false;
         int32_t requestId = 0;
+        uint8_t variant = UnifiedSwap;
         std::size_t sourceSlot = 0;
         std::size_t destinationSlot = 0;
         EquipmentItem source;
@@ -880,6 +909,13 @@ struct RelayState {
         float z = 0.0f;
         float pitch = 0.0f;
         float yaw = 0.0f;
+    };
+
+    struct AreaFillRouteStep {
+        float centerX = 0.0f;
+        float eyeY = 0.0f;
+        float centerZ = 0.0f;
+        bool goalReached = false;
     };
 
     mutable std::mutex mutex;
@@ -993,16 +1029,21 @@ struct RelayState {
     int32_t areaFillHeight = 1;
     std::vector<AreaFillPoint> areaFillPoints;
     std::vector<AreaFillCell> areaFillCells;
+    std::unordered_map<AreaFillPoint, int32_t, AreaFillPointHash>
+        areaFillSyntheticSolids;
     bool areaFillRunning = false;
     bool areaFillWaitingForBlocks = false;
     bool areaFillRefillPending = false;
     int32_t areaFillRefillRequestId = 0;
-    bool areaFillRefillLegacyFallback = false;
+    uint8_t areaFillRefillVariant = AreaFillRefillPlan::UnifiedSwap;
     std::size_t areaFillRefillSourceSlot = 0;
     std::size_t areaFillRefillDestinationSlot = 0;
     uint64_t areaFillRefillStartedAtMs = 0;
     bool areaFillPlacementPending = false;
     std::size_t areaFillPendingCell = 0;
+    std::size_t areaFillPendingHotbarSlot = 0;
+    int32_t areaFillPendingHeldCount = 0;
+    int32_t areaFillPendingBlockRuntimeId = 0;
     uint64_t areaFillPlacementStartedAtMs = 0;
     uint64_t areaFillLastPlacementAtMs = 0;
     int64_t areaFillItemNetworkId = 0;
@@ -1018,6 +1059,9 @@ struct RelayState {
     float areaFillMovementYaw = 0.0f;
     std::size_t areaFillRouteCell = 0;
     std::size_t areaFillScanCursor = 0;
+    bool areaFillRouteWaypointKnown = false;
+    std::size_t areaFillRouteWaypointCell = 0;
+    AreaFillRouteStep areaFillRouteWaypoint;
     uint64_t areaFillRevision = 1;
     std::string areaFillStatus = "Добавьте точки области";
     double playerHealth = 20.0;
@@ -1249,6 +1293,18 @@ struct RelayState {
     static bool isAirBlockName(std::string_view name) noexcept {
         return name == "air" || name == "cave_air" || name == "void_air" ||
             name == "structure_void";
+    }
+
+    static bool isUnsafeTraversalBlockName(std::string_view name) noexcept {
+        return blockNameContains(name, "water") ||
+            blockNameContains(name, "lava") ||
+            blockNameContains(name, "bubble_column") ||
+            blockNameContains(name, "powder_snow") ||
+            blockNameContains(name, "cactus") ||
+            blockNameContains(name, "sweet_berry") ||
+            blockNameContains(name, "cobweb") ||
+            blockNameContains(name, "portal") ||
+            name == "fire" || name == "soul_fire";
     }
 
     static int32_t mapRgb(int red, int green, int blue) noexcept {
@@ -2248,6 +2304,72 @@ struct RelayState {
         observeSchematicBlockUpdates({{x, y, z, runtimeId}});
     }
 
+    WorldBlockSample classifyWorldRuntimeId(int32_t runtimeId) const noexcept {
+        try {
+            std::lock_guard registryLock(blockRegistryMutex);
+            if (!blockRegistry.has_value()) {
+                return {
+                    true,
+                    runtimeId == 0,
+                    runtimeId,
+                    runtimeId != 0,
+                    runtimeId == 0 ? 0.0f : 1.0f,
+                    false
+                };
+            }
+            const auto* block = blockRegistry->blockByRuntimeId(runtimeId);
+            const auto* state = blockRegistry->stateByRuntimeId(runtimeId);
+            const std::string_view name = block != nullptr
+                ? std::string_view(block->name)
+                : state != nullptr
+                    ? std::string_view(state->name)
+                    : std::string_view {};
+            const bool air = runtimeId == 0 || isAirBlockName(name);
+            if (air) return {true, true, runtimeId, false, 0.0f, false};
+
+            // A walking surface must cover the full X/Z footprint of its
+            // block at one height. This accepts full blocks, slabs and snow
+            // layers, while rejecting fence tops and the partial upper half
+            // of stairs that could let the synthetic player fall sideways.
+            float safeTop = 0.0f;
+            if (state != nullptr) {
+                for (const auto& shape : state->shapes) {
+                    if (shape[3] <= 0.0 || shape[4] <= 0.0 ||
+                        shape[5] <= 0.0) {
+                        continue;
+                    }
+                    const double minimumX = shape[0] - shape[3] * 0.5;
+                    const double maximumX = shape[0] + shape[3] * 0.5;
+                    const double minimumZ = shape[2] - shape[5] * 0.5;
+                    const double maximumZ = shape[2] + shape[5] * 0.5;
+                    if (minimumX > 0.001 || maximumX < 0.999 ||
+                        minimumZ > 0.001 || maximumZ < 0.999) {
+                        continue;
+                    }
+                    safeTop = std::max(
+                        safeTop,
+                        static_cast<float>(shape[1] + shape[4] * 0.5)
+                    );
+                }
+            }
+            if (safeTop <= 0.0f && block != nullptr &&
+                block->boundingBox != "empty" &&
+                (state == nullptr || state->missingStateShape)) {
+                safeTop = 1.0f;
+            }
+            return {
+                true,
+                false,
+                runtimeId,
+                safeTop > 0.0f,
+                safeTop,
+                isUnsafeTraversalBlockName(name)
+            };
+        } catch (...) {
+            return {};
+        }
+    }
+
     WorldBlockSample worldBlockSample(
         int32_t x,
         int32_t y,
@@ -2302,15 +2424,8 @@ struct RelayState {
                     }
                 }
             }
-            if (semanticAir) return {true, true, 0};
-            std::lock_guard registryLock(blockRegistryMutex);
-            if (!blockRegistry.has_value()) return {true, false, runtimeId};
-            const auto* state = blockRegistry->stateById(runtimeId);
-            return {
-                true,
-                state != nullptr && isAirBlockName(state->name),
-                runtimeId
-            };
+            if (semanticAir) return {true, true, 0, false, 0.0f, false};
+            return classifyWorldRuntimeId(runtimeId);
         } catch (...) {
             return {};
         }
@@ -2364,6 +2479,7 @@ struct RelayState {
         constexpr int32_t MaximumSpan = 96;
         constexpr std::size_t MaximumCells = 1'800;
         areaFillCells.clear();
+        areaFillSyntheticSolids.clear();
         if (areaFillPoints.size() !=
             static_cast<std::size_t>(areaFillRequiredPoints)) {
             return true;
@@ -2409,7 +2525,17 @@ struct RelayState {
                         error = "Объём больше 1800 блоков — уменьшите контур или высоту";
                         return false;
                     }
-                    areaFillCells.push_back({x, y, z, false, false, true, 0});
+                    areaFillCells.push_back({
+                        x,
+                        y,
+                        z,
+                        false,
+                        false,
+                        true,
+                        false,
+                        0,
+                        0
+                    });
                 }
             }
         }
@@ -2420,6 +2546,7 @@ struct RelayState {
         areaFillRouteCell = 0;
         areaFillScanCursor = 0;
         areaFillSyntheticPositionKnown = false;
+        areaFillRouteWaypointKnown = false;
         areaFillStatus = "Область готова: " +
             std::to_string(areaFillCells.size()) + " блоков, высота " +
             std::to_string(areaFillHeight);
@@ -2445,11 +2572,12 @@ struct RelayState {
                 areaFillHeight = height;
                 areaFillPoints.clear();
                 areaFillCells.clear();
+                areaFillSyntheticSolids.clear();
                 areaFillRunning = false;
                 areaFillWaitingForBlocks = false;
                 areaFillRefillPending = false;
                 areaFillRefillRequestId = 0;
-                areaFillRefillLegacyFallback = false;
+                areaFillRefillVariant = AreaFillRefillPlan::UnifiedSwap;
                 areaFillPlacementPending = false;
                 areaFillSyntheticPositionKnown = false;
                 areaFillItemNetworkId = 0;
@@ -2463,7 +2591,7 @@ struct RelayState {
                 areaFillWaitingForBlocks = false;
                 areaFillRefillPending = false;
                 areaFillRefillRequestId = 0;
-                areaFillRefillLegacyFallback = false;
+                areaFillRefillVariant = AreaFillRefillPlan::UnifiedSwap;
                 areaFillPlacementPending = false;
                 areaFillSyntheticPositionKnown = false;
                 if (areaFillPoints.size() ==
@@ -2482,7 +2610,7 @@ struct RelayState {
                 areaFillRunning = false;
                 areaFillRefillPending = false;
                 areaFillRefillRequestId = 0;
-                areaFillRefillLegacyFallback = false;
+                areaFillRefillVariant = AreaFillRefillPlan::UnifiedSwap;
                 areaFillPlacementPending = false;
                 areaFillSyntheticPositionKnown = false;
                 areaFillStatus = "Автозаполнение выключено";
@@ -2513,15 +2641,17 @@ struct RelayState {
         areaFillWaitingForBlocks = false;
         areaFillRefillPending = false;
         areaFillRefillRequestId = 0;
-        areaFillRefillLegacyFallback = false;
+        areaFillRefillVariant = AreaFillRefillPlan::UnifiedSwap;
         areaFillPlacementPending = false;
         areaFillSyntheticPositionKnown = false;
         areaFillItemNetworkId = 0;
         areaFillItemName.clear();
         areaFillPoints.clear();
         areaFillCells.clear();
+        areaFillSyntheticSolids.clear();
         areaFillRouteCell = 0;
         areaFillScanCursor = 0;
+        areaFillRouteWaypointKnown = false;
         areaFillStatus = std::move(status);
         ++areaFillRevision;
     }
@@ -2533,9 +2663,10 @@ struct RelayState {
         areaFillWaitingForBlocks = false;
         areaFillRefillPending = false;
         areaFillRefillRequestId = 0;
-        areaFillRefillLegacyFallback = false;
+        areaFillRefillVariant = AreaFillRefillPlan::UnifiedSwap;
         areaFillPlacementPending = false;
         areaFillSyntheticPositionKnown = false;
+        areaFillRouteWaypointKnown = false;
         areaFillStatus = std::move(status);
         ++areaFillRevision;
     }
@@ -2596,11 +2727,56 @@ struct RelayState {
         return areaFillSnapshotValueLocked();
     }
 
+    bedrock::JsRuntimeValue shiftAreaFill(
+        int32_t deltaX,
+        int32_t deltaY,
+        int32_t deltaZ
+    ) noexcept {
+        deltaX = std::clamp(deltaX, -1, 1);
+        deltaY = std::clamp(deltaY, -1, 1);
+        deltaZ = std::clamp(deltaZ, -1, 1);
+        std::lock_guard lock(mutex);
+        if (areaFillRunning || areaFillPlacementPending ||
+            areaFillRefillPending) {
+            areaFillStatus =
+                "Сначала остановите заполнение, затем сдвигайте область";
+            return areaFillSnapshotValueLocked();
+        }
+        if (areaFillPoints.empty()) {
+            areaFillStatus = "Сначала добавьте точки области";
+            return areaFillSnapshotValueLocked();
+        }
+        if (deltaX == 0 && deltaY == 0 && deltaZ == 0) {
+            return areaFillSnapshotValueLocked();
+        }
+        for (auto& point : areaFillPoints) {
+            point.x += deltaX;
+            point.y += deltaY;
+            point.z += deltaZ;
+        }
+        areaFillWaitingForBlocks = false;
+        areaFillRefillVariant = AreaFillRefillPlan::UnifiedSwap;
+        areaFillSyntheticPositionKnown = false;
+        std::string error;
+        if (!rebuildAreaFillCellsLocked(error)) {
+            areaFillStatus = std::move(error);
+            ++areaFillRevision;
+        } else {
+            areaFillStatus = "Область сдвинута: X " +
+                std::to_string(deltaX) + ", Y " +
+                std::to_string(deltaY) + ", Z " +
+                std::to_string(deltaZ);
+            ++areaFillRevision;
+        }
+        return areaFillSnapshotValueLocked();
+    }
+
     bedrock::JsRuntimeValue toggleAreaFill() noexcept {
         std::lock_guard lock(mutex);
         if (areaFillRunning) {
             areaFillRunning = false;
             areaFillSyntheticPositionKnown = false;
+            areaFillRouteWaypointKnown = false;
             areaFillStatus = "Остановлено пользователем";
             ++areaFillRevision;
             return areaFillSnapshotValueLocked();
@@ -2639,9 +2815,10 @@ struct RelayState {
         areaFillWaitingForBlocks = false;
         areaFillRefillPending = false;
         areaFillRefillRequestId = 0;
-        areaFillRefillLegacyFallback = false;
+        areaFillRefillVariant = AreaFillRefillPlan::UnifiedSwap;
         areaFillPlacementPending = false;
         areaFillSyntheticPositionKnown = false;
+        areaFillRouteWaypointKnown = false;
         areaFillStatus = "Заполнение запущено: " + held.name;
         ++areaFillRevision;
         return areaFillSnapshotValueLocked();
@@ -2650,6 +2827,9 @@ struct RelayState {
     bedrock::JsRuntimeValue areaFillSnapshotValueLocked() const {
         std::size_t complete = 0;
         for (const auto& cell : areaFillCells) complete += cell.complete ? 1u : 0u;
+        const auto origin = areaFillPoints.empty()
+            ? AreaFillPoint {}
+            : areaFillPoints.front();
         std::vector<bedrock::JsRuntimeValue> points;
         points.reserve(areaFillPoints.size());
         for (const auto& point : areaFillPoints) {
@@ -2668,6 +2848,9 @@ struct RelayState {
             {"requiredPoints", bedrock::JsRuntimeValue::number(
                 areaFillRequiredPoints)},
             {"height", bedrock::JsRuntimeValue::number(areaFillHeight)},
+            {"originX", bedrock::JsRuntimeValue::number(origin.x)},
+            {"originY", bedrock::JsRuntimeValue::number(origin.y)},
+            {"originZ", bedrock::JsRuntimeValue::number(origin.z)},
             {"pointCount", bedrock::JsRuntimeValue::number(
                 static_cast<double>(areaFillPoints.size()))},
             {"points", bedrock::JsRuntimeValue::array(std::move(points))},
@@ -3911,6 +4094,10 @@ struct RelayState {
                 decoded.getInt(itemPrefix + ".stack_id", 0)
             )
         ));
+        item.blockRuntimeId = static_cast<int32_t>(decoded.getInt(
+            itemPrefix + ".block_runtime_id",
+            decoded.getInt(prefix + ".block_runtime_id", 0)
+        ));
         auto nbtDamage = itemNbtInteger(decoded, itemPrefix, "Damage");
         if (!nbtDamage.has_value()) {
             nbtDamage = itemNbtInteger(decoded, itemPrefix, "damage");
@@ -4149,13 +4336,22 @@ struct RelayState {
                 })}
             });
         }
-        if (item.transactionItem.kind != Value::Kind::Object) {
-            throw std::runtime_error(
-                "server-confirmed item payload is unavailable"
-            );
-        }
-
-        auto value = item.transactionItem;
+        auto value = item.transactionItem.kind == Value::Kind::Object
+            ? item.transactionItem
+            : Value::object({
+                {"network_id", Value::integer(item.networkId)},
+                {"count", Value::uinteger(static_cast<uint64_t>(
+                    std::max(0, item.count)))},
+                {"metadata", Value::uinteger(0)},
+                {"has_stack_id", Value::uinteger(item.stackId != 0 ? 1 : 0)},
+                {"stack_id", Value::integer(item.stackId)},
+                {"block_runtime_id", Value::integer(item.blockRuntimeId)},
+                {"extra", Value::object({
+                    {"has_nbt", Value::uinteger(0)},
+                    {"can_place_on", Value::array({})},
+                    {"can_destroy", Value::array({})}
+                })}
+            });
         if (!preserveStackId) {
             // The second Weathertop/direct trace variant intentionally omits
             // the stack network id even though InventorySlot carried one.
@@ -4407,34 +4603,129 @@ struct RelayState {
         );
     }
 
+    static const char* areaFillRefillVariantName(uint8_t variant) noexcept {
+        switch (variant) {
+            case AreaFillRefillPlan::UnifiedSwap:
+                return "confirmed hotbar_and_inventory swap";
+            case AreaFillRefillPlan::ExactSwap:
+                return "confirmed hotbar/inventory swap";
+            case AreaFillRefillPlan::InventorySwap:
+                return "confirmed inventory swap";
+            case AreaFillRefillPlan::UnifiedCursor:
+                return "hotbar_and_inventory take/place";
+            case AreaFillRefillPlan::ExactCursor:
+                return "hotbar/inventory take/place";
+            case AreaFillRefillPlan::InventoryCursor:
+                return "inventory take/place";
+            case AreaFillRefillPlan::LegacyPreserveStackId:
+                return "weathertop legacy со stack ID";
+            case AreaFillRefillPlan::LegacyWithoutStackId:
+                return "weathertop legacy без stack ID";
+            default:
+                return "unknown";
+        }
+    }
+
     bedrock::VersionedGamePacket makeAreaFillRefillPacket(
         const std::string& version,
         const AreaFillRefillPlan& plan
     ) {
         using Value = bedrock::ProtoDefValue;
-        if (plan.requestId != 0) {
-            // Weathertop dev uses one confirmed inventory-to-hotbar swap in
-            // the unified inventory container. Keep the request id negative
-            // and wait for ItemStackResponse before trusting the local cache.
+        if (plan.variant < AreaFillRefillPlan::LegacyPreserveStackId) {
+            const auto exactContainer = [](std::size_t slot) {
+                return slot < 9 ? std::string("hotbar") :
+                    std::string("inventory");
+            };
+            std::string sourceContainer;
+            std::string destinationContainer;
+            switch (plan.variant) {
+                case AreaFillRefillPlan::ExactSwap:
+                case AreaFillRefillPlan::ExactCursor:
+                    sourceContainer = exactContainer(plan.sourceSlot);
+                    destinationContainer = "hotbar";
+                    break;
+                case AreaFillRefillPlan::InventorySwap:
+                case AreaFillRefillPlan::InventoryCursor:
+                    sourceContainer = "inventory";
+                    destinationContainer = "inventory";
+                    break;
+                default:
+                    sourceContainer = "hotbar_and_inventory";
+                    destinationContainer = "hotbar_and_inventory";
+                    break;
+            }
+            const auto source = automationStackSlot(
+                sourceContainer,
+                static_cast<uint8_t>(plan.sourceSlot),
+                plan.source.stackId
+            );
+            const auto destination = automationStackSlot(
+                destinationContainer,
+                static_cast<uint8_t>(plan.destinationSlot),
+                plan.destination.stackId
+            );
+            std::vector<Value> actions;
+            if (plan.variant <= AreaFillRefillPlan::InventorySwap) {
+                actions.push_back(Value::object({
+                    {"type_id", Value::string("swap")},
+                    {"source", source},
+                    {"destination", destination}
+                }));
+            } else {
+                const auto count = static_cast<uint8_t>(std::clamp(
+                    plan.source.count,
+                    1,
+                    255
+                ));
+                const auto cursorEmpty = automationStackSlot("cursor", 0, 0);
+                const auto cursorSource = automationStackSlot(
+                    "cursor",
+                    0,
+                    plan.source.stackId
+                );
+                actions.push_back(Value::object({
+                    {"type_id", Value::string("take")},
+                    {"count", Value::uinteger(count)},
+                    {"source", source},
+                    {"destination", cursorEmpty}
+                }));
+                if (plan.destination.present) {
+                    actions.push_back(Value::object({
+                        {"type_id", Value::string("swap")},
+                        {"source", cursorSource},
+                        {"destination", destination}
+                    }));
+                    actions.push_back(Value::object({
+                        {"type_id", Value::string("place")},
+                        {"count", Value::uinteger(static_cast<uint8_t>(
+                            std::clamp(plan.destination.count, 1, 255)))},
+                        {"source", automationStackSlot(
+                            "cursor",
+                            0,
+                            plan.destination.stackId
+                        )},
+                        {"destination", automationStackSlot(
+                            sourceContainer,
+                            static_cast<uint8_t>(plan.sourceSlot),
+                            0
+                        )}
+                    }));
+                } else {
+                    actions.push_back(Value::object({
+                        {"type_id", Value::string("place")},
+                        {"count", Value::uinteger(count)},
+                        {"source", cursorSource},
+                        {"destination", destination}
+                    }));
+                }
+            }
             return makeAreaProtocolPacket(
                 version,
                 "item_stack_request",
                 Value::object({
                     {"requests", Value::array({Value::object({
                         {"request_id", Value::integer(plan.requestId)},
-                        {"actions", Value::array({Value::object({
-                            {"type_id", Value::string("swap")},
-                            {"source", automationStackSlot(
-                                "hotbar_and_inventory",
-                                static_cast<uint8_t>(plan.sourceSlot),
-                                plan.source.stackId
-                            )},
-                            {"destination", automationStackSlot(
-                                "hotbar_and_inventory",
-                                static_cast<uint8_t>(plan.destinationSlot),
-                                plan.destination.stackId
-                            )}
-                        })})},
+                        {"actions", Value::array(std::move(actions))},
                         {"custom_names", Value::array({})},
                         {"cause", Value::string("chat_public")}
                     })})}
@@ -4452,14 +4743,16 @@ struct RelayState {
                     static_cast<uint8_t>(plan.sourceSlot),
                     plan.source,
                     plan.destination,
-                    false
+                    plan.variant ==
+                        AreaFillRefillPlan::LegacyPreserveStackId
                 ),
                 legacyAutomationAction(
                     "inventory",
                     static_cast<uint8_t>(plan.destinationSlot),
                     plan.destination,
                     plan.source,
-                    false
+                    plan.variant ==
+                        AreaFillRefillPlan::LegacyPreserveStackId
                 )
             })}
         });
@@ -4836,12 +5129,158 @@ struct RelayState {
             if (!cell.worldKnown || cell.worldAir != sample.air) changed = true;
             cell.worldKnown = true;
             cell.worldAir = sample.air;
+            cell.runtimeId = sample.air ? 0 : sample.runtimeId;
             if (cell.complete != !sample.air) {
                 cell.complete = !sample.air;
                 changed = true;
             }
         }
         if (changed) ++areaFillRevision;
+    }
+
+    WorldBlockSample areaFillCollisionSample(
+        int32_t x,
+        int32_t y,
+        int32_t z
+    ) const noexcept {
+        const auto world = worldBlockSample(x, y, z);
+        if (world.known && !world.air) return world;
+        std::lock_guard lock(mutex);
+        const auto placed = areaFillSyntheticSolids.find({x, y, z});
+        if (placed == areaFillSyntheticSolids.end()) return world;
+        if (placed->second == 0) {
+            // Inventory consumption can confirm placement before the
+            // matching world update supplies a runtime ID. It is a valid
+            // placement support, but not yet a safe walking surface.
+            return {true, false, 0, false, 0.0f, false};
+        }
+        return classifyWorldRuntimeId(placed->second);
+    }
+
+    void confirmAreaFillPlacementLocked(
+        std::size_t index,
+        int32_t runtimeId,
+        std::string status
+    ) noexcept {
+        if (index >= areaFillCells.size()) return;
+        auto& cell = areaFillCells[index];
+        cell.complete = true;
+        cell.worldKnown = true;
+        cell.worldAir = false;
+        if (runtimeId != 0) cell.runtimeId = runtimeId;
+        cell.failures = 0;
+        cell.approachRequired = false;
+        areaFillRouteWaypointKnown = false;
+        areaFillSyntheticSolids.insert_or_assign(
+            AreaFillPoint {cell.x, cell.y, cell.z},
+            cell.runtimeId
+        );
+        if (areaFillPendingHotbarSlot < playerInventory.size()) {
+            auto& held = playerInventory[areaFillPendingHotbarSlot];
+            if (held.present && held.networkId == areaFillItemNetworkId &&
+                held.count == areaFillPendingHeldCount) {
+                if (held.count <= 1) {
+                    held = {};
+                } else {
+                    --held.count;
+                    if (held.transactionItem.kind ==
+                        bedrock::ProtoDefValue::Kind::Object) {
+                        held.transactionItem.objectValue["count"] =
+                            bedrock::ProtoDefValue::uinteger(
+                                static_cast<uint64_t>(held.count)
+                            );
+                    }
+                }
+            }
+        }
+        areaFillPlacementPending = false;
+        areaFillStatus = std::move(status);
+        ++areaFillRevision;
+    }
+
+    bool areaFillInventoryAcknowledgedPlacementLocked() const noexcept {
+        if (!areaFillPlacementPending ||
+            areaFillPendingHotbarSlot >= playerInventory.size() ||
+            areaFillPendingHeldCount <= 0) {
+            return false;
+        }
+        const auto& held = playerInventory[areaFillPendingHotbarSlot];
+        if (!held.present) return areaFillPendingHeldCount == 1;
+        return held.networkId == areaFillItemNetworkId &&
+            held.count < areaFillPendingHeldCount;
+    }
+
+    bool addAreaFillSupportColumn(const AreaFillPoint& target) noexcept {
+        constexpr int32_t MaximumSupportDepth = 12;
+        int32_t solidY = target.y - 1;
+        std::vector<WorldBlockSample> samples;
+        samples.reserve(MaximumSupportDepth);
+        for (int32_t depth = 1; depth <= MaximumSupportDepth; ++depth) {
+            const int32_t y = target.y - depth;
+            const auto sample = areaFillCollisionSample(target.x, y, target.z);
+            if (!sample.known) {
+                std::lock_guard lock(mutex);
+                areaFillStatus =
+                    "Загружаю блоки под стартовой опорой";
+                ++areaFillRevision;
+                return false;
+            }
+            samples.push_back(sample);
+            if (!sample.air) {
+                solidY = y;
+                break;
+            }
+        }
+        if (samples.empty() || samples.back().air) {
+            std::lock_guard lock(mutex);
+            areaFillStatus =
+                "Твёрдая поверхность для опоры не найдена в пределах 12 блоков";
+            ++areaFillRevision;
+            return false;
+        }
+        const int32_t required = target.y - solidY - 1;
+        if (required <= 0) return false;
+
+        std::lock_guard lock(mutex);
+        std::size_t added = 0;
+        for (int32_t y = solidY + 1; y < target.y; ++y) {
+            const auto existing = std::find_if(
+                areaFillCells.begin(),
+                areaFillCells.end(),
+                [target, y](const auto& cell) {
+                    return cell.x == target.x && cell.y == y &&
+                        cell.z == target.z;
+                }
+            );
+            if (existing != areaFillCells.end()) continue;
+            if (areaFillCells.size() >= 1'800) {
+                areaFillStatus =
+                    "Не хватает лимита области для безопасной опоры";
+                ++areaFillRevision;
+                return added > 0;
+            }
+            areaFillCells.push_back({
+                target.x,
+                y,
+                target.z,
+                false,
+                true,
+                true,
+                true,
+                0,
+                0
+            });
+            ++added;
+        }
+        if (added > 0) {
+            areaFillScanCursor = 0;
+            areaFillStatus = added == 1
+                ? "Добавлена одна стартовая опора"
+                : "Добавлена запасная опорная колонна: " +
+                    std::to_string(added) + " блоков";
+            ++areaFillRevision;
+        }
+        return added > 0;
     }
 
     void observeAreaFillWorldUpdate(
@@ -4859,15 +5298,27 @@ struct RelayState {
             if (cell.x != x || cell.y != y || cell.z != z) continue;
             cell.worldKnown = true;
             cell.worldAir = sample.air;
+            cell.runtimeId = sample.air ? 0 : sample.runtimeId;
+            if (sample.air) {
+                areaFillSyntheticSolids.erase({cell.x, cell.y, cell.z});
+            } else {
+                areaFillSyntheticSolids.insert_or_assign(
+                    AreaFillPoint {cell.x, cell.y, cell.z},
+                    sample.runtimeId
+                );
+            }
             if (cell.complete != !sample.air) {
                 cell.complete = !sample.air;
                 changed = true;
             }
             if (areaFillPlacementPending && areaFillPendingCell == index &&
                 !sample.air) {
-                areaFillPlacementPending = false;
-                areaFillStatus = "Установка подтверждена сервером";
-                changed = true;
+                confirmAreaFillPlacementLocked(
+                    index,
+                    sample.runtimeId,
+                    "Установка подтверждена сервером"
+                );
+                return;
             }
             break;
         }
@@ -4890,7 +5341,7 @@ struct RelayState {
                 target.y + support[1],
                 target.z + support[2]
             };
-            const auto sample = worldBlockSample(
+            const auto sample = areaFillCollisionSample(
                 against.x,
                 against.y,
                 against.z
@@ -4931,14 +5382,25 @@ struct RelayState {
             supportCandidates.begin(),
             supportCandidates.end()
         );
-        // Prefer the highest surface the player can step onto, but never
-        // climb or drop more than one block in a synthetic walking step.
+        // Prefer the highest surface reachable by a normal Bedrock step.
+        // Full-block drops and jumps are never synthesized: if the terrain
+        // changes by more than a slab, the route planner must go around it.
         for (auto it = std::make_reverse_iterator(uniqueEnd);
              it != supportCandidates.rend();
              ++it) {
             const int32_t supportY = *it;
-            const float feetY = static_cast<float>(supportY + 1);
-            if (std::abs(feetY - currentFeetY) > 1.05f) continue;
+            const auto centerSupport = areaFillCollisionSample(
+                static_cast<int32_t>(std::floor(centerX)),
+                supportY,
+                static_cast<int32_t>(std::floor(centerZ))
+            );
+            if (!centerSupport.known || !centerSupport.solid ||
+                centerSupport.hazardous) {
+                continue;
+            }
+            const float feetY = static_cast<float>(supportY) +
+                centerSupport.collisionTop;
+            if (std::abs(feetY - currentFeetY) > 0.55f) continue;
 
             // Check every column touched by the real 0.6-wide player AABB,
             // not just the block containing its centre. This prevents the
@@ -4957,29 +5419,221 @@ struct RelayState {
                 centerZ + PlayerHalfWidth - CollisionEpsilon
             ));
             bool safe = true;
-            bool hasSupport = false;
             for (int32_t x = minimumX; x <= maximumX && safe; ++x) {
                 for (int32_t z = minimumZ; z <= maximumZ; ++z) {
-                    const auto support = worldBlockSample(x, supportY, z);
-                    const auto body = worldBlockSample(x, supportY + 1, z);
-                    const auto head = worldBlockSample(x, supportY + 2, z);
-                    if (!support.known || !body.known || !body.air ||
-                        !head.known || !head.air) {
+                    const auto support = areaFillCollisionSample(x, supportY, z);
+                    const auto body = areaFillCollisionSample(x, supportY + 1, z);
+                    const auto head = areaFillCollisionSample(x, supportY + 2, z);
+                    const float supportTop = static_cast<float>(supportY) +
+                        support.collisionTop;
+                    if (!support.known || !support.solid ||
+                        support.hazardous ||
+                        std::abs(supportTop - feetY) > 0.02f ||
+                        !body.known || body.solid || body.hazardous ||
+                        !head.known || head.solid || head.hazardous) {
                         safe = false;
                         break;
                     }
-                    hasSupport = hasSupport || !support.air;
                 }
             }
-            // AABB collision resolution permits part of the footprint to
-            // cross an edge while another part is still supported. Requiring
-            // every support column to be solid would make a legitimate
-            // one-block step impossible during the boundary transition.
-            if (safe && hasSupport) {
+            // Equal-height collision under the entire 0.6-wide footprint
+            // prevents edge walking and keeps unknown chunks out of routes.
+            if (safe) {
                 return feetY + PlayerEyeHeight;
             }
         }
         return std::nullopt;
+    }
+
+    bool areaFillHasLineOfSight(
+        float eyeX,
+        float eyeY,
+        float eyeZ,
+        const AreaFillPoint& target
+    ) const noexcept {
+        const float targetX = target.x + 0.5f;
+        const float targetY = target.y + 0.5f;
+        const float targetZ = target.z + 0.5f;
+        const float dx = targetX - eyeX;
+        const float dy = targetY - eyeY;
+        const float dz = targetZ - eyeZ;
+        const float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+        const int steps = std::clamp(
+            static_cast<int>(std::ceil(distance / 0.125f)),
+            1,
+            160
+        );
+        const AreaFillPoint start {
+            static_cast<int32_t>(std::floor(eyeX)),
+            static_cast<int32_t>(std::floor(eyeY)),
+            static_cast<int32_t>(std::floor(eyeZ))
+        };
+        for (int step = 1; step < steps; ++step) {
+            const float ratio = static_cast<float>(step) /
+                static_cast<float>(steps);
+            const AreaFillPoint block {
+                static_cast<int32_t>(std::floor(eyeX + dx * ratio)),
+                static_cast<int32_t>(std::floor(eyeY + dy * ratio)),
+                static_cast<int32_t>(std::floor(eyeZ + dz * ratio))
+            };
+            if (block == start || block == target) continue;
+            const auto sample = areaFillCollisionSample(
+                block.x,
+                block.y,
+                block.z
+            );
+            if (!sample.known || !sample.air) return false;
+        }
+        return true;
+    }
+
+    std::optional<AreaFillRouteStep> areaFillRouteStep(
+        float currentX,
+        float currentZ,
+        float currentEyeY,
+        const AreaFillPoint& target,
+        int32_t baseFillY,
+        double maximumReach
+    ) const noexcept {
+        struct Node {
+            int32_t x = 0;
+            int32_t z = 0;
+            float eyeY = 0.0f;
+            std::size_t parent = std::numeric_limits<std::size_t>::max();
+        };
+        const auto keyFor = [](int32_t x, int32_t z) {
+            return (static_cast<uint64_t>(static_cast<uint32_t>(x)) << 32) |
+                static_cast<uint32_t>(z);
+        };
+        const auto distanceToTarget = [&target](
+            float x,
+            float eyeY,
+            float z
+        ) {
+            const double dx = x < target.x
+                ? target.x - x
+                : x > target.x + 1.0
+                    ? x - (target.x + 1.0)
+                    : 0.0;
+            const double dy = eyeY < target.y
+                ? target.y - eyeY
+                : eyeY > target.y + 1.0
+                    ? eyeY - (target.y + 1.0)
+                    : 0.0;
+            const double dz = z < target.z
+                ? target.z - z
+                : z > target.z + 1.0
+                    ? z - (target.z + 1.0)
+                    : 0.0;
+            return dx * dx + dy * dy + dz * dz;
+        };
+        const auto intersectsTarget = [&target](float x, float eyeY, float z) {
+            constexpr float EyeHeight = 1.62f;
+            const float feetY = eyeY - EyeHeight;
+            return static_cast<int32_t>(std::floor(x)) == target.x &&
+                static_cast<int32_t>(std::floor(z)) == target.z &&
+                feetY < target.y + 0.95f &&
+                feetY + 1.8f > target.y + 0.05f;
+        };
+
+        const int32_t startX = static_cast<int32_t>(std::floor(currentX));
+        const int32_t startZ = static_cast<int32_t>(std::floor(currentZ));
+        // Re-plan in a small local window and cache its first waypoint. A
+        // large 25x25 BFS on every 20 Hz movement packet caused unnecessary
+        // relay-thread load during long fills; repeated local windows still
+        // cross an arbitrarily large area.
+        constexpr int32_t SearchRadius = 7;
+        constexpr std::size_t MaximumNodes = 225;
+        std::vector<Node> nodes;
+        nodes.reserve(MaximumNodes);
+        nodes.push_back({startX, startZ, currentEyeY});
+        std::deque<std::size_t> open;
+        open.push_back(0);
+        std::unordered_map<uint64_t, std::size_t> visited;
+        visited.reserve(MaximumNodes);
+        visited.emplace(keyFor(startX, startZ), 0);
+        std::size_t best = 0;
+        double bestDistance = distanceToTarget(
+            startX + 0.5f,
+            currentEyeY,
+            startZ + 0.5f
+        );
+        std::optional<std::size_t> goal;
+        static constexpr std::array<std::array<int32_t, 2>, 4> Neighbours {{
+            {{1, 0}}, {{-1, 0}}, {{0, 1}}, {{0, -1}}
+        }};
+
+        while (!open.empty() && nodes.size() < MaximumNodes) {
+            const auto index = open.front();
+            open.pop_front();
+            const auto node = nodes[index];
+            const auto distance = distanceToTarget(
+                node.x + 0.5f,
+                node.eyeY,
+                node.z + 0.5f
+            );
+            if (!intersectsTarget(
+                    node.x + 0.5f,
+                    node.eyeY,
+                    node.z + 0.5f) &&
+                distance <= maximumReach * maximumReach &&
+                areaFillHasLineOfSight(
+                    node.x + 0.5f,
+                    node.eyeY,
+                    node.z + 0.5f,
+                    target
+                )) {
+                goal = index;
+                break;
+            }
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                best = index;
+            }
+            for (const auto& offset : Neighbours) {
+                const int32_t x = node.x + offset[0];
+                const int32_t z = node.z + offset[1];
+                if (std::abs(x - startX) > SearchRadius ||
+                    std::abs(z - startZ) > SearchRadius) {
+                    continue;
+                }
+                const auto key = keyFor(x, z);
+                if (visited.contains(key)) continue;
+                const auto eyeY = areaFillSafeStandingEyeY(
+                    x + 0.5f,
+                    z + 0.5f,
+                    node.eyeY,
+                    baseFillY
+                );
+                if (!eyeY.has_value()) continue;
+                const auto next = nodes.size();
+                nodes.push_back({x, z, *eyeY, index});
+                visited.emplace(key, next);
+                open.push_back(next);
+            }
+        }
+
+        std::size_t destination = goal.value_or(best);
+        if (destination == 0) {
+            if (!goal.has_value()) return std::nullopt;
+            return AreaFillRouteStep {
+                currentX,
+                currentEyeY,
+                currentZ,
+                true
+            };
+        }
+        while (nodes[destination].parent != 0 &&
+               nodes[destination].parent !=
+                    std::numeric_limits<std::size_t>::max()) {
+            destination = nodes[destination].parent;
+        }
+        return AreaFillRouteStep {
+            nodes[destination].x + 0.5f,
+            nodes[destination].eyeY,
+            nodes[destination].z + 0.5f,
+            false
+        };
     }
 
     bool maybeInjectAreaFill(
@@ -5033,6 +5687,7 @@ struct RelayState {
             std::lock_guard lock(mutex);
             if (areaFillRunning) {
                 areaFillSyntheticPositionKnown = false;
+                areaFillRouteWaypointKnown = false;
                 areaFillStatus = "Ручное управление — автопроход временно уступил";
             }
             return false;
@@ -5050,6 +5705,8 @@ struct RelayState {
         float nextYaw = 0.0f;
         AreaFillPoint movementFloor;
         AreaFillPoint movementTarget;
+        std::size_t movementCellIndex = 0;
+        double movementMaximumReach = 2.75;
         {
             std::lock_guard lock(mutex);
             if (!areaFillRunning) return false;
@@ -5060,10 +5717,17 @@ struct RelayState {
                     areaFillPlacementPending = false;
                 } else if (areaFillCells[areaFillPendingCell].complete ||
                            !areaFillCells[areaFillPendingCell].worldAir) {
-                    areaFillCells[areaFillPendingCell].complete = true;
-                    areaFillPlacementPending = false;
-                    areaFillStatus = "Установка подтверждена сервером";
-                    ++areaFillRevision;
+                    confirmAreaFillPlacementLocked(
+                        areaFillPendingCell,
+                        areaFillCells[areaFillPendingCell].runtimeId,
+                        "Установка подтверждена миром"
+                    );
+                } else if (areaFillInventoryAcknowledgedPlacementLocked()) {
+                    confirmAreaFillPlacementLocked(
+                        areaFillPendingCell,
+                        areaFillPendingBlockRuntimeId,
+                        "Установка подтверждена расходом блока"
+                    );
                 } else if (now - areaFillPlacementStartedAtMs < 1'400) {
                     return true;
                 } else {
@@ -5072,10 +5736,12 @@ struct RelayState {
                         255,
                         failed.failures + 1
                     ));
+                    failed.approachRequired = true;
+                    areaFillRouteWaypointKnown = false;
                     areaFillPlacementPending = false;
                     areaFillStatus = failed.failures >= 3
-                        ? "Сервер трижды отклонил блок — ищу следующий"
-                        : "Сервер не подтвердил блок — повторяю";
+                        ? "Блок не подтверждён — подхожу ближе и повторяю"
+                        : "Сервер не подтвердил блок — повторяю ближе";
                     ++areaFillRevision;
                 }
             }
@@ -5085,6 +5751,7 @@ struct RelayState {
             if (complete == areaFillCells.size()) {
                 areaFillRunning = false;
                 areaFillSyntheticPositionKnown = false;
+                areaFillRouteWaypointKnown = false;
                 areaFillStatus = "Готово: заполнено " +
                     std::to_string(complete) + " блоков";
                 ++areaFillRevision;
@@ -5108,24 +5775,24 @@ struct RelayState {
                     held.count > 0) {
                     areaFillRefillPending = false;
                     areaFillRefillRequestId = 0;
-                    areaFillRefillLegacyFallback = false;
+                    areaFillRefillVariant = AreaFillRefillPlan::UnifiedSwap;
                     areaFillStatus = "Хотбар пополнен — продолжаю";
                     ++areaFillRevision;
                 } else if (now - areaFillRefillStartedAtMs < 2'500) {
                     return true;
                 } else {
                     areaFillRefillPending = false;
-                    if (areaFillRefillRequestId != 0 &&
-                        !areaFillRefillLegacyFallback) {
-                        areaFillRefillRequestId = 0;
-                        areaFillRefillLegacyFallback = true;
-                        areaFillStatus =
-                            "ItemStackRequest не подтверждён — пробую legacy swap";
+                    areaFillRefillRequestId = 0;
+                    if (areaFillRefillVariant + 1 <
+                        AreaFillRefillPlan::VariantCount) {
+                        ++areaFillRefillVariant;
+                        areaFillStatus = "Перенос не подтверждён — пробую " +
+                            std::string(areaFillRefillVariantName(
+                                areaFillRefillVariant));
                         ++areaFillRevision;
                         return true;
                     }
-                    areaFillRefillRequestId = 0;
-                    areaFillRefillLegacyFallback = false;
+                    areaFillRefillVariant = AreaFillRefillPlan::UnifiedSwap;
                     areaFillRunning = false;
                     areaFillStatus =
                         "Сервер не подтвердил пополнение хотбара";
@@ -5138,20 +5805,25 @@ struct RelayState {
                     if (slot == destinationSlot) continue;
                     const auto& candidate = playerInventory[slot];
                     if (!candidate.present || candidate.count <= 0 ||
-                        candidate.networkId != areaFillItemNetworkId ||
-                        candidate.transactionItem.kind !=
-                            bedrock::ProtoDefValue::Kind::Object) {
+                        candidate.networkId != areaFillItemNetworkId) {
                         continue;
                     }
                     refill.valid = true;
+                    refill.variant = areaFillRefillVariant;
+                    if (candidate.stackId == 0 && refill.variant <
+                        AreaFillRefillPlan::LegacyPreserveStackId) {
+                        refill.variant =
+                            AreaFillRefillPlan::LegacyPreserveStackId;
+                    }
                     refill.sourceSlot = slot;
                     refill.destinationSlot = destinationSlot;
                     refill.source = candidate;
                     refill.destination = held;
-                    if (!areaFillRefillLegacyFallback &&
-                        candidate.stackId != 0) {
+                    if (refill.variant <
+                        AreaFillRefillPlan::LegacyPreserveStackId) {
                         refill.requestId = nextAutomationStackRequestId--;
                     }
+                    areaFillRefillVariant = refill.variant;
                     areaFillRefillPending = true;
                     areaFillRefillRequestId = refill.requestId;
                     areaFillRefillSourceSlot = slot;
@@ -5159,9 +5831,7 @@ struct RelayState {
                     areaFillRefillStartedAtMs = now;
                     areaFillStatus = "Перекладываю " + areaFillItemName +
                         " из слота " + std::to_string(slot) +
-                        (refill.requestId != 0
-                            ? " (подтверждаемый swap)"
-                            : " (legacy swap)");
+                        " через " + areaFillRefillVariantName(refill.variant);
                     ++areaFillRevision;
                     break;
                 }
@@ -5169,6 +5839,7 @@ struct RelayState {
                     areaFillRunning = false;
                     areaFillWaitingForBlocks = true;
                     areaFillSyntheticPositionKnown = false;
+                    areaFillRouteWaypointKnown = false;
                     areaFillStatus = "Блоки закончились. Возьмите ещё и нажмите кнопку снова";
                     ++areaFillRevision;
                     return true;
@@ -5176,6 +5847,7 @@ struct RelayState {
             } else if (held.networkId != areaFillItemNetworkId) {
                 areaFillRunning = false;
                 areaFillSyntheticPositionKnown = false;
+                areaFillRouteWaypointKnown = false;
                 areaFillStatus = "Выбран другой слот. Возьмите " +
                     areaFillItemName + " и запустите снова";
                 ++areaFillRevision;
@@ -5196,21 +5868,50 @@ struct RelayState {
                     : packetZ;
                 int32_t activeLayerY = std::numeric_limits<int32_t>::max();
                 for (const auto& cell : areaFillCells) {
-                    if (!cell.complete && cell.worldKnown && cell.worldAir &&
-                        cell.failures < 3) {
+                    if (!cell.complete && cell.worldKnown && cell.worldAir) {
                         activeLayerY = std::min(activeLayerY, cell.y);
                     }
                 }
-                double bestDistance = std::numeric_limits<double>::infinity();
+                std::unordered_set<AreaFillPoint, AreaFillPointHash>
+                    confirmedSolids;
+                confirmedSolids.reserve(areaFillCells.size());
+                for (const auto& cell : areaFillCells) {
+                    if (cell.complete && cell.worldKnown && !cell.worldAir) {
+                        confirmedSolids.insert({cell.x, cell.y, cell.z});
+                    }
+                }
+                static constexpr std::array<std::array<int32_t, 3>, 6>
+                    Neighbours {{
+                        {{0, -1, 0}}, {{0, 1, 0}}, {{1, 0, 0}},
+                        {{-1, 0, 0}}, {{0, 0, 1}}, {{0, 0, -1}}
+                    }};
+                double bestScore = std::numeric_limits<double>::infinity();
+                int bestSupportRank = 2;
                 std::size_t bestIndex = areaFillCells.size();
                 for (std::size_t index = 0; index < areaFillCells.size(); ++index) {
                     const auto& cell = areaFillCells[index];
                     if (cell.complete || !cell.worldKnown || !cell.worldAir ||
-                        cell.failures >= 3 || cell.y != activeLayerY) continue;
-                    const double dx = cell.x + 0.5 - currentX;
-                    const double dy = cell.y + 0.5 - currentY;
-                    const double dz = cell.z + 0.5 - currentZ;
+                        cell.approachRequired ||
+                        cell.y != activeLayerY) continue;
+                    const double dx = currentX < cell.x
+                        ? cell.x - currentX
+                        : currentX > cell.x + 1.0
+                            ? currentX - (cell.x + 1.0)
+                            : 0.0;
+                    const double dy = currentY < cell.y
+                        ? cell.y - currentY
+                        : currentY > cell.y + 1.0
+                            ? currentY - (cell.y + 1.0)
+                            : 0.0;
+                    const double dz = currentZ < cell.z
+                        ? cell.z - currentZ
+                        : currentZ > cell.z + 1.0
+                            ? currentZ - (cell.z + 1.0)
+                            : 0.0;
                     const double distance = dx * dx + dy * dy + dz * dz;
+                    const double maximumReach = cell.failures == 0
+                        ? 3.0
+                        : cell.failures == 1 ? 2.5 : 2.0;
                     // Never attempt to place a target through the player's
                     // own collision box. Walk far enough away first.
                     const bool occupiesTarget =
@@ -5218,9 +5919,24 @@ struct RelayState {
                         static_cast<int32_t>(std::floor(currentZ)) == cell.z &&
                         currentY - 1.62f < cell.y + 0.95f &&
                         currentY - 1.62f + 1.8f > cell.y + 0.05f;
-                    if (!occupiesTarget && distance <= 4.75 * 4.75 &&
-                        distance < bestDistance) {
-                        bestDistance = distance;
+                    bool chained = false;
+                    for (const auto& neighbour : Neighbours) {
+                        chained = confirmedSolids.contains({
+                            cell.x + neighbour[0],
+                            cell.y + neighbour[1],
+                            cell.z + neighbour[2]
+                        });
+                        if (chained) break;
+                    }
+                    const int supportRank = chained ? 0 : 1;
+                    const double score = distance +
+                        static_cast<double>(cell.failures) * 4.0;
+                    if (!occupiesTarget &&
+                        distance <= maximumReach * maximumReach &&
+                        (supportRank < bestSupportRank ||
+                         (supportRank == bestSupportRank && score < bestScore))) {
+                        bestSupportRank = supportRank;
+                        bestScore = score;
                         bestIndex = index;
                     }
                 }
@@ -5249,8 +5965,7 @@ struct RelayState {
                     : packetZ;
                 int32_t activeLayerY = std::numeric_limits<int32_t>::max();
                 for (const auto& cell : areaFillCells) {
-                    if (!cell.complete && cell.worldKnown && cell.worldAir &&
-                        cell.failures < 3) {
+                    if (!cell.complete && cell.worldKnown && cell.worldAir) {
                         activeLayerY = std::min(activeLayerY, cell.y);
                     }
                 }
@@ -5259,17 +5974,18 @@ struct RelayState {
                 for (std::size_t index = 0; index < areaFillCells.size(); ++index) {
                     const auto& cell = areaFillCells[index];
                     if (cell.complete || !cell.worldKnown || !cell.worldAir ||
-                        cell.failures >= 3 || cell.y != activeLayerY) continue;
+                        cell.y != activeLayerY) continue;
                     const float currentFeetY = currentY - 1.62f;
                     const bool occupiesTarget =
                         static_cast<int32_t>(std::floor(currentX)) == cell.x &&
                         static_cast<int32_t>(std::floor(currentZ)) == cell.z &&
                         currentFeetY < cell.y + 0.95f &&
                         currentFeetY + 1.8f > cell.y + 0.05f;
-                    if (occupiesTarget) continue;
                     const double dx = cell.x + 0.5 - currentX;
                     const double dz = cell.z + 0.5 - currentZ;
-                    const double distance = dx * dx + dz * dz;
+                    const double distance = dx * dx + dz * dz +
+                        static_cast<double>(cell.failures) * 4.0 +
+                        (occupiesTarget ? 0.0 : 0.01);
                     if (distance < bestDistance) {
                         bestDistance = distance;
                         bestIndex = index;
@@ -5293,6 +6009,7 @@ struct RelayState {
                     } else {
                         areaFillRunning = false;
                         areaFillSyntheticPositionKnown = false;
+                        areaFillRouteWaypointKnown = false;
                         areaFillStatus =
                             "Не удалось установить оставшиеся блоки: нет опоры";
                         ++areaFillRevision;
@@ -5301,9 +6018,13 @@ struct RelayState {
                 }
                 if (areaFillRouteCell != bestIndex) {
                     areaFillRouteCell = bestIndex;
+                    areaFillRouteWaypointKnown = false;
                     ++areaFillRevision;
                 }
                 const auto& target = areaFillCells[bestIndex];
+                movementMaximumReach = target.failures == 0
+                    ? 2.75
+                    : target.failures == 1 ? 2.35 : 1.85;
                 const double dx = target.x + 0.5 - currentX;
                 const double dz = target.z + 0.5 - currentZ;
                 const double distance = std::hypot(dx, dz);
@@ -5317,14 +6038,15 @@ struct RelayState {
                     nextYaw = static_cast<float>(
                         std::atan2(-dx, dz) * 57.29577951308232
                     );
-                    movementFloor = {
-                        static_cast<int32_t>(std::floor(nextX)),
-                        areaFillPoints.empty() ? target.y : areaFillPoints.front().y,
-                        static_cast<int32_t>(std::floor(nextZ))
-                    };
-                    movementTarget = {target.x, target.y, target.z};
-                    planMovement = true;
                 }
+                movementFloor = {
+                    static_cast<int32_t>(std::floor(nextX)),
+                    areaFillPoints.empty() ? target.y : areaFillPoints.front().y,
+                    static_cast<int32_t>(std::floor(nextZ))
+                };
+                movementTarget = {target.x, target.y, target.z};
+                movementCellIndex = bestIndex;
+                planMovement = true;
             }
         }
 
@@ -5341,6 +6063,9 @@ struct RelayState {
             if (placement.valid) {
                 const auto support = areaFillSupportFor(placement.target);
                 if (!support.has_value()) {
+                    const bool supportAdded = addAreaFillSupportColumn(
+                        placement.target
+                    );
                     std::lock_guard lock(mutex);
                     if (placement.cellIndex < areaFillCells.size()) {
                         auto& cell = areaFillCells[placement.cellIndex];
@@ -5349,7 +6074,30 @@ struct RelayState {
                             cell.failures + 1
                         ));
                     }
-                    areaFillStatus = "Для выбранного блока нет известной опоры";
+                    if (!supportAdded && areaFillStatus.empty()) {
+                        areaFillStatus =
+                            "Для блока пока нет доступной опоры — ищу другую сторону";
+                    }
+                    ++areaFillRevision;
+                    return true;
+                }
+                if (!areaFillHasLineOfSight(
+                        placement.playerX,
+                        placement.playerY,
+                        placement.playerZ,
+                        placement.target)) {
+                    std::lock_guard lock(mutex);
+                    if (placement.cellIndex < areaFillCells.size()) {
+                        auto& cell = areaFillCells[placement.cellIndex];
+                        cell.failures = static_cast<uint8_t>(std::min<int>(
+                            255,
+                            cell.failures + 1
+                        ));
+                        cell.approachRequired = true;
+                    }
+                    areaFillRouteWaypointKnown = false;
+                    areaFillStatus =
+                        "Между игроком и блоком препятствие — обхожу";
                     ++areaFillRevision;
                     return true;
                 }
@@ -5369,6 +6117,12 @@ struct RelayState {
                     }
                     areaFillPlacementPending = true;
                     areaFillPendingCell = placement.cellIndex;
+                    areaFillPendingHotbarSlot = static_cast<std::size_t>(
+                        placement.hotbarSlot
+                    );
+                    areaFillPendingHeldCount = placement.held.count;
+                    areaFillPendingBlockRuntimeId =
+                        placement.held.blockRuntimeId;
                     areaFillPlacementStartedAtMs = now;
                     areaFillLastPlacementAtMs = now;
                     areaFillStatus = "Ставлю блок " +
@@ -5383,87 +6137,82 @@ struct RelayState {
                 const float currentX = nextX - deltaX;
                 const float currentY = nextY;
                 const float currentZ = nextZ - deltaZ;
-                auto safeEyeY = areaFillSafeStandingEyeY(
+                std::optional<AreaFillRouteStep> route;
+                {
+                    std::lock_guard lock(mutex);
+                    if (areaFillRouteWaypointKnown &&
+                        areaFillRouteWaypointCell == movementCellIndex) {
+                        route = areaFillRouteWaypoint;
+                    }
+                }
+                if (!route.has_value()) {
+                    route = areaFillRouteStep(
+                        currentX,
+                        currentZ,
+                        currentY,
+                        movementTarget,
+                        movementFloor.y,
+                        movementMaximumReach
+                    );
+                    if (route.has_value() && !route->goalReached) {
+                        std::lock_guard lock(mutex);
+                        if (areaFillRouteCell == movementCellIndex) {
+                            areaFillRouteWaypointKnown = true;
+                            areaFillRouteWaypointCell = movementCellIndex;
+                            areaFillRouteWaypoint = *route;
+                        }
+                    }
+                }
+                if (!route.has_value()) {
+                    std::lock_guard lock(mutex);
+                    areaFillSyntheticPositionKnown = false;
+                    areaFillRouteWaypointKnown = false;
+                    areaFillStatus =
+                        "Безопасный маршрут пока не найден — жду обновление мира";
+                    ++areaFillRevision;
+                    return true;
+                }
+                const double routeX = route->centerX - currentX;
+                const double routeZ = route->centerZ - currentZ;
+                const double routeDistance = std::hypot(routeX, routeZ);
+                if (routeDistance < 0.01) {
+                    std::lock_guard lock(mutex);
+                    areaFillRouteWaypointKnown = false;
+                    if (route->goalReached &&
+                        areaFillRouteCell < areaFillCells.size()) {
+                        areaFillCells[areaFillRouteCell].approachRequired =
+                            false;
+                        areaFillStatus =
+                            "Безопасная позиция найдена — ставлю блок";
+                    } else {
+                        areaFillStatus = "Перестраиваю безопасный маршрут";
+                    }
+                    ++areaFillRevision;
+                    return true;
+                }
+                const double step = std::min(0.08, routeDistance);
+                deltaX = static_cast<float>(routeX / routeDistance * step);
+                deltaZ = static_cast<float>(routeZ / routeDistance * step);
+                nextX = currentX + deltaX;
+                nextZ = currentZ + deltaZ;
+                const auto safeEyeY = areaFillSafeStandingEyeY(
                     nextX,
                     nextZ,
                     currentY,
                     movementFloor.y
                 );
                 if (!safeEyeY.has_value()) {
-                    // The straight cell is blocked. Pick a safe neighbouring
-                    // cell that gets closest to the target instead of stopping
-                    // at the first existing block in the route.
-                    static constexpr std::array<std::array<int32_t, 2>, 4>
-                        Neighbours {{
-                            {{1, 0}}, {{-1, 0}}, {{0, 1}}, {{0, -1}}
-                        }};
-                    const int32_t currentCellX = static_cast<int32_t>(
-                        std::floor(currentX)
-                    );
-                    const int32_t currentCellZ = static_cast<int32_t>(
-                        std::floor(currentZ)
-                    );
-                    double bestScore = std::numeric_limits<double>::infinity();
-                    int32_t bestX = currentCellX;
-                    int32_t bestZ = currentCellZ;
-                    std::optional<float> bestEyeY;
-                    for (const auto& neighbour : Neighbours) {
-                        const int32_t candidateX = currentCellX + neighbour[0];
-                        const int32_t candidateZ = currentCellZ + neighbour[1];
-                        auto candidateEyeY = areaFillSafeStandingEyeY(
-                            candidateX + 0.5f,
-                            candidateZ + 0.5f,
-                            currentY,
-                            movementFloor.y
-                        );
-                        if (!candidateEyeY.has_value()) continue;
-                        const double dx = movementTarget.x + 0.5 -
-                            (candidateX + 0.5);
-                        const double dz = movementTarget.z + 0.5 -
-                            (candidateZ + 0.5);
-                        const double score = dx * dx + dz * dz;
-                        if (score < bestScore) {
-                            bestScore = score;
-                            bestX = candidateX;
-                            bestZ = candidateZ;
-                            bestEyeY = candidateEyeY;
-                        }
-                    }
-                    if (bestEyeY.has_value()) {
-                        const double dx = bestX + 0.5 - currentX;
-                        const double dz = bestZ + 0.5 - currentZ;
-                        const double distance = std::hypot(dx, dz);
-                        const double step = std::min(0.08, distance);
-                        deltaX = distance > 0.0
-                            ? static_cast<float>(dx / distance * step)
-                            : 0.0f;
-                        deltaZ = distance > 0.0
-                            ? static_cast<float>(dz / distance * step)
-                            : 0.0f;
-                        nextX = currentX + deltaX;
-                        nextZ = currentZ + deltaZ;
-                        auto actualEyeY = areaFillSafeStandingEyeY(
-                            nextX,
-                            nextZ,
-                            currentY,
-                            movementFloor.y
-                        );
-                        safeEyeY = actualEyeY.has_value()
-                            ? actualEyeY
-                            : bestEyeY;
-                        nextYaw = static_cast<float>(
-                            std::atan2(-dx, dz) * 57.29577951308232
-                        );
-                    }
-                }
-                if (!safeEyeY.has_value()) {
                     std::lock_guard lock(mutex);
-                    areaFillRunning = false;
                     areaFillSyntheticPositionKnown = false;
-                    areaFillStatus = "Автопроход остановлен: впереди нет безопасного пути";
+                    areaFillRouteWaypointKnown = false;
+                    areaFillStatus =
+                        "Маршрут перестраивается после изменения блоков";
                     ++areaFillRevision;
                     return true;
                 }
+                nextYaw = static_cast<float>(
+                    std::atan2(-routeX, routeZ) * 57.29577951308232
+                );
                 nextY = *safeEyeY;
                 deltaY = nextY - currentY;
                 auto packet = makeAreaFillMovementPacket(
@@ -5997,9 +6746,19 @@ struct RelayState {
             areaFillWaitingForBlocks = false;
             areaFillRefillPending = false;
             areaFillRefillRequestId = 0;
-            areaFillRefillLegacyFallback = false;
+            areaFillRefillVariant = AreaFillRefillPlan::UnifiedSwap;
             areaFillPlacementPending = false;
             areaFillSyntheticPositionKnown = false;
+            areaFillRouteWaypointKnown = false;
+            areaFillSyntheticSolids.clear();
+            for (auto& cell : areaFillCells) {
+                cell.complete = false;
+                cell.worldKnown = false;
+                cell.worldAir = true;
+                cell.runtimeId = 0;
+                cell.failures = 0;
+                cell.approachRequired = false;
+            }
             areaFillStatus = areaFillCells.empty()
                 ? "Добавьте точки области"
                 : "Мир сменился — проверьте точки и запустите снова";
@@ -6025,6 +6784,25 @@ struct RelayState {
                     miniMapDimension.load(std::memory_order_relaxed)
                 );
             }
+            std::lock_guard lock(mutex);
+            areaFillRunning = false;
+            areaFillPlacementPending = false;
+            areaFillRefillPending = false;
+            areaFillSyntheticPositionKnown = false;
+            areaFillRouteWaypointKnown = false;
+            areaFillSyntheticSolids.clear();
+            for (auto& cell : areaFillCells) {
+                cell.complete = false;
+                cell.worldKnown = false;
+                cell.worldAir = true;
+                cell.runtimeId = 0;
+                cell.failures = 0;
+                cell.approachRequired = false;
+            }
+            areaFillStatus = areaFillCells.empty()
+                ? "Добавьте точки области"
+                : "Измерение изменилось — проверьте область и запустите снова";
+            ++areaFillRevision;
         }
         if (serverbound && name == "interact") {
             try {
@@ -6222,9 +7000,14 @@ struct RelayState {
                         if (!accepted) {
                             areaFillRefillPending = false;
                             areaFillRefillRequestId = 0;
-                            areaFillRefillLegacyFallback = true;
+                            if (areaFillRefillVariant + 1 <
+                                AreaFillRefillPlan::VariantCount) {
+                                ++areaFillRefillVariant;
+                            }
                             areaFillStatus =
-                                "Сервер отклонил подтверждаемый swap — пробую legacy";
+                                "Сервер отклонил перенос — пробую " +
+                                std::string(areaFillRefillVariantName(
+                                    areaFillRefillVariant));
                             ++areaFillRevision;
                             continue;
                         }
@@ -6235,14 +7018,24 @@ struct RelayState {
                         if (areaFillRefillSourceSlot < playerInventory.size() &&
                             areaFillRefillDestinationSlot <
                                 playerInventory.size()) {
-                            std::swap(
-                                playerInventory[areaFillRefillSourceSlot],
-                                playerInventory[areaFillRefillDestinationSlot]
-                            );
+                            const auto& destination = playerInventory[
+                                areaFillRefillDestinationSlot
+                            ];
+                            // InventorySlot may arrive before the response.
+                            // Do not apply the same accepted swap twice.
+                            if (!destination.present ||
+                                destination.networkId != areaFillItemNetworkId ||
+                                destination.count <= 0) {
+                                std::swap(
+                                    playerInventory[areaFillRefillSourceSlot],
+                                    playerInventory[areaFillRefillDestinationSlot]
+                                );
+                            }
                         }
                         areaFillRefillPending = false;
                         areaFillRefillRequestId = 0;
-                        areaFillRefillLegacyFallback = false;
+                        areaFillRefillVariant =
+                            AreaFillRefillPlan::UnifiedSwap;
                         areaFillStatus =
                             "Пополнение хотбара подтверждено сервером";
                         ++areaFillRevision;
@@ -6641,9 +7434,19 @@ struct RelayState {
         areaFillWaitingForBlocks = false;
         areaFillRefillPending = false;
         areaFillRefillRequestId = 0;
-        areaFillRefillLegacyFallback = false;
+        areaFillRefillVariant = AreaFillRefillPlan::UnifiedSwap;
         areaFillPlacementPending = false;
         areaFillSyntheticPositionKnown = false;
+        areaFillRouteWaypointKnown = false;
+        areaFillSyntheticSolids.clear();
+        for (auto& cell : areaFillCells) {
+            cell.complete = false;
+            cell.worldKnown = false;
+            cell.worldAir = true;
+            cell.runtimeId = 0;
+            cell.failures = 0;
+            cell.approachRequired = false;
+        }
         areaFillStatus = areaFillCells.empty()
             ? "Добавьте точки области"
             : "Сессия завершена — запустите заполнение снова";
@@ -9743,6 +10546,7 @@ private:
         bedrock::BedrockServerConnection connection;
         std::string sessionId;
         std::string stage = "raknet_open";
+        std::chrono::steady_clock::time_point stageStartedAt;
         std::chrono::steady_clock::time_point deadline;
         uint64_t generation = 0;
     };
@@ -9925,6 +10729,7 @@ private:
         const bedrock::BedrockServerConnection& connection,
         std::string sessionId
     ) {
+        const auto now = std::chrono::steady_clock::now();
         {
             std::lock_guard lock(loginWatchdogMutex_);
             if (loginWatchdogStopping_) return;
@@ -9932,8 +10737,8 @@ private:
                 connection,
                 std::move(sessionId),
                 "raknet_open",
-                std::chrono::steady_clock::now() +
-                    std::chrono::seconds(20),
+                now,
+                now + std::chrono::seconds(20),
                 ++loginWatchdogGeneration_
             };
         }
@@ -9948,7 +10753,8 @@ private:
         if (!pendingLogin_ ||
             !samePeer(pendingLogin_->connection.peer, peer)) return;
         pendingLogin_->stage = stage;
-        pendingLogin_->deadline = std::chrono::steady_clock::now() +
+        pendingLogin_->stageStartedAt = std::chrono::steady_clock::now();
+        pendingLogin_->deadline = pendingLogin_->stageStartedAt +
             std::chrono::seconds(20);
         pendingLogin_->generation = ++loginWatchdogGeneration_;
         loginWatchdogCv_.notify_all();
@@ -9985,10 +10791,96 @@ private:
 
             const auto generation = pendingLogin_->generation;
             const auto deadline = pendingLogin_->deadline;
-            if (loginWatchdogCv_.wait_until(lock, deadline, [this, generation]() {
+            const bool watchFragmentedLogin =
+                pendingLogin_->stage == "request_network_settings";
+            const auto wakeAt = watchFragmentedLogin
+                ? std::min(
+                    deadline,
+                    std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(750)
+                )
+                : deadline;
+            if (loginWatchdogCv_.wait_until(lock, wakeAt, [this, generation]() {
                     return loginWatchdogStopping_ || !pendingLogin_ ||
                         pendingLogin_->generation != generation;
                 })) {
+                continue;
+            }
+
+            // A stale Minecraft UDP/RakNet socket can deliver the ~590 KiB
+            // Login packet with reliability sequence numbers belonging to a
+            // previous relay process. RakNet then counts the fragments as
+            // ignored forever: NetworkSettings was accepted, but Login can
+            // never be assembled. Detect that signature early and free the
+            // peer instead of making the user wait for the full watchdog.
+            if (watchFragmentedLogin &&
+                std::chrono::steady_clock::now() < deadline) {
+                const auto candidate = *pendingLogin_;
+                lock.unlock();
+                bedrock::RakNetServerPeerStatistics statistics;
+                {
+                    std::lock_guard relayLock(relayMutex_);
+                    if (relay_) {
+                        statistics = relay_->live().server()
+                            .transportStatistics(candidate.connection);
+                    }
+                }
+                lock.lock();
+                if (loginWatchdogStopping_) break;
+                if (!pendingLogin_ ||
+                    pendingLogin_->generation != generation) {
+                    continue;
+                }
+                const auto stageElapsed = std::chrono::duration_cast<
+                    std::chrono::milliseconds
+                >(
+                    std::chrono::steady_clock::now() -
+                        pendingLogin_->stageStartedAt
+                );
+                const bool poisonedFragmentStream =
+                    stageElapsed >= std::chrono::milliseconds(2'500) &&
+                    statistics.peerKnown && statistics.nativeActive &&
+                    statistics.statisticsAvailable &&
+                    statistics.userMessageBytesReceivedIgnored >=
+                        256ull * 1024ull &&
+                    statistics.userMessageBytesReceivedProcessed <
+                        64ull * 1024ull;
+                if (!poisonedFragmentStream) continue;
+
+                const auto poisoned = *pendingLogin_;
+                pendingLogin_.reset();
+                ++loginWatchdogGeneration_;
+                lock.unlock();
+                const auto visibleError =
+                    "Minecraft reused a stale local connection; reconnect "
+                    "to 127.0.0.1:19132";
+                {
+                    std::lock_guard stateLock(state_->mutex);
+                    state_->lastError = visibleError;
+                }
+                state_->push(
+                    "local_login_fragment_reset",
+                    "downstream_session=" + poisoned.sessionId +
+                        " last_stage=" + poisoned.stage +
+                        " elapsedMs=" + std::to_string(stageElapsed.count()) +
+                        " raknet={" +
+                        rakNetStatisticsBreadcrumb(statistics) +
+                        "}; closing stale fragmented login immediately so "
+                        "Minecraft can reconnect",
+                    "ERROR",
+                    "watchdog"
+                );
+                state_->flushFlight("local_login_fragment_reset", 48);
+                {
+                    std::lock_guard relayLock(relayMutex_);
+                    if (relay_) {
+                        relay_->live().disconnectDownstream(
+                            poisoned.connection,
+                            visibleError
+                        );
+                    }
+                }
+                lock.lock();
                 continue;
             }
 
@@ -10415,6 +11307,30 @@ Java_com_m9chko_bedrockrelay_NativeBridge_clearAreaFill(
     }
     const auto value = state
         ? state->clearAreaFill()
+        : bedrock::JsRuntimeValue::object({});
+    areaFillMarkerRefreshRequested.store(true, std::memory_order_relaxed);
+    return toJavaString(environment, jsonString(value));
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_m9chko_bedrockrelay_NativeBridge_shiftAreaFill(
+    JNIEnv* environment,
+    jclass,
+    jint deltaXValue,
+    jint deltaYValue,
+    jint deltaZValue
+) {
+    std::shared_ptr<RelayState> state;
+    {
+        std::lock_guard lock(controllerMutex);
+        state = currentState;
+    }
+    const auto value = state
+        ? state->shiftAreaFill(
+            static_cast<int32_t>(deltaXValue),
+            static_cast<int32_t>(deltaYValue),
+            static_cast<int32_t>(deltaZValue)
+        )
         : bedrock::JsRuntimeValue::object({});
     areaFillMarkerRefreshRequested.store(true, std::memory_order_relaxed);
     return toJavaString(environment, jsonString(value));
