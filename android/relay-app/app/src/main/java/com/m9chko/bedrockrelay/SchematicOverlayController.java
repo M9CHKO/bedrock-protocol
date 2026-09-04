@@ -59,7 +59,16 @@ final class SchematicOverlayController {
     private volatile boolean uiBlocked;
     private volatile boolean enabled;
     private volatile int fieldOfView = 70;
+    private volatile boolean texturesEnabled = true;
     private volatile int opacityPercent = 42;
+    private volatile boolean outlinesEnabled = true;
+    private volatile int outlineOpacityPercent = 68;
+    private volatile int correctOutlineColor =
+        RelayService.DEFAULT_SCHEMATIC_CORRECT_COLOR;
+    private volatile int wrongOutlineColor =
+        RelayService.DEFAULT_SCHEMATIC_WRONG_COLOR;
+    private volatile int missingOutlineColor =
+        RelayService.DEFAULT_SCHEMATIC_MISSING_COLOR;
     private volatile int maximumDistance = 96;
     private volatile int rotationQuarterTurns;
     private volatile boolean mirrored;
@@ -116,7 +125,13 @@ final class SchematicOverlayController {
     void configure(
         boolean enabled,
         int fov,
+        boolean textures,
         int opacity,
+        boolean outlines,
+        int outlineOpacity,
+        int correctColor,
+        int wrongColor,
+        int missingColor,
         int distance,
         int rotation,
         boolean mirrored,
@@ -124,17 +139,31 @@ final class SchematicOverlayController {
     ) {
         int nextFov = RelayService.clampEntityFov(fov);
         int nextOpacity = RelayService.clampSchematicOpacity(opacity);
+        int nextOutlineOpacity = RelayService.clampSchematicOpacity(
+            outlineOpacity
+        );
         int nextDistance = RelayService.clampSchematicDistance(distance);
         int nextRotation = Math.floorMod(rotation, 4);
         boolean queryChanged = rotationQuarterTurns != nextRotation ||
             this.mirrored != mirrored;
-        boolean markerSelectionChanged = opacityPercent != nextOpacity ||
+        boolean markerSelectionChanged = texturesEnabled != textures ||
+            opacityPercent != nextOpacity || outlinesEnabled != outlines ||
+            outlineOpacityPercent != nextOutlineOpacity ||
+            correctOutlineColor != correctColor ||
+            wrongOutlineColor != wrongColor ||
+            missingOutlineColor != missingColor ||
             maximumDistance != nextDistance || selectedLayer != layer;
         boolean enabledChanged = this.enabled != enabled;
 
         this.enabled = enabled;
         fieldOfView = nextFov;
+        texturesEnabled = textures;
         opacityPercent = nextOpacity;
+        outlinesEnabled = outlines;
+        outlineOpacityPercent = nextOutlineOpacity;
+        correctOutlineColor = correctColor;
+        wrongOutlineColor = wrongColor;
+        missingOutlineColor = missingColor;
         maximumDistance = nextDistance;
         rotationQuarterTurns = nextRotation;
         this.mirrored = mirrored;
@@ -607,7 +636,9 @@ final class SchematicOverlayController {
                 cameraKnown ? camera.z : 0.0d,
                 query.selectedLayer,
                 query.maximumDistance,
-                opacityPercent,
+                texturesEnabled || outlinesEnabled
+                    ? Math.max(opacityPercent, outlineOpacityPercent)
+                    : 0,
                 query.exactBedrockProperties
             );
         synchronized (blockQueryLock) {
@@ -631,7 +662,13 @@ final class SchematicOverlayController {
             boolean accepted = NativeBridge.replaceSchematicDebugMarkers(
                 result.records(),
                 result.expectedBlockStates(),
-                result.opacityPercent(),
+                texturesEnabled,
+                opacityPercent,
+                outlinesEnabled,
+                outlineOpacityPercent,
+                correctOutlineColor,
+                wrongOutlineColor,
+                missingOutlineColor,
                 result.total(),
                 result.correct(),
                 result.missing(),

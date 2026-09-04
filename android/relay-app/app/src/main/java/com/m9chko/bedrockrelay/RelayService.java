@@ -87,7 +87,17 @@ public final class RelayService extends Service {
     public static final String KEY_THREAT_WARNING_X = "threat_warning_x";
     public static final String KEY_THREAT_WARNING_Y = "threat_warning_y";
     public static final String KEY_SCHEMATIC_ENABLED = "schematic_enabled";
+    public static final String KEY_SCHEMATIC_TEXTURES = "schematic_textures";
     public static final String KEY_SCHEMATIC_OPACITY = "schematic_opacity";
+    public static final String KEY_SCHEMATIC_OUTLINES = "schematic_outlines";
+    public static final String KEY_SCHEMATIC_OUTLINE_OPACITY =
+        "schematic_outline_opacity";
+    public static final String KEY_SCHEMATIC_CORRECT_COLOR =
+        "schematic_correct_color";
+    public static final String KEY_SCHEMATIC_WRONG_COLOR =
+        "schematic_wrong_color";
+    public static final String KEY_SCHEMATIC_MISSING_COLOR =
+        "schematic_missing_color";
     public static final String KEY_SCHEMATIC_DISTANCE = "schematic_distance";
     public static final String KEY_SCHEMATIC_ROTATION = "schematic_rotation";
     public static final String KEY_SCHEMATIC_MIRROR = "schematic_mirror";
@@ -113,6 +123,9 @@ public final class RelayService extends Service {
     public static final int DEFAULT_MOB_COLOR = 0xffff5b62;
     public static final int DEFAULT_ITEM_COLOR = 0xffffcf4a;
     public static final int DEFAULT_THREAT_COLOR = 0xffff3b30;
+    public static final int DEFAULT_SCHEMATIC_CORRECT_COLOR = 0xff5df0a2;
+    public static final int DEFAULT_SCHEMATIC_WRONG_COLOR = 0xffff5b62;
+    public static final int DEFAULT_SCHEMATIC_MISSING_COLOR = 0xffffcf4a;
 
     public static final int MIN_RETAINED_RADIUS_CHUNKS = 10;
     public static final int MAX_RETAINED_RADIUS_CHUNKS = 64;
@@ -1248,10 +1261,34 @@ public final class RelayService extends Service {
             KEY_SCHEMATIC_ENABLED,
             false
         );
+        boolean schematicTextures = preferences.getBoolean(
+            KEY_SCHEMATIC_TEXTURES,
+            true
+        );
         int schematicOpacity = clampSchematicOpacity(preferences.getInt(
             KEY_SCHEMATIC_OPACITY,
             42
         ));
+        boolean schematicOutlines = preferences.getBoolean(
+            KEY_SCHEMATIC_OUTLINES,
+            true
+        );
+        int schematicOutlineOpacity = clampSchematicOpacity(preferences.getInt(
+            KEY_SCHEMATIC_OUTLINE_OPACITY,
+            68
+        ));
+        int schematicCorrectColor = preferences.getInt(
+            KEY_SCHEMATIC_CORRECT_COLOR,
+            DEFAULT_SCHEMATIC_CORRECT_COLOR
+        );
+        int schematicWrongColor = preferences.getInt(
+            KEY_SCHEMATIC_WRONG_COLOR,
+            DEFAULT_SCHEMATIC_WRONG_COLOR
+        );
+        int schematicMissingColor = preferences.getInt(
+            KEY_SCHEMATIC_MISSING_COLOR,
+            DEFAULT_SCHEMATIC_MISSING_COLOR
+        );
         int schematicDistance = clampSchematicDistance(preferences.getInt(
             KEY_SCHEMATIC_DISTANCE,
             96
@@ -1277,6 +1314,7 @@ public final class RelayService extends Service {
             .putInt(KEY_THREAT_DISTANCE, threatDistance)
             .putInt(KEY_THREAT_WARNING_SCALE, threatWarningScale)
             .putInt(KEY_SCHEMATIC_OPACITY, schematicOpacity)
+            .putInt(KEY_SCHEMATIC_OUTLINE_OPACITY, schematicOutlineOpacity)
             .putInt(KEY_SCHEMATIC_DISTANCE, schematicDistance)
             .putInt(KEY_SCHEMATIC_ROTATION, schematicRotation)
             .apply();
@@ -1328,7 +1366,13 @@ public final class RelayService extends Service {
                 schematicOverlayController.configure(
                     schematicEnabled,
                     entityFov,
+                    schematicTextures,
                     schematicOpacity,
+                    schematicOutlines,
+                    schematicOutlineOpacity,
+                    schematicCorrectColor,
+                    schematicWrongColor,
+                    schematicMissingColor,
                     schematicDistance,
                     schematicRotation,
                     schematicMirror,
@@ -1373,7 +1417,10 @@ public final class RelayService extends Service {
                         " threatAnalysis=" + threatAnalysis +
                         " threatDistance=" + threatDistance +
                         " schematic=" + schematicEnabled +
-                        " schematicOpacity=" + schematicOpacity +
+                        " schematicTextures=" + schematicTextures +
+                        " schematicTextureOpacity=" + schematicOpacity +
+                        " schematicOutlines=" + schematicOutlines +
+                        " schematicOutlineOpacity=" + schematicOutlineOpacity +
                         " schematicDistance=" + schematicDistance +
                         " schematicRotation=" + schematicRotation +
                         " schematicMirror=" + schematicMirror +
@@ -1531,7 +1578,7 @@ public final class RelayService extends Service {
     }
 
     public static int clampSchematicOpacity(int value) {
-        return Math.max(10, Math.min(85, value));
+        return Math.max(10, Math.min(100, value));
     }
 
     public static int clampSchematicDistance(int value) {

@@ -30,6 +30,7 @@ import java.util.Locale;
 
 /** Session-scoped Toolbox-style controls displayed over Minecraft. */
 final class RelayOverlayController {
+    private static final String KEY_DRAWER_OPEN = "relay_overlay_drawer_open";
     interface SchematicAnchorShift {
         void shift(int dx, int dy, int dz);
     }
@@ -54,6 +55,7 @@ final class RelayOverlayController {
     private ValueAnimator drawerAnimator;
     private int drawerPanelWidth;
     private boolean drawerOpen;
+    private boolean drawerShouldBeOpen;
     private boolean missingPermissionLogged;
     private boolean statusRetentionEnabled;
     private int statusConfiguredRadiusChunks = 24;
@@ -87,6 +89,7 @@ final class RelayOverlayController {
         this.preferences = preferences;
         this.settingsChanged = settingsChanged;
         this.schematicAnchorShift = schematicAnchorShift;
+        drawerShouldBeOpen = preferences.getBoolean(KEY_DRAWER_OPEN, true);
         this.windowManager = (WindowManager) context.getSystemService(
             Context.WINDOW_SERVICE
         );
@@ -152,7 +155,7 @@ final class RelayOverlayController {
             final LinearLayout addedRoot = windowRoot;
             addedRoot.post(() -> {
                 if (windowRoot == addedRoot) {
-                    animateDrawer(true);
+                    animateDrawer(drawerShouldBeOpen);
                 }
             });
             DiagnosticsLog.append(
@@ -222,7 +225,13 @@ final class RelayOverlayController {
         tab.setContentDescription(
             "Открыть меню CPE Relay; удерживайте и двигайте по вертикали"
         );
-        tab.setOnClickListener(view -> animateDrawer(!drawerOpen));
+        tab.setOnClickListener(view -> {
+            drawerShouldBeOpen = !drawerOpen;
+            preferences.edit()
+                .putBoolean(KEY_DRAWER_OPEN, drawerShouldBeOpen)
+                .apply();
+            animateDrawer(drawerShouldBeOpen);
+        });
         attachDrawerTabDrag(tab);
         return tab;
     }
@@ -1053,21 +1062,72 @@ final class RelayOverlayController {
         }
 
         root.addView(sectionHeader("ОТОБРАЖЕНИЕ"));
+        root.addView(toggle(
+            "Текстуры блоков схемы",
+            RelayService.KEY_SCHEMATIC_TEXTURES,
+            true
+        ));
         int opacity = RelayService.clampSchematicOpacity(preferences.getInt(
             RelayService.KEY_SCHEMATIC_OPACITY,
             42
         ));
-        TextView opacityLabel = settingLabel("Прозрачность фантомов: " +
+        TextView opacityLabel = settingLabel("Прозрачность текстур: " +
             opacity + "%");
         root.addView(opacityLabel);
-        SeekBar opacitySlider = slider(10, 85, opacity);
+        SeekBar opacitySlider = slider(10, 100, opacity);
         root.addView(opacitySlider);
         opacitySlider.setOnSeekBarChangeListener(seekListener(
-            value -> opacityLabel.setText("Прозрачность фантомов: " + value + "%"),
+            value -> opacityLabel.setText("Прозрачность текстур: " + value + "%"),
             value -> saveInt(
                 RelayService.KEY_SCHEMATIC_OPACITY,
                 RelayService.clampSchematicOpacity(value)
             )
+        ));
+
+        root.addView(toggle(
+            "Контуры блоков схемы",
+            RelayService.KEY_SCHEMATIC_OUTLINES,
+            true
+        ));
+        int outlineOpacity = RelayService.clampSchematicOpacity(
+            preferences.getInt(
+                RelayService.KEY_SCHEMATIC_OUTLINE_OPACITY,
+                68
+            )
+        );
+        TextView outlineOpacityLabel = settingLabel(
+            "Видимость контуров: " + outlineOpacity + "%"
+        );
+        root.addView(outlineOpacityLabel);
+        SeekBar outlineOpacitySlider = slider(10, 100, outlineOpacity);
+        root.addView(outlineOpacitySlider);
+        outlineOpacitySlider.setOnSeekBarChangeListener(seekListener(
+            value -> outlineOpacityLabel.setText(
+                "Видимость контуров: " + value + "%"
+            ),
+            value -> saveInt(
+                RelayService.KEY_SCHEMATIC_OUTLINE_OPACITY,
+                RelayService.clampSchematicOpacity(value)
+            )
+        ));
+
+        root.addView(settingLabel("Цвет правильного блока"));
+        root.addView(colorPicker(
+            RelayService.KEY_SCHEMATIC_CORRECT_COLOR,
+            RelayService.DEFAULT_SCHEMATIC_CORRECT_COLOR,
+            "schematics"
+        ));
+        root.addView(settingLabel("Цвет неправильного блока"));
+        root.addView(colorPicker(
+            RelayService.KEY_SCHEMATIC_WRONG_COLOR,
+            RelayService.DEFAULT_SCHEMATIC_WRONG_COLOR,
+            "schematics"
+        ));
+        root.addView(settingLabel("Цвет отсутствующего блока"));
+        root.addView(colorPicker(
+            RelayService.KEY_SCHEMATIC_MISSING_COLOR,
+            RelayService.DEFAULT_SCHEMATIC_MISSING_COLOR,
+            "schematics"
         ));
 
         int distance = RelayService.clampSchematicDistance(preferences.getInt(

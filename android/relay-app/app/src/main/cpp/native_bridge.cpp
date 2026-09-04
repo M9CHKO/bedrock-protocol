@@ -4880,7 +4880,7 @@ std::vector<SchematicDebugShape> planSchematicDebugShapes(
 // by server scripts. The ASCII prefix "CPE" makes accidental overlap with a
 // destination server's debug drawer registry practically impossible.
 constexpr uint64_t SchematicDebugNetworkIdBase = 0x4350450000000000ULL;
-// Textured previews are relay-owned falling-block actors. They never enter
+// Textured previews are relay-owned moving-block actors. They never enter
 // the authoritative chunk and use a separate ID range from debug shapes.
 constexpr uint64_t SchematicTextureActorIdBase = 0x4350451000000000ULL;
 constexpr std::size_t MaximumSchematicTextureActors = 1'800;
@@ -4909,23 +4909,23 @@ bedrock::ProtoDefValue schematicDebugVec3(double x, double y, double z) {
     });
 }
 
-int32_t schematicDebugArgb(int status, int opacityPercent) {
-    const bool wrong = status == 3;
-    const bool correct = status == 2;
-    const bool missing = status == 1;
-    const int effectiveOpacity = wrong
-        ? std::clamp(opacityPercent, 20, 85)
-        : correct
-            ? std::clamp(opacityPercent, 8, 24)
-            : missing
-                ? std::clamp(opacityPercent, 8, 20)
-                : std::clamp(opacityPercent, 8, 16);
+int32_t schematicDebugArgb(
+    int status,
+    int opacityPercent,
+    int32_t correctColor,
+    int32_t wrongColor,
+    int32_t missingColor
+) {
+    const uint32_t selectedColor = static_cast<uint32_t>(
+        status == 3 ? wrongColor : status == 2 ? correctColor : missingColor
+    );
+    const int effectiveOpacity = std::clamp(opacityPercent, 10, 100);
     const uint32_t alpha = static_cast<uint32_t>(std::lround(
         effectiveOpacity * 255.0 / 100.0
     ));
-    const uint32_t red = wrong ? 255u : correct ? 45u : 245u;
-    const uint32_t green = wrong ? 28u : correct ? 224u : 174u;
-    const uint32_t blue = wrong ? 28u : correct ? 76u : 55u;
+    const uint32_t red = (selectedColor >> 16u) & 0xffu;
+    const uint32_t green = (selectedColor >> 8u) & 0xffu;
+    const uint32_t blue = selectedColor & 0xffu;
     // The schema calls this field li32 while Bedrock interprets its bytes as
     // BEARGB. Packing conventional 0xAARRGGBB and writing it little-endian
     // produces the required B,G,R,A byte order.
@@ -4951,10 +4951,17 @@ bedrock::VersionedGamePacket makeLegacySchematicDebugCubePacket(
     const bedrock::ProtoDefPacketEncoder& encoder,
     const bedrock::VersionedPacketCodec& packetCodec,
     const SchematicDebugMarker& marker,
-    int opacityPercent
+    int opacityPercent,
+    int32_t correctColor,
+    int32_t wrongColor,
+    int32_t missingColor
 ) {
-    const bool wrong = marker.status == 3;
-    const double alpha = std::clamp(opacityPercent, 10, 85) / 100.0;
+    const double alpha = std::clamp(opacityPercent, 10, 100) / 100.0;
+    const uint32_t color = static_cast<uint32_t>(
+        marker.status == 3
+            ? wrongColor
+            : marker.status == 2 ? correctColor : missingColor
+    );
     const auto payload = encoder.encodePacket(
         "debug_renderer",
         bedrock::ProtoDefValue::object({
@@ -4967,9 +4974,15 @@ bedrock::VersionedGamePacket makeLegacySchematicDebugCubePacket(
                 {"y", bedrock::ProtoDefValue::floating(marker.y + 0.5)},
                 {"z", bedrock::ProtoDefValue::floating(marker.z + 0.5)}
             })},
-            {"red", bedrock::ProtoDefValue::floating(wrong ? 1.0 : 0.15)},
-            {"green", bedrock::ProtoDefValue::floating(wrong ? 0.10 : 0.85)},
-            {"blue", bedrock::ProtoDefValue::floating(wrong ? 0.10 : 1.0)},
+            {"red", bedrock::ProtoDefValue::floating(
+                ((color >> 16u) & 0xffu) / 255.0
+            )},
+            {"green", bedrock::ProtoDefValue::floating(
+                ((color >> 8u) & 0xffu) / 255.0
+            )},
+            {"blue", bedrock::ProtoDefValue::floating(
+                (color & 0xffu) / 255.0
+            )},
             {"alpha", bedrock::ProtoDefValue::floating(alpha)},
             // Rebuilds are event-driven; keep unchanged markers alive for a
             // full play session without periodic packet spam.
@@ -4985,6 +4998,9 @@ bedrock::VersionedGamePacket makeSchematicScriptDebugDrawerPacket(
     std::string_view version,
     const std::vector<ActiveSchematicDebugShape>& activeShapes,
     int opacityPercent,
+    int32_t correctColor,
+    int32_t wrongColor,
+    int32_t missingColor,
     std::size_t shapeOffset,
     std::size_t shapeCount
 ) {
@@ -5027,7 +5043,13 @@ bedrock::VersionedGamePacket makeSchematicScriptDebugDrawerPacket(
             {"rotation", bedrock::ProtoDefValue::null()},
             {"time_left", bedrock::ProtoDefValue::null()},
             {"color", bedrock::ProtoDefValue::integer(
-                schematicDebugArgb(shape.status, opacityPercent)
+                schematicDebugArgb(
+                    shape.status,
+                    opacityPercent,
+                    correctColor,
+                    wrongColor,
+                    missingColor
+                )
             )},
             {"text", bedrock::ProtoDefValue::null()},
             {"box_bound", schematicDebugVec3(sizeX, sizeY, sizeZ)},
@@ -5141,6 +5163,7 @@ std::vector<bedrock::VersionedGamePacket> makeSchematicDebugClearPackets(
 struct SchematicTextureActor {
     SchematicDebugMarker marker;
     int32_t blockRuntimeId = 0;
+    int textureOpacityPercent = 100;
 
     auto operator<=>(const SchematicTextureActor&) const = default;
 };
@@ -5179,13 +5202,18 @@ bedrock::VersionedGamePacket makeSchematicTextureActorPacket(
     uint64_t entityId
 ) {
     std::vector<bedrock::ProtoDefValue> metadata;
-    metadata.reserve(5);
+    metadata.reserve(6);
     metadata.push_back(schematicEntityMetadataEntry(
         "flags",
         "long",
         bedrock::ProtoDefValue::object({
             {"no_ai", bedrock::ProtoDefValue::boolean(true)}
         })
+    ));
+    metadata.push_back(schematicEntityMetadataEntry(
+        "base_runtime_id",
+        "int",
+        bedrock::ProtoDefValue::integer(actor.blockRuntimeId)
     ));
     metadata.push_back(schematicEntityMetadataEntry(
         "variant",
@@ -5195,9 +5223,13 @@ bedrock::VersionedGamePacket makeSchematicTextureActorPacket(
     metadata.push_back(schematicEntityMetadataEntry(
         "scale",
         "float",
-        // A small gap around the actor keeps the real block grid visible and
-        // makes the preview distinguishable from an authoritative block.
-        bedrock::ProtoDefValue::floating(0.92)
+        // Keep the preview inside the authoritative one-block grid. Bedrock's
+        // moving-block renderer has no protocol alpha field, so the intensity
+        // setting is represented by a deliberately small inset rather than by
+        // dropping whole blocks from the schematic.
+        bedrock::ProtoDefValue::floating(
+            0.94 + std::clamp(actor.textureOpacityPercent, 10, 100) * 0.0004
+        )
     ));
     for (const auto* key : {"boundingbox_width", "boundingbox_height"}) {
         metadata.push_back(schematicEntityMetadataEntry(
@@ -5220,7 +5252,7 @@ bedrock::VersionedGamePacket makeSchematicTextureActorPacket(
             )},
             {"runtime_id", bedrock::ProtoDefValue::uinteger(entityId)},
             {"entity_type", bedrock::ProtoDefValue::string(
-                "minecraft:falling_block"
+                "minecraft:moving_block"
             )},
             {"position", schematicDebugVec3(
                 actor.marker.x + 0.5,
@@ -6178,7 +6210,13 @@ public:
 
     bool replaceSchematicDebugMarkers(
         std::vector<SchematicDebugMarker> markers,
-        int opacityPercent,
+        bool texturesEnabled,
+        int textureOpacityPercent,
+        bool outlinesEnabled,
+        int outlineOpacityPercent,
+        int32_t correctOutlineColor,
+        int32_t wrongOutlineColor,
+        int32_t missingOutlineColor,
         uint64_t total,
         uint64_t correct,
         uint64_t missing,
@@ -6228,7 +6266,16 @@ public:
             if (markers.size() > MaximumDebugMarkers) {
                 markers.resize(MaximumDebugMarkers);
             }
-            opacityPercent = std::clamp(opacityPercent, 10, 85);
+            textureOpacityPercent = std::clamp(
+                textureOpacityPercent,
+                10,
+                100
+            );
+            outlineOpacityPercent = std::clamp(
+                outlineOpacityPercent,
+                10,
+                100
+            );
 
             const bool scriptDebug = supportsSchematicScriptDebugDrawer(
                 state_->version
@@ -6236,7 +6283,7 @@ public:
             std::vector<SchematicTextureActor> textureActors;
             std::vector<SchematicDebugMarker> legacyWrongMarkers;
             std::vector<SchematicDebugShape> debugShapes;
-            if (scriptDebug) {
+            if (scriptDebug && texturesEnabled) {
                 textureActors.reserve(MaximumSchematicTextureActors);
                 std::unordered_map<std::string, std::optional<int32_t>>
                     runtimeIds;
@@ -6260,10 +6307,16 @@ public:
                     // no-op when the expected block itself did not change.
                     marker.status = 1;
                     marker.expectedBlockState.clear();
-                    textureActors.push_back({std::move(marker), *found->second});
+                    textureActors.push_back({
+                        std::move(marker),
+                        *found->second,
+                        textureOpacityPercent
+                    });
                 }
+            }
+            if (scriptDebug && outlinesEnabled) {
                 debugShapes = planSchematicDebugShapes(*state_, markers);
-            } else {
+            } else if (!scriptDebug && outlinesEnabled) {
                 for (auto marker : markers) {
                     if (marker.status != 3) continue;
                     marker.expectedBlockState.clear();
@@ -6302,6 +6355,9 @@ public:
             std::vector<ActiveSchematicDebugShape> previousDebugShapes;
             std::vector<ActiveSchematicTextureActor> previousTextureActors;
             int previousOpacity = 0;
+            int32_t previousCorrectColor = 0;
+            int32_t previousWrongColor = 0;
+            int32_t previousMissingColor = 0;
             {
                 std::lock_guard markerLock(schematicMarkerMutex_);
                 if (!state_->schematicSnapshotMatches(
@@ -6342,13 +6398,19 @@ public:
                 if (debugShapesUnchanged &&
                     textureActorsUnchanged &&
                     (debugShapes.empty() ||
-                     opacityPercent == activeSchematicOpacity_)) {
+                     (outlineOpacityPercent == activeSchematicOpacity_ &&
+                      correctOutlineColor == activeSchematicCorrectColor_ &&
+                      wrongOutlineColor == activeSchematicWrongColor_ &&
+                      missingOutlineColor == activeSchematicMissingColor_))) {
                     return true;
                 }
                 if (!schematicDownstream_.has_value()) {
                     activeSchematicDebugShapes_.clear();
                     activeSchematicTextureActors_.clear();
-                    activeSchematicOpacity_ = opacityPercent;
+                    activeSchematicOpacity_ = outlineOpacityPercent;
+                    activeSchematicCorrectColor_ = correctOutlineColor;
+                    activeSchematicWrongColor_ = wrongOutlineColor;
+                    activeSchematicMissingColor_ = missingOutlineColor;
                     state_->schematicDisplayedMarkers.store(
                         0,
                         std::memory_order_relaxed
@@ -6363,6 +6425,9 @@ public:
                 previousDebugShapes = activeSchematicDebugShapes_;
                 previousTextureActors = activeSchematicTextureActors_;
                 previousOpacity = activeSchematicOpacity_;
+                previousCorrectColor = activeSchematicCorrectColor_;
+                previousWrongColor = activeSchematicWrongColor_;
+                previousMissingColor = activeSchematicMissingColor_;
             }
 
             std::vector<ActiveSchematicTextureActor> nextTextureActors;
@@ -6449,7 +6514,10 @@ public:
                 };
                 if (retained.shape !=
                         previousDebugShapes[previousIndex].shape ||
-                    opacityPercent != previousOpacity) {
+                    outlineOpacityPercent != previousOpacity ||
+                    correctOutlineColor != previousCorrectColor ||
+                    wrongOutlineColor != previousWrongColor ||
+                    missingOutlineColor != previousMissingColor) {
                     changedDebugShapes.push_back(retained);
                 }
                 nextDebugShapes.push_back(std::move(retained));
@@ -6517,7 +6585,10 @@ public:
                         debugCodec.packetCodec(),
                         state_->version,
                         changedDebugShapes,
-                        opacityPercent,
+                        outlineOpacityPercent,
+                        correctOutlineColor,
+                        wrongOutlineColor,
+                        missingOutlineColor,
                         offset,
                         count
                     ));
@@ -6537,7 +6608,11 @@ public:
                         count
                     ));
                 }
-                backend = "server_script_debug_drawer+falling_block_texture";
+                backend = texturesEnabled && outlinesEnabled
+                    ? "server_script_debug_drawer+moving_block_texture"
+                    : texturesEnabled
+                        ? "moving_block_texture"
+                        : "server_script_debug_drawer";
             } else {
                 packets.reserve(legacyWrongMarkers.size() + 1);
                 packets.push_back(makeLegacySchematicDebugClearPacket(
@@ -6549,7 +6624,10 @@ public:
                         debugEncoder,
                         debugCodec.packetCodec(),
                         marker,
-                        opacityPercent
+                        outlineOpacityPercent,
+                        correctOutlineColor,
+                        wrongOutlineColor,
+                        missingOutlineColor
                     ));
                 }
                 backend = "legacy_debug_renderer";
@@ -6572,7 +6650,10 @@ public:
                     activeSchematicDebugShapes_ = std::move(nextDebugShapes);
                     activeSchematicTextureActors_ =
                         std::move(nextTextureActors);
-                    activeSchematicOpacity_ = opacityPercent;
+                    activeSchematicOpacity_ = outlineOpacityPercent;
+                    activeSchematicCorrectColor_ = correctOutlineColor;
+                    activeSchematicWrongColor_ = wrongOutlineColor;
+                    activeSchematicMissingColor_ = missingOutlineColor;
                     nextSchematicDebugShapeId_ = nextDebugShapeId;
                     nextSchematicTextureActorId_ = nextTextureActorId;
                 }
@@ -6771,6 +6852,9 @@ private:
     uint64_t nextSchematicDebugShapeId_ = SchematicDebugNetworkIdBase;
     uint64_t nextSchematicTextureActorId_ = SchematicTextureActorIdBase;
     int activeSchematicOpacity_ = 0;
+    int32_t activeSchematicCorrectColor_ = 0;
+    int32_t activeSchematicWrongColor_ = 0;
+    int32_t activeSchematicMissingColor_ = 0;
     uint64_t schematicMarkerGeneration_ = 0;
     std::atomic<bool> stopped_ {false};
     std::mutex loginWatchdogMutex_;
@@ -7447,7 +7531,13 @@ Java_com_m9chko_bedrockrelay_NativeBridge_replaceSchematicDebugMarkers(
     jclass,
     jintArray markerRecords,
     jobjectArray expectedBlockStates,
-    jint opacityPercent,
+    jboolean texturesEnabled,
+    jint textureOpacityPercent,
+    jboolean outlinesEnabled,
+    jint outlineOpacityPercent,
+    jint correctOutlineColor,
+    jint wrongOutlineColor,
+    jint missingOutlineColor,
     jint total,
     jint correct,
     jint missing,
@@ -7524,7 +7614,13 @@ Java_com_m9chko_bedrockrelay_NativeBridge_replaceSchematicDebugMarkers(
         if (activeController) {
             return activeController->replaceSchematicDebugMarkers(
                 std::move(markers),
-                static_cast<int>(opacityPercent),
+                texturesEnabled == JNI_TRUE,
+                static_cast<int>(textureOpacityPercent),
+                outlinesEnabled == JNI_TRUE,
+                static_cast<int>(outlineOpacityPercent),
+                static_cast<int32_t>(correctOutlineColor),
+                static_cast<int32_t>(wrongOutlineColor),
+                static_cast<int32_t>(missingOutlineColor),
                 static_cast<uint64_t>(std::max<jint>(0, total)),
                 static_cast<uint64_t>(std::max<jint>(0, correct)),
                 static_cast<uint64_t>(std::max<jint>(0, missing)),
