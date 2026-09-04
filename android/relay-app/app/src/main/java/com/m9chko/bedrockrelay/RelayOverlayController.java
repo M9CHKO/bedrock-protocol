@@ -1266,8 +1266,10 @@ final class RelayOverlayController {
 
         TextView note = text(
             "После размещения якорь остаётся неподвижным в координатах мира и " +
-                "меняется только кнопками X/Y/Z, поворота и зеркала. Ближайшие " +
-                "отсутствующие блоки показаны уменьшенными текстурными " +
+                "меняется только кнопками X/Y/Z, поворота и зеркала. " +
+                "кнопки X/Y/Z можно нажимать сразу после размещения — смещение " +
+                "применится, как только будет найдена поверхность. " +
+                "Ближайшие отсутствующие блоки показаны уменьшенными текстурными " +
                 "фантомами, красная рамка отмечает только неправильный блок. " +
                 "Фантомы не имеют коллизии и не меняют настоящий чанк.",
             9,
@@ -1311,19 +1313,6 @@ final class RelayOverlayController {
     }
 
     private void adjustSchematicAnchor(int dx, int dy, int dz) {
-        if (!preferences.getBoolean(
-                RelayService.KEY_SCHEMATIC_PLACED,
-                false
-            )) {
-            DiagnosticsLog.append(
-                context,
-                "INFO",
-                "schematics",
-                "Anchor move ignored until the schematic is explicitly placed"
-            );
-            showPage("schematics");
-            return;
-        }
         schematicAnchorShift.shift(dx, dy, dz);
         showPage("schematics");
     }

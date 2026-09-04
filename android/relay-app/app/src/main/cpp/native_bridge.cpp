@@ -4880,7 +4880,7 @@ std::vector<SchematicDebugShape> planSchematicDebugShapes(
 // by server scripts. The ASCII prefix "CPE" makes accidental overlap with a
 // destination server's debug drawer registry practically impossible.
 constexpr uint64_t SchematicDebugNetworkIdBase = 0x4350450000000000ULL;
-// Textured previews are relay-owned moving-block actors. They never enter
+// Textured previews are relay-owned falling-block actors. They never enter
 // the authoritative chunk and use a separate ID range from debug shapes.
 constexpr uint64_t SchematicTextureActorIdBase = 0x4350451000000000ULL;
 constexpr std::size_t MaximumSchematicTextureActors = 1'800;
@@ -5202,18 +5202,13 @@ bedrock::VersionedGamePacket makeSchematicTextureActorPacket(
     uint64_t entityId
 ) {
     std::vector<bedrock::ProtoDefValue> metadata;
-    metadata.reserve(6);
+    metadata.reserve(5);
     metadata.push_back(schematicEntityMetadataEntry(
         "flags",
         "long",
         bedrock::ProtoDefValue::object({
             {"no_ai", bedrock::ProtoDefValue::boolean(true)}
         })
-    ));
-    metadata.push_back(schematicEntityMetadataEntry(
-        "base_runtime_id",
-        "int",
-        bedrock::ProtoDefValue::integer(actor.blockRuntimeId)
     ));
     metadata.push_back(schematicEntityMetadataEntry(
         "variant",
@@ -5224,7 +5219,7 @@ bedrock::VersionedGamePacket makeSchematicTextureActorPacket(
         "scale",
         "float",
         // Keep the preview inside the authoritative one-block grid. Bedrock's
-        // moving-block renderer has no protocol alpha field, so the intensity
+        // falling-block renderer has no protocol alpha field, so the intensity
         // setting is represented by a deliberately small inset rather than by
         // dropping whole blocks from the schematic.
         bedrock::ProtoDefValue::floating(
@@ -5252,7 +5247,7 @@ bedrock::VersionedGamePacket makeSchematicTextureActorPacket(
             )},
             {"runtime_id", bedrock::ProtoDefValue::uinteger(entityId)},
             {"entity_type", bedrock::ProtoDefValue::string(
-                "minecraft:moving_block"
+                "minecraft:falling_block"
             )},
             {"position", schematicDebugVec3(
                 actor.marker.x + 0.5,
@@ -6609,9 +6604,9 @@ public:
                     ));
                 }
                 backend = texturesEnabled && outlinesEnabled
-                    ? "server_script_debug_drawer+moving_block_texture"
+                    ? "server_script_debug_drawer+falling_block_texture"
                     : texturesEnabled
-                        ? "moving_block_texture"
+                        ? "falling_block_texture"
                         : "server_script_debug_drawer";
             } else {
                 packets.reserve(legacyWrongMarkers.size() + 1);

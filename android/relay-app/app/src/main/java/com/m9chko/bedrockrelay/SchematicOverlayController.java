@@ -41,6 +41,8 @@ final class SchematicOverlayController {
     // the final position. Otherwise every intermediate coordinate produces a
     // full debug-drawer replacement containing hundreds of shapes.
     private static final long PLACEMENT_SETTLE_MILLIS = 350L;
+    private static final long DEBUG_MARKER_RETRY_INITIAL_MILLIS = 1_000L;
+    private static final long DEBUG_MARKER_RETRY_MAX_MILLIS = 30_000L;
     private static final long FORCE_BLOCK_SNAPSHOT = Long.MIN_VALUE;
     private static final byte BLOCK_UNKNOWN = 0;
     private static final byte BLOCK_MISSING = 1;
@@ -83,12 +85,17 @@ final class SchematicOverlayController {
     private int placementX;
     private int placementZ;
     private int placementFallbackY;
+    private int pendingPlacementShiftX;
+    private int pendingPlacementShiftY;
+    private int pendingPlacementShiftZ;
     private boolean missingPermissionLogged;
     private SchematicView view;
     private final Object blockQueryLock = new Object();
     private volatile BlockQuery blockQuery;
     private volatile boolean debugMarkersDirty = true;
     private volatile boolean debugMarkerPlanPublished;
+    private volatile long debugMarkerRetryAfterMs;
+    private volatile long debugMarkerRetryDelayMs;
     private volatile int publishedCameraChunkX = Integer.MIN_VALUE;
     private volatile int publishedCameraChunkY = Integer.MIN_VALUE;
     private volatile int publishedCameraChunkZ = Integer.MIN_VALUE;
@@ -177,6 +184,8 @@ final class SchematicOverlayController {
             // The cached world comparison remains valid. Re-plan on the
             // snapshot executor without a visible clear/re-add flicker.
             debugMarkersDirty = true;
+            debugMarkerRetryAfterMs = 0L;
+            debugMarkerRetryDelayMs = 0L;
         }
         refreshPlacementRequest();
         SchematicView current = view;
@@ -258,10 +267,40 @@ final class SchematicOverlayController {
             mainHandler.post(() -> shiftAnchor(dx, dy, dz));
             return;
         }
+        boolean placed = preferences.getBoolean(
+            RelayService.KEY_SCHEMATIC_PLACED,
+            false
+        );
+        if (placementPending || !placed) {
+            if (!placementPending) {
+                beginPlacement(preferences.getLong(
+                    RelayService.KEY_SCHEMATIC_PLACE_REQUEST,
+                    0L
+                ));
+            }
+            pendingPlacementShiftX += dx;
+            pendingPlacementShiftY += dy;
+            pendingPlacementShiftZ += dz;
+            EntityOutlineOverlayController.CameraSample camera = latestCamera;
+            if (camera != null && camera.known) {
+                tryPlaceNearCamera(camera);
+            }
+            return;
+        }
         int x = preferences.getInt(RelayService.KEY_SCHEMATIC_ANCHOR_X, 0);
         int y = savedAnchorY();
         int z = preferences.getInt(RelayService.KEY_SCHEMATIC_ANCHOR_Z, 0);
-        saveAnchor(x + dx, y + dy, z + dz);
+        int nextX = x + dx;
+        int nextY = y + dy;
+        int nextZ = z + dz;
+        saveAnchor(nextX, nextY, nextZ);
+        DiagnosticsLog.append(
+            context,
+            "INFO",
+            "schematics",
+            "Schematic anchor moved to X=" + nextX +
+                " Y=" + nextY + " Z=" + nextZ
+        );
     }
 
     void hideImmediately() {
@@ -291,6 +330,9 @@ final class SchematicOverlayController {
         placementTargetCaptured = false;
         placementRequest = request;
         placementDeadlineMs = 0L;
+        pendingPlacementShiftX = 0;
+        pendingPlacementShiftY = 0;
+        pendingPlacementShiftZ = 0;
         reconcileWindow();
     }
 
@@ -323,13 +365,19 @@ final class SchematicOverlayController {
         int anchorY = collisionKnown
             ? SchematicPlacementTransform.placementAnchorY(surfaceY)
             : placementFallbackY;
-        saveAnchor(placementX, anchorY, placementZ);
+        int anchorX = placementX + pendingPlacementShiftX;
+        anchorY += pendingPlacementShiftY;
+        int anchorZ = placementZ + pendingPlacementShiftZ;
+        pendingPlacementShiftX = 0;
+        pendingPlacementShiftY = 0;
+        pendingPlacementShiftZ = 0;
+        saveAnchor(anchorX, anchorY, anchorZ);
         DiagnosticsLog.append(
             context,
             "INFO",
             "schematics",
-            "Schematic anchor fixed at X=" + placementX +
-                " Y=" + anchorY + " Z=" + placementZ +
+            "Schematic anchor fixed at X=" + anchorX +
+                " Y=" + anchorY + " Z=" + anchorZ +
                 " ground=" + (collisionKnown ? "block_collision" : "camera_fallback")
         );
         return true;
@@ -582,6 +630,8 @@ final class SchematicOverlayController {
             blockQuery = null;
         }
         debugMarkersDirty = true;
+        debugMarkerRetryAfterMs = 0L;
+        debugMarkerRetryDelayMs = 0L;
         publishedCameraChunkX = Integer.MIN_VALUE;
         publishedCameraChunkY = Integer.MIN_VALUE;
         publishedCameraChunkZ = Integer.MIN_VALUE;
@@ -612,6 +662,11 @@ final class SchematicOverlayController {
         int expectedDimension
     ) {
         if (blockQuery != query || !wantsFrames()) return;
+        long publishStartedAtMs = SystemClock.uptimeMillis();
+        if (publishStartedAtMs < debugMarkerRetryAfterMs) {
+            debugMarkersDirty = true;
+            return;
+        }
         EntityOutlineOverlayController.CameraSample camera = latestCamera;
         boolean cameraKnown = camera != null && camera.known;
         if (!cameraKnown || !query.matchesWindow(
@@ -679,10 +734,20 @@ final class SchematicOverlayController {
             );
             if (!accepted) {
                 debugMarkersDirty = true;
+                long nextDelay = debugMarkerRetryDelayMs <= 0L
+                    ? DEBUG_MARKER_RETRY_INITIAL_MILLIS
+                    : Math.min(
+                        DEBUG_MARKER_RETRY_MAX_MILLIS,
+                        debugMarkerRetryDelayMs * 2L
+                    );
+                debugMarkerRetryDelayMs = nextDelay;
+                debugMarkerRetryAfterMs = SystemClock.uptimeMillis() + nextDelay;
                 return;
             }
             debugMarkerPlanPublished = true;
             debugMarkersDirty = false;
+            debugMarkerRetryAfterMs = 0L;
+            debugMarkerRetryDelayMs = 0L;
             if (cameraKnown) {
                 publishedCameraChunkX = blockCoordinate(camera.x);
                 publishedCameraChunkY = blockCoordinate(camera.y);
