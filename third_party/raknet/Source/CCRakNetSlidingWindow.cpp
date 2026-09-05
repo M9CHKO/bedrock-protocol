@@ -54,8 +54,6 @@ void CCRakNetSlidingWindow::Init(CCTimeType curTime, uint32_t maxDatagramPayload
 	nextCongestionControlBlock=0;
 	backoffThisBlock=speedUpThisBlock=false;
 	expectedNextSequenceNumber=0;
-	acceptedIncomingDatagramCount=0;
-	resynchronizedInitialSequence=false;
 	_isContinuousSend=false;
 }
 // ----------------------------------------------------------------------------------------------------------------------------
@@ -130,6 +128,8 @@ void CCRakNetSlidingWindow::OnGotPacketPair(DatagramSequenceNumberType datagramS
 bool CCRakNetSlidingWindow::OnGotPacket(DatagramSequenceNumberType datagramSequenceNumber, bool isContinuousSend, CCTimeType curTime, uint32_t sizeInBytes, uint32_t *skippedMessageCount)
 {
 	(void) curTime;
+	(void) sizeInBytes;
+	(void) isContinuousSend;
 
 	if (oldestUnsentAck==0)
 		oldestUnsentAck=curTime;
@@ -138,7 +138,6 @@ bool CCRakNetSlidingWindow::OnGotPacket(DatagramSequenceNumberType datagramSeque
 	{
 		*skippedMessageCount=0;
 		expectedNextSequenceNumber=datagramSequenceNumber+(DatagramSequenceNumberType)1;
-		acceptedIncomingDatagramCount++;
 	}
 	else if (GreaterThan(datagramSequenceNumber, expectedNextSequenceNumber))
 	{
@@ -148,26 +147,10 @@ bool CCRakNetSlidingWindow::OnGotPacket(DatagramSequenceNumberType datagramSeque
 		{
 			// During testing, the nat punchthrough server got 51200 on the first packet. I have no idea where this comes from, but has happened twice
 			if (*skippedMessageCount>(uint32_t)50000)
-			{
-				// Bedrock can reuse a RakNet client transport whose datagram counter is
-				// already far ahead when it reconnects. Permit one bounded resync only
-				// at the beginning of a connection and only for a substantial data burst.
-				const bool canResynchronize = !resynchronizedInitialSequence &&
-					acceptedIncomingDatagramCount < 16 &&
-					isContinuousSend && sizeInBytes >= 512;
-				if (!canResynchronize)
-					return false;
-
-				resynchronizedInitialSequence=true;
-				*skippedMessageCount=0;
-			}
-			else
-			{
-				*skippedMessageCount=1000;
-			}
+				return false;
+			*skippedMessageCount=1000;
 		}
 		expectedNextSequenceNumber=datagramSequenceNumber+(DatagramSequenceNumberType)1;
-		acceptedIncomingDatagramCount++;
 	}
 	else
 	{

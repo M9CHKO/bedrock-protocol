@@ -6,6 +6,56 @@ final class ProjectionMath {
 
     private ProjectionMath() {}
 
+    // The twelve AABB edges. Clip edges before perspective division: dropping
+    // corners behind the eye makes nearby boxes shrink or disappear abruptly.
+    private static final int[] BOX_EDGES = {
+        0,1, 2,3, 4,5, 6,7, 0,2, 1,3, 4,6, 5,7, 0,4, 1,5, 2,6, 3,7
+    };
+
+    static boolean projectBox(double dx, double dy, double dz,
+        double halfWidth, double height, double sinYaw, double cosYaw,
+        double sinPitch, double cosPitch, double focal, double near,
+        double viewportWidth, double viewportHeight, double[] corners, double[] bounds) {
+        if (!Double.isFinite(dx + dy + dz + halfWidth + height + focal) ||
+            halfWidth <= 0 || height <= 0 || near <= 0 || focal <= 0) return false;
+        bounds[0] = bounds[1] = Double.POSITIVE_INFINITY;
+        bounds[2] = bounds[3] = Double.NEGATIVE_INFINITY;
+        for (int i = 0; i < 8; ++i) {
+            double x = dx + ((i & 4) == 0 ? -halfWidth : halfWidth);
+            double y = dy + ((i & 2) == 0 ? 0 : height);
+            double z = dz + ((i & 1) == 0 ? -halfWidth : halfWidth);
+            corners[i * 3] = viewX(x, z, sinYaw, cosYaw);
+            corners[i * 3 + 1] = viewY(x, y, z, sinYaw, cosYaw, sinPitch, cosPitch);
+            corners[i * 3 + 2] = depth(x, y, z, sinYaw, cosYaw, sinPitch, cosPitch);
+            if (corners[i * 3 + 2] >= near)
+                includeProjection(corners[i * 3], corners[i * 3 + 1], corners[i * 3 + 2],
+                    focal, viewportWidth, viewportHeight, bounds);
+        }
+        for (int edge = 0; edge < BOX_EDGES.length; edge += 2) {
+            int a = BOX_EDGES[edge] * 3, b = BOX_EDGES[edge + 1] * 3;
+            double za = corners[a + 2], zb = corners[b + 2];
+            if ((za < near) == (zb < near)) continue;
+            double t = (near - za) / (zb - za);
+            includeProjection(corners[a] + (corners[b] - corners[a]) * t,
+                corners[a + 1] + (corners[b + 1] - corners[a + 1]) * t,
+                near, focal, viewportWidth, viewportHeight, bounds);
+        }
+        return Double.isFinite(bounds[0]) && Double.isFinite(bounds[1]) &&
+            bounds[2] >= 0 && bounds[3] >= 0 &&
+            bounds[0] <= viewportWidth && bounds[1] <= viewportHeight;
+    }
+
+    private static void includeProjection(double x, double y, double z,
+        double focal, double width, double height, double[] bounds) {
+        double sx = width * 0.5 + x * focal / z;
+        double sy = height * 0.5 - y * focal / z;
+        if (!Double.isFinite(sx) || !Double.isFinite(sy)) return;
+        bounds[0] = Math.min(bounds[0], sx);
+        bounds[1] = Math.min(bounds[1], sy);
+        bounds[2] = Math.max(bounds[2], sx);
+        bounds[3] = Math.max(bounds[3], sy);
+    }
+
     /**
      * Bedrock changes the rendered FOV while the player moves quickly. The
      * exact render matrix is not sent over the protocol, so camera speed is

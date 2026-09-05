@@ -2609,7 +2609,7 @@ bool checkReliableSendBackpressure() {
     return ok;
 }
 
-bool checkReconnectSplitSequenceResynchronization() {
+bool checkSplitSequenceJumpRejection() {
     bedrock::RakNetServer server({
         .host = "127.0.0.1",
         .port = 0,
@@ -2619,7 +2619,7 @@ bool checkReconnectSplitSequenceResynchronization() {
     std::atomic<bool> opened {false};
     std::atomic<bool> sawPrelude {false};
     std::atomic<bool> sawLargePayload {false};
-    std::atomic<bool> acceptedSecondDiscontinuity {false};
+    std::atomic<bool> acceptedDiscontinuity {false};
     const std::vector<uint8_t> prelude {0xfe, 0x01, 0x02, 0x03};
     const std::vector<uint8_t> rejectedPayload(600, 0xfe);
     std::vector<uint8_t> largePayload(32'000);
@@ -2641,7 +2641,7 @@ bool checkReconnectSplitSequenceResynchronization() {
     ) {
         if (payload == prelude) sawPrelude = true;
         if (payload == largePayload) sawLargePayload = true;
-        if (payload == rejectedPayload) acceptedSecondDiscontinuity = true;
+        if (payload == rejectedPayload) acceptedDiscontinuity = true;
     });
     server.listen();
 
@@ -2677,11 +2677,22 @@ bool checkReconnectSplitSequenceResynchronization() {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
 
+    // Match the first Android release's normal RakNet window: an arbitrary
+    // far-ahead sequence must not reset it, even just after the prelude. A
+    // valid following split burst must still reassemble on this connection.
+    auto earlyJump = buildReliableDatagram(rejectedPayload, 60'003, 3, 3);
+    earlyJump.front() |= 0x08u;
+    if (!sendPacket(sock, target, earlyJump)) {
+        close(sock);
+        server.close();
+        return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
     constexpr std::size_t partBytes = 1'200;
     const uint32_t splitCount = static_cast<uint32_t>(
         (largePayload.size() + partBytes - 1) / partBytes
     );
-    constexpr uint32_t firstDatagramSequence = 60'003;
+    constexpr uint32_t firstDatagramSequence = 3;
     for (uint32_t splitIndex = 0; splitIndex < splitCount; ++splitIndex) {
         const auto beginOffset = static_cast<std::size_t>(splitIndex) *
             partBytes;
@@ -2731,13 +2742,12 @@ bool checkReconnectSplitSequenceResynchronization() {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     const bool ok = opened.load() && sawPrelude.load() &&
-        sawLargePayload.load() && !acceptedSecondDiscontinuity.load();
+        sawLargePayload.load() && !acceptedDiscontinuity.load();
     close(sock);
     server.close();
     if (!ok) {
-        std::cerr << "[SMOKE] large split payload stayed blocked after an "
-                     "early reconnect sequence discontinuity, or a second "
-                     "discontinuity was incorrectly accepted\n";
+        std::cerr << "[SMOKE] out-of-window sequence was accepted or poisoned "
+                     "the subsequent valid fragmented burst\n";
     }
     return ok;
 }
@@ -4440,7 +4450,7 @@ int main(int argc, char** argv) {
     if (!checkReliableSendBackpressure()) {
         return 1;
     }
-    if (!checkReconnectSplitSequenceResynchronization()) {
+    if (!checkSplitSequenceJumpRejection()) {
         return 1;
     }
     if (!checkProtocol827NetworkSettingsDelivery()) {

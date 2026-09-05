@@ -322,7 +322,10 @@ bool RakNetClient::connect() {
         threadCv_.notify_all();
         return false;
     }
-    if (cancelledBeforeWorker || closeRequested_.load()) {
+    // Once the worker is running, its onConnected callback may close the
+    // connection before this thread reaches the wait. Let the completion
+    // predicate distinguish that successful handshake from cancellation.
+    if (cancelledBeforeWorker) {
         close("connect cancelled");
         return false;
     }
@@ -382,7 +385,9 @@ void RakNetClient::close(const std::string& reason) {
         selfWorker = workerActive_ && workerThreadId_ == current;
         selfConnect = connectActive_ && connectThreadId_ == current;
 
-        if (!selfConnect) {
+        // connect() waits for the connected callback to finish. That callback
+        // must not wait back on connect() when it closes its own session.
+        if (!selfConnect && !selfWorker) {
             threadCv_.wait(lock, [this]() { return !connectActive_; });
         }
         if (thread_.joinable() && thread_.get_id() == current) {

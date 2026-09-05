@@ -19,6 +19,7 @@ public final class NativeBridge {
     public static native String supportedVersions();
 
     public static native void stopRelay();
+    public static native void refreshAreaFillMarkers();
 
     public static native void configureRuntime(
         boolean detailedLogging,

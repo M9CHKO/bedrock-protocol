@@ -2,8 +2,8 @@
 <resources>
     <style name="Theme.CpeRelay" parent="android:style/Theme.Material.NoActionBar">
         <item name="android:fontFamily">sans</item>
-        <item name="android:colorAccent">#57D7FF</item>
-        <item name="android:windowBackground">#0B1118</item>
+        <item name="android:colorAccent">#93B6FF</item>
+        <item name="android:windowBackground">#0C1018</item>
         <item name="android:navigationBarColor">#080D13</item>
         <item name="android:statusBarColor">#0B1118</item>
         <item name="android:windowLightStatusBar">false</item>

@@ -48,6 +48,18 @@ storage and are not committed to the repository.
 - `RelayOverlayController.java` — categorized in-game settings menu.
 - `DiagnosticsLog.java` — opt-in diagnostics storage.
 
+The launcher uses Connection, Modules and Journal tabs with a persistent
+launch/stop action row. `RelayUi.java` supplies shared surfaces, contrast and
+touch-target styling. Launcher JNI snapshots and log reads are coalesced on
+a background worker; schematic service actions also check native state off
+the input thread. Native start/stop use one serialized command worker with
+service ownership so delayed teardown cannot stop a newer instance.
+
+Ordinary diagnostic writes use a bounded 64-entry queue; fatal records take
+the synchronous durable path. Journal segments are bounded to 256 KiB each,
+and clearing invalidates already-queued writes. The UI reads only a bounded
+tail instead of repeatedly rebuilding the entire log.
+
 ## HUD controllers
 
 - `EntityOutlineOverlayController.java` — world-to-screen entity projection,
@@ -78,6 +90,12 @@ inventory, or chat UI is open.
 - `src/main/cpp/native_bridge.cpp` — version-aware Bedrock packet tracking,
   retained chunks, equipment/attributes/effects, automation requests, and
   mini-map raster generation.
+
+`include/bedrock/relay/AreaFillGeometry.hpp` holds platform-independent player
+bounds, yaw-relative input and sampled route checks. Autofill marker changes
+set a dirty flag in packet callbacks; a separate fixed-delay 100 ms worker
+publishes them without accumulating a render queue. Placement completion
+requires a server world update, not inventory consumption alone.
 
 The threat and mini-map features remain packet-only: they do not capture the
 screen, inject into Minecraft, or read Minecraft process memory.

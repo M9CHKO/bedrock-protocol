@@ -5,17 +5,101 @@
 #include <RakNetTypes.h>
 #include <RakPeerInterface.h>
 #include <RakSleep.h>
+#include <PluginInterface2.h>
+#include <InternalPacket.h>
 
 #include <algorithm>
+#include <array>
+#include <cstdio>
 #include <exception>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <utility>
 
 namespace bedrock {
 
-struct RakNetServer::NativeState {
+struct RakNetServer::NativeState final : RakNet::PluginInterface2 {
     RakNet::RakPeerInterface* peer = nullptr;
+    struct ReceiveTrace {
+        RakNet::SystemAddress address = RakNet::UNASSIGNED_SYSTEM_ADDRESS;
+        uint64_t guid = 0;
+        uint64_t packets = 0, fragments = 0, notifications = 0;
+        uint32_t reliable = 0, order = 0, splitIndex = 0, splitCount = 0;
+        uint32_t splitReliable = 0, splitOrder = 0;
+        unsigned channel = 0;
+        std::array<char, 128> notification {};
+    };
+    // Fixed storage: diagnostics cannot accumulate payloads, peers or log jobs.
+    std::array<ReceiveTrace, 64> traces {};
+    std::size_t nextTrace = 0;
+    std::mutex traceMutex;
+
+    bool UsesReliabilityLayer() const override { return true; }
+    ReceiveTrace& traceFor(const RakNet::SystemAddress& address) {
+        for (auto& trace : traces) if (trace.address == address) return trace;
+        auto& trace = traces[nextTrace++ % traces.size()];
+        trace = {};
+        trace.address = address;
+        return trace;
+    }
+    void OnNewConnection(const RakNet::SystemAddress& address, RakNet::RakNetGUID guid, bool) override {
+        std::lock_guard lock(traceMutex);
+        auto& trace = traceFor(address);
+        if (trace.guid != 0 && trace.guid != guid.g) {
+            trace = {};
+            trace.address = address;
+        }
+        trace.guid = guid.g;
+    }
+    void OnClosedConnection(const RakNet::SystemAddress& address, RakNet::RakNetGUID guid,
+                            RakNet::PI2_LostConnectionReason) override {
+        std::lock_guard lock(traceMutex);
+        for (auto& trace : traces)
+            if (trace.address == address && trace.guid == guid.g) trace = {};
+    }
+    void OnInternalPacket(RakNet::InternalPacket* packet, unsigned,
+                          RakNet::SystemAddress address, RakNet::TimeMS, int isSend) override {
+        if (isSend || !packet) return;
+        std::lock_guard lock(traceMutex);
+        auto& trace = traceFor(address);
+        ++trace.packets;
+        if (packet->splitPacketCount) ++trace.fragments;
+        const bool reliable = packet->reliability == RELIABLE ||
+            packet->reliability == RELIABLE_ORDERED || packet->reliability == RELIABLE_SEQUENCED;
+        const bool ordered = packet->reliability == RELIABLE_ORDERED ||
+            packet->reliability == RELIABLE_SEQUENCED || packet->reliability == UNRELIABLE_SEQUENCED;
+        trace.reliable = reliable ? static_cast<uint32_t>(packet->reliableMessageNumber) : 0;
+        trace.order = ordered ? static_cast<uint32_t>(packet->orderingIndex) : 0;
+        trace.channel = ordered ? packet->orderingChannel : 0;
+        if (packet->splitPacketCount) {
+            trace.splitIndex = packet->splitPacketIndex;
+            trace.splitCount = packet->splitPacketCount;
+            trace.splitReliable = trace.reliable;
+            trace.splitOrder = trace.order;
+        }
+    }
+    void OnReliabilityLayerNotification(const char* reason, const RakNet::BitSize_t,
+                                        RakNet::SystemAddress address, bool) override {
+        std::lock_guard lock(traceMutex);
+        auto& trace = traceFor(address);
+        ++trace.notifications;
+        std::snprintf(trace.notification.data(), trace.notification.size(), "%s", reason ? reason : "unknown");
+    }
+    std::string describe(const RakNet::SystemAddress& address) {
+        std::lock_guard lock(traceMutex);
+        for (const auto& trace : traces) {
+            if (trace.address != address) continue;
+            std::ostringstream out;
+            out << "frames=" << trace.packets << " fragments=" << trace.fragments
+                << " lastReliable=" << trace.reliable << " lastOrder=" << trace.order
+                << " lastSplitReliable=" << trace.splitReliable << " lastSplitOrder=" << trace.splitOrder
+                << " channel=" << trace.channel << " split=" << trace.splitIndex << '/' << trace.splitCount
+                << " notifications=" << trace.notifications << " lastNotification=" << trace.notification.data();
+            return out.str();
+        }
+        return {};
+    }
 };
 
 namespace {
@@ -85,6 +169,12 @@ void RakNetServer::listen() {
 
     auto* peer = RakNet::RakPeerInterface::GetInstance();
     if (!peer) throw std::runtime_error("Unable to allocate RakPeer");
+    {
+        std::lock_guard lock(native_->traceMutex);
+        native_->traces = {};
+        native_->nextTrace = 0;
+    }
+    peer->AttachPlugin(native_.get());
 
     const int maximumConnections = options_.maxPlayers > 0
         ? options_.maxPlayers
@@ -115,6 +205,7 @@ void RakNetServer::listen() {
         1
     );
     if (startup != RakNet::RAKNET_STARTED) {
+        peer->DetachPlugin(native_.get());
         RakNet::RakPeerInterface::DestroyInstance(peer);
         throw std::runtime_error(
             std::string("RakNet server startup failed: ") +
@@ -325,6 +416,7 @@ RakNetServerPeerStatistics RakNetServer::peerStatistics(
     result.resendBufferBytes = statistics.bytesInResendBuffer;
     result.packetLossLastSecond = statistics.packetlossLastSecond;
     result.packetLossTotal = statistics.packetlossTotal;
+    result.reliabilityDetails = native_->describe(address);
     return result;
 }
 
@@ -530,6 +622,7 @@ void RakNetServer::destroyPeer() noexcept {
     } catch (...) {
     }
     try {
+        peer->DetachPlugin(native_.get());
         RakNet::RakPeerInterface::DestroyInstance(peer);
     } catch (...) {
     }

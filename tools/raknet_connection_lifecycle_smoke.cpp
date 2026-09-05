@@ -1277,9 +1277,99 @@ bool checkOfflinePacketLivenessRouting() {
     return true;
 }
 
+
+bool checkFragmentedMinecraftLogin() {
+    bedrock::RakNetServer server({
+        .host = "127.0.0.1", .port = 0, .maxPlayers = 1,
+        .protocolVersion = 11, .serverGuid = 0x623456789abcdef0ull,
+        .advertisement = "fragmented-minecraft-login"
+    });
+    std::atomic<int> opens {0}, received {0}, closes {0};
+    std::atomic<bool> mismatch {false};
+    bedrock::RakNetServerPeer peer;
+    std::vector<uint8_t> login(600 * 1024);
+    for (std::size_t i = 0; i < login.size(); ++i)
+        login[i] = static_cast<uint8_t>((i * 31u + 17u) & 255u);
+    login[0] = 0xfe;
+    server.onOpenConnection([&](const auto& value) { peer = value; ++opens; });
+    server.onCloseConnection([&](const auto&) { ++closes; });
+    server.onEncapsulated([&](const auto&, const auto& payload) {
+        if (payload != login) mismatch.store(true);
+        ++received;
+    });
+    server.listen();
+    sockaddr_in target {};
+    target.sin_family = AF_INET;
+    target.sin_port = htons(server.boundPort());
+    inet_pton(AF_INET, "127.0.0.1", &target.sin_addr);
+    bool ok = true;
+    for (int attempt = 0; attempt < 10 && ok; ++attempt) {
+        const int socket = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (socket < 0) { ok = false; break; }
+        ok = completePeerConnection(server, socket, target, 11,
+            0x123456789abcdef0ull + attempt, 1492, opens, attempt + 1);
+        constexpr std::size_t fragmentBytes = 1300;
+        const uint32_t count = (login.size() + fragmentBytes - 1) / fragmentBytes;
+        uint32_t sequence = 2;
+        const auto sendFragment = [&](uint32_t index) {
+            std::vector<uint8_t> datagram {0x80};
+            writeTriadLE(datagram, sequence++);
+            datagram.push_back(0x70); // RELIABLE_ORDERED + split
+            const auto offset = index * fragmentBytes;
+            const auto length = std::min(fragmentBytes, login.size() - offset);
+            writeU16BE(datagram, static_cast<uint16_t>(length * 8));
+            writeTriadLE(datagram, index);
+            writeTriadLE(datagram, 0); // one ordered message, all fragments
+            datagram.push_back(0);
+            const auto writeU32 = [&](uint32_t value) {
+                for (int byte = 3; byte >= 0; --byte)
+                    datagram.push_back(static_cast<uint8_t>(value >> (byte * 8)));
+            };
+            writeU32(count);
+            writeU16BE(datagram, static_cast<uint16_t>(attempt + 1));
+            writeU32(index);
+            datagram.insert(datagram.end(), login.begin() + offset,
+                login.begin() + offset + length);
+            return sendPacket(socket, target, datagram);
+        };
+        // Send out of order, deliberately omit the middle fragment, and
+        // retransmit duplicates. This is the 600 KiB login, not tiny native
+        // client-to-native-server traffic that missed the Android failure.
+        for (uint32_t i = count; ok && i-- > 0;) {
+            if (i == count / 2) continue;
+            ok = sendFragment(i);
+            if (i % 4 == 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        if (ok && received.load() != attempt) ok = false;
+        for (uint32_t i = 0; ok && i < count; ++i) {
+            ok = sendFragment(i);
+            if (i % 4 == 0) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        ok = ok && waitForValue(received, attempt + 1, 2000);
+        if (ok) {
+            ok = sendFragment(count / 2);
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            ok = ok && received.load() == attempt + 1 && !mismatch.load();
+            const auto stats = server.peerStatistics(peer);
+            ok = ok && stats.statisticsAvailable && stats.userMessageBytesReceivedIgnored > 0 &&
+                !stats.reliabilityDetails.empty() && stats.reliabilityDetails.size() < 1024 &&
+                stats.reliabilityDetails.find("fragments=0") == std::string::npos &&
+                stats.reliabilityDetails.find("notifications=0") == std::string::npos;
+        }
+        server.closePeer(peer, true);
+        ok = waitForValue(closes, attempt + 1, 1000) && ok;
+        ::close(socket);
+    }
+    server.close();
+    if (!ok) std::cerr << "[RAKNET-LIFECYCLE-SMOKE] fragmented login failed: opens="
+        << opens << " received=" << received << "\n";
+    return ok;
+}
+
 } // namespace
 
 int main() {
+    if (!checkFragmentedMinecraftLogin()) return 1;
     constexpr uint8_t serverProtocol = 11;
     constexpr uint64_t serverGuid = 0x0102030405060708ull;
     constexpr uint64_t clientGuid = 0x1122334455667788ull;

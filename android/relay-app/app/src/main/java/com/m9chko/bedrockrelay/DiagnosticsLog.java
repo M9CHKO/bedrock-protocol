@@ -2,9 +2,8 @@ package com.m9chko.bedrockrelay;
 
 import android.content.Context;
 
-import java.io.ByteArrayOutputStream;
 import java.io.File;
-import java.io.FileInputStream;
+import java.io.RandomAccessFile;
 import java.io.FileOutputStream;
 import java.io.PrintWriter;
 import java.io.StringWriter;
@@ -13,10 +12,23 @@ import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.Locale;
 import java.util.regex.Pattern;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 /** Persistent, bounded and secret-redacted relay diagnostics. */
 final class DiagnosticsLog {
     private static final Object LOCK = new Object();
+    private static final AtomicLong EPOCH = new AtomicLong();
+    private static final AtomicLong DROPPED = new AtomicLong();
+    // Bounded independently of disk rotation: a slow disk cannot accumulate
+    // an unbounded backlog or make the packet/UI thread write synchronously.
+    private static final ThreadPoolExecutor WRITER = new ThreadPoolExecutor(
+        1, 1, 30, TimeUnit.SECONDS, new ArrayBlockingQueue<>(64),
+        task -> { Thread thread = new Thread(task, "relay-log"); thread.setDaemon(true); return thread; },
+        (task, executor) -> DROPPED.incrementAndGet()
+    );
     private static final String CURRENT = "relay-diagnostics.log";
     private static final String PREVIOUS = "relay-diagnostics.previous.log";
     // Keep at most two small segments. Detailed packet diagnostics must never
@@ -90,12 +102,29 @@ final class DiagnosticsLog {
         ).getBoolean(RelayService.KEY_DETAILED_LOGS, true)) {
             return;
         }
+        final Context app = context.getApplicationContext();
+        final String safe = redact(message);
+        final long timestamp = timestampMillis > 0 ? timestampMillis : System.currentTimeMillis();
+        final long epoch = EPOCH.get();
+        if (shouldSync(level, component)) {
+            writeEntry(app, level, component, safe, timestamp, epoch);
+        } else {
+            WRITER.execute(() -> writeEntry(app, level, component, safe, timestamp, epoch));
+        }
+    }
+
+    private static void writeEntry(Context context, String level, String component,
+                                   String message, long timestampMillis, long epoch) {
         synchronized (LOCK) {
+            if (epoch != EPOCH.get()) return;
             try {
                 long now = System.currentTimeMillis();
+                long dropped = DROPPED.getAndSet(0);
+                if (dropped > 0) writeLine(context, "WARN", "log",
+                    "Dropped " + dropped + " entries while log writer was busy", now, false);
                 String normalizedLevel = cleanTag(level, "INFO");
                 String normalizedComponent = cleanTag(component, "app");
-                String normalizedMessage = redact(message);
+                String normalizedMessage = message;
                 pruneExpired(context, now);
 
                 if (rollDebugWindow(context, normalizedLevel, now)) {
@@ -166,12 +195,15 @@ final class DiagnosticsLog {
             pruneExpired(context, System.currentTimeMillis());
             File current = file(context, CURRENT);
             if (!current.isFile()) return "Журнал пока пуст.";
-            byte[] bytes = readBytes(current);
-            int start = Math.max(0, bytes.length - Math.max(maximumBytes, 1024));
-            while (start < bytes.length && start > 0 && bytes[start] != '\n') {
-                ++start;
+            int limit = Math.min((int) MAX_FILE_BYTES, Math.max(maximumBytes, 1024));
+            boolean truncated = current.length() > limit;
+            byte[] bytes = readBytes(current, limit);
+            int start = 0;
+            if (truncated) {
+                while (start < bytes.length && bytes[start] != '\n') ++start;
+                if (start < bytes.length) ++start;
             }
-            String prefix = start == 0 ? "" : "… более ранние строки скрыты …\n";
+            String prefix = !truncated ? "" : "… более ранние строки скрыты …\n";
             return prefix + new String(
                 bytes,
                 Math.min(start, bytes.length),
@@ -183,6 +215,9 @@ final class DiagnosticsLog {
 
     static void clear(Context context) {
         synchronized (LOCK) {
+            EPOCH.incrementAndGet();
+            WRITER.getQueue().clear();
+            DROPPED.set(0);
             deleteQuietly(file(context, CURRENT));
             deleteQuietly(file(context, PREVIOUS));
             duplicateFingerprint = "";
@@ -198,8 +233,8 @@ final class DiagnosticsLog {
         return file(context, CURRENT).getAbsolutePath();
     }
 
-    private static void rotateIfNeeded(Context context, File current) {
-        if (!current.isFile() || current.length() < MAX_FILE_BYTES) return;
+    private static void rotateIfNeeded(Context context, File current, int incomingBytes) {
+        if (!current.isFile() || current.length() <= MAX_FILE_BYTES - incomingBytes) return;
         File previous = file(context, PREVIOUS);
         deleteQuietly(previous);
         if (!current.renameTo(previous)) {
@@ -282,12 +317,13 @@ final class DiagnosticsLog {
         boolean forceSync
     ) throws Exception {
         File current = file(context, CURRENT);
-        rotateIfNeeded(context, current);
         String timestamp = TIMESTAMP_FORMAT.format(new Date(timestampMillis));
         String line = timestamp + " [" + level + "] [" + component + "] " +
             message + "\n";
+        byte[] bytes = line.getBytes(StandardCharsets.UTF_8);
+        rotateIfNeeded(context, current, bytes.length);
         try (FileOutputStream output = new FileOutputStream(current, true)) {
-            output.write(line.getBytes(StandardCharsets.UTF_8));
+            output.write(bytes);
             // Ordinary ERROR events are flushed by close. Only an actual
             // process crash needs an expensive durable sync before Android
             // terminates the process.
@@ -309,14 +345,16 @@ final class DiagnosticsLog {
     }
 
     private static byte[] readBytes(File file) {
-        try (FileInputStream input = new FileInputStream(file);
-             ByteArrayOutputStream output = new ByteArrayOutputStream()) {
-            byte[] buffer = new byte[16 * 1024];
-            int count;
-            while ((count = input.read(buffer)) >= 0) {
-                if (count != 0) output.write(buffer, 0, count);
-            }
-            return output.toByteArray();
+        return readBytes(file, (int) MAX_FILE_BYTES + MAX_MESSAGE_CHARS * 4);
+    }
+
+    private static byte[] readBytes(File file, int limit) {
+        try (RandomAccessFile input = new RandomAccessFile(file, "r")) {
+            int length = (int) Math.min(input.length(), limit);
+            byte[] bytes = new byte[length];
+            input.seek(input.length() - length);
+            input.readFully(bytes);
+            return bytes;
         } catch (Throwable ignored) {
             return new byte[0];
         }

@@ -4,6 +4,7 @@
 #include <bedrock/bedrock.hpp>
 #include <bedrock/relay/EntityPositionTracker.hpp>
 #include <bedrock/relay/ItemDurability.hpp>
+#include <bedrock/relay/AreaFillGeometry.hpp>
 #include <bedrock/generated/GeneratedProtocolTypes.hpp>
 #include <bedrock/protodef/ProtoDefEncoder.hpp>
 #include <bedrock/protodef/ProtoDefWriter.hpp>
@@ -474,7 +475,8 @@ std::string rakNetStatisticsBreadcrumb(
            << " resendMessages=" << statistics.resendBufferMessages
            << " resendBytes=" << statistics.resendBufferBytes
            << " packetLossLastSecond=" << statistics.packetLossLastSecond
-           << " packetLossTotal=" << statistics.packetLossTotal;
+           << " packetLossTotal=" << statistics.packetLossTotal
+           << " reliability={" << statistics.reliabilityDetails << '}';
     return detail.str();
 }
 
@@ -857,6 +859,7 @@ struct RelayState {
         int32_t runtimeId = 0;
         uint8_t failures = 0;
         bool approachRequired = false;
+        uint64_t retryAfterMs = 0;
     };
 
     struct AreaFillMarker {
@@ -4995,16 +4998,17 @@ struct RelayState {
         decoded.set("delta.z", static_cast<double>(deltaZ));
         decoded.set("yaw", static_cast<double>(yaw));
         decoded.set("head_yaw", static_cast<double>(yaw));
-        decoded.set("move_vector.x", 0.0);
-        decoded.set("move_vector.z", 1.0);
-        decoded.set("analogue_move_vector.x", 0.0);
-        decoded.set("analogue_move_vector.z", 1.0);
-        decoded.set("raw_move_vector.x", 0.0);
-        decoded.set("raw_move_vector.z", 1.0);
-        decoded.set("input_data.up", true);
-        decoded.set("input_data.down", false);
-        decoded.set("input_data.left", false);
-        decoded.set("input_data.right", false);
+        const auto input = bedrock::area_fill::localInput(deltaX, deltaZ, yaw);
+        decoded.set("move_vector.x", input.x);
+        decoded.set("move_vector.z", input.z);
+        decoded.set("analogue_move_vector.x", input.x);
+        decoded.set("analogue_move_vector.z", input.z);
+        decoded.set("raw_move_vector.x", input.x);
+        decoded.set("raw_move_vector.z", input.z);
+        decoded.set("input_data.up", input.z > 0.01);
+        decoded.set("input_data.down", input.z < -0.01);
+        decoded.set("input_data.left", input.x > 0.01);
+        decoded.set("input_data.right", input.x < -0.01);
         decoded.set("input_data.sprinting", false);
         bedrock::ProtoDefPacketEncoder encoder(version, itemProtocolVariables);
         auto payload = encoder.encodePacket(
@@ -5198,18 +5202,6 @@ struct RelayState {
         ++areaFillRevision;
     }
 
-    bool areaFillInventoryAcknowledgedPlacementLocked() const noexcept {
-        if (!areaFillPlacementPending ||
-            areaFillPendingHotbarSlot >= playerInventory.size() ||
-            areaFillPendingHeldCount <= 0) {
-            return false;
-        }
-        const auto& held = playerInventory[areaFillPendingHotbarSlot];
-        if (!held.present) return areaFillPendingHeldCount == 1;
-        return held.networkId == areaFillItemNetworkId &&
-            held.count < areaFillPendingHeldCount;
-    }
-
     bool addAreaFillSupportColumn(const AreaFillPoint& target) noexcept {
         constexpr int32_t MaximumSupportDepth = 12;
         int32_t solidY = target.y - 1;
@@ -5326,7 +5318,8 @@ struct RelayState {
     }
 
     std::optional<std::tuple<AreaFillPoint, int32_t, int32_t>>
-    areaFillSupportFor(const AreaFillPoint& target) const noexcept {
+    areaFillSupportFor(const AreaFillPoint& target,
+        std::optional<bedrock::area_fill::Point> eye = std::nullopt) const noexcept {
         static constexpr std::array<std::array<int32_t, 4>, 6> Supports {{
             {{0, -1, 0, 1}},
             {{0, 1, 0, 0}},
@@ -5346,7 +5339,21 @@ struct RelayState {
                 against.y,
                 against.z
             );
-            if (sample.known && !sample.air) {
+            if (sample.known && sample.solid && !sample.hazardous) {
+                if (eye.has_value()) {
+                    // The server checks the clicked support face, not the
+                    // nearest corner of the empty target block.
+                    const bedrock::area_fill::Point hit {
+                        against.x + 0.5 - support[0] * 0.5,
+                        against.y + 0.5 - support[1] * 0.5,
+                        against.z + 0.5 - support[2] * 0.5};
+                    const double facing = (eye->x - hit.x) * -support[0] +
+                        (eye->y - hit.y) * -support[1] +
+                        (eye->z - hit.z) * -support[2];
+                    if (facing < -0.001 ||
+                        bedrock::area_fill::distanceSquared(*eye, hit) > 9.0 ||
+                        !areaFillHasLineOfSight(eye->x, eye->y, eye->z, target, hit)) continue;
+                }
                 return std::tuple<AreaFillPoint, int32_t, int32_t> {
                     against,
                     support[3],
@@ -5449,15 +5456,15 @@ struct RelayState {
         float eyeX,
         float eyeY,
         float eyeZ,
-        const AreaFillPoint& target
+        const AreaFillPoint& target,
+        std::optional<bedrock::area_fill::Point> hit = std::nullopt
     ) const noexcept {
-        const float targetX = target.x + 0.5f;
-        const float targetY = target.y + 0.5f;
-        const float targetZ = target.z + 0.5f;
-        const float dx = targetX - eyeX;
-        const float dy = targetY - eyeY;
-        const float dz = targetZ - eyeZ;
-        const float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+        const auto destination = hit.value_or(bedrock::area_fill::Point {
+            target.x + 0.5, target.y + 0.5, target.z + 0.5});
+        const double dx = destination.x - eyeX;
+        const double dy = destination.y - eyeY;
+        const double dz = destination.z - eyeZ;
+        const double distance = std::sqrt(dx * dx + dy * dy + dz * dz);
         const int steps = std::clamp(
             static_cast<int>(std::ceil(distance / 0.125f)),
             1,
@@ -5469,8 +5476,7 @@ struct RelayState {
             static_cast<int32_t>(std::floor(eyeZ))
         };
         for (int step = 1; step < steps; ++step) {
-            const float ratio = static_cast<float>(step) /
-                static_cast<float>(steps);
+            const double ratio = static_cast<double>(step) / steps;
             const AreaFillPoint block {
                 static_cast<int32_t>(std::floor(eyeX + dx * ratio)),
                 static_cast<int32_t>(std::floor(eyeY + dy * ratio)),
@@ -5510,30 +5516,12 @@ struct RelayState {
             float eyeY,
             float z
         ) {
-            const double dx = x < target.x
-                ? target.x - x
-                : x > target.x + 1.0
-                    ? x - (target.x + 1.0)
-                    : 0.0;
-            const double dy = eyeY < target.y
-                ? target.y - eyeY
-                : eyeY > target.y + 1.0
-                    ? eyeY - (target.y + 1.0)
-                    : 0.0;
-            const double dz = z < target.z
-                ? target.z - z
-                : z > target.z + 1.0
-                    ? z - (target.z + 1.0)
-                    : 0.0;
-            return dx * dx + dy * dy + dz * dz;
+            return bedrock::area_fill::distanceSquared(
+                {x, eyeY, z}, {target.x + 0.5, target.y + 0.5, target.z + 0.5});
         };
         const auto intersectsTarget = [&target](float x, float eyeY, float z) {
-            constexpr float EyeHeight = 1.62f;
-            const float feetY = eyeY - EyeHeight;
-            return static_cast<int32_t>(std::floor(x)) == target.x &&
-                static_cast<int32_t>(std::floor(z)) == target.z &&
-                feetY < target.y + 0.95f &&
-                feetY + 1.8f > target.y + 0.05f;
+            return bedrock::area_fill::intersectsPlayer(
+                {x, eyeY, z}, {double(target.x), double(target.y), double(target.z)});
         };
 
         const int32_t startX = static_cast<int32_t>(std::floor(currentX));
@@ -5554,10 +5542,11 @@ struct RelayState {
         visited.emplace(keyFor(startX, startZ), 0);
         std::size_t best = 0;
         double bestDistance = distanceToTarget(
-            startX + 0.5f,
+            currentX,
             currentEyeY,
-            startZ + 0.5f
+            currentZ
         );
+        const bool targetHasSupport = areaFillSupportFor(target).has_value();
         std::optional<std::size_t> goal;
         static constexpr std::array<std::array<int32_t, 2>, 4> Neighbours {{
             {{1, 0}}, {{-1, 0}}, {{0, 1}}, {{0, -1}}
@@ -5567,20 +5556,20 @@ struct RelayState {
             const auto index = open.front();
             open.pop_front();
             const auto node = nodes[index];
-            const auto distance = distanceToTarget(
-                node.x + 0.5f,
-                node.eyeY,
-                node.z + 0.5f
-            );
+            const float nodeX = index == 0 ? currentX : node.x + 0.5f;
+            const float nodeZ = index == 0 ? currentZ : node.z + 0.5f;
+            const auto distance = distanceToTarget(nodeX, node.eyeY, nodeZ);
             if (!intersectsTarget(
-                    node.x + 0.5f,
+                    nodeX,
                     node.eyeY,
-                    node.z + 0.5f) &&
+                    nodeZ) &&
                 distance <= maximumReach * maximumReach &&
+                (!targetHasSupport || areaFillSupportFor(target,
+                    bedrock::area_fill::Point {nodeX, node.eyeY, nodeZ}).has_value()) &&
                 areaFillHasLineOfSight(
-                    node.x + 0.5f,
+                    nodeX,
                     node.eyeY,
-                    node.z + 0.5f,
+                    nodeZ,
                     target
                 )) {
                 goal = index;
@@ -5606,6 +5595,13 @@ struct RelayState {
                     baseFillY
                 );
                 if (!eyeY.has_value()) continue;
+                if (!bedrock::area_fill::safeSegment(
+                        {nodeX, node.eyeY, nodeZ}, {x + 0.5, *eyeY, z + 0.5},
+                        [&](double px, double pz, double py) {
+                            return areaFillSafeStandingEyeY(
+                                static_cast<float>(px), static_cast<float>(pz),
+                                static_cast<float>(py), baseFillY);
+                        })) continue;
                 const auto next = nodes.size();
                 nodes.push_back({x, z, *eyeY, index});
                 visited.emplace(key, next);
@@ -5650,6 +5646,7 @@ struct RelayState {
         float packetY = 0.0f;
         float packetZ = 0.0f;
         float packetPitch = 0.0f;
+        float packetYaw = 0.0f;
         uint64_t packetTick = 0;
         bool manualMovement = false;
         try {
@@ -5664,6 +5661,12 @@ struct RelayState {
             packetY = static_cast<float>(decoded.getDouble("position.y", 0.0));
             packetZ = static_cast<float>(decoded.getDouble("position.z", 0.0));
             packetPitch = static_cast<float>(decoded.getDouble("pitch", 0.0));
+            packetYaw = static_cast<float>(decoded.getDouble("yaw", 0.0));
+            if (!std::isfinite(packetX) || !std::isfinite(packetY) ||
+                !std::isfinite(packetZ) || !std::isfinite(packetPitch) ||
+                !std::isfinite(packetYaw)) {
+                throw std::runtime_error("non-finite player position or rotation");
+            }
             packetTick = decoded.getUInt("tick", 0);
             manualMovement = decoded.getBool("input_data.up", false) ||
                 decoded.getBool("input_data.down", false) ||
@@ -5722,13 +5725,9 @@ struct RelayState {
                         areaFillCells[areaFillPendingCell].runtimeId,
                         "Установка подтверждена миром"
                     );
-                } else if (areaFillInventoryAcknowledgedPlacementLocked()) {
-                    confirmAreaFillPlacementLocked(
-                        areaFillPendingCell,
-                        areaFillPendingBlockRuntimeId,
-                        "Установка подтверждена расходом блока"
-                    );
-                } else if (now - areaFillPlacementStartedAtMs < 1'400) {
+                } else if (now - areaFillPlacementStartedAtMs < 2'500) {
+                    // Consuming an item alone does not prove which world cell
+                    // was placed. Never turn a rejected/ghost block into floor.
                     return true;
                 } else {
                     auto& failed = areaFillCells[areaFillPendingCell];
@@ -5891,7 +5890,7 @@ struct RelayState {
                 for (std::size_t index = 0; index < areaFillCells.size(); ++index) {
                     const auto& cell = areaFillCells[index];
                     if (cell.complete || !cell.worldKnown || !cell.worldAir ||
-                        cell.approachRequired ||
+                        cell.retryAfterMs > now || cell.approachRequired ||
                         cell.y != activeLayerY) continue;
                     const double dx = currentX < cell.x
                         ? cell.x - currentX
@@ -5914,11 +5913,9 @@ struct RelayState {
                         : cell.failures == 1 ? 2.5 : 2.0;
                     // Never attempt to place a target through the player's
                     // own collision box. Walk far enough away first.
-                    const bool occupiesTarget =
-                        static_cast<int32_t>(std::floor(currentX)) == cell.x &&
-                        static_cast<int32_t>(std::floor(currentZ)) == cell.z &&
-                        currentY - 1.62f < cell.y + 0.95f &&
-                        currentY - 1.62f + 1.8f > cell.y + 0.05f;
+                    const bool occupiesTarget = bedrock::area_fill::intersectsPlayer(
+                        {currentX, currentY, currentZ},
+                        {double(cell.x), double(cell.y), double(cell.z)});
                     bool chained = false;
                     for (const auto& neighbour : Neighbours) {
                         chained = confirmedSolids.contains({
@@ -5974,13 +5971,10 @@ struct RelayState {
                 for (std::size_t index = 0; index < areaFillCells.size(); ++index) {
                     const auto& cell = areaFillCells[index];
                     if (cell.complete || !cell.worldKnown || !cell.worldAir ||
-                        cell.y != activeLayerY) continue;
-                    const float currentFeetY = currentY - 1.62f;
-                    const bool occupiesTarget =
-                        static_cast<int32_t>(std::floor(currentX)) == cell.x &&
-                        static_cast<int32_t>(std::floor(currentZ)) == cell.z &&
-                        currentFeetY < cell.y + 0.95f &&
-                        currentFeetY + 1.8f > cell.y + 0.05f;
+                        cell.retryAfterMs > now || cell.y != activeLayerY) continue;
+                    const bool occupiesTarget = bedrock::area_fill::intersectsPlayer(
+                        {currentX, currentY, currentZ},
+                        {double(cell.x), double(cell.y), double(cell.z)});
                     const double dx = cell.x + 0.5 - currentX;
                     const double dz = cell.z + 0.5 - currentZ;
                     const double distance = dx * dx + dz * dz +
@@ -6007,11 +6001,8 @@ struct RelayState {
                             ++areaFillRevision;
                         }
                     } else {
-                        areaFillRunning = false;
-                        areaFillSyntheticPositionKnown = false;
-                        areaFillRouteWaypointKnown = false;
                         areaFillStatus =
-                            "Не удалось установить оставшиеся блоки: нет опоры";
+                            "Ожидаю повторной проверки оставшихся блоков";
                         ++areaFillRevision;
                     }
                     return true;
@@ -6061,11 +6052,13 @@ struct RelayState {
                 return true;
             }
             if (placement.valid) {
-                const auto support = areaFillSupportFor(placement.target);
+                const auto support = areaFillSupportFor(placement.target,
+                    bedrock::area_fill::Point {placement.playerX,
+                        placement.playerY, placement.playerZ});
                 if (!support.has_value()) {
-                    const bool supportAdded = addAreaFillSupportColumn(
-                        placement.target
-                    );
+                    const bool hasSupport = areaFillSupportFor(placement.target).has_value();
+                    const bool supportAdded = !hasSupport &&
+                        addAreaFillSupportColumn(placement.target);
                     std::lock_guard lock(mutex);
                     if (placement.cellIndex < areaFillCells.size()) {
                         auto& cell = areaFillCells[placement.cellIndex];
@@ -6073,6 +6066,11 @@ struct RelayState {
                             255,
                             cell.failures + 1
                         ));
+                        cell.approachRequired = hasSupport;
+                    }
+                    if (hasSupport) {
+                        areaFillRouteWaypointKnown = false;
+                        areaFillStatus = "Подхожу к доступной грани опоры на расстояние до 3 блоков";
                     }
                     if (!supportAdded && areaFillStatus.empty()) {
                         areaFillStatus =
@@ -6165,6 +6163,11 @@ struct RelayState {
                 }
                 if (!route.has_value()) {
                     std::lock_guard lock(mutex);
+                    if (movementCellIndex < areaFillCells.size()) {
+                        auto& cell = areaFillCells[movementCellIndex];
+                        cell.retryAfterMs = now + 2'000;
+                        cell.failures = static_cast<uint8_t>(std::min<int>(255, cell.failures + 1));
+                    }
                     areaFillSyntheticPositionKnown = false;
                     areaFillRouteWaypointKnown = false;
                     areaFillStatus =
@@ -6210,11 +6213,13 @@ struct RelayState {
                     ++areaFillRevision;
                     return true;
                 }
-                nextYaw = static_cast<float>(
-                    std::atan2(-routeX, routeZ) * 57.29577951308232
-                );
+                // Let the user look around while walking. Input vectors are
+                // transformed to this yaw, not by forcing the camera to turn.
+                nextYaw = packetYaw;
                 nextY = *safeEyeY;
+                deltaX = nextX - currentX;
                 deltaY = nextY - currentY;
+                deltaZ = nextZ - currentZ;
                 auto packet = makeAreaFillMovementPacket(
                     version,
                     event,
@@ -6635,6 +6640,27 @@ struct RelayState {
         bool serverbound
     ) noexcept {
         const auto& name = event.packet.name;
+        if (!serverbound && (name == "correct_player_move_prediction" || name == "move_player")) {
+            bool controlling = false;
+            {
+                std::lock_guard lock(mutex);
+                controlling = areaFillRunning && areaFillSyntheticPositionKnown;
+            }
+            if (controlling) {
+                try {
+                    std::lock_guard decodeLock(itemDecodeMutex);
+                    bedrock::RelayPacketEvent decoded(version, event, itemProtocolVariables, true);
+                    const auto camera = entityPositions.cameraSnapshot();
+                    const bool correction = name == "correct_player_move_prediction" ||
+                        (decoded.getUInt("runtime_id", 0) == camera.runtimeId &&
+                         decoded.getString("mode", "normal") != "normal");
+                    if (correction) stopAreaFill(
+                        "Сервер скорректировал позицию. Автопроход остановлен; запустите снова из безопасного места");
+                } catch (...) {
+                    stopAreaFill("Не удалось проверить коррекцию позиции — автопроход остановлен");
+                }
+            }
+        }
         if (serverbound && name == "set_player_inventory_options") {
             minecraftUiBlocked.store(true, std::memory_order_relaxed);
         } else if (name == "container_close") {
@@ -9112,15 +9138,9 @@ public:
                 version,
                 event
             );
-            const bool areaFillRefreshRequested =
-                areaFillMarkerRefreshRequested.exchange(
-                    false,
-                    std::memory_order_relaxed
-                );
             if (areaFillOwnedPacket ||
-                configuredAreaFill.load(std::memory_order_relaxed) ||
-                areaFillRefreshRequested) {
-                refreshAreaFillDebugMarkers();
+                configuredAreaFill.load(std::memory_order_relaxed)) {
+                areaFillMarkerRefreshRequested.store(true, std::memory_order_relaxed);
             }
             if (areaFillOwnedPacket) {
                 syncAreaFillDownstreamMovement();
@@ -9169,7 +9189,7 @@ public:
             state->enqueueMiniMapChunk(version, event.packet);
             if (event.packet.name == "update_block" ||
                 event.packet.name == "update_block_synced") {
-                refreshAreaFillDebugMarkers();
+                areaFillMarkerRefreshRequested.store(true, std::memory_order_relaxed);
             }
             if (event.packet.name == "start_game" ||
                 event.packet.name == "change_dimension") {
@@ -11620,6 +11640,18 @@ Java_com_m9chko_bedrockrelay_NativeBridge_replaceSchematicDebugMarkers(
         }
         return JNI_FALSE;
     }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_m9chko_bedrockrelay_NativeBridge_refreshAreaFillMarkers(JNIEnv*, jclass) {
+    const bool requested = areaFillMarkerRefreshRequested.exchange(false, std::memory_order_relaxed);
+    if (!requested && !configuredAreaFill.load(std::memory_order_relaxed)) return;
+    std::shared_ptr<RelayController> activeController;
+    {
+        std::lock_guard lock(controllerMutex);
+        activeController = controller;
+    }
+    if (activeController) activeController->refreshAreaFillDebugMarkers();
 }
 
 extern "C" JNIEXPORT void JNICALL

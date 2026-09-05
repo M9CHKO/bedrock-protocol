@@ -46,6 +46,8 @@ struct LevelChunkRetentionStats {
     uint64_t evictedForMemory = 0;
     uint64_t parseFailures = 0;
     uint64_t worldResets = 0;
+    uint64_t skippedOversized = 0;
+    std::size_t maximumChunks = 0;
 };
 
 struct LevelChunkRetentionUpdate {
@@ -64,8 +66,10 @@ struct LevelChunkRetentionUpdate {
 class LevelChunkRetentionCache {
 public:
     explicit LevelChunkRetentionCache(
-        std::size_t maximumBytes = DefaultLevelChunkRetentionMaximumBytes
-    ) : maximumBytes_(std::max<std::size_t>(maximumBytes, 1u)) {}
+        std::size_t maximumBytes = DefaultLevelChunkRetentionMaximumBytes,
+        std::size_t maximumChunks = 8192
+    ) : maximumBytes_(std::max<std::size_t>(maximumBytes, 1u)),
+        maximumChunks_(std::max<std::size_t>(maximumChunks, 1u)) {}
 
     void configure(bool enabled, uint32_t radiusChunks) noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -121,6 +125,27 @@ public:
                 return update;
             }
 
+            std::size_t encodedSize = packet.fullPacket.size();
+            bool oversized = encodedSize > maximumBytes_;
+            if (packet.fullPacket.empty()) {
+                std::size_t headerSize = 1;
+                for (uint32_t id = packet.packetId; id >= 128; id >>= 7) ++headerSize;
+                if (packet.payload.size() > maximumBytes_ ||
+                    headerSize > maximumBytes_ - packet.payload.size()) {
+                    oversized = true;
+                } else encodedSize = headerSize + packet.payload.size();
+            }
+            if (oversized) {
+                // A packet that cannot fit must not copy its payload or evict
+                // unrelated useful chunks. Remove only an obsolete same-key value.
+                const auto stale = chunks_.find(key);
+                if (stale != chunks_.end()) {
+                    residentBytes_ -= stale->second.bytes.size();
+                    chunks_.erase(stale);
+                }
+                ++skippedOversized_;
+                return update;
+            }
             std::vector<uint8_t> bytes = packet.fullPacket;
             if (bytes.empty()) {
                 VersionedPacketCodec::writeVarUInt(bytes, packet.packetId);
@@ -200,6 +225,7 @@ public:
         evictedForMemory_ = 0;
         parseFailures_ = 0;
         worldResets_ = 0;
+        skippedOversized_ = 0;
         sequence_ = 0;
     }
 
@@ -225,6 +251,8 @@ public:
         out.evictedForMemory = evictedForMemory_;
         out.parseFailures = parseFailures_;
         out.worldResets = worldResets_;
+        out.skippedOversized = skippedOversized_;
+        out.maximumChunks = maximumChunks_;
         return out;
     }
 
@@ -268,6 +296,8 @@ private:
         RetainedLevelChunkKeyHash
     > chunks_;
     std::size_t maximumBytes_;
+    std::size_t maximumChunks_;
+    uint64_t skippedOversized_ = 0;
     std::size_t residentBytes_ = 0;
     bool enabled_ = false;
     uint32_t configuredRadiusChunks_ = 0;
@@ -349,7 +379,8 @@ private:
 
     std::size_t evictForMemoryUnlocked() noexcept {
         std::size_t evicted = 0;
-        while (residentBytes_ > maximumBytes_ && !chunks_.empty()) {
+        while ((residentBytes_ > maximumBytes_ || chunks_.size() > maximumChunks_) &&
+               !chunks_.empty()) {
             auto victim = chunks_.end();
             uint64_t victimDistance = 0;
             for (auto it = chunks_.begin(); it != chunks_.end(); ++it) {

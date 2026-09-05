@@ -1290,6 +1290,9 @@ final class EntityOutlineOverlayController {
             if (animating) postInvalidateOnAnimation();
         }
 
+        private final double[] projectionCorners = new double[24];
+        private final double[] projectionBounds = new double[4];
+
         private boolean drawTrack(
             Canvas canvas,
             RenderTrack track,
@@ -1320,85 +1323,18 @@ final class EntityOutlineOverlayController {
                 track.screenBox.hide();
                 return false;
             }
-            double centerDepth = ProjectionMath.depth(
-                centerDx,
-                centerDy,
-                centerDz,
-                sinYaw,
-                cosYaw,
-                sinPitch,
-                cosPitch
-            );
-            if (centerDepth <= NearPlane) {
+            if (!ProjectionMath.projectBox(
+                entityX - cameraX, entityY - cameraY, entityZ - cameraZ,
+                track.width * 0.5, track.height, sinYaw, cosYaw, sinPitch,
+                cosPitch, focal, NearPlane, getWidth(), getHeight(),
+                projectionCorners, projectionBounds)) {
                 track.screenBox.hide();
                 return false;
             }
-
-            double halfWidth = track.width * 0.5;
-            double minimumX = Double.POSITIVE_INFINITY;
-            double minimumY = Double.POSITIVE_INFINITY;
-            double maximumX = Double.NEGATIVE_INFINITY;
-            double maximumY = Double.NEGATIVE_INFINITY;
-            int projected = 0;
-            for (int xSide = -1; xSide <= 1; xSide += 2) {
-                for (int zSide = -1; zSide <= 1; zSide += 2) {
-                    for (int ySide = 0; ySide <= 1; ++ySide) {
-                        double dx = entityX + xSide * halfWidth - cameraX;
-                        double dy = entityY + ySide * track.height - cameraY;
-                        double dz = entityZ + zSide * halfWidth - cameraZ;
-
-                        // Bedrock yaw 0 faces +Z and positive yaw turns
-                        // towards -X, so screen-right points along the
-                        // negative of this horizontal basis.
-                        double viewX = ProjectionMath.viewX(
-                            dx,
-                            dz,
-                            sinYaw,
-                            cosYaw
-                        );
-                        double viewY = ProjectionMath.viewY(
-                            dx,
-                            dy,
-                            dz,
-                            sinYaw,
-                            cosYaw,
-                            sinPitch,
-                            cosPitch
-                        );
-                        double viewZ = ProjectionMath.depth(
-                            dx,
-                            dy,
-                            dz,
-                            sinYaw,
-                            cosYaw,
-                            sinPitch,
-                            cosPitch
-                        );
-                        if (viewZ <= NearPlane) continue;
-
-                        double screenX = getWidth() * 0.5 +
-                            viewX * focal / viewZ;
-                        double screenY = getHeight() * 0.5 -
-                            viewY * focal / viewZ;
-                        if (!Double.isFinite(screenX) ||
-                            !Double.isFinite(screenY)) continue;
-                        minimumX = Math.min(minimumX, screenX);
-                        minimumY = Math.min(minimumY, screenY);
-                        maximumX = Math.max(maximumX, screenX);
-                        maximumY = Math.max(maximumY, screenY);
-                        ++projected;
-                    }
-                }
-            }
-            if (projected == 0) {
-                track.screenBox.hide();
-                return false;
-            }
-
-            float left = (float) minimumX;
-            float top = (float) minimumY;
-            float right = (float) maximumX;
-            float bottom = (float) maximumY;
+            float left = (float) projectionBounds[0];
+            float top = (float) projectionBounds[1];
+            float right = (float) projectionBounds[2];
+            float bottom = (float) projectionBounds[3];
             float projectedWidth = right - left;
             float projectedHeight = bottom - top;
             float minimumWidth = density * (track.item ? 1.5f : 2.5f);

@@ -204,8 +204,6 @@ class CCRakNetSlidingWindow
 	/// Track which datagram sequence numbers have arrived.
 	/// If a sequence number is skipped, send a NAK for all skipped messages
 	DatagramSequenceNumberType expectedNextSequenceNumber;
-	uint32_t acceptedIncomingDatagramCount;
-	bool resynchronizedInitialSequence;
 
 	bool _isContinuousSend;
 

@@ -38,6 +38,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public final class RelayService extends Service {
     public static final String PREFERENCES = "relay";
     public static final String KEY_HOST = "destination_host";
+    public static final String ACTION_APPLY_SETTINGS =
+        "com.m9chko.bedrockrelay.APPLY_SETTINGS";
     public static final String KEY_PORT = "destination_port";
     public static final String KEY_VERSION = "minecraft_version";
     public static final String KEY_LAST_ERROR = "last_error";
@@ -166,13 +168,18 @@ public final class RelayService extends Service {
     private static final int OVERLAY_POLL_INTERVAL_MS = 12;
     private static final int ENTITY_SNAPSHOT_EVERY_POLLS = 4;
 
-    private final ExecutorService commandExecutor =
+    // Shared across service recreation so an old asynchronous stop cannot
+    // race the next instance's start. Native ownership is worker-confined.
+    private static final ExecutorService commandExecutor =
         Executors.newSingleThreadExecutor();
+    private static RelayService nativeOwner;
     private final ExecutorService schematicExecutor =
         Executors.newSingleThreadExecutor();
     private final ScheduledExecutorService pollExecutor =
         Executors.newSingleThreadScheduledExecutor();
     private final ScheduledExecutorService entityPollExecutor =
+        Executors.newSingleThreadScheduledExecutor();
+    private final ScheduledExecutorService markerPollExecutor =
         Executors.newSingleThreadScheduledExecutor();
     private final AtomicBoolean pollingStarted = new AtomicBoolean(false);
     private final AtomicBoolean entityPollingStarted = new AtomicBoolean(false);
@@ -254,6 +261,13 @@ public final class RelayService extends Service {
             preferences
         );
         reloadSchematicModel();
+        // Marker encoding and queueing must never delay the relay packet
+        // callback or camera polling. Fixed delay also prevents backlogs.
+        markerPollExecutor.scheduleWithFixedDelay(() -> {
+            if (serviceStopping) return;
+            try { NativeBridge.refreshAreaFillMarkers(); }
+            catch (Throwable ignored) { /* renderer reports session-scoped errors */ }
+        }, 100, 100, TimeUnit.MILLISECONDS);
         createNotificationChannel();
         DiagnosticsLog.append(
             this,
@@ -268,40 +282,38 @@ public final class RelayService extends Service {
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         String action = intent == null ? null : intent.getAction();
+        if (ACTION_APPLY_SETTINGS.equals(action)) {
+            if (!serviceStopping) applyRuntimeOptions(true);
+            return START_NOT_STICKY;
+        }
         if (ACTION_STOP.equals(action)) {
             DiagnosticsLog.append(this, "INFO", "service", "Stop action received");
             stopRelayAndSelf();
             return START_NOT_STICKY;
         }
-        if (ACTION_RELOAD_SCHEMATIC.equals(action)) {
-            boolean relayRunning = false;
-            try {
-                relayRunning = new JSONObject(NativeBridge.snapshot())
-                    .optBoolean("running", false);
-            } catch (Throwable ignored) {
-            }
-            if (relayRunning) {
-                reloadSchematicModel();
-            } else {
-                stopSelf(startId);
-            }
-            return START_NOT_STICKY;
-        }
-        if (ACTION_IMPORT_SCHEMATIC_DOCUMENT.equals(action)) {
-            boolean relayRunning = false;
-            try {
-                relayRunning = new JSONObject(NativeBridge.snapshot())
-                    .optBoolean("running", false);
-            } catch (Throwable ignored) {
-            }
-            if (relayRunning) {
-                importSchematicDocument(
-                    intent.getStringExtra(EXTRA_SCHEMATIC_URI),
-                    intent.getStringExtra(EXTRA_SCHEMATIC_NAME)
-                );
-            } else {
-                stopSelf(startId);
-            }
+        if (ACTION_RELOAD_SCHEMATIC.equals(action) ||
+            ACTION_IMPORT_SCHEMATIC_DOCUMENT.equals(action)) {
+            final boolean importDocument = ACTION_IMPORT_SCHEMATIC_DOCUMENT.equals(action);
+            final String uriValue = intent.getStringExtra(EXTRA_SCHEMATIC_URI);
+            final String sourceName = intent.getStringExtra(EXTRA_SCHEMATIC_NAME);
+            // Even this existence check can wait on a native lock. Never do
+            // it on Android's input-dispatch thread.
+            commandExecutor.execute(() -> {
+                if (serviceStopping) return;
+                boolean relayRunning = false;
+                try {
+                    relayRunning = new JSONObject(NativeBridge.snapshot())
+                        .optBoolean("running", false);
+                } catch (Throwable ignored) {
+                }
+                final boolean active = relayRunning;
+                mainHandler.post(() -> {
+                    if (serviceStopping) return;
+                    if (!active) stopSelf(startId);
+                    else if (importDocument) importSchematicDocument(uriValue, sourceName);
+                    else reloadSchematicModel();
+                });
+            });
             return START_NOT_STICKY;
         }
         if (!ACTION_START.equals(action)) {
@@ -358,7 +370,7 @@ public final class RelayService extends Service {
         serviceStopping = true;
         overlaySessionReady = false;
         overlayShouldBeVisible = false;
-        if (overlayController != null) overlayController.hide();
+        if (overlayController != null) overlayController.destroy();
         if (entityOverlayController != null) {
             entityOverlayController.hideImmediately();
         }
@@ -381,22 +393,18 @@ public final class RelayService extends Service {
             areaFillOverlayController.destroy();
         }
         DiagnosticsLog.append(this, "INFO", "service", "Service destroying");
-        try {
-            NativeBridge.stopRelay();
-        } catch (Throwable error) {
-            DiagnosticsLog.appendError(
-                this,
-                "native",
-                "Native stop failed during service destruction",
-                error
-            );
-        }
-        preferences.edit().putBoolean(KEY_RELAY_ACTIVE, false).commit();
+        commandExecutor.execute(() -> {
+            try {
+                stopOwnedNativeRelay();
+            } catch (Throwable error) {
+                DiagnosticsLog.appendError(this, "native", "Native stop failed during destruction", error);
+            }
+        });
         releaseWakeLock();
         pollExecutor.shutdownNow();
         entityPollExecutor.shutdownNow();
+        markerPollExecutor.shutdownNow();
         schematicExecutor.shutdownNow();
-        commandExecutor.shutdownNow();
         super.onDestroy();
     }
 
@@ -406,6 +414,8 @@ public final class RelayService extends Service {
     }
 
     private void startNativeRelay(String host, int port, String version) {
+        if (serviceStopping) return;
+        nativeOwner = this;
         DiagnosticsLog.append(
             this,
             "INFO",
@@ -811,6 +821,7 @@ public final class RelayService extends Service {
         if ("upstream_ready".equals(type)) {
             overlaySessionReady = true;
             preferences.edit()
+                .remove(KEY_LAST_ERROR)
                 .remove(KEY_AUTH_CODE)
                 .remove(KEY_AUTH_URI)
                 .apply();
@@ -1060,7 +1071,7 @@ public final class RelayService extends Service {
         refreshNotification();
         commandExecutor.execute(() -> {
             try {
-                NativeBridge.stopRelay();
+                stopOwnedNativeRelay();
             } catch (Throwable error) {
                 DiagnosticsLog.appendError(
                     this,
@@ -1083,6 +1094,14 @@ public final class RelayService extends Service {
 
     private void reportError(String message) {
         reportError(message, null);
+    }
+
+    // Native shutdown is serialized with start, never on Android's input thread.
+    private void stopOwnedNativeRelay() {
+        if (nativeOwner != this) return;
+        NativeBridge.stopRelay();
+        nativeOwner = null;
+        preferences.edit().putBoolean(KEY_RELAY_ACTIVE, false).commit();
     }
 
     private void reportError(String message, Throwable error) {
@@ -1442,6 +1461,7 @@ public final class RelayService extends Service {
         });
         try {
             commandExecutor.execute(() -> {
+                if (serviceStopping) return;
                 try {
                     NativeBridge.configureRuntime(
                         detailedLogs,

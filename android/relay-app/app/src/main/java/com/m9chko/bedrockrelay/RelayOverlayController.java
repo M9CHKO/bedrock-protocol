@@ -43,6 +43,12 @@ final class RelayOverlayController {
     private final Runnable settingsChanged;
     private final SchematicAnchorShift schematicAnchorShift;
     private final WindowManager windowManager;
+    private final java.util.concurrent.ExecutorService logReader =
+        java.util.concurrent.Executors.newSingleThreadExecutor(task -> {
+            Thread thread = new Thread(task, "overlay-log-reader");
+            thread.setDaemon(true);
+            return thread;
+        });
 
     private WindowManager.LayoutParams windowParams;
     private volatile LinearLayout windowRoot;
@@ -194,6 +200,11 @@ final class RelayOverlayController {
 
     boolean isShowing() {
         return windowRoot != null;
+    }
+
+    void destroy() {
+        hide();
+        logReader.shutdownNow();
     }
 
     void hide() {
@@ -432,8 +443,8 @@ final class RelayOverlayController {
     }
 
     private View sectionHeader(String value) {
-        TextView header = text("└─ " + value, 9, true);
-        header.setTextColor(0xff6f91bd);
+        TextView header = text(value, 11, true);
+        header.setTextColor(RelayUi.ACCENT);
         header.setPadding(dp(4), dp(5), dp(3), dp(5));
         return header;
     }
@@ -442,17 +453,17 @@ final class RelayOverlayController {
         LinearLayout card = new LinearLayout(context);
         card.setOrientation(LinearLayout.VERTICAL);
         card.setPadding(dp(13), dp(11), dp(13), dp(11));
-        card.setBackground(cardBackground(false));
-        TextView heading = text(title, 13, true);
+        card.setBackground(RelayUi.action(context, RelayUi.SURFACE, 14, RelayUi.BORDER));
+        TextView heading = text(title + "  ›", 15, true);
         heading.setTextColor(0xffedf5ff);
         card.addView(heading);
-        TextView detail = text(subtitle, 10, false);
+        TextView detail = text(subtitle, 12, false);
         detail.setTextColor(0xff9eacbc);
         detail.setPadding(0, dp(3), 0, 0);
         card.addView(detail);
         card.setOnClickListener(view -> showPage(page));
         card.setClickable(true);
-        card.setElevation(dp(3));
+        card.setMinimumHeight(dp(64));
         card.setLayoutParams(margins(-1, -2, 0, 0, 0, dp(7)));
         return card;
     }
@@ -1765,11 +1776,22 @@ final class RelayOverlayController {
         clear.setPadding(dp(10), dp(9), dp(10), dp(9));
         clear.setBackground(actionBackground());
         clear.setOnClickListener(view -> {
-            DiagnosticsLog.clear(context);
-            if (logText != null) logText.setText("Журнал пока пуст.");
+            clear.setEnabled(false);
+            logReader.execute(() -> {
+                DiagnosticsLog.clear(context);
+                clear.post(() -> {
+                    clear.setEnabled(true);
+                    if (logText != null) logText.setText("Журнал пока пуст.");
+                });
+            });
         });
         root.addView(clear, margins(-1, -2, 0, 0, 0, dp(7)));
-        logText = text(DiagnosticsLog.readTail(context, 32 * 1024), 8, false);
+        logText = text("Загрузка журнала…", 11, false);
+        final TextView target = logText;
+        logReader.execute(() -> {
+            String value = DiagnosticsLog.readTail(context, 32 * 1024);
+            target.post(() -> { if (logText == target) target.setText(value); });
+        });
         logText.setTypeface(android.graphics.Typeface.MONOSPACE);
         logText.setTextColor(0xffb9c7d6);
         logText.setTextIsSelectable(true);
@@ -1782,6 +1804,7 @@ final class RelayOverlayController {
         Switch control = new Switch(context);
         control.setText(label);
         control.setTextSize(13);
+        control.setMinHeight(dp(48));
         control.setTextColor(Color.WHITE);
         control.setChecked(preferences.getBoolean(key, defaultValue));
         control.setPadding(dp(1), dp(2), dp(1), dp(2));
@@ -2294,8 +2317,7 @@ final class RelayOverlayController {
     }
 
     private Button smallButton(String label) {
-        Button button = new Button(context);
-        button.setText(label);
+        Button button = RelayUi.button(context, label, false);
         button.setTextSize(18);
         button.setTextColor(Color.WHITE);
         button.setAllCaps(false);
@@ -2304,12 +2326,7 @@ final class RelayOverlayController {
     }
 
     private TextView text(String value, int sizeSp, boolean bold) {
-        TextView text = new TextView(context);
-        text.setText(value);
-        text.setTextSize(sizeSp);
-        text.setTextColor(Color.WHITE);
-        if (bold) text.setTypeface(text.getTypeface(), android.graphics.Typeface.BOLD);
-        return text;
+        return RelayUi.text(context, value, Math.max(11, sizeSp), bold);
     }
 
     private LinearLayout.LayoutParams margins(

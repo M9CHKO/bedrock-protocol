@@ -70,6 +70,8 @@ struct RakNetServerPeerStatistics {
     uint64_t resendBufferBytes = 0;
     float packetLossLastSecond = 0.0f;
     float packetLossTotal = 0.0f;
+    // Bounded, metadata-only receive diagnostics; never contains packet bytes.
+    std::string reliabilityDetails;
 };
 
 class RakNetServer {

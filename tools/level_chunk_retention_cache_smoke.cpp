@@ -54,6 +54,23 @@ bedrock::VersionedGamePacket makeLevelChunk(
 int main() {
     bool ok = true;
 
+    bedrock::LevelChunkRetentionCache bounded(64, 3);
+    bounded.configure(true, 128);
+    for (int i = 0; i < 100; ++i) bounded.observeLevelChunk(makeLevelChunk(0, i, 0, 1));
+    ok &= check(bounded.stats().residentChunks == 3, "tiny packets escaped count budget");
+    auto oversized = makeLevelChunk(0, 97, 0, 1);
+    oversized.fullPacket.resize(65);
+    ok &= check(!bounded.observeLevelChunk(oversized).stored, "oversized packet retained");
+    ok &= check(!bounded.contains(0, 97, 0) && bounded.contains(0, 98, 0) &&
+        bounded.contains(0, 99, 0), "oversized replacement removed unrelated data or kept stale bytes");
+    ok &= check(bounded.stats().skippedOversized == 1, "oversized count missing");
+    oversized.fullPacket.clear();
+    oversized.payload.resize(65);
+    ok &= check(!bounded.observeLevelChunk(oversized).stored, "payload-only packet escaped byte budget");
+    bounded.resetSession();
+    ok &= check(bounded.stats().skippedOversized == 0 && bounded.stats().residentBytes == 0,
+        "session reset did not clear cache counters");
+
     bedrock::LevelChunkRetentionCache cache(1024);
     const auto ignored = cache.observeLevelChunk(makeLevelChunk(0, 0, 0, 1));
     ok &= check(ignored.recognized, "disabled cache did not recognize level_chunk");
