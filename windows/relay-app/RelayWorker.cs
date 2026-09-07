@@ -158,12 +158,27 @@ internal sealed class WorkerSession : IDisposable
 
 internal static class RelayWorker
 {
+    // One coalesced worker loop, not a UI timer. Restoration also runs while
+    // Minecraft is in a workbench and the main app is minimized.
+    private static async Task Maintain(CancellationToken cancellation)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(100));
+        try
+        {
+            while (await timer.WaitForNextTickAsync(cancellation).ConfigureAwait(false))
+                RelayBackend.Invoke(new { action = "tick" });
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
+    }
     internal static async Task<int> Run(string name, bool test)
     {
+        using var lifetime = new CancellationTokenSource();
+        Task maintenance = Task.CompletedTask;
         try
         {
             using var pipe = new NamedPipeClientStream(".", name, PipeDirection.InOut, PipeOptions.Asynchronous);
             await pipe.ConnectAsync(10000).ConfigureAwait(false);
+            if (!test) maintenance = Task.Run(() => Maintain(lifetime.Token));
             using var testSocket = test ? new UdpClient(new IPEndPoint(IPAddress.Loopback, 0)) : null;
             bool hangOnStop = false;
             while (true)
@@ -193,5 +208,12 @@ internal static class RelayWorker
             }
         }
         catch { return 1; } // Never print IPC payloads, device codes or token contents.
+        finally
+        {
+            lifetime.Cancel();
+            // Process-owned cleanup stays bounded, including native failures.
+            try { await maintenance.WaitAsync(TimeSpan.FromSeconds(1)).ConfigureAwait(false); }
+            catch (Exception) { }
+        }
     }
 }

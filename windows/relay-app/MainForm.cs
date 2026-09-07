@@ -9,6 +9,7 @@ internal sealed class MainForm : Form
     private readonly RelayBackend backend;
     private readonly AppSettings settings;
     private readonly FloatingDepositForm floating = new();
+    private readonly FloatingDepositForm floatingAuto2 = new(autoCraft: true);
     private readonly System.Windows.Forms.Timer pollTimer = new() { Interval = 500 };
     private readonly System.Windows.Forms.Timer configTimer = new() { Interval = 250 };
     private readonly System.Windows.Forms.Timer overlayTimer = new() { Interval = 250 };
@@ -31,6 +32,14 @@ internal sealed class MainForm : Form
     private readonly CheckBox totem = Check("Автототем");
     private readonly CheckBox floatingEnabled = Check("Панель поверх окон, в том числе Minecraft и сундуков");
     private readonly CheckBox detailed = Check("Подробный журнал");
+    private readonly CheckBox auto2 = Check("Включить Авто 2 · крафт с NBT и разгрузка в сундуки");
+    private readonly TrackBar craftSpeed = new() { Minimum = 0, Maximum = 98, TickStyle = TickStyle.None, Width = 734, Height = 48 };
+    private readonly TrackBar windowSpeed = new() { Minimum = 0, Maximum = 27, TickStyle = TickStyle.None, Width = 734, Height = 48 };
+    private readonly Label craftSpeedLabel = Label("");
+    private readonly Label windowSpeedLabel = Label("");
+    private readonly Label auto2Status = Label("Выберите NBT в библиотеке и включите NBT-крафт. Авто 2 запускается только кнопкой.");
+    private readonly Button auto2Toggle = Button("▶  Запустить Авто 2", true);
+    private bool auto2CommandPending, auto2Busy, upstreamReady;
     private readonly TrackBar speed = new() { Minimum = 0, Maximum = 297, TickFrequency = 30, Width = 600, Height = 48 };
     private readonly Label speedLabel = Label("Пауза между переносами: 1000 мс");
     private readonly Label depositStatus = Label("Разгрузка выключена");
@@ -57,7 +66,7 @@ internal sealed class MainForm : Form
         backend = testBackend ?? new RelayBackend();
         lifecycleTest = testBackend != null;
         settings = preview ? new AppSettings() : AppSettings.Load();
-        Text = "CPE Relay — Windows 1.0.2";
+        Text = "CPE Relay — Windows 1.1.0";
         AutoScaleMode = AutoScaleMode.Dpi;
         Font = new Font("Segoe UI", 10);
         Size = new Size(1080, 790); MinimumSize = new Size(860, 700);
@@ -74,7 +83,7 @@ internal sealed class MainForm : Form
             var button = new RelayButton { Text = names[i], Navigation = true, Width = 194, Height = 51, Margin = new Padding(0, 0, 0, 7) };
             button.Click += (_, _) => SelectPage(page); navigation.Add(button); nav.Controls.Add(button);
         }
-        var signature = new Label { Text = "LOCAL RELAY\nWindows x64  /  1.0.2", Dock = DockStyle.Bottom, Height = 52, ForeColor = Theme.Muted, Padding = new Padding(13, 8, 0, 0), Font = new Font("Segoe UI", 9) };
+        var signature = new Label { Text = "LOCAL RELAY\nWindows x64  /  1.1.0", Dock = DockStyle.Bottom, Height = 52, ForeColor = Theme.Muted, Padding = new Padding(13, 8, 0, 0), Font = new Font("Segoe UI", 9) };
         sidebar.Controls.Add(nav); sidebar.Controls.Add(signature); sidebar.Controls.Add(brand);
         var footer = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 77, Padding = new Padding(26, 12, 0, 0), BackColor = Theme.Sidebar, WrapContents = false };
         footer.Controls.AddRange([start, stop, status, memory]);
@@ -90,20 +99,31 @@ internal sealed class MainForm : Form
         version.Items.Add(settings.Version); version.SelectedIndex = 0;
         deposit.Checked = settings.Deposit; hotbar.Checked = settings.Hotbar; armor.Checked = settings.Armor;
         totem.Checked = settings.Totem; detailed.Checked = settings.Logging; floatingEnabled.Checked = settings.FloatingButton;
+        auto2.Checked = settings.Auto2;
+        craftSpeed.Value = (5000 - AppSettings.ClampCraftInterval(settings.CraftIntervalMs)) / 50;
+        windowSpeed.Value = (3000 - AppSettings.ClampWindowPause(settings.WindowPauseMs)) / 100;
+        UpdateCraftSpeed();
+        craftSpeed.ValueChanged += (_, _) => { UpdateCraftSpeed(); ScheduleConfig(); };
+        windowSpeed.ValueChanged += (_, _) => { UpdateCraftSpeed(); ScheduleConfig(); };
         speed.Value = (3000 - AppSettings.ClampInterval(settings.IntervalMs)) / 10;
         UpdateSpeed();
         speed.ValueChanged += (_, _) => { UpdateSpeed(); ScheduleConfig(); };
-        foreach (var check in new[] { deposit, hotbar, armor, totem, detailed, floatingEnabled }) check.CheckedChanged += (_, _) => ScheduleConfig();
+        foreach (var check in new[] { deposit, hotbar, armor, totem, detailed, floatingEnabled, auto2 }) check.CheckedChanged += (_, _) => ScheduleConfig();
         start.Click += async (_, _) => await StartRelay();
         stop.Click += async (_, _) => await StopRelay();
         floating.Toggle = () => deposit.Checked = !deposit.Checked;
+        floatingAuto2.Toggle = async () => await ToggleAuto2();
+        auto2Toggle.Click += async (_, _) => await ToggleAuto2();
         configTimer.Tick += async (_, _) => { configTimer.Stop(); await ApplySettings(); };
         pollTimer.Tick += async (_, _) => await Poll();
-        overlayTimer.Tick += (_, _) => floating.UpdateVisibility(running && !closing && !stopping, floatingEnabled.Checked);
+        overlayTimer.Tick += (_, _) => {
+            floating.UpdateVisibility(running && !closing && !stopping, floatingEnabled.Checked);
+            floatingAuto2.UpdateVisibility(running && !closing && !stopping, floatingEnabled.Checked && (auto2.Checked || auto2Busy));
+        };
         if (!preview) overlayTimer.Start();
         Shown += async (_, _) => { if (!preview) await Initialize(); };
         FormClosing += OnClosing;
-        FormClosed += (_, _) => { pollTimer.Dispose(); configTimer.Dispose(); overlayTimer.Dispose(); floating.Dispose(); backend.Dispose(); };
+        FormClosed += (_, _) => { pollTimer.Dispose(); configTimer.Dispose(); overlayTimer.Dispose(); floating.Dispose(); floatingAuto2.Dispose(); backend.Dispose(); };
         RefreshFiles(); SetBusy(false);
     }
 
@@ -222,7 +242,7 @@ internal sealed class MainForm : Form
     private Panel BuildNbt()
     {
         var tab = new Panel(); var body = Stack(); tab.Controls.Add(body);
-        Heading(body, "Библиотека NBT", "Ваши шалкеры с ПК. Выберите файл — и используйте его при ручном крафте.");
+        Heading(body, "Библиотека NBT", "Ваши шалкеры с ПК — для ручного крафта и автоматического цикла Авто 2.");
         folderButton.Click += (_, _) => ChooseFolder();
         nbtFiles.SelectedIndexChanged += (_, _) => { if (nbtFiles.SelectedItem is string file) slot.Text = SlotFromFile(file); };
         nbtFiles.DrawMode = DrawMode.OwnerDrawFixed; nbtFiles.ItemHeight = 31;
@@ -244,7 +264,7 @@ internal sealed class MainForm : Form
         var off = Button("Выключить"); off.Click += async (_, _) => await NbtAction("nbt.off");
         Card(body, Section("КРАФТ  /  НЕПРЕРЫВНЫЙ РЕЖИМ"), Label("Имя слота · A–Z, цифры, _ или - · до 32 символов"),
             slot, Row(arm, save, off), nbtStatus, nbtFeedback,
-            Label("Создавайте шалкеры в верстаке вручную. Выбранный NBT применяется до выключения режима."));
+            Label("Выбранный NBT используется вручную или в Авто 2. Для автоматического цикла\nоткройте «Модули» или нажмите плавающую кнопку «Авто 2»."));
         Card(body, Section("БЫСТРЫЕ КОМАНДЫ"), Label(".nbt copy    ·    .nbt save имя    ·    .nbt craft имя    ·    .nbt off"));
         return tab;
     }
@@ -252,6 +272,12 @@ internal sealed class MainForm : Form
     {
         var tab = new Panel(); var body = Stack(); tab.Controls.Add(body);
         Heading(body, "Меньше действий.", "Настройте разгрузку и снаряжение под свой темп игры.");
+        var resetCraft = Button("Сбросить паузы");
+        resetCraft.Click += (_, _) => { craftSpeed.Value = 80; windowSpeed.Value = 23; };
+        Card(body, Section("АВТО 2  /  ВЕРСТАК → СУНДУКИ"), auto2, Row(auto2Toggle, resetCraft), auto2Status,
+            craftSpeedLabel, craftSpeed, windowSpeedLabel, windowSpeed,
+            Label("Вправо — быстрее. Крафт: 100–5000 мс. Переходы: 300–3000 мс.\nПолные сундуки пропускаются весь запуск. При исчерпании ресурсов или места цикл завершится."),
+            Label("Включите NBT-крафт в библиотеке. Раковины и сундуки должны быть в инвентаре.\nВерстак и сундуки — в пределах 4 блоков. Закройте меню Minecraft и нажмите «Старт»."));
         Card(body, Section("АВТОРАЗГРУЗКА ШАЛКЕРОВ"), deposit, hotbar, floatingEnabled,
             Label("Откройте сундук: используются только свободные ячейки."), depositStatus);
         speed.Width = 734; speed.TickStyle = TickStyle.None;
@@ -293,6 +319,11 @@ internal sealed class MainForm : Form
         finally { if (operation == lifecycle) SetBusy(false); }
     }
     private void UpdateSpeed() => speedLabel.Text = $"Пауза между переносами: {3000 - speed.Value * 10} мс";
+    private void UpdateCraftSpeed()
+    {
+        craftSpeedLabel.Text = $"Пауза между крафтами: {5000 - craftSpeed.Value * 50} мс";
+        windowSpeedLabel.Text = $"Пауза переходов между окнами: {3000 - windowSpeed.Value * 100} мс";
+    }
     private void ReadSettings()
     {
         settings.Host = host.Text.Trim(); settings.Port = (int)port.Value; settings.Version = version.Text;
@@ -300,6 +331,8 @@ internal sealed class MainForm : Form
         settings.NbtDirectory = directory.Text; settings.Deposit = deposit.Checked; settings.Hotbar = hotbar.Checked;
         settings.Armor = armor.Checked; settings.Totem = totem.Checked; settings.Logging = detailed.Checked;
         settings.FloatingButton = floatingEnabled.Checked; settings.IntervalMs = 3000 - speed.Value * 10;
+        settings.Auto2 = auto2.Checked; settings.CraftIntervalMs = 5000 - craftSpeed.Value * 50;
+        settings.WindowPauseMs = 3000 - windowSpeed.Value * 100;
     }
     private void ScheduleConfig() { if (!initialized || closing || stopping) return; configTimer.Stop(); configTimer.Start(); }
     private async Task<bool> ApplySettings()
@@ -309,7 +342,8 @@ internal sealed class MainForm : Form
         {
             ReadSettings(); if (!preview) settings.Save();
             await backend.Call(new { action = "configure", deposit = settings.Deposit, hotbar = settings.Hotbar,
-                armor = settings.Armor, totem = settings.Totem, logging = settings.Logging, intervalMs = settings.IntervalMs });
+                armor = settings.Armor, totem = settings.Totem, logging = settings.Logging, intervalMs = settings.IntervalMs,
+                auto2 = settings.Auto2, craftIntervalMs = settings.CraftIntervalMs, windowPauseMs = settings.WindowPauseMs });
             return !closing && !stopping;
         }
         catch (Exception error) { ShowError(error); return false; }
@@ -321,6 +355,33 @@ internal sealed class MainForm : Form
         stop.Enabled = !stopping && (starting || running);
         host.Enabled = port.Enabled = version.Enabled = folderButton.Enabled = !value && !running && !stopping;
         profile.Enabled = profiles.Enabled = !value && !running && !stopping;
+        auto2Toggle.Enabled = !auto2CommandPending && !value && !stopping && (auto2Busy || (upstreamReady && auto2.Checked));
+    }
+    private async Task ToggleAuto2()
+    {
+        if (auto2CommandPending || closing || stopping || !running) return;
+        int operation = lifecycle;
+        auto2CommandPending = true; floatingAuto2.SetCommandPending(true); auto2Toggle.Enabled = false;
+        try
+        {
+            if (!await ApplySettings() || operation != lifecycle) return;
+            var result = await backend.Call(new { action = "auto2.toggle" });
+            if (!closing && operation == lifecycle) { UpdateAuto2(result); AddLog("Авто 2: " + result.Text("status")); }
+        }
+        catch (Exception error) { ShowError(error); }
+        finally
+        {
+            auto2CommandPending = false;
+            if (!closing && !IsDisposed) { floatingAuto2.SetCommandPending(false); SetBusy(busy); await Poll(); }
+        }
+    }
+    private void UpdateAuto2(JsonElement value)
+    {
+        auto2Busy = value.Flag("busy");
+        auto2Toggle.Text = auto2Busy ? (value.Flag("running") ? "■  Остановить Авто 2" : "Завершение Авто 2…") : "▶  Запустить Авто 2";
+        auto2Status.Text = value.Text("status", "Авто 2 остановлено") +
+            (value.ValueKind == JsonValueKind.Object && value.TryGetProperty("crafted", out var crafted) && value.TryGetProperty("stored", out var stored) ?
+                $"\nКрафт: {crafted}  ·  В сундук: {stored}  ·  Шаблон: {value.Text("template", "—")}" : "");
     }
     private async Task StartRelay()
     {
@@ -348,13 +409,13 @@ internal sealed class MainForm : Form
     {
         if (closing || stopping) return;
         ++lifecycle; stopping = true;
-        pollTimer.Stop(); configTimer.Stop(); floating.Hide();
+        pollTimer.Stop(); configTimer.Stop(); floating.Hide(); floatingAuto2.Hide();
         SetBusy(true); status.Text = "Остановка…";
         try
         {
             bool forced = await backend.StopAsync();
             if (closing) return;
-            running = false; status.Text = "Реле остановлено";
+            running = false; upstreamReady = false; auto2Busy = false; status.Text = "Реле остановлено";
             auth.Text = "При первом входе Minecraft здесь появится код Microsoft.";
             nbtStatus.Text = "NBT-крафт выключен";
             AddLog(forced ? "Ядро не ответило за 3 секунды и было завершено. Можно запустить реле снова." : "Реле остановлено.");
@@ -392,6 +453,7 @@ internal sealed class MainForm : Form
     private void UpdateState(JsonElement state)
     {
         running = state.Flag("running");
+        upstreamReady = state.Flag("upstreamReady");
         if (!busy) status.Text = !running ? "Реле остановлено" : state.Flag("upstreamReady") ? "Подключено к серверу" :
             state.Flag("upstreamStarted") ? "Авторизация / подключение к серверу" : "Ожидание Minecraft";
         if (state.Flag("upstreamReady")) auth.Text = "Вход выполнен. Код больше не нужен.";
@@ -399,6 +461,8 @@ internal sealed class MainForm : Form
         if (state.TryGetProperty("shulkerDeposit", out var value))
             depositStatus.Text = value.Flag("supported") ? value.Text("status") + "  ·  Отправлено: " + value.GetProperty("sent") + "  ·  Подтверждено: " + value.GetProperty("confirmed") : "Авторазгрузка недоступна для выбранного формата пакетов.";
         floating.UpdateIndicators(state, deposit.Checked);
+        UpdateAuto2(state.TryGetProperty("autoCraftStore", out var craft) ? craft : default);
+        floatingAuto2.UpdateIndicators(state, auto2.Checked);
         if (!busy) SetBusy(false);
     }
     private static string SlotFromFile(string file) => file.EndsWith(".cpenbt.json", StringComparison.OrdinalIgnoreCase)
@@ -513,7 +577,7 @@ internal sealed class MainForm : Form
         if ((preview && !lifecycleTest) || closeAllowed) return;
         e.Cancel = true;
         if (closing) return;
-        closing = true; ++lifecycle; pollTimer.Stop(); configTimer.Stop(); floating.Hide(); Hide(); Enabled = false;
+        closing = true; ++lifecycle; pollTimer.Stop(); configTimer.Stop(); floating.Hide(); floatingAuto2.Hide(); Hide(); Enabled = false;
         // A failed settings write must never skip shutdown, nor keep a window open.
         Task save = Task.CompletedTask;
         if (!preview)

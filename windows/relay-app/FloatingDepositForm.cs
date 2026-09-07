@@ -10,21 +10,25 @@ internal sealed class FloatingDepositForm : Form
     [DllImport("user32.dll")] private static extern IntPtr SendMessage(IntPtr window, int message, IntPtr wparam, IntPtr lparam);
     private readonly RelayButton button = new() { Dock = DockStyle.Fill, Text = "Разгрузка · ВЫКЛ" };
     private readonly Label detail = new() { Dock = DockStyle.Bottom, Height = 51, ForeColor = Theme.Muted, Padding = new Padding(8, 2, 8, 2) };
+    private readonly bool autoCraft;
+    private bool commandPending;
     internal Action? Toggle;
     protected override bool ShowWithoutActivation => true;
     protected override CreateParams CreateParams
     {
         get { var value = base.CreateParams; value.ExStyle |= 0x08000000 | 0x00000080; return value; }
     }
-    internal FloatingDepositForm()
+    internal FloatingDepositForm(bool autoCraft = false)
     {
-        Text = "CPE · Разгрузка";
+        this.autoCraft = autoCraft;
+        Text = autoCraft ? "CPE · Авто 2" : "CPE · Разгрузка";
         FormBorderStyle = FormBorderStyle.None;
         BackColor = Theme.Sidebar;
         ShowInTaskbar = false; TopMost = true;
         StartPosition = FormStartPosition.Manual;
         Size = new Size(340, 121);
         Location = new Point(Screen.PrimaryScreen!.WorkingArea.Right - Width - 30, 120);
+        if (autoCraft) { Top = 270; Height = 151; detail.Height = 81; button.Text = "Авто 2 · СТАРТ"; }
         Font = new Font("Segoe UI", 10);
         var handle = new Label { Text = "⋮⋮  CPE RELAY — перетащить", Dock = DockStyle.Top, Height = 24,
             ForeColor = Theme.Muted, BackColor = Theme.Sidebar, TextAlign = ContentAlignment.MiddleCenter };
@@ -34,6 +38,19 @@ internal sealed class FloatingDepositForm : Form
     }
     internal void UpdateIndicators(JsonElement state, bool requested)
     {
+        if (autoCraft)
+        {
+            bool present = state.TryGetProperty("autoCraftStore", out var craft);
+            bool active = present && craft.Flag("busy");
+            button.Enabled = !commandPending && (active || (requested && state.Flag("upstreamReady")));
+            button.Text = commandPending ? "Авто 2 · ПРИМЕНЕНИЕ…" : active ?
+                (craft.Flag("running") ? "Авто 2 · СТОП" : "Авто 2 · ЗАВЕРШЕНИЕ…") : "Авто 2 · СТАРТ";
+            bool selected = present && craft.Flag("running");
+            if (button.Selected != selected) { button.Selected = selected; button.Invalidate(); }
+            detail.Text = present ? craft.Text("status") + "\nКрафт: " + craft.GetProperty("crafted") +
+                "  ·  В сундук: " + craft.GetProperty("stored") : "Ожидание Minecraft и выбранного NBT";
+            return;
+        }
         bool available = state.TryGetProperty("shulkerDeposit", out var value);
         bool enabled = available && value.Flag("enabled");
         bool supported = available && value.Flag("supported");
@@ -43,6 +60,11 @@ internal sealed class FloatingDepositForm : Form
         if (button.Selected != enabled) { button.Selected = enabled; button.Invalidate(); }
         detail.Text = available ? value.Text("status") + "\nОтправлено: " + value.GetProperty("sent") +
             "  ·  Подтверждено: " + value.GetProperty("confirmed") : "Ожидание состояния реле";
+    }
+    internal void SetCommandPending(bool pending)
+    {
+        commandPending = pending;
+        if (pending) { button.Enabled = false; button.Text = "Авто 2 · ПРИМЕНЕНИЕ…"; }
     }
     internal void UpdateVisibility(bool running, bool setting)
     {

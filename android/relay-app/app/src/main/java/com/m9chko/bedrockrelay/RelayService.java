@@ -81,6 +81,7 @@ public final class RelayService extends Service {
     public static final String KEY_AUTO_ARMOR = "auto_armor";
     public static final String KEY_AUTO_TOTEM = "auto_totem";
     public static final String KEY_SHULKER_DEPOSIT_ENABLED = "shulker_deposit_enabled";
+    public static final String KEY_AUTO_CRAFT_STORE_BUTTON = "auto_craft_store_button";
     public static final String KEY_SHULKER_DEPOSIT_HOTBAR = "shulker_deposit_hotbar";
     public static final String KEY_SHULKER_DEPOSIT_BUTTON = "shulker_deposit_button";
     public static final String KEY_SHULKER_DEPOSIT_INTERVAL_MS = "shulker_deposit_interval_ms";
@@ -211,6 +212,7 @@ public final class RelayService extends Service {
     private SchematicOverlayController schematicOverlayController;
     private AreaFillOverlayController areaFillOverlayController;
     private ShulkerDepositOverlayController depositOverlayController;
+    private ShulkerDepositOverlayController autoCraftOverlayController;
     private volatile boolean depositButtonSessionVisible;
     private SchematicRepository schematicRepository;
     private NbtTransferRepository nbtTransferRepository;
@@ -279,6 +281,14 @@ public final class RelayService extends Service {
         );
         depositOverlayController = new ShulkerDepositOverlayController(
             this, preferences, () -> applyRuntimeOptions(true));
+        autoCraftOverlayController = new ShulkerDepositOverlayController(this, preferences, () -> {
+            if (serviceStopping) return;
+            commandExecutor.execute(() -> {
+                if (serviceStopping) return;
+                try { NativeBridge.toggleAutoCraftStore(); }
+                catch (Throwable error) { DiagnosticsLog.appendError(this, "auto2", "Could not toggle Auto 2", error); }
+            });
+        }, true);
         reloadSchematicModel();
         // Marker encoding and queueing must never delay the relay packet
         // callback or camera polling. Fixed delay also prevents backlogs.
@@ -394,6 +404,7 @@ public final class RelayService extends Service {
         overlayShouldBeVisible = false;
         if (overlayController != null) overlayController.destroy();
         if (depositOverlayController != null) depositOverlayController.destroy();
+        if (autoCraftOverlayController != null) autoCraftOverlayController.destroy();
         if (entityOverlayController != null) {
             entityOverlayController.hideImmediately();
         }
@@ -1116,6 +1127,7 @@ public final class RelayService extends Service {
     private void updateOverlayGameplayStatus(JSONObject state) {
         JSONObject deposit = state.optJSONObject("shulkerDeposit");
         if (depositOverlayController != null) depositOverlayController.update(deposit);
+        if (autoCraftOverlayController != null) autoCraftOverlayController.update(state.optJSONObject("autoCraftStore"));
         if (overlayController != null) overlayController.updateDepositStatus(deposit);
         if (threatOverlayController != null) {
             threatOverlayController.updatePlayerState(state);
@@ -1392,6 +1404,10 @@ public final class RelayService extends Service {
         boolean shulkerDepositHotbar = preferences.getBoolean(KEY_SHULKER_DEPOSIT_HOTBAR, false);
         int shulkerDepositInterval = ShulkerDepositSettings.clampInterval(preferences.getInt(
             KEY_SHULKER_DEPOSIT_INTERVAL_MS, ShulkerDepositSettings.DEFAULT_INTERVAL_MS));
+        int autoCraftInterval = AutoCraftSettings.CRAFT.clamp(preferences.getInt(
+            AutoCraftSettings.CRAFT.key, AutoCraftSettings.CRAFT.defaultMs));
+        int autoCraftWindowPause = AutoCraftSettings.WINDOW.clamp(preferences.getInt(
+            AutoCraftSettings.WINDOW.key, AutoCraftSettings.WINDOW.defaultMs));
         boolean areaFillEnabled = preferences.getBoolean(
             KEY_AREA_FILL_ENABLED,
             false
@@ -1560,6 +1576,7 @@ public final class RelayService extends Service {
                 );
             }
             if (depositOverlayController != null) depositOverlayController.configure();
+            if (autoCraftOverlayController != null) autoCraftOverlayController.configure();
         });
         try {
             commandExecutor.execute(() -> {
@@ -1578,6 +1595,8 @@ public final class RelayService extends Service {
                     );
                     NativeBridge.configureShulkerDeposit(shulkerDeposit, shulkerDepositHotbar,
                         shulkerDepositInterval);
+                    NativeBridge.configureAutoCraftStore(preferences.getBoolean(KEY_AUTO_CRAFT_STORE_BUTTON, true),
+                        autoCraftInterval, autoCraftWindowPause);
                     NativeBridge.configureAreaFill(
                         areaFillEnabled,
                         areaFillPoints,
@@ -1658,6 +1677,8 @@ public final class RelayService extends Service {
             depositButtonSessionVisible = depositVisible;
             mainHandler.post(() -> {
                 if (depositOverlayController != null) depositOverlayController.setSessionVisible(
+                    overlayShouldBeVisible && !serviceStopping);
+                if (autoCraftOverlayController != null) autoCraftOverlayController.setSessionVisible(
                     overlayShouldBeVisible && !serviceStopping);
             });
         }

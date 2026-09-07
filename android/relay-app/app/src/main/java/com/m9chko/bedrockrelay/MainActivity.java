@@ -110,6 +110,7 @@ public final class MainActivity extends Activity {
     private final ExecutorService uiWorker = Executors.newSingleThreadExecutor();
     private final java.util.Map<String, Switch> moduleSwitches = new java.util.HashMap<>();
     private SeekBar depositSpeedSlider;
+    private AutoCraftSettingsControls autoCraftSettingsControls;
     private LinearLayout connectionPage;
     private LinearLayout logsPage;
     private TextView connectionTab;
@@ -190,6 +191,7 @@ public final class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         activityResumed = true;
+        if (autoCraftSettingsControls != null) autoCraftSettingsControls.refresh();
         for (java.util.Map.Entry<String, Switch> entry : moduleSwitches.entrySet()) {
             entry.getValue().setChecked(preferences.getBoolean(entry.getKey(), entry.getValue().isChecked()));
         }
@@ -396,6 +398,13 @@ public final class MainActivity extends Activity {
         addModule(content, "Авто-тотем", "Пополнение левой руки из инвентаря", RelayService.KEY_AUTO_TOTEM, false);
         addModule(content, "Авто-броня", "Выбор снаряжения из инвентаря", RelayService.KEY_AUTO_ARMOR, false);
         addModule(content, "Разгрузка шалкеров", "Автоматически в свободные слоты открытого сундука", RelayService.KEY_SHULKER_DEPOSIT_ENABLED, false);
+        addModule(content, "Автоматизация 2", "Плавающая кнопка: шалкеры с выбранным NBT → сундуки. Верстак и сундуки рядом, без ходьбы. Удержание кнопки — статус", RelayService.KEY_AUTO_CRAFT_STORE_BUTTON, true);
+        LinearLayout craftCard = card();
+        autoCraftSettingsControls = new AutoCraftSettingsControls(this, preferences, () -> {
+            if (relayRunning) startService(new Intent(this, RelayService.class).setAction(RelayService.ACTION_APPLY_SETTINGS));
+        });
+        craftCard.addView(autoCraftSettingsControls);
+        content.addView(craftCard, margins(-1, -2, 0, 0, 0, dp(8)));
         addModule(content, "Разгружать хотбар", "Включая шалкеры в нижних 9 слотах", RelayService.KEY_SHULKER_DEPOSIT_HOTBAR, false);
         addModule(content, "Кнопка разгрузки", "Не скрывается в сундуках · перетаскивается", RelayService.KEY_SHULKER_DEPOSIT_BUTTON, true);
         addDepositSpeed(content);

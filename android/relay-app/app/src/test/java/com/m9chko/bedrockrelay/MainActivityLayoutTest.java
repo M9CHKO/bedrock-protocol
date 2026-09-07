@@ -63,6 +63,8 @@ public class MainActivityLayoutTest {
                 navBounds.bottom <= height);
             modules.performClick();
             assertTrue(find(root, "Инструменты мира").getVisibility() == View.VISIBLE);
+            assertNotNull(root.findViewWithTag(AutoCraftSettings.CRAFT.key));
+            assertNotNull(root.findViewWithTag(AutoCraftSettings.WINDOW.key));
             View row = (View) find(root, "Авто-тотем").getParent().getParent();
             row.performClick();
             assertTrue(activity.getSharedPreferences(RelayService.PREFERENCES, Context.MODE_PRIVATE)

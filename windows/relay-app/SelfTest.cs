@@ -23,6 +23,7 @@ internal static class SelfTest
                 "Bundled native library, instructions and both block registries available at runtime");
             Require(AppSettings.ClampInterval(-1) == 30 && AppSettings.ClampInterval(5000) == 3000, "Speed bounds: 30–3000 ms");
             Require(AppSettings.ValidSlot("Weathertop_End_Nested") && !AppSettings.ValidSlot("../test") && !AppSettings.ValidSlot(new string('x', 33)), "Safe NBT slot names");
+            AutoCraftUiTests.Run(output, Require);
             using (var form = new MainForm(preview: true))
             {
                 form.StartPosition = FormStartPosition.Manual; form.Location = new Point(-15000, -15000);
@@ -77,13 +78,27 @@ internal static class SelfTest
                 if (fixture != null) File.Copy(fixture, Path.Combine(nbt, "test.qznbt"), true);
                 foreach (var version in new[] { "1.21.2", "1.21.100" })
                 {
-                    RelayBackend.Invoke(new { action = "configure", deposit = true, intervalMs = 30 });
+                    RelayBackend.Invoke(new { action = "configure", deposit = true, intervalMs = 30,
+                        auto2 = true, craftIntervalMs = 100, windowPauseMs = 300 });
                     string data = Path.Combine(AppContext.BaseDirectory, "minecraft-data", version);
                     var state = RelayBackend.Invoke(new { action = "start", host = "127.0.0.1", port = 19133, version, directory = root, nbtDirectory = nbt,
                         minecraftDataDirectory = Directory.Exists(data) ? data : "", authProfile = "Player 123" });
                     Require(state.Flag("running") && state.Flag("listening"), $"Native relay starts for {version} with Unicode data path");
                     Require(state.Flag("pingOk"), $"Native Winsock loopback verification for {version}");
                     Require(state.GetProperty("shulkerDeposit").Flag("supported"), $"Deposit compatibility gate for {version}");
+                    var craft = state.GetProperty("autoCraftStore");
+                    Require(!craft.Flag("busy") && craft.GetProperty("craftIntervalMs").GetInt32() == 100 &&
+                        craft.GetProperty("windowPauseMs").GetInt32() == 300, $"Auto 2 settings reach native core without autorun on {version}");
+                    craft = RelayBackend.Invoke(new { action = "auto2.toggle" });
+                    Require(!craft.Flag("busy") && craft.Text("status").Contains("NBT"), $"Auto 2 rejects missing NBT without opening a window on {version}");
+                    Require(RelayBackend.Invoke(new { action = "tick" }).Flag("ok"), "Maintenance tick is callable without an open GUI");
+                    RelayBackend.Invoke(new { action = "configure", auto2 = false, craftIntervalMs = -100, windowPauseMs = 50000 });
+                    craft = RelayBackend.Invoke(new { action = "snapshot" }).GetProperty("autoCraftStore");
+                    Require(craft.GetProperty("craftIntervalMs").GetInt32() == 100 && craft.GetProperty("windowPauseMs").GetInt32() == 3000,
+                        "Native API clamps Auto 2 timings");
+                    bool auto2Rejected = false;
+                    try { RelayBackend.Invoke(new { action = "auto2.toggle" }); } catch (InvalidOperationException) { auto2Rejected = true; }
+                    Require(auto2Rejected, "Disabled Auto 2 cannot be started through API");
                     using (var socket = new UdpClient(AddressFamily.InterNetwork))
                     {
                         socket.Client.ReceiveTimeout = 3000;

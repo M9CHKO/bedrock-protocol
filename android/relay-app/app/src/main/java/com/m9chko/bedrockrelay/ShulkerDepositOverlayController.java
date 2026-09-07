@@ -27,10 +27,22 @@ final class ShulkerDepositOverlayController {
     private WindowManager.LayoutParams params;
     private String status = "Откройте сундук";
     private int sent;
+    private final boolean autoCraft;
+    private boolean running;
+    private boolean busy;
+    private int crafted;
+    private String template = "";
+    private long lastClick;
 
     ShulkerDepositOverlayController(Context context, SharedPreferences preferences,
             Runnable settingsChanged) {
+        this(context, preferences, settingsChanged, false);
+    }
+
+    ShulkerDepositOverlayController(Context context, SharedPreferences preferences,
+            Runnable settingsChanged, boolean autoCraft) {
         this.context = context;
+        this.autoCraft = autoCraft;
         this.preferences = preferences;
         this.settingsChanged = settingsChanged;
         windows = (WindowManager) context.getSystemService(Context.WINDOW_SERVICE);
@@ -49,14 +61,22 @@ final class ShulkerDepositOverlayController {
 
     void update(JSONObject value) {
         if (value == null) return;
-        sent = value.optInt("sent", 0);
+        String previousStatus = status;
+        sent = value.optInt(autoCraft ? "stored" : "sent", 0);
+        crafted = value.optInt("crafted", 0);
+        template = value.optString("template", "");
+        running = value.optBoolean("running", false);
+        busy = value.optBoolean("busy", false);
         status = value.optString("status", status);
+        if (autoCraft && sessionVisible && !busy && !status.equals(previousStatus)) {
+            android.widget.Toast.makeText(context, status, android.widget.Toast.LENGTH_LONG).show();
+        }
         refreshText();
     }
 
     void configure() {
         if (shouldShow(sessionVisible, preferences.getBoolean(
-                RelayService.KEY_SHULKER_DEPOSIT_BUTTON, true))) addWindow();
+                autoCraft ? RelayService.KEY_AUTO_CRAFT_STORE_BUTTON : RelayService.KEY_SHULKER_DEPOSIT_BUTTON, true))) addWindow();
         else removeWindow();
         refreshText();
     }
@@ -74,13 +94,20 @@ final class ShulkerDepositOverlayController {
         button.setPadding(dp(8), dp(6), dp(8), dp(6));
         button.setElevation(dp(7));
         button.setOnClickListener(view -> {
+            if (autoCraft) {
+                long now = android.os.SystemClock.elapsedRealtime();
+                if (now - lastClick < 350) return;
+                lastClick = now;
+                settingsChanged.run(); return;
+            }
             boolean active = preferences.getBoolean(RelayService.KEY_SHULKER_DEPOSIT_ENABLED, false);
             preferences.edit().putBoolean(RelayService.KEY_SHULKER_DEPOSIT_ENABLED, !active).apply();
             settingsChanged.run();
             refreshText();
         });
         button.setOnLongClickListener(view -> {
-            android.widget.Toast.makeText(context, status, android.widget.Toast.LENGTH_LONG).show();
+            android.widget.Toast.makeText(context, (autoCraft && !template.isEmpty() ? "NBT: " + template + "\n" : "") +
+                status, android.widget.Toast.LENGTH_LONG).show();
             return true;
         });
         params = new WindowManager.LayoutParams(
@@ -91,8 +118,11 @@ final class ShulkerDepositOverlayController {
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT);
         params.gravity = Gravity.TOP | Gravity.START;
-        params.x = preferences.getInt(KEY_X, dp(12));
-        params.y = preferences.getInt(KEY_Y, dp(310));
+        params.x = preferences.getInt(autoCraft ? "auto2_button_x" : KEY_X, dp(autoCraft ? 140 : 12));
+        params.y = preferences.getInt(autoCraft ? "auto2_button_y" : KEY_Y, dp(310));
+        // Minecraft is usually landscape; keep a new/saved button onscreen.
+        params.x = Math.max(0, Math.min(params.x, context.getResources().getDisplayMetrics().widthPixels - dp(110)));
+        params.y = Math.max(0, Math.min(params.y, context.getResources().getDisplayMetrics().heightPixels - dp(70)));
         attachDrag();
         try { windows.addView(button, params); }
         catch (RuntimeException error) {
@@ -130,7 +160,8 @@ final class ShulkerDepositOverlayController {
                         }
                         return true;
                     case MotionEvent.ACTION_UP:
-                        if (dragged) preferences.edit().putInt(KEY_X, params.x).putInt(KEY_Y, params.y).apply();
+                        if (dragged) preferences.edit().putInt(autoCraft ? "auto2_button_x" : KEY_X, params.x)
+                            .putInt(autoCraft ? "auto2_button_y" : KEY_Y, params.y).apply();
                         else if (event.getEventTime() - downTime >= ViewConfiguration.getLongPressTimeout()) view.performLongClick();
                         else view.performClick();
                         return true;
@@ -143,11 +174,14 @@ final class ShulkerDepositOverlayController {
 
     private void refreshText() {
         if (button == null) return;
-        boolean enabled = preferences.getBoolean(RelayService.KEY_SHULKER_DEPOSIT_ENABLED, false);
-        String label = enabled ? "Разгрузка: ВКЛ\nОтправлено: " + sent : "Разгрузка: ВЫКЛ";
+        boolean enabled = autoCraft ? running : preferences.getBoolean(RelayService.KEY_SHULKER_DEPOSIT_ENABLED, false);
+        String label = autoCraft ? (busy ? (running ? "Авто 2: СТОП" : "Авто 2: завершение") +
+            "\nКрафт: " + crafted + " · В сундук: " + sent : "Авто 2: СТАРТ") :
+            enabled ? "Разгрузка: ВКЛ\nОтправлено: " + sent : "Разгрузка: ВЫКЛ";
         if (label.contentEquals(button.getText())) return;
         button.setText(label);
-        button.setContentDescription(label + ". Нажмите для переключения; удерживайте для статуса; перетащите для перемещения.");
+        button.setContentDescription(label + (autoCraft ? ". NBT: " + template : "") +
+            ". Нажмите для переключения; удерживайте для статуса; перетащите для перемещения.");
         GradientDrawable background = new GradientDrawable();
         background.setColor(enabled ? 0xe6256547 : 0xe62c3443);
         background.setCornerRadius(dp(12));

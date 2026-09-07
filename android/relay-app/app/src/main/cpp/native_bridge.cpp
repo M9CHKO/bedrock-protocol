@@ -6,6 +6,7 @@
 #include <bedrock/relay/ItemDurability.hpp>
 #include <bedrock/relay/AreaFillGeometry.hpp>
 #include <bedrock/relay/ShulkerDeposit.hpp>
+#include <bedrock/relay/AutoCraftStore.hpp>
 #include <bedrock/generated/GeneratedProtocolTypes.hpp>
 #include <bedrock/nbt/BedrockNbt.hpp>
 #include <bedrock/protodef/ProtoDefNbt.hpp>
@@ -83,6 +84,9 @@ std::atomic<bool> configuredAutoTotem {false};
 std::atomic<bool> configuredShulkerDeposit {false};
 std::atomic<bool> configuredShulkerDepositHotbar {false};
 std::atomic<int> configuredShulkerDepositIntervalMs {bedrock::ShulkerDeposit::DefaultIntervalMs};
+std::atomic<bool> configuredAutoCraftStore {true};
+std::atomic<int> configuredAutoCraftIntervalMs {1000};
+std::atomic<int> configuredAutoCraftWindowPauseMs {700};
 std::atomic<bool> configuredMiniMap {false};
 std::atomic<bool> configuredSchematic {false};
 std::atomic<bool> configuredAreaFill {false};
@@ -1218,6 +1222,23 @@ struct RelayState {
     bool playerInventoryReady = false;
     mutable std::mutex depositMutex;
     bedrock::ShulkerDeposit shulkerDeposit;
+    bedrock::AutoCraftStore autoCraftStore;
+    std::atomic<bool> autoCraftWorldTracking {false};
+    std::vector<std::pair<uint8_t, std::vector<uint8_t>>> autoCraftClientUpdates;
+    std::optional<bedrock::VersionedGamePacket> autoCraftClientClose; // depositMutex
+    struct AutoCraftTableRestore {
+        static constexpr uint64_t DelayMs = 500;
+        bedrock::AutoCraftStore::Target target;
+        std::string sessionId;
+        uint64_t readyAt = 0, sequence = 0;
+        bool clientClosed = false;
+        bool ready(uint64_t now) const { return clientClosed || now >= readyAt; }
+    };
+    std::optional<AutoCraftTableRestore> autoCraftTableRestore; // depositMutex
+    uint64_t autoCraftTableRestoreSequence = 0;
+    mutable std::mutex autoCraftTargetsMutex;
+    std::vector<bedrock::AutoCraftStore::Target> autoCraftKnownTargets;
+    std::optional<bedrock::AutoCraftStore::Target> autoCraftClickedTarget; // depositMutex
     std::optional<bedrock::ShulkerDeposit::Click> depositChestClick;
     uint64_t depositChestClickAt = 0;
     int32_t selectedHotbarSlot = -1;
@@ -1938,6 +1959,7 @@ struct RelayState {
     }
 
     void resetMiniMapWorld(int32_t dimension) noexcept {
+        { std::lock_guard lock(autoCraftTargetsMutex); autoCraftKnownTargets.clear(); }
         miniMapDimension.store(dimension, std::memory_order_relaxed);
         {
             std::lock_guard lock(miniMapMutex);
@@ -2294,7 +2316,9 @@ struct RelayState {
         // complete 192-block square could exhaust a mobile process during a
         // long session, so retain the nearest working set and let compact
         // minimap tiles preserve already-rendered surroundings.
-        while (schematicColumns.size() > MaximumDecodedWorldColumns) {
+        const bool autoCraftOnly = autoCraftWorldTracking.load() &&
+            !schematicEnabled.load() && !areaFillEnabled.load() && !miniMapEnabled.load();
+        while (schematicColumns.size() > (autoCraftOnly ? 9u : MaximumDecodedWorldColumns)) {
             auto farthest = schematicColumns.begin();
             int64_t farthestDistance = -1;
             uint64_t oldestRevision = std::numeric_limits<uint64_t>::max();
@@ -2847,7 +2871,7 @@ struct RelayState {
             }
             if (enabledChanged) ++areaFillRevision;
         }
-        const bool tracking = enabled ||
+        const bool tracking = enabled || autoCraftWorldTracking.load() ||
             schematicEnabled.load(std::memory_order_relaxed);
         const bool wasTracking = schematicWorldTrackingActive.exchange(
             tracking,
@@ -3381,6 +3405,11 @@ struct RelayState {
                     distanceSquared += 1'000'000;
                 }
             }
+            // Auto 2 only needs the 3x3 nearby columns. Do not copy or decode
+            // the rest of the view distance just to locate a workbench.
+            if (autoCraftWorldTracking.load() && !schematicEnabled.load() &&
+                !areaFillEnabled.load() && !miniMapEnabled.load() &&
+                packet.name == "level_chunk" && (!camera.known || distanceSquared > 2)) return;
             MiniMapChunkJob incoming {
                 version,
                 packet.name,
@@ -3757,6 +3786,13 @@ struct RelayState {
             const int32_t chunkX = packet.originX + entry.dx;
             const int32_t sectionY = packet.originY + entry.dy;
             const int32_t chunkZ = packet.originZ + entry.dz;
+            // The envelope origin need not be inside the nearby 3x3 area:
+            // relative entry offsets may still point to the player's chunk.
+            if (autoCraftWorldTracking.load() && !schematicEnabled.load() &&
+                !areaFillEnabled.load() && !miniMapEnabled.load() &&
+                (!camera.known || packet.dimension != miniMapDimension.load() ||
+                 std::abs(int64_t(chunkX)-cameraChunkX)>1 ||
+                 std::abs(int64_t(chunkZ)-cameraChunkZ)>1)) continue;
             std::optional<bedrock::BedrockSubChunk> decodedSection;
             std::string entryDecodeError;
             try {
@@ -4035,7 +4071,10 @@ struct RelayState {
                 std::shared_ptr<bedrock::BedrockChunkColumn> column;
                 try {
                     column = std::make_shared<bedrock::BedrockChunkColumn>(
-                        bedrock::BedrockLevelChunkCodec::decodeNoCacheColumn(
+                        (autoCraftWorldTracking.load() && !schematicEnabled.load() &&
+                         !areaFillEnabled.load() && !miniMapEnabled.load())
+                        ? bedrock::BedrockLevelChunkCodec::decodeNoCacheBlockSectionsFallback(packet, airRuntimeId)
+                        : bedrock::BedrockLevelChunkCodec::decodeNoCacheColumn(
                             packet,
                             versionAtLeast(job.version, 1, 18, 0),
                             airRuntimeId
@@ -4379,11 +4418,18 @@ struct RelayState {
             {
                 std::lock_guard depositLock(depositMutex);
                 shulkerDeposit.shulkerIds.clear();
+                shulkerDeposit.retainedIngredientIds.clear();
+                autoCraftStore.shellId = autoCraftStore.chestId = autoCraftStore.resultId = 0;
                 for (const auto& [id, name] : itemNames) {
+                    if (name == "minecraft:shulker_shell") autoCraftStore.shellId = static_cast<int32_t>(id);
+                    if (name == "minecraft:chest") autoCraftStore.chestId = static_cast<int32_t>(id);
+                    if (name == "minecraft:undyed_shulker_box") autoCraftStore.resultId = static_cast<int32_t>(id);
                     if (name == "minecraft:shulker_box" || name.ends_with("_shulker_box")) {
                         shulkerDeposit.shulkerIds.insert(static_cast<int32_t>(id));
                     }
                 }
+                if (autoCraftStore.shellId) shulkerDeposit.retainedIngredientIds.insert(autoCraftStore.shellId);
+                if (autoCraftStore.chestId) shulkerDeposit.retainedIngredientIds.insert(autoCraftStore.chestId);
             }
             bool equipmentChanged = false;
             for (auto& item : equipment) {
@@ -7623,19 +7669,325 @@ struct RelayState {
         );
     }
 
+    bool autoCraftBusy() const {
+        std::lock_guard lock(depositMutex);
+        return autoCraftStore.busy() || autoCraftTableRestore.has_value();
+    }
+
+    void rememberAutoCraftTarget(bedrock::AutoCraftStore::Target target) {
+        target.confirmedAt = steadyMilliseconds();
+        std::lock_guard lock(autoCraftTargetsMutex);
+        std::erase_if(autoCraftKnownTargets, [&](const auto& old) {
+            return old.key() == target.key() || target.confirmedAt - old.confirmedAt > bedrock::AutoCraftStore::TargetLifetimeMs;
+        });
+        if (autoCraftKnownTargets.size() >= 32) autoCraftKnownTargets.erase(autoCraftKnownTargets.begin());
+        autoCraftKnownTargets.push_back(target);
+    }
+
+    bool rememberedAutoCraftTarget(const bedrock::AutoCraftStore::Target& target) const {
+        const auto now = steadyMilliseconds();
+        std::lock_guard lock(autoCraftTargetsMutex);
+        return std::any_of(autoCraftKnownTargets.begin(), autoCraftKnownTargets.end(), [&](const auto& known) {
+            return known.key() == target.key() && known.runtime == target.runtime &&
+                now - known.confirmedAt <= bedrock::AutoCraftStore::TargetLifetimeMs;
+        });
+    }
+
+    std::vector<bedrock::AutoCraftStore::Target> autoCraftNearbyTargets() const {
+        std::vector<bedrock::AutoCraftStore::Target> targets;
+        const auto camera = entityPositions.cameraSnapshot();
+        if (!camera.known) return targets;
+        const int cx = static_cast<int>(std::floor(camera.x));
+        const int cy = static_cast<int>(std::floor(camera.y));
+        const int cz = static_cast<int>(std::floor(camera.z));
+        for (int x = cx - 4; x <= cx + 4; ++x)
+        for (int y = cy - 4; y <= cy + 4; ++y)
+        for (int z = cz - 4; z <= cz + 4; ++z) {
+            const auto sample = worldBlockSample(x, y, z);
+            if (!sample.known || sample.air) continue;
+            std::string name;
+            {
+                std::lock_guard lock(blockRegistryMutex);
+                const auto* block = blockRegistry ? blockRegistry->blockByRuntimeId(sample.runtimeId) : nullptr;
+                if (block) name = block->name;
+            }
+            if (name.starts_with("minecraft:")) name.erase(0, 10);
+            if (name != "crafting_table" && name != "chest" && name != "trapped_chest") continue;
+            // Conservative line-of-sight to an exposed face. Unknown cells
+            // count as blocked; never interact through unloaded chunks/walls.
+            for (int face = 0; face < 6; ++face) {
+                const double px = x + (face == 4 ? -0.01 : face == 5 ? 1.01 : 0.5);
+                const double py = y + (face == 0 ? -0.01 : face == 1 ? 1.01 : 0.5);
+                const double pz = z + (face == 2 ? -0.01 : face == 3 ? 1.01 : 0.5);
+                const double dx = px - camera.x, dy = py - camera.y, dz = pz - camera.z;
+                const double distance = std::sqrt(dx*dx + dy*dy + dz*dz);
+                if (distance > 4.25) continue;
+                const int steps = std::max(1, static_cast<int>(std::ceil(distance / 0.15)));
+                bool clear = true;
+                for (int i = 1; i <= steps; ++i) {
+                    const double t = double(i) / steps;
+                    const auto block = worldBlockSample(static_cast<int>(std::floor(camera.x + dx*t)),
+                        static_cast<int>(std::floor(camera.y + dy*t)), static_cast<int>(std::floor(camera.z + dz*t)));
+                    if (!block.known || !block.air) { clear = false; break; }
+                }
+                if (clear) { targets.push_back({x,y,z,sample.runtimeId,face,name != "crafting_table",distance}); break; }
+            }
+        }
+        // A manually clicked block followed by a matching server open is
+        // independent evidence when a chunk/air section is missing. Retain
+        // only tiny coordinates/IDs, never chest contents or nested NBT.
+        std::vector<bedrock::AutoCraftStore::Target> known;
+        { std::lock_guard lock(autoCraftTargetsMutex); known = autoCraftKnownTargets; }
+        const auto now = steadyMilliseconds();
+        for (auto candidate : known) {
+            if (now - candidate.confirmedAt > bedrock::AutoCraftStore::TargetLifetimeMs ||
+                std::any_of(targets.begin(), targets.end(), [&](const auto& t) { return t.key() == candidate.key(); })) continue;
+            const auto block = worldBlockSample(candidate.x, candidate.y, candidate.z);
+            if (block.known && block.runtimeId != candidate.runtime) continue;
+            const int face = candidate.face;
+            const double dx = candidate.x + (face == 4 ? -0.01 : face == 5 ? 1.01 : 0.5) - camera.x;
+            const double dy = candidate.y + (face == 0 ? -0.01 : face == 1 ? 1.01 : 0.5) - camera.y;
+            const double dz = candidate.z + (face == 2 ? -0.01 : face == 3 ? 1.01 : 0.5) - camera.z;
+            candidate.distance = std::sqrt(dx*dx + dy*dy + dz*dz);
+            if (candidate.distance > 4.25) continue;
+            const int steps = std::max(1, static_cast<int>(std::ceil(candidate.distance / 0.15)));
+            bool clear = true;
+            for (int i = 1; i <= steps; ++i) {
+                const double t = double(i)/steps;
+                const auto cell = worldBlockSample(static_cast<int>(std::floor(camera.x+dx*t)),
+                    static_cast<int>(std::floor(camera.y+dy*t)), static_cast<int>(std::floor(camera.z+dz*t)));
+                if (cell.known && !cell.air) { clear = false; break; }
+            }
+            if (clear) targets.push_back(candidate);
+        }
+        return targets;
+    }
+
+    bedrock::ShulkerDeposit::Slot prepareAutoCraftTemplate(
+        const bedrock::ProtoDefValue& extra, int32_t id, int32_t runtime) const {
+        using V = bedrock::ProtoDefValue;
+        bedrock::ProtoDefEncoder encoder([this](const std::string& name) {
+            return bedrock::generatedProtocolTypeJson(version, name);
+        });
+        encoder.setVariables(itemProtocolVariables->snapshot());
+        const auto schema = bedrock::generatedProtocolTypeJson(version, "Item");
+        if (!schema) throw std::runtime_error("Item schema unavailable");
+        bedrock::ProtoDefWriter writer;
+        encoder.encode(*schema, V::object({{"network_id", V::integer(id)}, {"count", V::integer(1)},
+            {"metadata", V::integer(0)}, {"has_stack_id", V::integer(0)},
+            {"block_runtime_id", V::integer(runtime)}, {"extra", extra}}), writer);
+        auto wire = std::make_shared<const std::vector<uint8_t>>(writer.take());
+        bedrock::PacketFieldCursor cursor(*wire); bedrock::ProtoDefReader reader(cursor);
+        return {bedrock::ShulkerDeposit::readItem(reader), wire, true};
+    }
+
+    void toggleAutoCraftStore() {
+        uint64_t revision;
+        {
+            std::lock_guard lock(depositMutex);
+            if (autoCraftStore.busy()) {
+                autoCraftStore.stop(shulkerDeposit, "Остановлено кнопкой", steadyMilliseconds());
+                return;
+            }
+            if (autoCraftTableRestore) {
+                autoCraftStore.status = "Дождитесь восстановления верстака";
+                return;
+            }
+            revision = autoCraftStore.revision;
+        }
+        bool otherAutomation = false;
+        std::shared_ptr<const bedrock::ProtoDefValue> extra;
+        std::string templateName;
+        {
+            std::lock_guard lock(mutex);
+            otherAutomation = areaFillRunning || pendingAutomationRequestId != 0 ||
+                automationInventorySessionOpen || automationInventoryOpenRequested;
+            if (nbtCraftArmed) extra = nbtCraftExtraCache;
+            templateName = nbtCraftSlot;
+        }
+        if (!extra || !nbtTestEndpointAllowed()) {
+            std::lock_guard lock(depositMutex);
+            autoCraftStore.status = "Сначала выберите NBT-файл или выполните .nbt craft имя";
+            return;
+        }
+        auto nearby = autoCraftNearbyTargets();
+        const auto camera = entityPositions.cameraSnapshot();
+        const auto runtime = schematicRuntimeId("minecraft:undyed_shulker_box");
+        int32_t resultId;
+        { std::lock_guard lock(depositMutex); resultId = autoCraftStore.resultId; }
+        bedrock::ShulkerDeposit::Slot prepared;
+        try { prepared = prepareAutoCraftTemplate(*extra, resultId, runtime.value_or(0)); }
+        catch (const std::exception& error) {
+            std::lock_guard lock(depositMutex);
+            autoCraftStore.status = "Не удалось подготовить NBT: " + safeMessage(error.what());
+            return;
+        }
+        std::lock_guard lock(depositMutex);
+        if (autoCraftStore.revision != revision) return;
+        if (otherAutomation || minecraftUiBlocked.load() || !camera.known) {
+            autoCraftStore.status = "Закройте меню/контейнер и остановите другие автоматизации";
+            return;
+        }
+        autoCraftStore.resultRuntime = runtime.value_or(0);
+        autoCraftStore.preparedResult = std::move(prepared);
+        autoCraftStore.templateName = std::move(templateName);
+        autoCraftStore.start(shulkerDeposit, std::move(nearby), camera.x, camera.y, camera.z, steadyMilliseconds());
+    }
+
+    bedrock::JsRuntimeValue autoCraftSnapshot() const {
+        using J = bedrock::JsRuntimeValue;
+        std::lock_guard lock(depositMutex);
+        return J::object({{"running", J::boolean(autoCraftStore.running)},
+            {"busy", J::boolean(autoCraftStore.busy() || autoCraftTableRestore.has_value())}, {"status", J::string(autoCraftStore.status)},
+            {"template", J::string(autoCraftStore.templateName)},
+            {"crafted", J::number(autoCraftStore.crafted)}, {"stored", J::number(autoCraftStore.stored)},
+            {"craftIntervalMs", J::number(autoCraftStore.craftIntervalMs)},
+            {"windowPauseMs", J::number(autoCraftStore.windowPauseMs)}});
+    }
+
+    void maybeInjectAutoCraft(const std::string& version, bedrock::BedrockRelayPacketEvent& event) noexcept {
+        if (event.canceled || (event.packet.name != "player_auth_input" && event.packet.name != "move_player") ||
+            !event.replacements.empty()) return;
+        try {
+            const auto camera = entityPositions.cameraSnapshot();
+            // Never nest the world-cache mutex under the inventory mutex:
+            // the UI snapshot takes the main-state lock before inventory.
+            std::optional<bedrock::AutoCraftStore::Target> nextTarget;
+            uint64_t revision;
+            {
+                std::lock_guard lock(depositMutex);
+                if (!autoCraftStore.busy() || autoCraftTableRestore) return;
+                nextTarget = autoCraftStore.nextTarget(); revision = autoCraftStore.revision;
+            }
+            const auto targetSample = nextTarget ? worldBlockSample(nextTarget->x, nextTarget->y, nextTarget->z) : WorldBlockSample{};
+            const bool remembered = nextTarget && rememberedAutoCraftTarget(*nextTarget);
+            std::lock_guard lock(depositMutex);
+            if (!autoCraftStore.busy() || autoCraftStore.revision != revision || autoCraftTableRestore) return;
+            const auto now = steadyMilliseconds();
+            const double dx = camera.x-autoCraftStore.startX, dy = camera.y-autoCraftStore.startY, dz = camera.z-autoCraftStore.startZ;
+            if (autoCraftStore.running && (!camera.known || dx*dx+dy*dy+dz*dz > 0.75*0.75))
+                autoCraftStore.stop(shulkerDeposit, "Игрок переместился — остановлено", now);
+            auto action = autoCraftStore.poll(shulkerDeposit, now);
+            using A = bedrock::AutoCraftStore::Action;
+            if (action.kind == A::None) return;
+            const auto codec = bedrock::VersionedMcpeCodec::forVersion(version);
+            std::vector<bedrock::VersionedGamePacket> packets {event.packet};
+            if (action.kind == A::Open) {
+                if (!nextTarget || nextTarget->key() != action.target.key() ||
+                    (targetSample.known ? targetSample.runtimeId != action.target.runtime : !remembered))
+                    throw std::runtime_error("Блок изменился или выгружен");
+                int hand = -1;
+                for (int i = 0; i < 9; ++i) if (shulkerDeposit.player[i].known &&
+                    (!shulkerDeposit.player[i].item.present() || shulkerDeposit.player[i].wire)) { hand = i; break; }
+                if (hand < 0) throw std::runtime_error("Оставьте свободный слот в хотбаре для открытия контейнеров");
+                const auto held = bedrock::AutoCraftStore::wire(shulkerDeposit.player[hand]);
+                bedrock::ProtoDefWriter equipment;
+                equipment.varuint64(camera.runtimeId); equipment.bytes(held);
+                equipment.u8(hand); equipment.u8(hand); equipment.u8(0);
+                packets.push_back(codec.packetCodec().makePacketByName("mob_equipment", equipment.take()));
+                bedrock::ProtoDefWriter click;
+                click.zigzag32(0); click.varuint32(2); click.varuint32(0); click.varuint32(0);
+                if (shulkerDeposit.modern) click.varuint32(1); // player_input
+                click.zigzag32(action.target.x); click.varuint32(static_cast<uint32_t>(action.target.y));
+                click.zigzag32(action.target.z); click.zigzag32(action.target.face); click.zigzag32(hand);
+                click.bytes(held); click.f32le(camera.x); click.f32le(camera.y); click.f32le(camera.z);
+                const int face = action.target.face;
+                click.f32le(face == 4 ? 0 : face == 5 ? 1 : 0.5f);
+                click.f32le(face == 0 ? 0 : face == 1 ? 1 : 0.5f);
+                click.f32le(face == 2 ? 0 : face == 3 ? 1 : 0.5f);
+                click.varuint32(static_cast<uint32_t>(action.target.runtime));
+                if (shulkerDeposit.modern) click.varuint32(1); // success
+                packets.push_back(codec.packetCodec().makePacketByName("inventory_transaction", click.take()));
+            } else if (action.kind == A::Close) {
+                // Ask Minecraft to close its GUI. Its genuine response is
+                // forwarded upstream; never impersonate that response first.
+                using V = bedrock::ProtoDefValue;
+                autoCraftClientClose = makeAreaProtocolPacket(version, "container_close", V::object({
+                    {"window_id", V::integer(static_cast<int8_t>(action.window))},
+                    {"window_type", V::integer(action.windowType)}, {"server", V::boolean(true)}}));
+            } else if (action.kind == A::CraftOne) {
+                for (const auto& bytes : action.transactions)
+                    packets.push_back(codec.packetCodec().makePacketByName("inventory_transaction", bytes));
+                autoCraftClientUpdates = std::move(action.updates);
+            } else if (action.kind == A::DepositOne) {
+                packets.push_back(codec.packetCodec().makePacketByName("inventory_transaction",
+                    bedrock::ShulkerDeposit::legacyPayload(*action.deposit)));
+            }
+            if (packets.size() > 1) event.replace(std::move(packets));
+        } catch (const std::exception& error) {
+            std::lock_guard lock(depositMutex);
+            // An encoding failure happened before event.replace: an open was
+            // not sent, so there is no server response to wait for.
+            if (autoCraftStore.stage == bedrock::AutoCraftStore::Stage::OpeningTable ||
+                autoCraftStore.stage == bedrock::AutoCraftStore::Stage::OpeningChest)
+                autoCraftStore.reset(shulkerDeposit);
+            autoCraftStore.stop(shulkerDeposit, "Ошибка Авто 2: " + safeMessage(error.what()), steadyMilliseconds());
+            shulkerDeposit.inventoryReady = false;
+            autoCraftClientUpdates.clear();
+            autoCraftClientClose.reset();
+        }
+    }
+
+    struct AutoCraftClosePlan {
+        std::vector<bedrock::VersionedGamePacket> packets;
+        bool restoreTable = false;
+    };
+
+    bedrock::VersionedGamePacket autoCraftBlockPacket(
+        const bedrock::AutoCraftStore::Target& target, int32_t runtime) const {
+        bedrock::ProtoDefWriter block;
+        block.zigzag32(target.x); block.varuint32(static_cast<uint32_t>(target.y)); block.zigzag32(target.z);
+        block.varuint32(static_cast<uint32_t>(runtime));
+        block.varuint32(1 | 2 | 16); // neighbours, network, priority
+        block.varuint32(0);
+        return bedrock::VersionedMcpeCodec::forVersion(version).packetCodec().makePacketByName("update_block", block.take());
+    }
+
+    bedrock::VersionedGamePacket autoCraftRestorePacket(const bedrock::AutoCraftStore::Target& target) const {
+        const auto current = worldBlockSample(target.x, target.y, target.z);
+        return autoCraftBlockPacket(target, current.known ? current.runtimeId : target.runtime);
+    }
+
+    AutoCraftClosePlan autoCraftClosePackets(
+        const bedrock::VersionedGamePacket& close, const bedrock::AutoCraftStore::Target& owned) const {
+        AutoCraftClosePlan plan{{close}, false};
+        if (close.payload.size() < 2 || close.payload[1] != 1) return plan;
+        // Workbench screens do not reliably respond to ContainerClose alone.
+        // Geyser's CraftingInventoryTranslator/BlockInventoryHolder uses the
+        // client-only block refresh. Do NOT restore in this same packet batch:
+        // allow Minecraft to process the absent block in a separate game tick.
+        // Never edit the server world or feed visual updates into our cache.
+        {
+            std::lock_guard lock(blockRegistryMutex);
+            if (!blockRegistry || !blockRegistry->blockByName("air"))
+                throw std::runtime_error("air runtime unavailable for workbench close");
+        }
+        // schematicRuntimeId intentionally rejects air (placement API).
+        const auto air = actualAirRuntimeId();
+        plan.packets.push_back(autoCraftBlockPacket(owned, air));
+        plan.restoreTable = true;
+        return plan;
+    }
+
     void recordDepositClick(const bedrock::ShulkerDeposit::Click& click) {
         bool chest = false;
+        bool table = false;
         {
             std::lock_guard lock(blockRegistryMutex);
             if (blockRegistry) {
                 const auto* block = blockRegistry->blockByRuntimeId(static_cast<int32_t>(click.runtimeId));
                 chest = block && (block->name == "chest" || block->name == "trapped_chest" ||
                     block->name == "minecraft:chest" || block->name == "minecraft:trapped_chest");
+                table = block && (block->name == "crafting_table" || block->name == "minecraft:crafting_table");
             }
         }
         std::lock_guard lock(depositMutex);
         depositChestClick = chest ? std::make_optional(click) : std::nullopt;
         depositChestClickAt = steadyMilliseconds();
+        autoCraftClickedTarget.reset();
+        if ((chest || table) && click.face >= 0 && click.face <= 5)
+            autoCraftClickedTarget = bedrock::AutoCraftStore::Target{click.x,click.y,click.z,
+                static_cast<int32_t>(click.runtimeId),click.face,chest,0,depositChestClickAt};
     }
 
     void observeDepositPacket(const bedrock::VersionedGamePacket& packet, bool serverbound) noexcept {
@@ -7643,17 +7995,32 @@ struct RelayState {
         try {
             if (serverbound && name == "inventory_transaction") {
                 std::optional<bedrock::ShulkerDeposit::Click> click;
+                std::string diagnostic;
                 {
                     std::lock_guard lock(depositMutex);
                     if (!shulkerDeposit.supported) return;
-                    click = shulkerDeposit.observeTransaction(packet.payload);
+                    bedrock::ShulkerDeposit::TransactionInfo info;
+                    click = shulkerDeposit.observeTransaction(packet.payload, &info);
+                    // An action-free TYPE_MISMATCH requests synchronization
+                    // after slot updates. It is not a click or an item move.
+                    // Forward it; actual server corrections still stop Auto 2.
+                    if (autoCraftStore.running && info.manual()) {
+                        diagnostic = "type=" + std::to_string(info.type) +
+                            " actions=" + std::to_string(info.actions) +
+                            " window=" + std::to_string(autoCraftStore.window);
+                        autoCraftStore.stop(shulkerDeposit,
+                            "Ручное действие — остановлено", steadyMilliseconds());
+                    }
                 }
+                if (!diagnostic.empty()) push("auto2_manual_action", diagnostic, "INFO", "automation");
                 if (click) recordDepositClick(*click);
                 return;
             }
             if (serverbound && name == "item_stack_request") {
                 std::lock_guard lock(depositMutex);
                 shulkerDeposit.manualInteraction();
+                if (autoCraftStore.running) autoCraftStore.stop(shulkerDeposit,
+                    "Ручной запрос инвентаря — остановлено", steadyMilliseconds());
                 return;
             }
             if (name == "container_close" && !packet.payload.empty()) {
@@ -7663,8 +8030,13 @@ struct RelayState {
             }
             if (!serverbound && name == "change_dimension") {
                 std::lock_guard lock(depositMutex);
+                autoCraftStore.reset(shulkerDeposit);
+                autoCraftClientUpdates.clear();
+                autoCraftClientClose.reset();
+                autoCraftTableRestore.reset();
                 shulkerDeposit.resetSession();
                 depositChestClick.reset();
+                autoCraftClickedTarget.reset();
                 return;
             }
             if (!serverbound && (name == "inventory_content" || name == "inventory_slot")) {
@@ -7675,6 +8047,10 @@ struct RelayState {
                     window != shulkerDeposit.window)) return;
                 shulkerDeposit.observeInventory(packet.payload, name == "inventory_content",
                     steadyMilliseconds());
+                if (autoCraftStore.running && window == 0)
+                    autoCraftStore.inventory(shulkerDeposit,
+                        bedrock::ShulkerDeposit::readInventory(packet.payload, name == "inventory_content", shulkerDeposit.modern),
+                        steadyMilliseconds());
             }
         } catch (const std::exception& error) {
             std::lock_guard lock(depositMutex);
@@ -7686,6 +8062,10 @@ struct RelayState {
 
     void configureDeposit(bool enabled, bool hotbar, int intervalMs) {
         std::lock_guard lock(depositMutex);
+        if (autoCraftStore.busy()) {
+            shulkerDeposit.intervalMs = bedrock::ShulkerDeposit::clampIntervalMs(intervalMs);
+            return;
+        }
         shulkerDeposit.configure(enabled, hotbar, steadyMilliseconds(), intervalMs);
     }
 
@@ -7777,6 +8157,34 @@ struct RelayState {
         if (serverbound && name == "set_player_inventory_options") {
             minecraftUiBlocked.store(true, std::memory_order_relaxed);
         } else if (name == "container_close") {
+            bool allowUiClear = true;
+            std::string diagnostic;
+            {
+                std::lock_guard lock(depositMutex);
+                const bool wasBusy = autoCraftStore.busy();
+                const auto owned = autoCraftStore.window;
+                const auto id = event.packet.payload.empty() ? 0 : event.packet.payload.front();
+                const bool matched = autoCraftStore.closed(shulkerDeposit, id, steadyMilliseconds(), serverbound);
+                // A server acknowledgement must not clear a still-open GUI
+                // or a newer window. Only Minecraft can confirm its closure.
+                if (wasBusy) allowUiClear = matched && serverbound;
+                if (matched && serverbound) {
+                    autoCraftClientClose.reset();
+                    if (autoCraftTableRestore) autoCraftTableRestore->clientClosed = true;
+                }
+                diagnostic = "direction=" + std::string(serverbound ? "serverbound" : "clientbound") +
+                    " id=" + std::to_string(id) + " owned=" + std::to_string(owned) +
+                    " type=" + (event.packet.payload.size() >= 2 ?
+                        std::to_string(static_cast<int8_t>(event.packet.payload[1])) : "missing") +
+                    " serverInitiated=" + (event.packet.payload.size() >= 3 ?
+                        (event.packet.payload[2] ? "true" : "false") : "missing") +
+                    " auto2=" + (wasBusy ? "true" : "false") +
+                    " matched=" + (matched ? "true" : "false") +
+                    " clientClosed=" + (autoCraftStore.clientClosed ? "true" : "false") +
+                    " serverClosed=" + (autoCraftStore.serverClosed ? "true" : "false");
+            }
+            if (!diagnostic.empty()) push("auto2_close", diagnostic, "INFO", "automation");
+            if (!allowUiClear) return;
             minecraftUiBlocked.store(false, std::memory_order_relaxed);
             std::lock_guard lock(mutex);
             openContainerWindowId = bedrock::ProtoDefValue::null();
@@ -7804,19 +8212,56 @@ struct RelayState {
                 );
                 const auto* windowId = decoded.value("window_id");
                 const auto* windowType = decoded.value("window_type");
+                std::optional<bedrock::AutoCraftStore::Target> confirmedTarget;
+                std::string openDiagnostic;
                 {
                     std::lock_guard lock(depositMutex);
                     const auto id = event.packet.payload.empty() ? 0 : event.packet.payload.front();
+                    const auto type = event.packet.payload.size() > 1 ? event.packet.payload[1] : 255;
+                    const auto x = static_cast<int32_t>(decoded.getInt("coordinates.x", INT32_MIN));
+                    const auto y = static_cast<int32_t>(decoded.getInt("coordinates.y", INT32_MIN));
+                    const auto z = static_cast<int32_t>(decoded.getInt("coordinates.z", INT32_MIN));
+                    const auto now = steadyMilliseconds();
                     const auto distance = depositChestClick ?
                         std::abs(decoded.getInt("coordinates.x", INT32_MIN) - depositChestClick->x) +
                         std::abs(decoded.getInt("coordinates.z", INT32_MIN) - depositChestClick->z) : INT64_MAX;
                     const bool matchingClick = depositChestClick && distance <= 1 &&
                         steadyMilliseconds() - depositChestClickAt < 5000 &&
                         decoded.getInt("coordinates.y", INT32_MIN) == depositChestClick->y;
-                    shulkerDeposit.open(id, matchingClick &&
-                        decoded.getString("window_type", "") == "container", steadyMilliseconds(), distance == 1);
+                    const bool wasBusy = autoCraftStore.busy();
+                    const auto expectedTarget = autoCraftStore.target;
+                    const bool accepted = autoCraftStore.opened(shulkerDeposit, id, type, x, y, z, now);
+                    if (accepted) confirmedTarget = expectedTarget;
+                    else {
+                        shulkerDeposit.open(id, matchingClick &&
+                            decoded.getString("window_type", "") == "container", steadyMilliseconds(), distance == 1);
+                    }
+                    if (autoCraftClickedTarget) {
+                        const auto& clicked = *autoCraftClickedTarget;
+                        const auto delta = std::abs(int64_t(x) - clicked.x) + std::abs(int64_t(z) - clicked.z);
+                        const bool validId = (id >= 1 && id <= 100) || (!clicked.chest && id == 255);
+                        if (validId && now - clicked.confirmedAt < 5000 && y == clicked.y &&
+                            delta <= (clicked.chest ? 1 : 0) && type == (clicked.chest ? 0 : 1))
+                            confirmedTarget = clicked;
+                    }
+                    if (wasBusy || confirmedTarget) {
+                        openDiagnostic = "id=" + std::to_string(id) + " type=" + std::to_string(type) +
+                            " position=" + std::to_string(x) + "," + std::to_string(y) + "," + std::to_string(z) +
+                            " auto2=" + (wasBusy ? "true" : "false") + " accepted=" + (accepted ? "true" : "false") +
+                            " remembered=" + (confirmedTarget ? "true" : "false");
+                        if (wasBusy) openDiagnostic += " expected=" + std::to_string(expectedTarget.x) + "," +
+                            std::to_string(expectedTarget.y) + "," + std::to_string(expectedTarget.z);
+                    }
                     depositChestClick.reset();
+                    autoCraftClickedTarget.reset();
                 }
+                // Never take world/main-state locks while holding depositMutex.
+                if (confirmedTarget) {
+                    observeSchematicBlockUpdate(confirmedTarget->x, confirmedTarget->y,
+                        confirmedTarget->z, confirmedTarget->runtime);
+                    rememberAutoCraftTarget(*confirmedTarget);
+                }
+                if (!openDiagnostic.empty()) push("auto2_open", openDiagnostic, "INFO", "automation");
                 if (windowId != nullptr && windowType != nullptr) {
                     std::lock_guard lock(mutex);
                     const bool automationOwned =
@@ -7859,9 +8304,14 @@ struct RelayState {
                 bedrock::RelayPacketEvent decoded(version, event);
                 {
                     std::lock_guard lock(depositMutex);
+                    autoCraftStore.reset(shulkerDeposit);
+                    autoCraftClientUpdates.clear();
+                    autoCraftClientClose.reset();
+                    autoCraftTableRestore.reset();
                     shulkerDeposit.resetSession();
                     shulkerDeposit.authoritative = decoded.getBool("server_authoritative_inventory", true);
                     depositChestClick.reset();
+                    autoCraftClickedTarget.reset();
                 }
                 configureBlockRuntimeIds(decoded.getBool(
                     "block_network_ids_are_hashes",
@@ -8665,8 +9115,13 @@ struct RelayState {
     void clearGameplayTelemetry() {
         {
             std::lock_guard lock(depositMutex);
+            autoCraftStore.reset(shulkerDeposit);
+            autoCraftClientUpdates.clear();
+            autoCraftClientClose.reset();
+            autoCraftTableRestore.reset();
             shulkerDeposit.resetSession();
             depositChestClick.reset();
+            autoCraftClickedTarget.reset();
         }
         minecraftUiBlocked.store(false, std::memory_order_relaxed);
         resetMiniMapWorld(0);
@@ -8752,7 +9207,7 @@ struct RelayState {
             miniMap,
             std::memory_order_relaxed
         );
-        const bool tracking = schematic ||
+        const bool tracking = schematic || autoCraftWorldTracking.load() ||
             areaFillEnabled.load(std::memory_order_relaxed);
         const bool wasTracking = schematicWorldTrackingActive.exchange(
             tracking,
@@ -9291,6 +9746,7 @@ bedrock::JsRuntimeValue snapshotValue(
             state->automationStatus
         )},
         {"shulkerDeposit", state->depositSnapshot()},
+        {"autoCraftStore", state->autoCraftSnapshot()},
         {"areaFill", state->areaFillSnapshotValueLocked()},
         {"playerHealthKnown", bedrock::JsRuntimeValue::boolean(
             state->playerHealthKnown
@@ -10363,7 +10819,9 @@ public:
                 queueNbtFeedback(*response);
                 return;
             }
-            state->maybeRewriteNbtCraft(version, event);
+            // Auto 2 owns a frozen template and must observe manual crafting
+            // before the independent .nbt craft rewriter can consume it.
+            if (!state->autoCraftBusy()) state->maybeRewriteNbtCraft(version, event);
             if (!event.replacements.empty()) {
                 // Craft replacement returns early, but the slot index still
                 // needs the final completed item (without decoding its NBT).
@@ -10392,6 +10850,8 @@ public:
                             !manualActions->arrayValue.empty())) {
                         std::lock_guard lock(state->depositMutex);
                         state->shulkerDeposit.manualInteraction();
+                        if (state->autoCraftStore.running) state->autoCraftStore.stop(state->shulkerDeposit,
+                            "Ручное действие — остановлено", steadyMilliseconds());
                     }
                     constexpr double Missing =
                         std::numeric_limits<double>::quiet_NaN();
@@ -10453,7 +10913,10 @@ public:
                 state->entityPositions.observeServerbound(event.packet);
             }
             state->observeDecodedGameplayPacket(version, event, true);
-            const bool areaFillOwnedPacket = state->maybeInjectAreaFill(
+            // Auto 2 owns inventory/container traffic until its final close.
+            // Do not interleave equipment swaps or area-fill placement with it.
+            const bool autoCraftOwnsPacket = state->autoCraftBusy();
+            const bool areaFillOwnedPacket = !autoCraftOwnsPacket && state->maybeInjectAreaFill(
                 version,
                 event
             );
@@ -10464,9 +10927,13 @@ public:
             if (areaFillOwnedPacket) {
                 syncAreaFillDownstreamMovement();
             } else {
-                state->maybeInjectAutomation(version, event);
-                state->maybeInjectDeposit(version, event);
+                if (state->autoCraftBusy()) state->maybeInjectAutoCraft(version, event);
+                else {
+                    state->maybeInjectAutomation(version, event);
+                    state->maybeInjectDeposit(version, event);
+                }
                 queueDepositUpdates(event.sessionId);
+                queueAutoCraftUpdates(event.sessionId);
             }
             if (isResourcePackTransportPacket(event.packet.name)) {
                 const auto sampleIndex =
@@ -10926,6 +11393,44 @@ public:
                 "WARN",
                 "destination"
             );
+        }
+    }
+
+    // Driven by the existing 100 ms Android worker, even while Minecraft's
+    // inventory screen sends no movement. No new thread or blocking sleep.
+    void restoreAutoCraftTable() noexcept {
+        try {
+            std::optional<RelayState::AutoCraftTableRestore> restore;
+            {
+                std::lock_guard lock(state_->depositMutex);
+                if (!state_->autoCraftTableRestore ||
+                    !state_->autoCraftTableRestore->ready(steadyMilliseconds())) return;
+                restore = state_->autoCraftTableRestore;
+            }
+            std::optional<bedrock::BedrockServerConnection> downstream;
+            {
+                std::lock_guard lock(schematicMarkerMutex_);
+                if (schematicDownstreamSessionId_ == restore->sessionId) downstream = schematicDownstream_;
+            }
+            if (!downstream) return; // session teardown clears pending state
+            // Use the latest known server block, not an unconditional table.
+            // World-cache lookup stays outside inventory/relay locks.
+            const auto packet = state_->autoCraftRestorePacket(restore->target);
+            {
+                std::lock_guard relayLock(relayMutex_);
+                std::lock_guard stateLock(state_->depositMutex);
+                const auto& pending = state_->autoCraftTableRestore;
+                if (!pending || pending->sequence != restore->sequence || pending->sessionId != restore->sessionId) return;
+                if (!relay_ || !relay_->live().queueClientboundPackets(*downstream, {packet})) return;
+                state_->autoCraftTableRestore.reset();
+            }
+            state_->push("auto2_table_restored", "direction=clientbound reason=" +
+                std::string(restore->clientClosed ? "client_closed" : "refresh_delay") +
+                " position=" + std::to_string(restore->target.x) + "," + std::to_string(restore->target.y) + "," +
+                std::to_string(restore->target.z), "INFO", "automation");
+        } catch (...) {
+            // Retain the single small restore record for the next worker
+            // tick. Never unblock new openings until restoration was queued.
         }
     }
 
@@ -11922,6 +12427,68 @@ private:
     bool loginWatchdogStopping_ = false;
     std::thread loginWatchdogThread_;
 
+    void queueAutoCraftUpdates(const std::string& sessionId) noexcept {
+        try {
+            restoreAutoCraftTable();
+            std::vector<std::pair<uint8_t, std::vector<uint8_t>>> updates;
+            std::optional<bedrock::VersionedGamePacket> close;
+            bedrock::AutoCraftStore::Target closeTarget;
+            bool modern;
+            {
+                std::lock_guard lock(state_->depositMutex);
+                updates = std::move(state_->autoCraftClientUpdates);
+                state_->autoCraftClientUpdates.clear();
+                close = std::move(state_->autoCraftClientClose);
+                state_->autoCraftClientClose.reset();
+                closeTarget = state_->autoCraftStore.target;
+                modern = state_->shulkerDeposit.modern;
+            }
+            if (updates.empty() && !close) return;
+            std::optional<bedrock::BedrockServerConnection> downstream;
+            {
+                std::lock_guard lock(schematicMarkerMutex_);
+                if (schematicDownstreamSessionId_ == sessionId) downstream = schematicDownstream_;
+            }
+            if (!downstream) throw std::runtime_error("downstream unavailable");
+            const auto codec = bedrock::VersionedMcpeCodec::forVersion(state_->version);
+            std::vector<bedrock::VersionedGamePacket> packets;
+            for (const auto& [slot, wire] : updates)
+                packets.push_back(codec.packetCodec().makePacketByName("inventory_slot",
+                    bedrock::ShulkerDeposit::slotPayload(0, slot, &wire, {}, 12, modern)));
+            const auto closePlan = close ? state_->autoCraftClosePackets(*close, closeTarget) :
+                RelayState::AutoCraftClosePlan{};
+            bool sentClose = false;
+            {
+                std::lock_guard lock(relayMutex_);
+                std::lock_guard stateLock(state_->depositMutex);
+                const auto& m = state_->autoCraftStore;
+                if (close && m.stage == bedrock::AutoCraftStore::Stage::Closing &&
+                    m.closeSent && !m.clientClosed && !close->payload.empty() && close->payload.front() == m.window &&
+                    closeTarget.key() == m.target.key()) {
+                    packets.insert(packets.end(), closePlan.packets.begin(), closePlan.packets.end());
+                    sentClose = true;
+                }
+                if (packets.empty()) return;
+                if (!relay_ || !relay_->live().queueClientboundPackets(*downstream, packets))
+                    throw std::runtime_error("clientbound queue rejected Auto 2 update");
+                if (sentClose && closePlan.restoreTable) {
+                    state_->autoCraftTableRestore = RelayState::AutoCraftTableRestore{closeTarget, sessionId,
+                        steadyMilliseconds() + RelayState::AutoCraftTableRestore::DelayMs,
+                        ++state_->autoCraftTableRestoreSequence, false};
+                }
+            }
+            if (sentClose) state_->push("auto2_close_request", "direction=clientbound serverInitiated=true id=" +
+                std::to_string(close->payload.front()) + " type=" + std::to_string(close->payload[1]) +
+                " tableRefresh=" + (closePlan.restoreTable ? "true" : "false") +
+                " restoreDelayMs=" + std::to_string(closePlan.restoreTable ? RelayState::AutoCraftTableRestore::DelayMs : 0),
+                "INFO", "automation");
+        } catch (...) {
+            std::lock_guard lock(state_->depositMutex);
+            state_->autoCraftStore.reset(state_->shulkerDeposit);
+            state_->autoCraftStore.status = "Minecraft не получил обновление/закрытие окна — остановлено";
+        }
+    }
+
     void queueDepositUpdates(const std::string& sessionId) noexcept {
         try {
             std::optional<bedrock::ShulkerDeposit::Plan> update;
@@ -12453,6 +13020,8 @@ Java_com_m9chko_bedrockrelay_NativeBridge_startRelay(
     jstring minecraftDataDirectoryValue
 ) {
     auto state = std::make_shared<RelayState>();
+    state->autoCraftWorldTracking.store(configuredAutoCraftStore.load());
+    state->autoCraftStore.configureTiming(configuredAutoCraftIntervalMs.load(), configuredAutoCraftWindowPauseMs.load());
     state->configureRuntime(
         configuredDetailedLogging.load(std::memory_order_relaxed),
         configuredChunkRetention.load(std::memory_order_relaxed),
@@ -12713,6 +13282,40 @@ Java_com_m9chko_bedrockrelay_NativeBridge_configureRuntime(
             clampedRadius
         );
     }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_m9chko_bedrockrelay_NativeBridge_toggleAutoCraftStore(JNIEnv*, jclass) {
+    std::shared_ptr<RelayState> state;
+    { std::lock_guard lock(controllerMutex); state = currentState; }
+    if (state) {
+        try { state->toggleAutoCraftStore(); }
+        catch (const std::exception& error) {
+            std::lock_guard lock(state->depositMutex);
+            state->autoCraftStore.stop(state->shulkerDeposit,
+                "Не удалось запустить Авто 2: " + safeMessage(error.what()), steadyMilliseconds());
+        }
+    }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_m9chko_bedrockrelay_NativeBridge_configureAutoCraftStore(
+    JNIEnv*, jclass, jboolean enabled, jint craftMs, jint windowMs) {
+    configuredAutoCraftStore.store(enabled == JNI_TRUE);
+    configuredAutoCraftIntervalMs.store(bedrock::AutoCraftStore::clampCraftInterval(craftMs));
+    configuredAutoCraftWindowPauseMs.store(bedrock::AutoCraftStore::clampWindowPause(windowMs));
+    std::shared_ptr<RelayState> state;
+    { std::lock_guard lock(controllerMutex); state = currentState; }
+    if (!state) return;
+    state->autoCraftWorldTracking.store(enabled == JNI_TRUE);
+    {
+        std::lock_guard lock(state->depositMutex);
+        state->autoCraftStore.configureTiming(craftMs, windowMs);
+        if (enabled != JNI_TRUE && state->autoCraftStore.busy()) state->autoCraftStore.stop(state->shulkerDeposit,
+            "Авто 2 выключено в настройках", steadyMilliseconds());
+    }
+    state->configureGameplayFeatures(state->autoArmorEnabled.load(), state->autoTotemEnabled.load(),
+        state->miniMapEnabled.load(), state->schematicEnabled.load());
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -13153,13 +13756,16 @@ Java_com_m9chko_bedrockrelay_NativeBridge_replaceSchematicDebugMarkers(
 extern "C" JNIEXPORT void JNICALL
 Java_com_m9chko_bedrockrelay_NativeBridge_refreshAreaFillMarkers(JNIEnv*, jclass) {
     const bool requested = areaFillMarkerRefreshRequested.exchange(false, std::memory_order_relaxed);
-    if (!requested && !configuredAreaFill.load(std::memory_order_relaxed)) return;
     std::shared_ptr<RelayController> activeController;
     {
         std::lock_guard lock(controllerMutex);
         activeController = controller;
     }
-    if (activeController) activeController->refreshAreaFillDebugMarkers();
+    if (activeController) {
+        activeController->restoreAutoCraftTable();
+        if (requested || configuredAreaFill.load(std::memory_order_relaxed))
+            activeController->refreshAreaFillDebugMarkers();
+    }
 }
 
 extern "C" JNIEXPORT void JNICALL

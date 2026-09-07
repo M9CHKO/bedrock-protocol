@@ -5,9 +5,18 @@ Minecraft Bedrock Protocol Client Library for C++20
 Standalone Android 8+ relay app (no Termux), including a directly
 installable arm64 APK: [Android relay app](android/relay-app/README.md).
 
-Current Android build:
-[CPE Relay 1.3.0](android/relay-app/apk/CPE-Relay-v1.3.0-arm64-v8a-release-debug-signed.apk)
-([SHA-256](android/relay-app/apk/CPE-Relay-v1.3.0-arm64-v8a-release-debug-signed.apk.sha256)).
+Current builds:
+
+- [Windows 1.1.0 — standalone x64 EXE](https://github.com/M9CHKO/bedrock-protocol/releases/tag/windows-v1.1.0), no ZIP or separate .NET install. [Instructions](windows/relay-app/README.txt).
+- [Android 1.3.15 — arm64 APK](https://github.com/M9CHKO/bedrock-protocol/releases/tag/android-v1.3.15), Android 8+; optimized Release, debug-signed. [SHA-256](android/relay-app/apk/CPE-Relay-v1.3.15-arm64-v8a-release-debug-signed.apk.sha256).
+
+Both frontends include Auto 2 for Bedrock 1.21.2 and 1.21.100: craft shulkers
+with a selected NBT template, close the workbench, unload into nearby chests,
+and repeat until materials or chest space run out. Craft/window timing is
+configurable; full chests are remembered for the active run. Minecraft and
+server close confirmations gate the next window. Windows has a separate
+floating Auto 2 button that remains available in container screens.
+
 The Android frontend transparently carries server-required resource packs and
 adds an optional packet-derived HUD: entity projection, retained-chunk status,
 equipment and durability, mini-map, threat analysis, auto-equipment, polygonal

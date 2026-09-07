@@ -48,6 +48,8 @@ public final class NativeBridge {
     );
 
     public static native void configureShulkerDeposit(boolean enabled, boolean includeHotbar, int intervalMs);
+    public static native void configureAutoCraftStore(boolean enabled, int craftIntervalMs, int windowPauseMs);
+    public static native void toggleAutoCraftStore();
 
     public static native String areaFillSnapshot();
 

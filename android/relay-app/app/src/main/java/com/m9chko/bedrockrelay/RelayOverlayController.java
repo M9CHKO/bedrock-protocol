@@ -1615,6 +1615,13 @@ final class RelayOverlayController {
     }
 
     private void buildAutomationPage(LinearLayout root) {
+        root.addView(toggle("Автоматизация 2 · плавающая кнопка", RelayService.KEY_AUTO_CRAFT_STORE_BUTTON, true));
+        root.addView(settingLabel("Авто 2: крафт шалкеров с выбранным NBT → ближайшие сундуки → повтор. " +
+            "Встаньте у верстака и сундуков (до 4 блоков), закройте меню и нажмите СТАРТ. " +
+            "Удерживайте кнопку для статуса. Паузы крафта и смены окон — ниже. " +
+            "Сначала выберите NBT-файл или .nbt craft имя. Шаблон фиксируется при старте. " +
+            "Сервер должен поддерживать legacy-инвентарь."));
+        root.addView(new AutoCraftSettingsControls(context, preferences, settingsChanged));
         root.addView(toggle("Авторазгрузка шалкеров в сундук",
             RelayService.KEY_SHULKER_DEPOSIT_ENABLED, false));
         root.addView(toggle("Разгружать также хотбар",

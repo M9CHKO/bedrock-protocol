@@ -115,8 +115,10 @@ internal static class ShutdownTests
         floating.UpdateVisibility(true, false);
         require(!floating.Visible, "Floating panel preference hides it immediately");
         floating.Location = new Point(-15000, -15000); floating.Show();
+        var floatingAuto2 = Field<FloatingDepositForm>(form, "floatingAuto2");
+        floatingAuto2.Location = new Point(-15000, -15000); floatingAuto2.Show();
         form.Close();
-        require(!form.Visible && !floating.Visible, "Close immediately hides both main and floating windows");
+        require(!form.Visible && !floating.Visible && !floatingAuto2.Visible, "Close immediately hides main, deposit and Auto 2 floating windows");
         await WaitUntil(() => form.IsDisposed && Exited(restartedPid) && PortFree(port));
         require(true, "Close finishes and releases UDP even when native stop never returns");
 

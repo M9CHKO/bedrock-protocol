@@ -25,6 +25,12 @@ void desktopStop() {
 }
 DesktopValue desktopCall(const DesktopValue& request) {
     const auto action = stringProperty(request, "action");
+    if (action == "tick") {
+        std::shared_ptr<RelayController> active;
+        { std::lock_guard lock(controllerMutex); active = controller; }
+        if (active) active->restoreAutoCraftTable();
+        return DesktopValue::object({{"ok", DesktopValue::boolean(true)}});
+    }
     if (action == "versions") {
         auto result = DesktopValue::array();
         for (const auto& version : bedrock::versions()) result.push(DesktopValue::string(version));
@@ -51,6 +57,8 @@ DesktopValue desktopCall(const DesktopValue& request) {
             throw std::runtime_error("Нужны абсолютные пути к папкам");
         desktopStop();
         auto state = std::make_shared<RelayState>();
+        state->autoCraftWorldTracking.store(configuredAutoCraftStore.load());
+        state->autoCraftStore.configureTiming(configuredAutoCraftIntervalMs.load(), configuredAutoCraftWindowPauseMs.load());
         state->destinationHost = host;
         state->destinationPort = static_cast<uint16_t>(port);
         state->version = version;
@@ -86,10 +94,23 @@ DesktopValue desktopCall(const DesktopValue& request) {
         const bool totem = desktopBool(request, "totem");
         const bool logging = desktopBool(request, "logging");
         const int delay = bedrock::ShulkerDeposit::clampIntervalMs(desktopInt(request, "intervalMs", 1000));
+        const bool auto2 = desktopBool(request, "auto2");
+        const int craftMs = bedrock::AutoCraftStore::clampCraftInterval(desktopInt(request, "craftIntervalMs", 1000));
+        const int windowMs = bedrock::AutoCraftStore::clampWindowPause(desktopInt(request, "windowPauseMs", 700));
+        configuredAutoCraftStore = auto2;
+        configuredAutoCraftIntervalMs = craftMs;
+        configuredAutoCraftWindowPauseMs = windowMs;
         configuredDetailedLogging = logging;
         configuredShulkerDeposit = deposit; configuredShulkerDepositHotbar = hotbar;
         configuredShulkerDepositIntervalMs = delay; configuredAutoArmor = armor; configuredAutoTotem = totem;
         if (state) {
+            state->autoCraftWorldTracking.store(auto2);
+            {
+                std::lock_guard lock(state->depositMutex);
+                state->autoCraftStore.configureTiming(craftMs, windowMs);
+                if (!auto2 && state->autoCraftStore.busy()) state->autoCraftStore.stop(state->shulkerDeposit,
+                    "Авто 2 выключено в настройках", steadyMilliseconds());
+            }
             state->configureDeposit(deposit, hotbar, delay);
             state->configureRuntime(logging, false, 24);
             state->configureGameplayFeatures(armor, totem, false, false);
@@ -106,6 +127,12 @@ DesktopValue desktopCall(const DesktopValue& request) {
         return events;
     }
     if (!state) throw std::runtime_error("Сначала запустите реле");
+    if (action == "auto2.toggle") {
+        if (!configuredAutoCraftStore.load() && !state->autoCraftBusy())
+            throw std::runtime_error("Включите Авто 2 в разделе «Модули»");
+        state->toggleAutoCraftStore();
+        return state->autoCraftSnapshot();
+    }
     auto slot = stringProperty(request, "slot");
     if (slot.empty()) slot = "default";
     if (action == "nbt.copy") return DesktopValue::string(state->copyHeldNbtToFile(slot));

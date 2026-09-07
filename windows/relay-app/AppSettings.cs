@@ -20,15 +20,22 @@ internal sealed class AppSettings
     public bool Totem { get; set; }
     public bool Logging { get; set; }
     public bool FloatingButton { get; set; } = true;
+    public bool Auto2 { get; set; } = true;
+    public int CraftIntervalMs { get; set; } = 1000;
+    public int WindowPauseMs { get; set; } = 700;
     public int IntervalMs { get; set; } = 1000;
     internal static bool ValidSlot(string name) => Regex.IsMatch(name, @"\A[A-Za-z0-9_-]{1,32}\z");
     internal static int ClampInterval(int value) => Math.Clamp(value, 30, 3000);
+    internal static int ClampCraftInterval(int value) => Math.Clamp(value, 100, 5000);
+    internal static int ClampWindowPause(int value) => Math.Clamp(value, 300, 3000);
     internal static AppSettings Load()
     {
         try
         {
             var value = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(SettingsFile)) ?? new();
             value.IntervalMs = ClampInterval(value.IntervalMs);
+            value.CraftIntervalMs = ClampCraftInterval(value.CraftIntervalMs);
+            value.WindowPauseMs = ClampWindowPause(value.WindowPauseMs);
             value.Port = Math.Clamp(value.Port, 1, 65535);
             if (!AuthProfiles.ValidName(value.AuthProfile)) value.AuthProfile = "default";
             if (string.IsNullOrWhiteSpace(value.NbtDirectory)) value.NbtDirectory = new AppSettings().NbtDirectory;

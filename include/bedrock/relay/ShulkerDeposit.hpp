@@ -51,6 +51,11 @@ public:
     struct Click {
         int32_t x = 0, y = 0, z = 0;
         uint32_t runtimeId = 0;
+        int32_t face = 1;
+    };
+    struct TransactionInfo {
+        uint32_t type = 0, actions = 0;
+        bool manual() const { return actions != 0 || type >= 2; }
     };
     struct Plan {
         uint32_t window = 0;
@@ -73,6 +78,9 @@ public:
     int intervalMs = DefaultIntervalMs;
     std::string status = "Выключено";
     std::set<int32_t> shulkerIds;
+    // Small crafting ingredients may be retained by AutoCraftStore. They are
+    // never deposit candidates and share the same bounded opaque-wire cache.
+    std::set<int32_t> retainedIngredientIds;
     std::array<Slot, 36> player {};
     std::vector<Slot> chest;
     std::optional<Plan> pending;
@@ -295,7 +303,7 @@ public:
     // Observe only slot headers of genuine client moves. This keeps legacy
     // inventory state current on servers which deliberately omit success
     // echoes. Opening/clicking a block is not a manual inventory move.
-    std::optional<Click> observeTransaction(const std::vector<uint8_t>& bytes) {
+    std::optional<Click> observeTransaction(const std::vector<uint8_t>& bytes, TransactionInfo* info = nullptr) {
         PacketFieldCursor cursor(bytes);
         ProtoDefReader reader(cursor);
         const auto legacy = reader.zigzag32();
@@ -334,7 +342,7 @@ public:
             value.x = reader.zigzag32();
             value.y = static_cast<int32_t>(reader.varuint32());
             value.z = reader.zigzag32();
-            reader.zigzag32(); // face
+            value.face = reader.zigzag32();
             reader.zigzag32(); // hotbar slot
             readItem(reader);
             reader.skip(24); // position + click position
@@ -343,6 +351,7 @@ public:
             if (action == 0) click = value;
         }
         if (type <= 2 && reader.remaining()) throw std::runtime_error("transaction trailing bytes");
+        if (info) *info = {type, count};
         if (window && count) manualInteraction();
         for (const auto& change : changes) {
             player[change.slot] = cacheItem(change.item, bytes, true);
@@ -530,7 +539,8 @@ private:
 
     Slot cacheItem(const Item& item, const std::vector<uint8_t>& bytes, bool retain) {
         Slot slot {item, {}, true};
-        if (retain && item.present() && shulkerIds.count(item.id)) {
+        if (retain && item.present() && (shulkerIds.count(item.id) ||
+            (retainedIngredientIds.count(item.id) && item.end - item.begin <= 4096))) {
             const auto length = item.end - item.begin;
             if (length <= MaximumCacheBytes && cachedBytes() <= MaximumCacheBytes - length) {
                 slot.wire = std::make_shared<const std::vector<uint8_t>>(
