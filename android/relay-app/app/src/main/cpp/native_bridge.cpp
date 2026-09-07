@@ -5252,10 +5252,12 @@ struct RelayState {
 
             bedrock::ProtoDefValue* destinationItem = nullptr;
             std::size_t destinationSlot = 0;
+            std::string destinationWindow;
             for (auto& action : actions->arrayValue) {
+                const auto inventoryId = objectString(action, "inventory_id");
                 if (action.kind != bedrock::ProtoDefValue::Kind::Object ||
                     objectString(action, "source_type") != "container" ||
-                    objectString(action, "inventory_id") != "inventory") {
+                    (inventoryId != "inventory" && inventoryId != "ui")) {
                     continue;
                 }
                 const auto oldItemIt = action.objectValue.find("old_item");
@@ -5269,14 +5271,37 @@ struct RelayState {
                 if (itemIsPresent(oldItem) || !itemIsPresent(newItem)) {
                     continue;
                 }
+                // The desktop DLL also accepts PlayerUIOnly: taking a recipe
+                // result onto the cursor does not add it to Inventory yet.
+                // Pair only the same genuine result, never an unrelated UI
+                // ingredient or another item added by this transaction.
+                if (packetInteger(newItem->get("network_id")).value_or(0) !=
+                        generatedNetworkId ||
+                    packetInteger(newItem->get("metadata")).value_or(0) !=
+                        packetInteger(generatedItem->get("metadata")).value_or(0) ||
+                    packetInteger(generatedItem->get("count")).value_or(0) <= 0 ||
+                    packetInteger(newItem->get("count")).value_or(0) !=
+                        packetInteger(generatedItem->get("count")).value_or(0)) {
+                    continue;
+                }
                 destinationItem = newItem;
+                destinationWindow = inventoryId;
                 destinationSlot = static_cast<std::size_t>(std::max<int64_t>(
                     0,
                     packetInteger(action.get("slot")).value_or(0)
                 ));
                 break;
             }
-            if (destinationItem == nullptr) return;
+            if (destinationItem == nullptr) {
+                push(
+                    "nbt_craft_skipped",
+                    "slot=" + slot + " reason=no_matching_inventory_or_ui_destination " +
+                        describeNbtCraftActions(*actions),
+                    "DEBUG",
+                    "nbt"
+                );
+                return;
+            }
 
             // Match the DLL Aether path: build one completed stack from the
             // genuine crafting-result side, attach the armed NBT, and use
@@ -5310,6 +5335,7 @@ struct RelayState {
                 "nbt_craft_rewritten",
                 "slot=" + slot +
                     " result=" + generatedName +
+                    " destinationWindow=" + destinationWindow +
                     " destinationSlot=" + std::to_string(destinationSlot) +
                     " actions=" + std::to_string(actions->arrayValue.size()) +
                     " mode=aether_file_continuous",

@@ -57,7 +57,7 @@ internal sealed class MainForm : Form
         backend = testBackend ?? new RelayBackend();
         lifecycleTest = testBackend != null;
         settings = preview ? new AppSettings() : AppSettings.Load();
-        Text = "CPE Relay — Windows 1.0.1";
+        Text = "CPE Relay — Windows 1.0.2";
         AutoScaleMode = AutoScaleMode.Dpi;
         Font = new Font("Segoe UI", 10);
         Size = new Size(1080, 790); MinimumSize = new Size(860, 700);
@@ -74,7 +74,7 @@ internal sealed class MainForm : Form
             var button = new RelayButton { Text = names[i], Navigation = true, Width = 194, Height = 51, Margin = new Padding(0, 0, 0, 7) };
             button.Click += (_, _) => SelectPage(page); navigation.Add(button); nav.Controls.Add(button);
         }
-        var signature = new Label { Text = "LOCAL RELAY\nWindows x64  /  1.0.1", Dock = DockStyle.Bottom, Height = 52, ForeColor = Theme.Muted, Padding = new Padding(13, 8, 0, 0), Font = new Font("Segoe UI", 9) };
+        var signature = new Label { Text = "LOCAL RELAY\nWindows x64  /  1.0.2", Dock = DockStyle.Bottom, Height = 52, ForeColor = Theme.Muted, Padding = new Padding(13, 8, 0, 0), Font = new Font("Segoe UI", 9) };
         sidebar.Controls.Add(nav); sidebar.Controls.Add(signature); sidebar.Controls.Add(brand);
         var footer = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 77, Padding = new Padding(26, 12, 0, 0), BackColor = Theme.Sidebar, WrapContents = false };
         footer.Controls.AddRange([start, stop, status, memory]);

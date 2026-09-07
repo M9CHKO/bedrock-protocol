@@ -149,6 +149,13 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_WINDOWS_APP)
     target_include_directories(cpe_relay_windows PRIVATE windows/relay-app/native)
     target_link_libraries(cpe_relay_windows PRIVATE BedrockProtocol::bedrock_protocol winhttp)
     set_target_properties(cpe_relay_windows PROPERTIES PREFIX "")
+
+    # Explicit local regression: exercises the shared production NBT handler
+    # without launching a relay or contacting a Minecraft server.
+    add_executable(relay-nbt-craft-smoke EXCLUDE_FROM_ALL tools/relay_nbt_craft_smoke.cpp)
+    target_compile_definitions(relay-nbt-craft-smoke PRIVATE BEDROCK_RELAY_WINDOWS=1 NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_include_directories(relay-nbt-craft-smoke PRIVATE windows/relay-app/native)
+    target_link_libraries(relay-nbt-craft-smoke PRIVATE BedrockProtocol::bedrock_protocol winhttp)
 endif()
 
 # Backward compatible target name for old local tests.
