@@ -54,7 +54,7 @@ DesktopValue desktopCall(const DesktopValue& request) {
         state->destinationHost = host;
         state->destinationPort = static_cast<uint16_t>(port);
         state->version = version;
-        state->shulkerDeposit.supported = bedrock::ShulkerDeposit::supports(version);
+        state->shulkerDeposit.setVersion(version);
         state->nbtTransferDirectory = std::filesystem::u8path(nbt);
         std::filesystem::create_directories(state->nbtTransferDirectory);
         const auto authDirectory = authProfile.empty() ? directory / "auth" : directory / "profiles" / authProfile / "auth";

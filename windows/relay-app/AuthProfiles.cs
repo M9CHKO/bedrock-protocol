@@ -46,13 +46,10 @@ internal static class AuthProfiles
         if (files.Length == 0 || files.Length > 32) throw new InvalidOperationException("Нужна папка одного профиля реле с файлами *-cache.json.");
         var result = new List<(string Suffix, byte[] Bytes)>();
         string? prefix = null; long total = 0;
-        foreach (string file in files)
+        try { foreach (string file in files)
         {
             var match = CacheName.Match(Path.GetFileName(file));
             if (!match.Success) continue;
-            if (prefix != null && prefix != match.Groups[1].Value.ToLowerInvariant())
-                throw new InvalidOperationException("В папке токены нескольких профилей. Выберите папку только одного аккаунта.");
-            prefix = match.Groups[1].Value.ToLowerInvariant();
             var info = new FileInfo(file); total += info.Length;
             if ((info.Attributes & FileAttributes.ReparsePoint) != 0 || info.Length > 4 * 1024 * 1024 || total > 8 * 1024 * 1024)
                 throw new InvalidOperationException("Недопустимый файл токенов или превышен размер 8 МиБ.");
@@ -63,32 +60,60 @@ internal static class AuthProfiles
             {
                 using var json = JsonDocument.Parse(bytes, new JsonDocumentOptions { MaxDepth = 64 });
                 if (json.RootElement.ValueKind != JsonValueKind.Object) throw new JsonException();
+                // Failed logins create empty placeholders under another key.
+                // They are not a second account and must not block an import.
+                if (!json.RootElement.EnumerateObject().Any()) { CryptographicOperations.ZeroMemory(bytes); continue; }
             }
-            catch (JsonException) { throw new InvalidOperationException("Повреждён JSON токенов. Содержимое скрыто из соображений безопасности."); }
+            catch (JsonException) { CryptographicOperations.ZeroMemory(bytes); throw new InvalidOperationException("Повреждён JSON токенов. Содержимое скрыто из соображений безопасности."); }
+            if (prefix != null && prefix != match.Groups[1].Value.ToLowerInvariant())
+            { CryptographicOperations.ZeroMemory(bytes); throw new InvalidOperationException("В папке токены нескольких профилей. Выберите папку только одного аккаунта."); }
+            prefix = match.Groups[1].Value.ToLowerInvariant();
             result.Add((match.Groups[2].Value.ToLowerInvariant() + "-cache.json", bytes));
         }
         if (!result.Any(x => x.Suffix == "live-cache.json"))
             throw new InvalidOperationException("Не найден live-cache.json. Нужен полный кэш авторизации Live из реле, не одиночный access token.");
         return result;
+        } catch { foreach (var entry in result) CryptographicOperations.ZeroMemory(entry.Bytes); throw; }
     }
-    internal static int Import(string source, string name, string? root = null)
+    private static void RejectLink(string path)
     {
-        string parent = root ?? Root;
+        if (Directory.Exists(path) && (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)
+            throw new InvalidOperationException("Папка профиля не должна быть ссылкой.");
+    }
+    internal static bool HasCache(string name, string? root = null)
+    {
+        if (!ValidName(name)) return false;
+        string path = Path.Combine(Folder(name, root), "auth", Hash(name) + "_live-cache.json");
+        return File.Exists(path) && new FileInfo(path).Length > 2;
+    }
+    internal static int Import(string source, string name, string? root = null, bool replaceExisting = false)
+    {
+        string parent = Path.GetFullPath(root ?? Root);
         string target = Folder(name, parent);
-        if (Directory.Exists(target)) throw new InvalidOperationException("Профиль уже существует. Укажите новое имя, чтобы сохранить прежние токены.");
+        if (Directory.Exists(target) && !replaceExisting) throw new InvalidOperationException("Профиль уже существует. Подтвердите загрузку с резервной копией или выберите новое имя.");
+        string auth = Path.Combine(target, "auth");
+        RejectLink(parent); RejectLink(target); RejectLink(auth);
         var cache = ReadCache(source); // Validate all input before creating the destination.
-        CreatePrivateDirectory(parent); CreatePrivateDirectory(target);
-        string auth = Path.Combine(target, "auth"); CreatePrivateDirectory(auth);
+        string stage = Path.Combine(target, "auth-import-" + Guid.NewGuid().ToString("N"));
+        string backup = Path.Combine(target, "auth-backup-" + DateTime.Now.ToString("yyyyMMdd-HHmmss") + "-" + Guid.NewGuid().ToString("N")[..8]);
+        bool backedUp = false;
         try
         {
+            CreatePrivateDirectory(parent); CreatePrivateDirectory(target); CreatePrivateDirectory(stage);
             foreach (var file in cache)
             {
-                string path = Path.Combine(auth, Hash(name) + "_" + file.Suffix);
+                string path = Path.Combine(stage, Hash(name) + "_" + file.Suffix);
                 using var output = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None);
                 output.Write(file.Bytes); output.Flush(true);
             }
+            // Only exact, validated children of this profile are moved. Keep
+            // the original directory intact until all new files are durable.
+            RejectLink(target); RejectLink(auth);
+            if (Directory.Exists(auth)) { Directory.Move(auth, backup); backedUp = true; }
+            try { Directory.Move(stage, auth); }
+            catch { if (backedUp && !Directory.Exists(auth)) Directory.Move(backup, auth); throw; }
         }
-        catch (IOException) { throw new InvalidOperationException("Не удалось записать профиль целиком. Не используйте его; повторите импорт под новым именем."); }
+        catch (IOException) { throw new InvalidOperationException("Не удалось загрузить профиль. Старые токены сохранены в auth или auth-backup; повторите после остановки реле."); }
         finally { foreach (var file in cache) CryptographicOperations.ZeroMemory(file.Bytes); }
         return cache.Count;
     }

@@ -1,5 +1,6 @@
 #include <bedrock/relay/ShulkerDeposit.hpp>
 #include <bedrock/protodef/ProtoDefPacketDecoder.hpp>
+#include <bedrock/protodef/ProtoDefPacketEncoder.hpp>
 #include <chrono>
 #include <iostream>
 
@@ -21,11 +22,11 @@ static Bytes item(int32_t id, std::size_t extra = 10) {
     return w.take();
 }
 
-static Bytes inventory(uint32_t window, const std::vector<Bytes>& items) {
+static Bytes inventory(uint32_t window, const std::vector<Bytes>& items, bool modern = true) {
     bedrock::ProtoDefWriter w;
     w.varuint32(window); w.varuint32(static_cast<uint32_t>(items.size()));
     for (const auto& value : items) w.bytes(value);
-    w.u8(window == 0 ? 12 : 7); w.boolValue(false); w.zigzag32(0);
+    if (modern) { w.u8(window == 0 ? 12 : 7); w.boolValue(false); w.zigzag32(0); }
     return w.take();
 }
 
@@ -278,8 +279,88 @@ static void speedTests() {
     require(d.poll(10030).has_value(), "pacing restarts at actual send time");
 }
 
+static void versionTests() {
+    // Container IDs corroborated against the PC DLL SDK ContainerID.h /
+    // InventorySource.h and DP1.cpp: player=0, offhand=119, armor=120,
+    // UI=124, combined stack container=12; don't substitute shell ID 582
+    // for an outer shulker. Item IDs are learned from each server's palette.
+    require(!Deposit::supports("unknown-version"), "unknown layout remains disabled");
+    for (const std::string version : {"1.21.2", "1.21.100"}) {
+        const bool modern = version == "1.21.100";
+        bedrock::ProtoDefPacketDecoder decoder(version);
+        bedrock::ProtoDefPacketEncoder encoder(version);
+        for (bool authoritative : {false, true}) {
+            Deposit d; d.setVersion(version); d.authoritative = authoritative;
+            require(d.supported && d.modern == modern, "correct version-specific layout");
+            // Deliberately use a server-assigned ID, not 205 / 218.
+            d.shulkerIds = {901}; d.configure(true, false, 0, 30);
+            auto player = std::vector<Bytes>(36, item(0));
+            player[9] = item(901); player[10] = item(901);
+            auto contents = inventory(0, player, modern);
+            decoder.decodePacketStrict("inventory_content", contents);
+            d.observeInventory(contents, true, 0);
+            bedrock::ProtoDefWriter click;
+            click.zigzag32(0); click.varuint32(2); click.varuint32(0); click.varuint32(0);
+            if (modern) click.varuint32(1);
+            click.zigzag32(-3); click.varuint32(64); click.zigzag32(17);
+            click.zigzag32(1); click.zigzag32(0); click.bytes(item(0));
+            click.bytes(Bytes(24, 0)); click.varuint32(777);
+            if (modern) click.varuint32(1);
+            const auto payload = click.take();
+            decoder.decodePacketStrict("inventory_transaction", payload);
+            auto observed = d.observeTransaction(payload);
+            require(observed && observed->x == -3 && observed->y == 64 && observed->z == 17 && observed->runtimeId == 777,
+                "version-specific chest click fields");
+            d.open(23, true, 0);
+            d.observeInventory(inventory(23, std::vector<Bytes>(54, item(0)), modern), true, 0);
+            auto plan = d.poll(400);
+            require(plan && plan->window == 23 && plan->source == 9 && plan->destination == 0 && plan->modern == modern,
+                "actual server window ID, not fixed first window");
+            decoder.decodePacketStrict("inventory_transaction", Deposit::legacyPayload(*plan));
+            const auto request = encoder.encodePacket("item_stack_request", Deposit::stackRequestValue(*plan));
+            decoder.decodePacketStrict("item_stack_request", request);
+            for (const auto& [name, expected] : std::vector<std::pair<std::string, int>>{{"armor", 6}, {"offhand", 34}}) {
+                auto equipment = Deposit::stackRequestValue(*plan);
+                auto& action = equipment.objectValue["requests"].arrayValue[0].objectValue["actions"].arrayValue[0];
+                action.objectValue["destination"] = Deposit::stackSlotValue(modern, name, 0, 0);
+                auto encoded = encoder.encodePacket("item_stack_request", equipment);
+                decoder.decodePacketStrict("item_stack_request", encoded);
+                bedrock::PacketFieldCursor cursor(encoded); bedrock::ProtoDefReader check(cursor);
+                check.varuint32(); check.zigzag32(); check.varuint32(); check.u8(); check.u8(); check.u8();
+                if (modern) check.u8();
+                check.u8(); check.zigzag32();
+                require(check.u8() == expected, "versioned armor/offhand stack container mapping");
+            }
+            // Check wire bytes independently: old slot type is a single byte;
+            // modern has a following optional dynamic-container flag.
+            bedrock::PacketFieldCursor requestCursor(request); bedrock::ProtoDefReader r(requestCursor);
+            require(r.varuint32() == 1 && r.zigzag32() == plan->requestId && r.varuint32() == 1 && r.u8() == 1 && r.u8() == 1,
+                "stack request header and place action");
+            require(r.u8() == 12, "combined inventory ID from PC DLL");
+            if (modern) require(r.u8() == 0, "modern source dynamic flag");
+            require(r.u8() == 9 && r.zigzag32() == 41 && r.u8() == 7, "source slot/stack ID and chest container ID");
+            if (modern) require(r.u8() == 0, "modern destination dynamic flag");
+            require(r.u8() == 0 && r.zigzag32() == 0, "empty destination slot");
+            const auto clear = Deposit::slotPayload(0, 9, nullptr, {}, 12, modern);
+            const auto filled = Deposit::slotPayload(23, 0, plan->item.wire.get(), {}, 7, modern);
+            decoder.decodePacketStrict("inventory_slot", clear); decoder.decodePacketStrict("inventory_slot", filled);
+            d.observeInventory(clear, false, 405); d.observeInventory(filled, false, 410);
+            require(d.confirmed == 1 && !d.poll(429) && d.poll(430), "echoed transfer continues at 30ms in both versions");
+            d.close(23);
+            require(!d.window && !d.pending && d.chest.empty(), "versioned chest close cleanup");
+        }
+        // Same opaque fast path for old-format full nested chests.
+        Deposit heavy; heavy.setVersion(version); heavy.open(2, true, 0);
+        auto nested = item(901, 220000); std::fill(nested.end() - 220000, nested.end(), 0xff);
+        const auto chest = inventory(2, std::vector<Bytes>(54, nested), modern);
+        for (int i = 0; i < 1000; ++i) heavy.observeInventory(chest, true, 0);
+        require(heavy.chestReady && heavy.cachedBytes() == 0, "both versions skip and never retain chest NBT");
+        std::cout << "version " << version << ": legacy + authoritative deposit, opaque 54-slot chest passed\n";
+    }
+}
+
 int main() {
-    try { stateTests(); legacyTests(); largeTests(); wholeInventoryTest(); speedTests(); }
+    try { stateTests(); legacyTests(); largeTests(); wholeInventoryTest(); speedTests(); versionTests(); }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
     std::cout << "Shulker deposit smoke passed\n";
 }

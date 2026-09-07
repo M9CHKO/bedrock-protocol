@@ -3,6 +3,7 @@
 #include <bedrock/generated/GeneratedProtocolTypes.hpp>
 #include <bedrock/protodef/ProtoDefReader.hpp>
 #include <bedrock/protodef/ProtoDefWriter.hpp>
+#include <bedrock/protodef/ProtoDefValue.hpp>
 #include <algorithm>
 #include <array>
 #include <memory>
@@ -57,12 +58,13 @@ public:
         uint8_t sourceContainer = 12, destinationContainer = 7;
         uint64_t generation = 0;
         int32_t requestId = 0;
-        bool authoritative = false;
+        bool authoritative = false, modern = true;
         std::optional<uint32_t> dynamicId;
         Slot item;
     };
 
     bool enabled = false, includeHotbar = false, supported = false;
+    bool modern = true;
     bool authoritative = false, inventoryReady = false, chestReady = false;
     bool stopped = false;
     uint32_t window = 0, sent = 0, confirmed = 0;
@@ -77,18 +79,29 @@ public:
     std::optional<Plan> clientUpdate;
     uint64_t pendingAt = 0;
 
-    static bool supports(const std::string& version) {
+    static bool matchesLayout(const std::string& version, const std::string& reference) {
         // Fail closed on a changed wire layout, rather than misreading NBT as
         // a slot index. The generated, bundled schema is the source of truth.
-        for (const char* type : {"Item", "ItemStacks", "FullContainerName",
+        for (const char* type : {"Item", "ItemStacks",
                 "packet_inventory_content", "packet_inventory_slot",
                 "TransactionActions", "TransactionLegacy", "TransactionUseItem",
-                "WindowIDZigzag32", "BlockCoordinates"}) {
+                "WindowIDZigzag32", "WindowIDVarint", "BlockCoordinates",
+                "StackRequestSlotInfo", "ContainerSlotType", "ItemStackRequest",
+                "packet_item_stack_request", "packet_item_stack_response"}) {
             const auto actual = generatedProtocolTypeJson(version, type);
-            const auto expected = generatedProtocolTypeJson("1.21.100", type);
+            const auto expected = generatedProtocolTypeJson(reference, type);
             if (!actual || !expected || *actual != *expected) return false;
         }
+        if (reference == "1.21.100" && generatedProtocolTypeJson(version, "FullContainerName") !=
+            generatedProtocolTypeJson(reference, "FullContainerName")) return false;
         return true;
+    }
+    static bool supports(const std::string& version) {
+        return matchesLayout(version, "1.21.100") || matchesLayout(version, "1.21.2");
+    }
+    void setVersion(const std::string& version) {
+        modern = matchesLayout(version, "1.21.100");
+        supported = modern || matchesLayout(version, "1.21.2");
     }
 
     static Item readItem(ProtoDefReader& reader) {
@@ -117,23 +130,22 @@ public:
         if (present) result.dynamicId = reader.u32le();
     }
 
-    static Inventory readInventory(const std::vector<uint8_t>& bytes, bool full) {
+    static Inventory readInventory(const std::vector<uint8_t>& bytes, bool full, bool modern = true) {
         PacketFieldCursor cursor(bytes);
         ProtoDefReader reader(cursor);
         Inventory result;
         result.full = full;
         result.window = reader.varuint32();
+        result.container = result.window == 0 ? 12 : 7;
         if (full) {
             const auto count = reader.varuint32();
             if (count > 54) throw std::runtime_error("unsupported inventory size");
             result.items.reserve(count);
             for (uint32_t i = 0; i < count; ++i) result.items.push_back(readItem(reader));
-            readContainer(reader, result);
-            readItem(reader); // storage item, also opaque
+            if (modern) { readContainer(reader, result); readItem(reader); } // opaque storage item
         } else {
             result.slot = reader.varuint32();
-            readContainer(reader, result);
-            readItem(reader);
+            if (modern) { readContainer(reader, result); readItem(reader); }
             result.items.push_back(readItem(reader));
         }
         if (reader.remaining()) throw std::runtime_error("inventory trailing bytes");
@@ -204,7 +216,7 @@ public:
     }
 
     void observeInventory(const std::vector<uint8_t>& bytes, bool full, uint64_t /*now*/) {
-        const auto update = readInventory(bytes, full);
+        const auto update = readInventory(bytes, full, modern);
         if (update.window != 0 && update.window != window) return;
         const bool own = update.window == 0;
         if (own && full && update.items.size() != player.size()) {
@@ -317,7 +329,7 @@ public:
         std::optional<Click> click;
         if (type == 2) {
             const auto action = reader.varuint32();
-            reader.varuint32(); // trigger
+            if (modern) reader.varuint32(); // trigger was added after 1.21.2
             Click value;
             value.x = reader.zigzag32();
             value.y = static_cast<int32_t>(reader.varuint32());
@@ -327,7 +339,7 @@ public:
             readItem(reader);
             reader.skip(24); // position + click position
             value.runtimeId = reader.varuint32();
-            reader.varuint32(); // prediction
+            if (modern) reader.varuint32(); // prediction
             if (action == 0) click = value;
         }
         if (type <= 2 && reader.remaining()) throw std::runtime_error("transaction trailing bytes");
@@ -399,6 +411,7 @@ public:
         plan.destinationContainer = chestContainerId;
         plan.item = player[source];
         plan.authoritative = authoritative;
+        plan.modern = modern;
         plan.dynamicId = chestDynamicId;
         plan.requestId = nextRequestId--;
         pending = plan;
@@ -453,16 +466,39 @@ public:
 
     static std::vector<uint8_t> slotPayload(uint32_t windowId, uint8_t slot,
         const std::vector<uint8_t>* item, std::optional<uint32_t> dynamicId = {},
-        uint8_t containerId = 255) {
+        uint8_t containerId = 255, bool modern = true) {
         ProtoDefWriter writer;
         writer.varuint32(windowId); writer.varuint32(slot);
-        writer.u8(containerId == 255 ? (windowId == 0 ? 12 : 7) : containerId);
-        writer.boolValue(dynamicId.has_value());
-        if (dynamicId) writer.u32le(*dynamicId);
-        writer.zigzag32(0); // storage_item
+        if (modern) {
+            writer.u8(containerId == 255 ? (windowId == 0 ? 12 : 7) : containerId);
+            writer.boolValue(dynamicId.has_value());
+            if (dynamicId) writer.u32le(*dynamicId);
+            writer.zigzag32(0); // storage_item
+        }
         if (item) writer.bytes(*item);
         else writer.zigzag32(0);
         return writer.take();
+    }
+
+    static ProtoDefValue stackSlotValue(bool modern, std::string name, uint8_t index,
+        int32_t id, std::optional<uint32_t> dynamic = {}) {
+        using Value = ProtoDefValue;
+        Value type = Value::string(std::move(name));
+        if (modern) type = Value::object({{"container_id", std::move(type)},
+            {"dynamic_container_id", dynamic ? Value::uinteger(*dynamic) : Value::null()}});
+        return Value::object({{"slot_type", std::move(type)}, {"slot", Value::uinteger(index)},
+            {"stack_id", Value::integer(id)}});
+    }
+    static ProtoDefValue stackRequestValue(const Plan& plan) {
+        using Value = ProtoDefValue;
+        return Value::object({{"requests", Value::array({Value::object({
+            {"request_id", Value::integer(plan.requestId)},
+            {"actions", Value::array({Value::object({{"type_id", Value::string("place")},
+                {"count", Value::uinteger(plan.item.item.count)},
+                {"source", stackSlotValue(plan.modern, "hotbar_and_inventory", plan.source, plan.item.item.stackId)},
+                {"destination", stackSlotValue(plan.modern, "container", plan.destination, 0, plan.dynamicId)}})})},
+            {"custom_names", Value::array({})}, {"cause", Value::string("chat_public")}
+        })})}});
     }
 
     std::size_t cachedBytes() const {

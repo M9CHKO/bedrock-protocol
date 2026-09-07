@@ -16,6 +16,11 @@ internal static class SelfTest
         void Require(bool value, string name) { if (!value) throw new InvalidOperationException(name); checks.Add(name); }
         try
         {
+            Require(File.Exists(Path.Combine(AppContext.BaseDirectory, "cpe_relay_windows.dll")) &&
+                File.Exists(Path.Combine(AppContext.BaseDirectory, "README.txt")) &&
+                File.Exists(Path.Combine(AppContext.BaseDirectory, "minecraft-data", "1.21.2", "blockStates.json")) &&
+                File.Exists(Path.Combine(AppContext.BaseDirectory, "minecraft-data", "1.21.100", "blockStates.json")),
+                "Bundled native library, instructions and both block registries available at runtime");
             Require(AppSettings.ClampInterval(-1) == 30 && AppSettings.ClampInterval(5000) == 3000, "Speed bounds: 30–3000 ms");
             Require(AppSettings.ValidSlot("Weathertop_End_Nested") && !AppSettings.ValidSlot("../test") && !AppSettings.ValidSlot(new string('x', 33)), "Safe NBT slot names");
             using (var form = new MainForm(preview: true))
@@ -37,7 +42,7 @@ internal static class SelfTest
             string cacheFixture = Path.Combine(output, "synthetic-cache"), profileRoot = Path.Combine(output, "synthetic-profiles");
             Directory.CreateDirectory(cacheFixture);
             File.WriteAllText(Path.Combine(cacheFixture, "abcdef_live-cache.json"), "{\"test\":\"not-a-real-token\"}");
-            File.WriteAllText(Path.Combine(cacheFixture, "abcdef_xbl-cache.json"), "{}");
+            File.WriteAllText(Path.Combine(cacheFixture, "abcdef_xbl-cache.json"), "{\"test\":true}");
             Require(AuthProfiles.Import(cacheFixture, "Player 123", profileRoot) == 2, "Import synthetic auth profile");
             Require(File.Exists(Path.Combine(profileRoot, "Player 123", "auth", AuthProfiles.Hash("Player 123") + "_live-cache.json")), "Imported cache filenames use selected profile key");
             bool overwriteRejected = false;
@@ -46,10 +51,18 @@ internal static class SelfTest
             string exportedRoot = Path.Combine(output, "synthetic-export");
             Require(AuthProfiles.Import(Path.Combine(profileRoot, "Player 123"), "Player 123", exportedRoot) == 2, "Profile export round-trip");
             File.WriteAllText(Path.Combine(cacheFixture, "123456_bed-cache.json"), "{}");
+            Require(AuthProfiles.Import(cacheFixture, "Player 123", profileRoot, replaceExisting: true) == 2, "Explicit import into existing profile ignores empty failed-login placeholders");
+            var backup = Directory.GetDirectories(Path.Combine(profileRoot, "Player 123"), "auth-backup-*").Single();
+            Require(File.ReadAllText(Path.Combine(backup, AuthProfiles.Hash("Player 123") + "_live-cache.json")) == "{\"test\":\"not-a-real-token\"}" && AuthProfiles.HasCache("Player 123", profileRoot), "Previous credentials are preserved and imported nickname key is ready");
+            File.WriteAllText(Path.Combine(cacheFixture, "123456_bed-cache.json"), "{\"differentAccount\":true}");
             bool mixedRejected = false;
             try { AuthProfiles.Import(cacheFixture, "Mixed", profileRoot); } catch (InvalidOperationException) { mixedRejected = true; }
             Require(mixedRejected && !Directory.Exists(Path.Combine(profileRoot, "Mixed")), "Mixed-account cache rejected before any destination writes");
-            if (!args.Contains("--preview-only"))
+            bool failedReplace = false;
+            try { AuthProfiles.Import(cacheFixture, "Player 123", profileRoot, replaceExisting: true); } catch (InvalidOperationException) { failedReplace = true; }
+            Require(failedReplace && AuthProfiles.HasCache("Player 123", profileRoot) && Directory.GetDirectories(Path.Combine(profileRoot, "Player 123"), "auth-backup-*").Length == 1, "Invalid replacement leaves active profile and backup untouched");
+            if (!args.Contains("--preview-only")) ShutdownTests.Run(output, Require);
+            if (!args.Contains("--preview-only") && !args.Contains("--shutdown-only"))
             {
                 var versions = RelayBackend.Invoke(new { action = "versions" });
                 Require(versions.EnumerateArray().Any(v => v.GetString() == "1.21.2"), "Native codec includes 1.21.2");
@@ -70,7 +83,7 @@ internal static class SelfTest
                         minecraftDataDirectory = Directory.Exists(data) ? data : "", authProfile = "Player 123" });
                     Require(state.Flag("running") && state.Flag("listening"), $"Native relay starts for {version} with Unicode data path");
                     Require(state.Flag("pingOk"), $"Native Winsock loopback verification for {version}");
-                    Require(state.GetProperty("shulkerDeposit").Flag("supported") == (version == "1.21.100"), $"Deposit compatibility gate for {version}");
+                    Require(state.GetProperty("shulkerDeposit").Flag("supported"), $"Deposit compatibility gate for {version}");
                     using (var socket = new UdpClient(AddressFamily.InterNetwork))
                     {
                         socket.Client.ReceiveTimeout = 3000;
@@ -103,6 +116,6 @@ internal static class SelfTest
             File.WriteAllText(Path.Combine(output, "result.json"), JsonSerializer.Serialize(new { ok = false, checks, error = error.ToString() }, new JsonSerializerOptions { WriteIndented = true }));
             return 1;
         }
-        finally { if (!args.Contains("--preview-only")) { try { RelayBackend.Invoke(new { action = "stop" }); } catch { } } }
+        finally { if (!args.Contains("--preview-only") && !args.Contains("--shutdown-only")) { try { RelayBackend.Invoke(new { action = "stop" }); } catch { } } }
     }
 }

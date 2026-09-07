@@ -6,11 +6,12 @@ namespace CpeRelay.Windows;
 
 internal sealed class MainForm : Form
 {
-    private readonly RelayBackend backend = new();
+    private readonly RelayBackend backend;
     private readonly AppSettings settings;
     private readonly FloatingDepositForm floating = new();
     private readonly System.Windows.Forms.Timer pollTimer = new() { Interval = 500 };
     private readonly System.Windows.Forms.Timer configTimer = new() { Interval = 250 };
+    private readonly System.Windows.Forms.Timer overlayTimer = new() { Interval = 250 };
     private readonly TextBox host = new() { Width = 370 };
     private readonly NumericUpDown port = new() { Minimum = 1, Maximum = 65535, Width = 125 };
     private readonly ComboBox version = new RelayComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 220 };
@@ -28,7 +29,7 @@ internal sealed class MainForm : Form
     private readonly CheckBox hotbar = Check("Включать шалкеры из хотбара (слоты 1–9)");
     private readonly CheckBox armor = Check("Автоброня");
     private readonly CheckBox totem = Check("Автототем");
-    private readonly CheckBox floatingEnabled = Check("Плавающая кнопка поверх Minecraft, в том числе в сундуках");
+    private readonly CheckBox floatingEnabled = Check("Панель поверх окон, в том числе Minecraft и сундуков");
     private readonly CheckBox detailed = Check("Подробный журнал");
     private readonly TrackBar speed = new() { Minimum = 0, Maximum = 297, TickFrequency = 30, Width = 600, Height = 48 };
     private readonly Label speedLabel = Label("Пауза между переносами: 1000 мс");
@@ -42,17 +43,21 @@ internal sealed class MainForm : Form
     private readonly Button start = Button("▶  Запустить реле", true);
     private readonly Button stop = Button("■  Остановить");
     private readonly Button folderButton = Button("Выбрать папку…");
-    private bool initialized, busy, polling, running, closing, closeAllowed;
+    private bool initialized, busy, polling, running, closing, closeAllowed, starting, stopping;
+    private int lifecycle;
     private readonly bool preview;
+    private readonly bool lifecycleTest;
     private readonly Panel pages = new() { Dock = DockStyle.Fill, BackColor = Theme.Background };
     private readonly List<RelayButton> navigation = [];
     private readonly List<Panel> screens = [];
 
-    internal MainForm(bool preview = false)
+    internal MainForm(bool preview = false, RelayBackend? testBackend = null)
     {
         this.preview = preview;
+        backend = testBackend ?? new RelayBackend();
+        lifecycleTest = testBackend != null;
         settings = preview ? new AppSettings() : AppSettings.Load();
-        Text = "CPE Relay — Windows";
+        Text = "CPE Relay — Windows 1.0.1";
         AutoScaleMode = AutoScaleMode.Dpi;
         Font = new Font("Segoe UI", 10);
         Size = new Size(1080, 790); MinimumSize = new Size(860, 700);
@@ -69,7 +74,7 @@ internal sealed class MainForm : Form
             var button = new RelayButton { Text = names[i], Navigation = true, Width = 194, Height = 51, Margin = new Padding(0, 0, 0, 7) };
             button.Click += (_, _) => SelectPage(page); navigation.Add(button); nav.Controls.Add(button);
         }
-        var signature = new Label { Text = "LOCAL RELAY\nWindows x64  /  1.0", Dock = DockStyle.Bottom, Height = 52, ForeColor = Theme.Muted, Padding = new Padding(13, 8, 0, 0), Font = new Font("Segoe UI", 9) };
+        var signature = new Label { Text = "LOCAL RELAY\nWindows x64  /  1.0.1", Dock = DockStyle.Bottom, Height = 52, ForeColor = Theme.Muted, Padding = new Padding(13, 8, 0, 0), Font = new Font("Segoe UI", 9) };
         sidebar.Controls.Add(nav); sidebar.Controls.Add(signature); sidebar.Controls.Add(brand);
         var footer = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 77, Padding = new Padding(26, 12, 0, 0), BackColor = Theme.Sidebar, WrapContents = false };
         footer.Controls.AddRange([start, stop, status, memory]);
@@ -94,9 +99,11 @@ internal sealed class MainForm : Form
         floating.Toggle = () => deposit.Checked = !deposit.Checked;
         configTimer.Tick += async (_, _) => { configTimer.Stop(); await ApplySettings(); };
         pollTimer.Tick += async (_, _) => await Poll();
+        overlayTimer.Tick += (_, _) => floating.UpdateVisibility(running && !closing && !stopping, floatingEnabled.Checked);
+        if (!preview) overlayTimer.Start();
         Shown += async (_, _) => { if (!preview) await Initialize(); };
         FormClosing += OnClosing;
-        FormClosed += (_, _) => { pollTimer.Dispose(); configTimer.Dispose(); floating.Dispose(); };
+        FormClosed += (_, _) => { pollTimer.Dispose(); configTimer.Dispose(); overlayTimer.Dispose(); floating.Dispose(); backend.Dispose(); };
         RefreshFiles(); SetBusy(false);
     }
 
@@ -142,10 +149,11 @@ internal sealed class MainForm : Form
             Label("Выберите версию установленной игры. Реле не преобразует протокол между версиями."));
         var launch = Button("Открыть Minecraft", true); launch.Click += (_, _) => OpenShell("minecraft://");
         var copy = Button("Копировать адрес"); copy.Click += (_, _) => Clipboard.SetText("127.0.0.1");
+        var help = Button("Инструкция"); help.Click += (_, _) => OpenShell(Path.Combine(AppContext.BaseDirectory, "README.txt"));
         Card(body, Section("02  /  ПОДКЛЮЧЕНИЕ ИГРЫ"),
             new Label { Text = "127.0.0.1  :  19132", AutoSize = true, ForeColor = Theme.Text, Font = new Font("Consolas", 21), Margin = new Padding(0, 0, 0, 9) },
             Label("Запустите реле кнопкой внизу. В Minecraft добавьте сервер с этим адресом и портом."),
-            Row(launch, copy), Label("Если Windows блокирует локальное подключение, откройте README.txt рядом с EXE."));
+            Row(launch, copy, help), Label("Если Windows блокирует локальное подключение, откройте «Инструкция»."));
         var login = Button("Открыть страницу входа"); login.Click += (_, _) => OpenShell("https://www.microsoft.com/link");
         Card(body, Section("03  /  MICROSOFT"), profileBadge, auth, login);
         return tab;
@@ -164,7 +172,7 @@ internal sealed class MainForm : Form
         var import = Button("Загрузить папку токенов", true); import.Click += async (_, _) => await TransferProfile(false);
         var export = Button("Сохранить папку…"); export.Click += async (_, _) => await TransferProfile(true);
         Card(body, Section("ПЕРЕНОС АВТОРИЗАЦИИ"), Row(import, export), profileFeedback,
-            Label("Импортируйте кэш реле с файлами *-cache.json. Нужен полный профиль Live, не одиночный токен.\nСначала остановите реле. Для импорта укажите новое имя: существующие профили не заменяются."));
+            Label("Импортируйте кэш реле с файлами *-cache.json. Нужен полный профиль Live, не одиночный токен.\nСначала остановите реле. Можно загрузить в существующий профиль: старый кэш останется в auth-backup."));
         body.Controls.Add(Label("Папка содержит доступ к аккаунту. Храните её у себя и никому не передавайте.\nИстёкшие или отозванные токены могут потребовать повторного входа Microsoft."));
         return tab;
     }
@@ -172,7 +180,9 @@ internal sealed class MainForm : Form
     {
         string name = profile.Text.Trim();
         profilePath.Text = AuthProfiles.ValidName(name) ? AuthProfiles.Folder(name) : "Укажите допустимое имя профиля.";
-        profileBadge.Text = "Профиль авторизации: " + name + "  ·  смена в разделе «Профили»";
+        bool cached = false;
+        try { cached = AuthProfiles.HasCache(name); } catch (Exception error) when (error is IOException or UnauthorizedAccessException) { }
+        profileBadge.Text = "Профиль: " + name + (cached ? "  ·  кэш найден (вход ещё не проверен)" : "  ·  кэш не загружен — выберите «Профили»");
     }
     private void RefreshProfiles()
     {
@@ -193,13 +203,18 @@ internal sealed class MainForm : Form
         if (!AuthProfiles.ValidName(name)) { ShowError(new InvalidOperationException("Сначала укажите допустимый ник/имя профиля.")); return; }
         using var dialog = new FolderBrowserDialog { Description = export ? "Куда сохранить папку с токенами? Не передавайте её другим." : "Папка профиля или auth с файлами *-cache.json", UseDescriptionForTitle = true };
         if (dialog.ShowDialog(this) != DialogResult.OK) return;
+        if (!export && Directory.Exists(AuthProfiles.Folder(name)) && MessageBox.Show(this,
+            $"Загрузить токены в профиль «{name}»? Прежняя папка auth будет сохранена рядом как auth-backup. После импорта этот профиль будет выбран для входа.",
+            "Загрузка профиля", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
         SetBusy(true);
         try
         {
             string selected = dialog.SelectedPath;
-            int count = await Task.Run(() => export ? AuthProfiles.Import(AuthProfiles.Folder(name), name, selected) : AuthProfiles.Import(selected, name));
+            int count = await Task.Run(() => export ? AuthProfiles.Import(AuthProfiles.Folder(name), name, selected) : AuthProfiles.Import(selected, name, replaceExisting: true));
+            if (closing) return;
+            profile.Text = name;
             profileFeedback.Text = export ? $"Сохранена папка «{name}» ({count} файлов). Храните её в секрете." : $"Загружен профиль «{name}» ({count} файлов). Можно запускать реле.";
-            RefreshProfiles(); ReadSettings(); settings.Save();
+            RefreshProfiles(); profiles.SelectedItem = name; UpdateProfilePath(); ReadSettings(); settings.Save();
         }
         catch (Exception error) { ShowError(error); }
         finally { SetBusy(false); }
@@ -261,18 +276,21 @@ internal sealed class MainForm : Form
     }
     private async Task Initialize()
     {
+        int operation = lifecycle;
         SetBusy(true);
         try
         {
             var versions = await backend.Call(new { action = "versions" });
+            if (closing || operation != lifecycle) return;
             version.Items.Clear();
             foreach (var value in versions.EnumerateArray()) version.Items.Add(value.GetString()!);
             version.SelectedItem = settings.Version;
             if (version.SelectedIndex < 0) version.SelectedIndex = version.Items.Count - 1;
-            initialized = true; await ApplySettings(); pollTimer.Start();
+            initialized = true; await ApplySettings();
+            if (!closing && operation == lifecycle) pollTimer.Start();
         }
         catch (Exception error) { ShowError(error); }
-        finally { SetBusy(false); }
+        finally { if (operation == lifecycle) SetBusy(false); }
     }
     private void UpdateSpeed() => speedLabel.Text = $"Пауза между переносами: {3000 - speed.Value * 10} мс";
     private void ReadSettings()
@@ -283,58 +301,76 @@ internal sealed class MainForm : Form
         settings.Armor = armor.Checked; settings.Totem = totem.Checked; settings.Logging = detailed.Checked;
         settings.FloatingButton = floatingEnabled.Checked; settings.IntervalMs = 3000 - speed.Value * 10;
     }
-    private void ScheduleConfig() { if (!initialized || closing) return; configTimer.Stop(); configTimer.Start(); }
-    private async Task ApplySettings()
+    private void ScheduleConfig() { if (!initialized || closing || stopping) return; configTimer.Stop(); configTimer.Start(); }
+    private async Task<bool> ApplySettings()
     {
+        if (closing || stopping) return false;
         try
         {
-            ReadSettings(); settings.Save();
+            ReadSettings(); if (!preview) settings.Save();
             await backend.Call(new { action = "configure", deposit = settings.Deposit, hotbar = settings.Hotbar,
                 armor = settings.Armor, totem = settings.Totem, logging = settings.Logging, intervalMs = settings.IntervalMs });
+            return !closing && !stopping;
         }
-        catch (Exception error) { ShowError(error); }
+        catch (Exception error) { ShowError(error); return false; }
     }
     private void SetBusy(bool value)
     {
-        busy = value; start.Enabled = !value && !running; stop.Enabled = !value && running;
-        host.Enabled = port.Enabled = version.Enabled = folderButton.Enabled = !value && !running;
-        profile.Enabled = profiles.Enabled = !value && !running;
+        if (closing || IsDisposed) return;
+        busy = value; start.Enabled = !value && !running && !stopping;
+        stop.Enabled = !stopping && (starting || running);
+        host.Enabled = port.Enabled = version.Enabled = folderButton.Enabled = !value && !running && !stopping;
+        profile.Enabled = profiles.Enabled = !value && !running && !stopping;
     }
     private async Task StartRelay()
     {
-        if (busy || !initialized) return;
+        if (busy || !initialized || closing || stopping) return;
+        int operation = ++lifecycle;
+        starting = true;
         SetBusy(true); status.Text = "Запуск…";
         try
         {
-            await ApplySettings();
-            AuthProfiles.Ensure(settings.AuthProfile);
+            if (!await ApplySettings() || closing || operation != lifecycle) return;
+            if (!preview) AuthProfiles.Ensure(settings.AuthProfile);
             string data = Path.Combine(AppContext.BaseDirectory, "minecraft-data", version.Text);
             if (!Directory.Exists(data)) data = "";
             var result = await backend.Call(new { action = "start", host = settings.Host, port = settings.Port,
                 version = settings.Version, directory = AppSettings.DirectoryPath, nbtDirectory = settings.NbtDirectory,
                 authProfile = settings.AuthProfile,
                 minecraftDataDirectory = data });
+            if (closing || operation != lifecycle) return;
             UpdateState(result); AddLog("Реле запущено. В Minecraft подключитесь к 127.0.0.1:19132.");
         }
-        catch (Exception error) { running = false; status.Text = "Ошибка запуска"; ShowError(error); }
-        finally { SetBusy(false); }
+        catch (Exception error) { if (!closing && operation == lifecycle) { running = false; status.Text = "Ошибка запуска"; ShowError(error); } }
+        finally { if (operation == lifecycle) { starting = false; SetBusy(false); } }
     }
     private async Task StopRelay()
     {
-        if (busy) return;
+        if (closing || stopping) return;
+        ++lifecycle; stopping = true;
+        pollTimer.Stop(); configTimer.Stop(); floating.Hide();
         SetBusy(true); status.Text = "Остановка…";
-        try { await backend.Call(new { action = "stop" }); running = false; status.Text = "Реле остановлено"; floating.Hide(); }
+        try
+        {
+            bool forced = await backend.StopAsync();
+            if (closing) return;
+            running = false; status.Text = "Реле остановлено";
+            auth.Text = "При первом входе Minecraft здесь появится код Microsoft.";
+            nbtStatus.Text = "NBT-крафт выключен";
+            AddLog(forced ? "Ядро не ответило за 3 секунды и было завершено. Можно запустить реле снова." : "Реле остановлено.");
+        }
         catch (Exception error) { ShowError(error); }
-        finally { SetBusy(false); }
+        finally { starting = false; stopping = false; SetBusy(false); if (!closing && initialized) pollTimer.Start(); }
     }
     private async Task Poll()
     {
-        if (polling || closing || preview) return;
+        if (polling || closing || stopping || preview) return;
+        int operation = lifecycle;
         polling = true;
         try
         {
             var result = await backend.Poll();
-            if (result is null || closing) return;
+            if (result is null || closing || stopping || operation != lifecycle) return;
             UpdateState(result.Value.State);
             var messages = new List<string>();
             foreach (var item in result.Value.Events.EnumerateArray())
@@ -348,20 +384,21 @@ internal sealed class MainForm : Form
             }
             AddLogs(messages);
             using var process = Process.GetCurrentProcess();
-            memory.Text = $"Память: {process.PrivateMemorySize64 / 1048576} МБ";
-            floating.UpdateState(running, deposit.Checked, floatingEnabled.Checked, this);
+            memory.Text = $"Окно: {process.PrivateMemorySize64 / 1048576} МБ";
         }
-        catch (Exception error) { AddLog(error.Message); }
+        catch (Exception error) { if (!closing && operation == lifecycle) AddLog(error.Message); }
         finally { polling = false; }
     }
     private void UpdateState(JsonElement state)
     {
         running = state.Flag("running");
-        if (!busy) status.Text = !running ? "Реле остановлено" : state.Flag("upstreamReady") ? "Подключено к серверу" : "Ожидание Minecraft";
+        if (!busy) status.Text = !running ? "Реле остановлено" : state.Flag("upstreamReady") ? "Подключено к серверу" :
+            state.Flag("upstreamStarted") ? "Авторизация / подключение к серверу" : "Ожидание Minecraft";
         if (state.Flag("upstreamReady")) auth.Text = "Вход выполнен. Код больше не нужен.";
         nbtStatus.Text = state.Flag("nbtCraftArmed") ? "NBT-крафт активен: " + state.Text("nbtCraftSlot") : "NBT-крафт выключен";
         if (state.TryGetProperty("shulkerDeposit", out var value))
-            depositStatus.Text = value.Flag("supported") ? value.Text("status") : "Авторазгрузка недоступна для выбранного протокола. Используйте 1.21.100.";
+            depositStatus.Text = value.Flag("supported") ? value.Text("status") + "  ·  Отправлено: " + value.GetProperty("sent") + "  ·  Подтверждено: " + value.GetProperty("confirmed") : "Авторазгрузка недоступна для выбранного формата пакетов.";
+        floating.UpdateIndicators(state, deposit.Checked);
         if (!busy) SetBusy(false);
     }
     private static string SlotFromFile(string file) => file.EndsWith(".cpenbt.json", StringComparison.OrdinalIgnoreCase)
@@ -462,6 +499,7 @@ internal sealed class MainForm : Form
     }
     private void ShowError(Exception error)
     {
+        if (closing || stopping || IsDisposed || error is OperationCanceledException) return;
         if (!preview) AddLog(error.Message);
         MessageBox.Show(this, error.Message, "CPE Relay", MessageBoxButtons.OK, MessageBoxIcon.Warning);
     }
@@ -472,12 +510,24 @@ internal sealed class MainForm : Form
     }
     private async void OnClosing(object? sender, FormClosingEventArgs e)
     {
-        if (preview || closeAllowed) return;
+        if ((preview && !lifecycleTest) || closeAllowed) return;
         e.Cancel = true;
         if (closing) return;
-        closing = true; pollTimer.Stop(); configTimer.Stop(); floating.Hide(); Enabled = false;
-        try { ReadSettings(); settings.Save(); await backend.Call(new { action = "stop" }); }
-        catch (Exception error) { LogStore.Append("Остановка: " + error.Message); }
-        finally { await LogStore.Finish(); closeAllowed = true; Close(); }
+        closing = true; ++lifecycle; pollTimer.Stop(); configTimer.Stop(); floating.Hide(); Hide(); Enabled = false;
+        // A failed settings write must never skip shutdown, nor keep a window open.
+        Task save = Task.CompletedTask;
+        if (!preview)
+        {
+            ReadSettings();
+            save = Task.Run(() => { try { settings.Save(); } catch (Exception error) { LogStore.Append("Настройки: " + error.Message); } });
+        }
+        try { await backend.StopAsync(); }
+        catch (Exception error) { if (!preview) LogStore.Append("Остановка: " + error.Message); }
+        finally
+        {
+            backend.Dispose();
+            if (!preview) { try { await Task.WhenAll(save, LogStore.Finish()).WaitAsync(TimeSpan.FromMilliseconds(500)); } catch { } }
+            closeAllowed = true; Close();
+        }
     }
 }

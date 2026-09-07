@@ -3,13 +3,20 @@ using System.Text.Json;
 
 namespace CpeRelay.Windows;
 
-internal sealed class RelayBackend
+internal sealed class RelayBackend : IDisposable
 {
     [DllImport("cpe_relay_windows.dll", CallingConvention = CallingConvention.Cdecl)]
     private static extern IntPtr cpe_call([MarshalAs(UnmanagedType.LPUTF8Str)] string json);
     [DllImport("cpe_relay_windows.dll", CallingConvention = CallingConvention.Cdecl)]
     private static extern void cpe_free(IntPtr value);
-    private readonly SemaphoreSlim gate = new(1, 1);
+    private readonly object sync = new();
+    private readonly bool testWorker;
+    private WorkerSession? worker;
+    private Task<bool>? stopping;
+    private bool disposed;
+
+    internal RelayBackend(bool testWorker = false) => this.testWorker = testWorker;
+    internal bool HasWorker { get { lock (sync) return worker is { IsDisposed: false }; } }
 
     internal static JsonElement Invoke(object request)
     {
@@ -29,17 +36,49 @@ internal sealed class RelayBackend
 
     internal async Task<JsonElement> Call(object request)
     {
-        await gate.WaitAsync();
-        try { return await Task.Run(() => Invoke(request)); }
-        finally { gate.Release(); }
+        WorkerSession selected;
+        lock (sync)
+        {
+            if (disposed || stopping is { IsCompleted: false }) throw new OperationCanceledException();
+            if (worker is null || worker.IsDisposed) worker = new WorkerSession(testWorker);
+            selected = worker;
+        }
+        return await selected.Call(request);
+    }
+
+    // Stop bypasses the command queue. A blocked native call must not prevent
+    // its own cancellation. Only this backend's owned helper can be terminated.
+    internal Task<bool> StopAsync()
+    {
+        lock (sync)
+        {
+            if (stopping is { IsCompleted: false }) return stopping;
+            var previous = worker; worker = null;
+            return stopping = previous is null ? Task.FromResult(false) : previous.StopAsync();
+        }
     }
 
     // Polling never queues behind slow starts, file loads or stops.
     internal async Task<(JsonElement State, JsonElement Events)?> Poll()
     {
-        if (!await gate.WaitAsync(0)) return null;
-        try { return await Task.Run(() => (Invoke(new { action = "snapshot" }), Invoke(new { action = "events" }))); }
-        finally { gate.Release(); }
+        WorkerSession? selected;
+        lock (sync)
+        {
+            if (disposed || stopping is { IsCompleted: false }) return null;
+            selected = worker;
+        }
+        if (selected is null || selected.IsDisposed)
+            return (JsonSerializer.SerializeToElement(new { running = false }), JsonSerializer.SerializeToElement(Array.Empty<object>()));
+        return await selected.Poll();
+    }
+
+    public void Dispose()
+    {
+        lock (sync)
+        {
+            disposed = true;
+            worker?.Dispose(); worker = null;
+        }
     }
 }
 

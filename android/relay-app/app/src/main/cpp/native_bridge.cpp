@@ -5357,20 +5357,14 @@ struct RelayState {
         });
     }
 
-    static bedrock::ProtoDefValue automationStackSlot(
+    bedrock::ProtoDefValue automationStackSlot(
         std::string container,
         uint8_t slot,
         int32_t stackId
     ) {
-        using Value = bedrock::ProtoDefValue;
-        return Value::object({
-            {"slot_type", Value::object({
-                {"container_id", Value::string(std::move(container))},
-                {"dynamic_container_id", Value::null()}
-            })},
-            {"slot", Value::uinteger(slot)},
-            {"stack_id", Value::integer(stackId)}
-        });
+        return bedrock::ShulkerDeposit::stackSlotValue(
+            bedrock::generatedProtocolTypeJson(version, "FullContainerName").has_value(),
+            std::move(container), slot, stackId);
     }
 
     bedrock::VersionedGamePacket makeAutomationStackRequestPacket(
@@ -7700,26 +7694,8 @@ struct RelayState {
             if (!plan) return;
             bedrock::VersionedGamePacket move;
             if (plan->authoritative) {
-                using Value = bedrock::ProtoDefValue;
-                auto destination = automationStackSlot("container", plan->destination, 0);
-                if (plan->dynamicId) {
-                    destination.objectValue["slot_type"].objectValue["dynamic_container_id"] =
-                        Value::uinteger(*plan->dynamicId);
-                }
-                move = makeAreaProtocolPacket(version, "item_stack_request", Value::object({
-                    {"requests", Value::array({Value::object({
-                        {"request_id", Value::integer(plan->requestId)},
-                        {"actions", Value::array({Value::object({
-                            {"type_id", Value::string("place")},
-                            {"count", Value::uinteger(plan->item.item.count)},
-                            {"source", automationStackSlot("hotbar_and_inventory", plan->source,
-                                plan->item.item.stackId)},
-                            {"destination", std::move(destination)}
-                        })})},
-                        {"custom_names", Value::array({})},
-                        {"cause", Value::string("chat_public")}
-                    })})}
-                }));
+                move = makeAreaProtocolPacket(version, "item_stack_request",
+                    bedrock::ShulkerDeposit::stackRequestValue(*plan));
             } else {
                 move = bedrock::VersionedMcpeCodec::forVersion(version).packetCodec()
                     .makePacketByName("inventory_transaction", bedrock::ShulkerDeposit::legacyPayload(*plan));
@@ -8216,7 +8192,7 @@ struct RelayState {
                             if (containers && containers->kind == bedrock::PacketValue::Kind::Array) {
                                 for (const auto& container : containers->arrayValue) {
                                     const auto* type = container.get("slot_type");
-                                    const auto* id = type ? type->get("container_id") : nullptr;
+                                    const auto* id = type && type->kind == bedrock::PacketValue::Kind::Object ? type->get("container_id") : type;
                                     if (!id || (id->stringValue != "container" && numericValue(id) != 7)) continue;
                                     const auto* slots = container.get("slots");
                                     if (!slots || slots->kind != bedrock::PacketValue::Kind::Array) continue;
@@ -11940,10 +11916,10 @@ private:
             std::vector<bedrock::VersionedGamePacket> packets;
             packets.reserve(2);
             packets.push_back(codec.packetCodec().makePacketByName("inventory_slot",
-                bedrock::ShulkerDeposit::slotPayload(0, update->source, nullptr, {}, update->sourceContainer)));
+                bedrock::ShulkerDeposit::slotPayload(0, update->source, nullptr, {}, update->sourceContainer, update->modern)));
             packets.push_back(codec.packetCodec().makePacketByName("inventory_slot",
                 bedrock::ShulkerDeposit::slotPayload(update->window, update->destination,
-                    update->item.wire.get(), update->dynamicId, update->destinationContainer)));
+                    update->item.wire.get(), update->dynamicId, update->destinationContainer, update->modern)));
             std::lock_guard relayLock(relayMutex_);
             std::lock_guard depositLock(state_->depositMutex);
             if (state_->shulkerDeposit.generation != update->generation ||
@@ -12500,7 +12476,7 @@ Java_com_m9chko_bedrockrelay_NativeBridge_startRelay(
         state->destinationHost = destinationHost;
         state->destinationPort = static_cast<uint16_t>(destinationPortValue);
         state->version = version;
-        state->shulkerDeposit.supported = bedrock::ShulkerDeposit::supports(version);
+        state->shulkerDeposit.setVersion(version);
         state->configureDeposit(configuredShulkerDeposit.load(), configuredShulkerDepositHotbar.load(),
             configuredShulkerDepositIntervalMs.load());
         state->nbtTransferDirectory =
