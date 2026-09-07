@@ -1333,7 +1333,18 @@ public:
         const VersionedGamePacket& packet,
         VersionedMcpeCompression compression = VersionedMcpeCompression::Automatic
     ) {
-        queuePackets(connection, {packet}, compression);
+        // Do not construct an initializer_list/vector of a multi-megabyte
+        // packet merely to enqueue one item (each owns both raw buffers).
+        const auto session = sessionSnapshot(connection);
+        if (!session) return;
+        std::lock_guard<std::recursive_mutex> outboundLock(session->outboundMutex);
+        processOutboundPacket(session, packet);
+        {
+            std::lock_guard<std::mutex> lock(session->mutex);
+            if (session->status == BedrockServerClientStatus::Disconnected) return;
+            session->queuedPackets.push_back({packet, compression});
+        }
+        ensureOutboundQueueScheduler();
     }
 
     void queuePackets(

@@ -1,11 +1,6 @@
 #include "bedrock/RakNetConnect.hpp"
 
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <sys/types.h>
-#include <unistd.h>
+#include "bedrock/detail/PlatformSocket.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -190,7 +185,7 @@ static std::pair<std::string, uint16_t> readRakNetAddressIPv4(
 }
 
 static bool recvPacket(
-    int sock,
+    detail::Socket sock,
     std::vector<uint8_t>& out,
     int timeoutMs
 ) {
@@ -202,7 +197,7 @@ static bool recvPacket(
     tv.tv_sec = timeoutMs / 1000;
     tv.tv_usec = (timeoutMs % 1000) * 1000;
 
-    int ready = select(sock + 1, &readfds, nullptr, nullptr, &tv);
+    int ready = select(detail::selectWidth(sock), &readfds, nullptr, nullptr, &tv);
 
     if (ready <= 0) {
         return false;
@@ -210,14 +205,7 @@ static bool recvPacket(
 
     out.assign(4096, 0);
 
-    ssize_t received = recvfrom(
-        sock,
-        out.data(),
-        out.size(),
-        0,
-        nullptr,
-        nullptr
-    );
+    auto received = detail::receiveDatagram(sock, out.data(), out.size());
 
     if (received <= 0) {
         return false;
@@ -228,11 +216,11 @@ static bool recvPacket(
 }
 
 static void sendPacket(
-    int sock,
+    detail::Socket sock,
     const sockaddr_in& target,
     const std::vector<uint8_t>& packet
 ) {
-    ssize_t sent = sendto(
+    auto sent = detail::sendDatagram(
         sock,
         packet.data(),
         packet.size(),
@@ -333,9 +321,10 @@ RakNetOpenResult RakNetConnector::openConnection(
 
     addrinfo hints {};
     addrinfo* res = nullptr;
-    int sock = -1;
+    detail::Socket sock = detail::invalidSocket;
 
     try {
+        detail::ensureSockets();
         hints.ai_family = AF_INET;
         hints.ai_socktype = SOCK_DGRAM;
         hints.ai_protocol = IPPROTO_UDP;
@@ -362,7 +351,7 @@ RakNetOpenResult RakNetConnector::openConnection(
 
         sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 
-        if (sock < 0) {
+        if (sock == detail::invalidSocket) {
             result.error = "socket failed";
             freeaddrinfo(res);
             return result;
@@ -398,7 +387,7 @@ RakNetOpenResult RakNetConnector::openConnection(
 
         if (!gotReply1) {
             result.error = "timeout waiting for OpenConnectionReply1 on all MTU candidates";
-            close(sock);
+            detail::closeSocket(sock);
             freeaddrinfo(res);
             return result;
         }
@@ -410,7 +399,7 @@ RakNetOpenResult RakNetConnector::openConnection(
 
         if (reply1.size() < 28) {
             result.error = "OpenConnectionReply1 too small";
-            close(sock);
+            detail::closeSocket(sock);
             freeaddrinfo(res);
             return result;
         }
@@ -424,14 +413,14 @@ RakNetOpenResult RakNetConnector::openConnection(
                << static_cast<int>(id1);
 
             result.error = ss.str();
-            close(sock);
+            detail::closeSocket(sock);
             freeaddrinfo(res);
             return result;
         }
 
         if (!checkMagic(reply1, off1)) {
             result.error = "invalid magic in OpenConnectionReply1";
-            close(sock);
+            detail::closeSocket(sock);
             freeaddrinfo(res);
             return result;
         }
@@ -442,7 +431,7 @@ RakNetOpenResult RakNetConnector::openConnection(
 
         if (off1 >= reply1.size()) {
             result.error = "OpenConnectionReply1 missing security byte";
-            close(sock);
+            detail::closeSocket(sock);
             freeaddrinfo(res);
             return result;
         }
@@ -495,7 +484,7 @@ RakNetOpenResult RakNetConnector::openConnection(
 
         if (!recvPacket(sock, reply2, timeoutMs)) {
             result.error = "timeout waiting for OpenConnectionReply2";
-            close(sock);
+            detail::closeSocket(sock);
             freeaddrinfo(res);
             return result;
         }
@@ -504,7 +493,7 @@ RakNetOpenResult RakNetConnector::openConnection(
 
         if (reply2.size() < 35) {
             result.error = "OpenConnectionReply2 too small";
-            close(sock);
+            detail::closeSocket(sock);
             freeaddrinfo(res);
             return result;
         }
@@ -518,14 +507,14 @@ RakNetOpenResult RakNetConnector::openConnection(
                << static_cast<int>(id2);
 
             result.error = ss.str();
-            close(sock);
+            detail::closeSocket(sock);
             freeaddrinfo(res);
             return result;
         }
 
         if (!checkMagic(reply2, off2)) {
             result.error = "invalid magic in OpenConnectionReply2";
-            close(sock);
+            detail::closeSocket(sock);
             freeaddrinfo(res);
             return result;
         }
@@ -546,12 +535,12 @@ RakNetOpenResult RakNetConnector::openConnection(
 
         result.ok = true;
 
-        close(sock);
+        detail::closeSocket(sock);
         freeaddrinfo(res);
         return result;
     } catch (const std::exception& e) {
-        if (sock >= 0) {
-            close(sock);
+        if (sock != detail::invalidSocket) {
+            detail::closeSocket(sock);
         }
 
         if (res) {

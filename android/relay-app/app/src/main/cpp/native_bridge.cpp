@@ -5,14 +5,23 @@
 #include <bedrock/relay/EntityPositionTracker.hpp>
 #include <bedrock/relay/ItemDurability.hpp>
 #include <bedrock/relay/AreaFillGeometry.hpp>
+#include <bedrock/relay/ShulkerDeposit.hpp>
 #include <bedrock/generated/GeneratedProtocolTypes.hpp>
+#include <bedrock/nbt/BedrockNbt.hpp>
+#include <bedrock/protodef/ProtoDefNbt.hpp>
 #include <bedrock/protodef/ProtoDefEncoder.hpp>
+#include <bedrock/protodef/ProtoDefJson.hpp>
 #include <bedrock/protodef/ProtoDefWriter.hpp>
 #include <bedrock/world/BedrockBlockRegistry.hpp>
 #include <bedrock/world/BedrockSubChunkPacket.hpp>
 
+#if defined(BEDROCK_RELAY_WINDOWS)
+#include <bedrock/auth/FileAuthCache.hpp>
+#include <cpe/WindowsHttp.hpp>
+#else
 #include <android/log.h>
 #include <jni.h>
+#endif
 
 #include <atomic>
 #include <algorithm>
@@ -26,6 +35,7 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <fstream>
 #include <future>
 #include <iterator>
 #include <limits>
@@ -59,12 +69,20 @@ constexpr std::size_t AndroidLevelChunkRetentionMaximumBytes =
 constexpr std::size_t MaximumDecodedWorldColumns = 320;
 constexpr std::size_t MaximumQueuedWorldPackets = 128;
 constexpr std::size_t MaximumMiniMapTiles = 768;
+constexpr std::size_t MaximumNbtTransferFileBytes = 8u * 1024u * 1024u;
+constexpr std::size_t MaximumNbtTransferNodes = 100'000;
+constexpr std::size_t MaximumNbtTransferDepth = 32;
+constexpr std::size_t MaximumTrackedInventoryPacketBytes = 256u * 1024u;
+constexpr std::size_t StructuredItemPacketBytes = 16u * 1024u;
 
 std::atomic<bool> configuredDetailedLogging {true};
 std::atomic<bool> configuredChunkRetention {false};
 std::atomic<int> configuredRetainedRadiusChunks {24};
 std::atomic<bool> configuredAutoArmor {false};
 std::atomic<bool> configuredAutoTotem {false};
+std::atomic<bool> configuredShulkerDeposit {false};
+std::atomic<bool> configuredShulkerDepositHotbar {false};
+std::atomic<int> configuredShulkerDepositIntervalMs {bedrock::ShulkerDeposit::DefaultIntervalMs};
 std::atomic<bool> configuredMiniMap {false};
 std::atomic<bool> configuredSchematic {false};
 std::atomic<bool> configuredAreaFill {false};
@@ -118,10 +136,12 @@ constexpr bool NativeCompilerOptimized = true;
 constexpr bool NativeCompilerOptimized = false;
 #endif
 
+#if !defined(BEDROCK_RELAY_WINDOWS)
 JavaVM* javaVm = nullptr;
 jclass nativeBridgeClass = nullptr;
 jmethodID httpFetchMethod = nullptr;
 std::mutex javaBridgeMutex;
+#endif
 
 std::string jsonString(const bedrock::JsRuntimeValue& value) {
     return bedrock::JsRuntimeJson::stringify(value).value_or("null");
@@ -423,8 +443,12 @@ std::string packetBreadcrumb(
     detail << "direction=" << direction
            << " packet=" << packet.name
            << " fullBytes=" << packet.fullPacket.size()
-           << " payloadBytes=" << packet.payload.size()
-           << " hash=0x" << std::hex << packetHash(packet.fullPacket);
+           << " payloadBytes=" << packet.payload.size();
+    if (packet.fullPacket.size() <= MaximumTrackedInventoryPacketBytes) {
+        detail << " hash=0x" << std::hex << packetHash(packet.fullPacket);
+    } else {
+        detail << " hash=skipped_large";
+    }
     return detail.str();
 }
 
@@ -499,6 +523,7 @@ std::string_view rakNetCloseSignal(uint8_t packetId) noexcept {
     }
 }
 
+#if !defined(BEDROCK_RELAY_WINDOWS)
 class AttachedEnvironment {
 public:
     AttachedEnvironment() {
@@ -699,6 +724,195 @@ public:
 
 private:
     std::shared_ptr<bedrock::JsMicrotaskQueue> queue_;
+};
+#endif
+
+// Reader for the desktop Qazaq Client QZNBTF02 transfer format. The desktop
+// file stores a platform-neutral tag tree after an ABI metadata block. Android
+// never uses the vtable addresses from that block, but it still authenticates
+// the complete block and payload with the same FNV-1a checksum as the DLL.
+class QazaqNbtTransferReader {
+public:
+    explicit QazaqNbtTransferReader(std::vector<uint8_t> bytes)
+        : bytes_(std::move(bytes)) {}
+
+    bedrock::NbtValue readRoot() {
+        constexpr std::array<uint8_t, 8> magic {
+            'Q', 'Z', 'N', 'B', 'T', 'F', '0', '2'
+        };
+        constexpr std::size_t metadataBytes = sizeof(uint32_t) * 14;
+        constexpr std::size_t headerBytes = 8 + 4 + 4 + 8 + metadataBytes;
+        if (bytes_.size() < headerBytes ||
+            !std::equal(magic.begin(), magic.end(), bytes_.begin())) {
+            throw std::runtime_error("QZNBTF02 header is invalid");
+        }
+        offset_ = 8;
+        const auto version = read<uint32_t>();
+        const auto declaredSize = read<uint32_t>();
+        const auto storedChecksum = read<uint64_t>();
+        if (version != 2 || declaredSize == 0 ||
+            declaredSize > MaximumNbtTransferFileBytes ||
+            bytes_.size() != headerBytes + declaredSize) {
+            throw std::runtime_error("QZNBTF02 size or version is invalid");
+        }
+        uint64_t checksum = 1469598103934665603ULL;
+        for (std::size_t index = 24; index < bytes_.size(); ++index) {
+            checksum ^= bytes_[index];
+            checksum *= 1099511628211ULL;
+        }
+        if (checksum != storedChecksum) {
+            throw std::runtime_error("QZNBTF02 checksum is invalid");
+        }
+        offset_ = headerBytes;
+        auto root = readTag(0);
+        if (offset_ != bytes_.size() ||
+            root.type != bedrock::NbtTagType::Compound) {
+            throw std::runtime_error("QZNBTF02 payload is invalid");
+        }
+        return root;
+    }
+
+private:
+    template <typename T>
+    T read() {
+        if (sizeof(T) > bytes_.size() - offset_) {
+            throw std::runtime_error("QZNBTF02 payload is truncated");
+        }
+        T value {};
+        std::memcpy(&value, bytes_.data() + offset_, sizeof(T));
+        offset_ += sizeof(T);
+        return value;
+    }
+
+    std::string readString() {
+        const auto size = read<uint32_t>();
+        if (size > MaximumNbtTransferFileBytes ||
+            size > bytes_.size() - offset_) {
+            throw std::runtime_error("QZNBTF02 string is invalid");
+        }
+        std::string value(
+            reinterpret_cast<const char*>(bytes_.data() + offset_),
+            size
+        );
+        offset_ += size;
+        return value;
+    }
+
+    bedrock::NbtValue readTag(std::size_t depth) {
+        if (depth > MaximumNbtTransferDepth ||
+            ++nodes_ > MaximumNbtTransferNodes) {
+            throw std::runtime_error("QZNBTF02 tree limit exceeded");
+        }
+        const auto rawType = read<uint8_t>();
+        if (rawType > static_cast<uint8_t>(bedrock::NbtTagType::IntArray)) {
+            throw std::runtime_error("QZNBTF02 tag type is invalid");
+        }
+        const auto type = static_cast<bedrock::NbtTagType>(rawType);
+        switch (type) {
+            case bedrock::NbtTagType::End:
+                return bedrock::NbtValue::end();
+            case bedrock::NbtTagType::Byte:
+                return bedrock::NbtValue::byte(read<int8_t>());
+            case bedrock::NbtTagType::Short:
+                return bedrock::NbtValue::shortInteger(read<int16_t>());
+            case bedrock::NbtTagType::Int:
+                return bedrock::NbtValue::integer(read<int32_t>());
+            case bedrock::NbtTagType::Long:
+                return bedrock::NbtValue::longInteger(read<int64_t>());
+            case bedrock::NbtTagType::Float:
+                return bedrock::NbtValue::floating(read<float>());
+            case bedrock::NbtTagType::Double:
+                return bedrock::NbtValue::doubleFloating(read<double>());
+            case bedrock::NbtTagType::ByteArray: {
+                const auto count = read<uint32_t>();
+                if (count > bytes_.size() - offset_) {
+                    throw std::runtime_error("QZNBTF02 byte array is invalid");
+                }
+                std::vector<uint8_t> value(
+                    bytes_.begin() + static_cast<std::ptrdiff_t>(offset_),
+                    bytes_.begin() + static_cast<std::ptrdiff_t>(offset_ + count)
+                );
+                offset_ += count;
+                return bedrock::NbtValue::byteArray(std::move(value));
+            }
+            case bedrock::NbtTagType::String:
+                return bedrock::NbtValue::string(readString());
+            case bedrock::NbtTagType::List: {
+                const auto rawElementType = read<uint8_t>();
+                if (rawElementType >
+                    static_cast<uint8_t>(bedrock::NbtTagType::IntArray)) {
+                    throw std::runtime_error("QZNBTF02 list type is invalid");
+                }
+                const auto elementType = static_cast<bedrock::NbtTagType>(
+                    rawElementType
+                );
+                const auto count = read<uint32_t>();
+                if (count > MaximumNbtTransferNodes - nodes_ ||
+                    count > bytes_.size() - offset_ ||
+                    (elementType == bedrock::NbtTagType::End && count != 0)) {
+                    throw std::runtime_error("QZNBTF02 list is invalid");
+                }
+                std::vector<bedrock::NbtValue> values;
+                values.reserve(count);
+                for (uint32_t index = 0; index < count; ++index) {
+                    auto child = readTag(depth + 1);
+                    if (child.type != elementType) {
+                        throw std::runtime_error(
+                            "QZNBTF02 list element type does not match"
+                        );
+                    }
+                    values.push_back(std::move(child));
+                }
+                return bedrock::NbtValue::list(
+                    elementType,
+                    std::move(values)
+                );
+            }
+            case bedrock::NbtTagType::Compound: {
+                const auto count = read<uint32_t>();
+                if (count > MaximumNbtTransferNodes - nodes_ ||
+                    count > (bytes_.size() - offset_) / 5) {
+                    throw std::runtime_error("QZNBTF02 compound is invalid");
+                }
+                std::vector<bedrock::NbtNamedValue> values;
+                values.reserve(count);
+                std::unordered_set<std::string> names;
+                for (uint32_t index = 0; index < count; ++index) {
+                    auto name = readString();
+                    if (name.size() > 4096 || !names.insert(name).second) {
+                        throw std::runtime_error(
+                            "QZNBTF02 compound key is invalid"
+                        );
+                    }
+                    values.push_back({
+                        std::move(name),
+                        readTag(depth + 1)
+                    });
+                }
+                return bedrock::NbtValue::compound(std::move(values));
+            }
+            case bedrock::NbtTagType::IntArray: {
+                const auto count = read<uint32_t>();
+                if (count > MaximumNbtTransferFileBytes / sizeof(int32_t) ||
+                    count > (bytes_.size() - offset_) / sizeof(int32_t)) {
+                    throw std::runtime_error("QZNBTF02 int array is invalid");
+                }
+                std::vector<int32_t> values;
+                values.reserve(count);
+                for (uint32_t index = 0; index < count; ++index) {
+                    values.push_back(read<int32_t>());
+                }
+                return bedrock::NbtValue::intArray(std::move(values));
+            }
+            case bedrock::NbtTagType::LongArray:
+                break;
+        }
+        throw std::runtime_error("QZNBTF02 unsupported tag type");
+    }
+
+    std::vector<uint8_t> bytes_;
+    std::size_t offset_ = 0;
+    std::size_t nodes_ = 0;
 };
 
 struct RelayState {
@@ -937,6 +1151,14 @@ struct RelayState {
     std::string destinationHost;
     uint16_t destinationPort = 19132;
     std::string version = "1.21.100";
+    std::filesystem::path nbtTransferDirectory;
+    bool nbtCraftArmed = false;
+    std::string nbtCraftSlot = "default";
+    uint64_t nbtCopyCount = 0;
+    uint64_t nbtCraftRewriteCount = 0;
+    uint64_t nbtCraftCandidateCount = 0;
+    uint32_t nbtCraftDiagnosticRemaining = 0;
+    std::shared_ptr<const bedrock::ProtoDefValue> nbtCraftExtraCache;
     std::string destinationGameVersion;
     int destinationProtocolVersion = -1;
     int64_t destinationLatencyMs = 0;
@@ -994,6 +1216,10 @@ struct RelayState {
     uint64_t equipmentRevision = 0;
     std::vector<EquipmentItem> playerInventory;
     bool playerInventoryReady = false;
+    mutable std::mutex depositMutex;
+    bedrock::ShulkerDeposit shulkerDeposit;
+    std::optional<bedrock::ShulkerDeposit::Click> depositChestClick;
+    uint64_t depositChestClickAt = 0;
     int32_t selectedHotbarSlot = -1;
     int32_t nextAutomationStackRequestId = -1;
     int32_t nextAutomationLegacyTicket = 1'000'000;
@@ -4150,6 +4376,15 @@ struct RelayState {
             for (auto& [runtimeId, name] : palette) {
                 itemNames.insert_or_assign(runtimeId, std::move(name));
             }
+            {
+                std::lock_guard depositLock(depositMutex);
+                shulkerDeposit.shulkerIds.clear();
+                for (const auto& [id, name] : itemNames) {
+                    if (name == "minecraft:shulker_box" || name.ends_with("_shulker_box")) {
+                        shulkerDeposit.shulkerIds.insert(static_cast<int32_t>(id));
+                    }
+                }
+            }
             bool equipmentChanged = false;
             for (auto& item : equipment) {
                 if (!item.present) continue;
@@ -4362,6 +4597,740 @@ struct RelayState {
             value.objectValue.erase("stack_id");
         }
         return value;
+    }
+
+    static std::string lowerAscii(std::string value) {
+        std::transform(
+            value.begin(),
+            value.end(),
+            value.begin(),
+            [](unsigned char byte) {
+                return static_cast<char>(std::tolower(byte));
+            }
+        );
+        return value;
+    }
+
+    static bool isLocalNbtTestHost(std::string host) noexcept {
+        host = lowerAscii(std::move(host));
+        if (host == "localhost" || host == "::1" || host == "[::1]" ||
+            host.rfind("127.", 0) == 0 || host.rfind("10.", 0) == 0 ||
+            host.rfind("192.168.", 0) == 0) {
+            return true;
+        }
+        if (host.rfind("172.", 0) == 0) {
+            const auto dot = host.find('.', 4);
+            if (dot != std::string::npos) {
+                try {
+                    const auto second = std::stoi(host.substr(4, dot - 4));
+                    return second >= 16 && second <= 31;
+                } catch (...) {
+                }
+            }
+        }
+        return false;
+    }
+
+    bool nbtTestEndpointAllowed() const noexcept {
+        std::lock_guard lock(mutex);
+        return destinationPort == 19132 || destinationPort == 19133;
+    }
+
+    static bool validNbtSlot(std::string_view slot) noexcept {
+        if (slot.empty() || slot.size() > 32) return false;
+        return std::all_of(slot.begin(), slot.end(), [](unsigned char byte) {
+            return std::isalnum(byte) || byte == '_' || byte == '-';
+        });
+    }
+
+    std::filesystem::path nbtTransferPath(std::string_view slot) const {
+        return nbtTransferDirectory /
+            (std::string(slot) + ".cpenbt.json");
+    }
+
+    std::filesystem::path qazaqNbtTransferPath(std::string_view slot) const {
+        return nbtTransferDirectory / (std::string(slot) + ".qznbt");
+    }
+
+    static bool nbtTreeWithinBudget(
+        const bedrock::ProtoDefValue& value,
+        std::size_t depth,
+        std::size_t& nodes
+    ) noexcept {
+        if (depth > MaximumNbtTransferDepth ||
+            ++nodes > MaximumNbtTransferNodes) {
+            return false;
+        }
+        if (value.kind == bedrock::ProtoDefValue::Kind::Object) {
+            for (const auto& [_, child] : value.objectValue) {
+                if (!nbtTreeWithinBudget(child, depth + 1, nodes)) {
+                    return false;
+                }
+            }
+        } else if (value.kind == bedrock::ProtoDefValue::Kind::Array) {
+            for (const auto& child : value.arrayValue) {
+                if (!nbtTreeWithinBudget(child, depth + 1, nodes)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    static bool itemIsPresent(
+        const bedrock::ProtoDefValue* item
+    ) noexcept {
+        if (item == nullptr ||
+            item->kind != bedrock::ProtoDefValue::Kind::Object) {
+            return false;
+        }
+        return packetInteger(item->get("network_id")).value_or(0) != 0;
+    }
+
+    static bool isShulkerName(std::string_view name) noexcept {
+        return name.find("shulker_box") != std::string_view::npos;
+    }
+
+    static std::string objectString(
+        const bedrock::ProtoDefValue& object,
+        std::string_view key
+    ) {
+        if (object.kind != bedrock::ProtoDefValue::Kind::Object) return {};
+        const auto* value = object.get(std::string(key));
+        return value != nullptr &&
+                value->kind == bedrock::ProtoDefValue::Kind::String
+            ? value->stringValue
+            : std::string();
+    }
+
+    static bool craftingActionMatches(
+        const bedrock::ProtoDefValue& action,
+        int32_t expected
+    ) noexcept {
+        const auto raw = packetInteger(action.get("action"));
+        if (!raw) return false;
+        if (*raw == expected) return true;
+        return static_cast<int32_t>(static_cast<uint32_t>(*raw)) == expected;
+    }
+
+    static bool isAetherCraftResultSource(
+        const bedrock::ProtoDefValue& action
+    ) noexcept {
+        const auto sourceType = objectString(action, "source_type");
+        if (sourceType == "container") {
+            return objectString(action, "inventory_id") ==
+                "crafting_result";
+        }
+        if (sourceType != "craft" && sourceType != "craft_slot") {
+            return false;
+        }
+
+        // Bedrock protocol 827 (1.21.100) encodes CRAFTING_TAKE_RESULT as 7.
+        // Keep -4 for compatibility with the legacy desktop representation.
+        return craftingActionMatches(action, 7) ||
+            craftingActionMatches(action, -4);
+    }
+
+    static std::string describeNbtCraftActions(
+        const bedrock::ProtoDefValue& actions
+    ) {
+        if (actions.kind != bedrock::ProtoDefValue::Kind::Array) {
+            return "actions=not_array";
+        }
+        std::ostringstream stream;
+        stream << "actions=" << actions.arrayValue.size();
+        const auto count = std::min<std::size_t>(
+            actions.arrayValue.size(),
+            24
+        );
+        for (std::size_t index = 0; index < count; ++index) {
+            const auto& action = actions.arrayValue[index];
+            if (action.kind != bedrock::ProtoDefValue::Kind::Object) {
+                stream << " | " << index << ":non_object";
+                continue;
+            }
+            const auto* oldItem = action.get("old_item");
+            const auto* newItem = action.get("new_item");
+            stream << " | " << index
+                << ":src=" << objectString(action, "source_type");
+            const auto inventoryId = objectString(action, "inventory_id");
+            if (!inventoryId.empty()) stream << ",inv=" << inventoryId;
+            if (const auto actionId = packetInteger(action.get("action"))) {
+                stream << ",act=" << *actionId;
+            }
+            stream << ",slot="
+                << packetInteger(action.get("slot")).value_or(-1)
+                << ",old="
+                << packetInteger(oldItem == nullptr
+                    ? nullptr
+                    : oldItem->get("network_id")).value_or(0)
+                << 'x'
+                << packetInteger(oldItem == nullptr
+                    ? nullptr
+                    : oldItem->get("count")).value_or(0)
+                << ",new="
+                << packetInteger(newItem == nullptr
+                    ? nullptr
+                    : newItem->get("network_id")).value_or(0)
+                << 'x'
+                << packetInteger(newItem == nullptr
+                    ? nullptr
+                    : newItem->get("count")).value_or(0);
+        }
+        if (actions.arrayValue.size() > count) stream << " | ...";
+        return stream.str();
+    }
+
+    bedrock::ProtoDefValue loadNbtTransferFile(
+        std::string_view slot
+    ) const {
+        const auto jsonPath = nbtTransferPath(slot);
+        const auto qazaqPath = qazaqNbtTransferPath(slot);
+        std::error_code error;
+        const bool jsonExists = std::filesystem::exists(jsonPath, error);
+        error.clear();
+        const bool qazaqExists = std::filesystem::exists(qazaqPath, error);
+        if (!jsonExists && !qazaqExists) {
+            throw std::runtime_error("NBT file was not found");
+        }
+        bool useQazaq = qazaqExists && !jsonExists;
+        if (jsonExists && qazaqExists) {
+            error.clear();
+            const auto jsonTime = std::filesystem::last_write_time(
+                jsonPath,
+                error
+            );
+            const bool jsonTimeKnown = !error;
+            error.clear();
+            const auto qazaqTime = std::filesystem::last_write_time(
+                qazaqPath,
+                error
+            );
+            useQazaq = !jsonTimeKnown || (!error && qazaqTime > jsonTime);
+        }
+        const auto path = useQazaq ? qazaqPath : jsonPath;
+        error.clear();
+        const auto size = std::filesystem::file_size(path, error);
+        if (error) {
+            throw std::runtime_error("NBT file was not found");
+        }
+        const auto maximumFileSize = MaximumNbtTransferFileBytes +
+            (useQazaq ? 80u : 0u);
+        if (size == 0 || size > maximumFileSize) {
+            throw std::runtime_error("NBT file size is invalid");
+        }
+        std::ifstream stream(path, std::ios::binary);
+        if (!stream) throw std::runtime_error("NBT file could not be opened");
+        std::vector<uint8_t> bytes(static_cast<std::size_t>(size));
+        stream.read(
+            reinterpret_cast<char*>(bytes.data()),
+            static_cast<std::streamsize>(bytes.size())
+        );
+        if (!stream || static_cast<std::size_t>(stream.gcount()) != bytes.size()) {
+            throw std::runtime_error("NBT file could not be read completely");
+        }
+        if (useQazaq) {
+            auto root = QazaqNbtTransferReader(std::move(bytes)).readRoot();
+            const auto* itemName = root.find("Name");
+            const auto* tag = root.find("tag");
+            if (itemName == nullptr ||
+                itemName->type != bedrock::NbtTagType::String ||
+                !isShulkerName(itemName->stringValue) || tag == nullptr ||
+                tag->type != bedrock::NbtTagType::Compound) {
+                throw std::runtime_error(
+                    "QZNBTF02 does not contain a shulker item"
+                );
+            }
+            return bedrock::ProtoDefValue::object({
+                {"has_nbt", bedrock::ProtoDefValue::string("true")},
+                {"nbt", bedrock::ProtoDefValue::object({
+                    {"version", bedrock::ProtoDefValue::integer(1)},
+                    {"nbt", bedrock::nbtValueToProtoDefValue(*tag)}
+                })},
+                {"can_place_on", bedrock::ProtoDefValue::array({})},
+                {"can_destroy", bedrock::ProtoDefValue::array({})},
+                {"blocking_tick", bedrock::ProtoDefValue::integer(0)}
+            });
+        }
+        const std::string json(bytes.begin(), bytes.end());
+        auto root = bedrock::ProtoDefJson::parse(json);
+        std::size_t nodes = 0;
+        if (!nbtTreeWithinBudget(root, 0, nodes) ||
+            root.kind != bedrock::ProtoDefValue::Kind::Object ||
+            objectString(root, "format") != "cpe-relay-nbt-v1") {
+            throw std::runtime_error("NBT file format is invalid");
+        }
+        const auto* itemName = root.get("source_item");
+        const auto* extra = root.get("extra");
+        if (itemName == nullptr ||
+            itemName->kind != bedrock::ProtoDefValue::Kind::String ||
+            !isShulkerName(itemName->stringValue) || extra == nullptr ||
+            extra->kind != bedrock::ProtoDefValue::Kind::Object ||
+            !packetValueHasContent(extra->get("nbt"))) {
+            throw std::runtime_error("NBT file does not contain a shulker NBT");
+        }
+        return *extra;
+    }
+
+    std::string copyHeldNbtToFile(std::string_view slot) {
+        EquipmentItem held;
+        {
+            std::lock_guard lock(mutex);
+            // MobEquipment carries the complete held descriptor and lets the
+            // inventory cache discard large nested shulker payloads. Fall
+            // back to the selected inventory slot for older servers.
+            if (equipment[0].present && isShulkerName(equipment[0].name) &&
+                equipment[0].transactionItem.kind ==
+                    bedrock::ProtoDefValue::Kind::Object) {
+                held = equipment[0];
+            } else {
+                if (!playerInventoryReady || selectedHotbarSlot < 0 ||
+                    static_cast<std::size_t>(selectedHotbarSlot) >=
+                        playerInventory.size()) {
+                    return "Инвентарь ещё не синхронизирован.";
+                }
+                held = playerInventory[static_cast<std::size_t>(
+                    selectedHotbarSlot
+                )];
+            }
+        }
+        if (!held.present || !isShulkerName(held.name) ||
+            held.transactionItem.kind !=
+                bedrock::ProtoDefValue::Kind::Object) {
+            return "Возьмите шалкер с NBT в основную руку.";
+        }
+        // Packet observers keep large item tags as wire bytes. Expand only
+        // for an explicit copy/save, never on each held-item or slot update.
+        auto extraIt = held.transactionItem.objectValue.find("extra");
+        if (extraIt != held.transactionItem.objectValue.end()) {
+            auto wrapperIt = extraIt->second.objectValue.find("nbt");
+            if (wrapperIt != extraIt->second.objectValue.end()) {
+                auto tagIt = wrapperIt->second.objectValue.find("nbt");
+                if (tagIt != wrapperIt->second.objectValue.end() &&
+                    tagIt->second.kind == bedrock::ProtoDefValue::Kind::Bytes) {
+                    bedrock::PacketFieldCursor cursor(tagIt->second.bytesValue);
+                    bedrock::ProtoDefReader reader(cursor);
+                    auto tag = bedrock::readProtoDefNbt(
+                        reader, bedrock::BedrockNbtEncoding::LittleEndian
+                    );
+                    if (reader.remaining() != 0) {
+                        return "Повреждённое NBT предмета: лишние байты.";
+                    }
+                    tagIt->second = std::move(tag);
+                }
+            }
+        }
+        const auto* extra = held.transactionItem.get("extra");
+        if (extra == nullptr ||
+            extra->kind != bedrock::ProtoDefValue::Kind::Object ||
+            !packetValueHasContent(extra->get("nbt"))) {
+            return "У шалкера нет NBT, которое можно скопировать.";
+        }
+        auto root = bedrock::ProtoDefValue::object({
+            {"format", bedrock::ProtoDefValue::string("cpe-relay-nbt-v1")},
+            {"minecraft_version", bedrock::ProtoDefValue::string(version)},
+            {"source_item", bedrock::ProtoDefValue::string(held.name)},
+            {"extra", *extra}
+        });
+        std::size_t nodes = 0;
+        if (!nbtTreeWithinBudget(root, 0, nodes)) {
+            return "NBT слишком большое или слишком глубоко вложено.";
+        }
+        const auto json = bedrock::ProtoDefJson::stringify(root);
+        if (json.empty() || json.size() > MaximumNbtTransferFileBytes) {
+            return "NBT превышает безопасный лимит 8 МиБ.";
+        }
+        try {
+            std::filesystem::create_directories(nbtTransferDirectory);
+            const auto path = nbtTransferPath(slot);
+            auto temporary = path;
+            temporary += ".tmp";
+            {
+                std::ofstream stream(
+                    temporary,
+                    std::ios::binary | std::ios::trunc
+                );
+                if (!stream) {
+                    throw std::runtime_error("temporary file open failed");
+                }
+                stream.write(json.data(), static_cast<std::streamsize>(
+                    json.size()
+                ));
+                stream.flush();
+                if (!stream) {
+                    throw std::runtime_error("temporary file write failed");
+                }
+            }
+            std::error_code renameError;
+            std::filesystem::rename(temporary, path, renameError);
+            if (renameError) {
+                std::error_code removeError;
+                std::filesystem::remove(path, removeError);
+                renameError.clear();
+                std::filesystem::rename(temporary, path, renameError);
+            }
+            if (renameError) {
+                std::error_code cleanupError;
+                std::filesystem::remove(temporary, cleanupError);
+                throw std::runtime_error(renameError.message());
+            }
+            {
+                std::lock_guard lock(mutex);
+                ++nbtCopyCount;
+            }
+            push(
+                "nbt_copy",
+                "slot=" + std::string(slot) +
+                    " item=" + held.name +
+                    " bytes=" + std::to_string(json.size()) +
+                    " nodes=" + std::to_string(nodes) +
+                    " path=" + path.string(),
+                "INFO",
+                "nbt"
+            );
+            return "NBT сохранено в слот '" + std::string(slot) + "'.";
+        } catch (const std::exception& error) {
+            push(
+                "nbt_copy_failed",
+                safeMessage(error.what()),
+                "ERROR",
+                "nbt"
+            );
+            return "Не удалось сохранить NBT; смотрите журнал приложения.";
+        }
+    }
+
+    std::string armNbtCraftFromFile(std::string_view slot) {
+        if (!nbtTestEndpointAllowed()) {
+            return "NBT доступно только на тестовом порту 19132/19133.";
+        }
+        if (!validNbtSlot(slot)) {
+            return "Имя слота: 1–32 символа A-Z, 0-9, _ или -.";
+        }
+        try {
+            auto extra = loadNbtTransferFile(slot);
+            auto wrapperIt = extra.objectValue.find("nbt");
+            if (wrapperIt != extra.objectValue.end()) {
+                auto tagIt = wrapperIt->second.objectValue.find("nbt");
+                if (tagIt != wrapperIt->second.objectValue.end()) {
+                    bedrock::ProtoDefWriter writer;
+                    bedrock::writeProtoDefNbt(
+                        writer, tagIt->second,
+                        bedrock::BedrockNbtEncoding::LittleEndian
+                    );
+                    tagIt->second = bedrock::ProtoDefValue::bytes(writer.take());
+                }
+            }
+            auto cachedExtra = std::make_shared<const bedrock::ProtoDefValue>(
+                std::move(extra)
+            );
+            {
+                std::lock_guard lock(mutex);
+                nbtCraftSlot = std::string(slot);
+                nbtCraftArmed = true;
+                nbtCraftDiagnosticRemaining = 24;
+                nbtCraftExtraCache = std::move(cachedExtra);
+            }
+            push(
+                "nbt_craft_armed",
+                "slot=" + std::string(slot) +
+                    " mode=continuous file_backed=true",
+                "INFO",
+                "nbt"
+            );
+            return "NBT '" + std::string(slot) +
+                "' активно для всех следующих крафтов шалкера.";
+        } catch (const std::exception& error) {
+            push(
+                "nbt_craft_arm_failed",
+                "slot=" + std::string(slot) + " error=" +
+                    safeMessage(error.what()),
+                "WARN",
+                "nbt"
+            );
+            return "Файл NBT '" + std::string(slot) +
+                "' не найден, повреждён или содержит не шалкер.";
+        }
+    }
+
+    std::string stopNbtCraftMode() {
+        std::lock_guard lock(mutex);
+        nbtCraftArmed = false;
+        nbtCraftDiagnosticRemaining = 0;
+        nbtCraftExtraCache.reset();
+        return "Непрерывный NBT-крафт отключён.";
+    }
+
+    std::string nbtCraftModeStatus() const {
+        std::lock_guard lock(mutex);
+        return nbtCraftArmed
+            ? "Активно непрерывно: " + nbtCraftSlot
+            : "NBT-крафт выключен";
+    }
+
+    std::optional<std::string> handleNbtCommand(
+        const std::string& packetVersion,
+        bedrock::BedrockRelayPacketEvent& event
+    ) noexcept {
+        if (event.packet.name != "text") return std::nullopt;
+        try {
+            std::string message;
+            {
+                std::lock_guard decodeLock(itemDecodeMutex);
+                bedrock::RelayPacketEvent decoded(
+                    packetVersion,
+                    event,
+                    itemProtocolVariables,
+                    true
+                );
+                message = decoded.getString("message", "");
+            }
+            std::istringstream input(message);
+            std::vector<std::string> args;
+            for (std::string argument; input >> argument;) {
+                args.push_back(std::move(argument));
+            }
+            if (args.empty() || lowerAscii(args[0]) != ".nbt") {
+                return std::nullopt;
+            }
+            event.cancel();
+            if (!nbtTestEndpointAllowed()) {
+                return "Команды NBT разрешены только для локального тестового "
+                    "узла на порту 19132/19133.";
+            }
+            if (args.size() < 2 || args.size() > 3) {
+                return "Использование: .nbt save имя, .nbt copy [слот], "
+                    ".nbt craft [слот] или .nbt off.";
+            }
+            const auto action = lowerAscii(args[1]);
+            const auto slot = args.size() == 3 ? args[2] : "default";
+            if (!validNbtSlot(slot)) {
+                return "Имя слота: 1–32 символа A-Z, 0-9, _ или -.";
+            }
+            if (action == "copy" || action == "save") {
+                return copyHeldNbtToFile(slot);
+            }
+            if (action == "craft") {
+                return armNbtCraftFromFile(slot);
+            }
+            if (action == "off") {
+                return stopNbtCraftMode();
+            }
+            return "Неизвестная команда. Используйте .nbt save, .nbt copy, "
+                ".nbt craft или .nbt off.";
+        } catch (const std::exception& error) {
+            push(
+                "nbt_command_failed",
+                safeMessage(error.what()),
+                "ERROR",
+                "nbt"
+            );
+            return std::string("Ошибка команды NBT; смотрите журнал приложения.");
+        } catch (...) {
+            push(
+                "nbt_command_failed",
+                "unknown native exception",
+                "ERROR",
+                "nbt"
+            );
+            return std::string("Ошибка команды NBT; смотрите журнал приложения.");
+        }
+    }
+
+    void maybeRewriteNbtCraft(
+        const std::string& packetVersion,
+        bedrock::BedrockRelayPacketEvent& event
+    ) noexcept {
+        if (event.packet.name != "inventory_transaction") return;
+        std::string slot;
+        std::shared_ptr<const bedrock::ProtoDefValue> cachedExtra;
+        bool writeDiagnostic = false;
+        {
+            std::lock_guard lock(mutex);
+            if (!nbtCraftArmed || !nbtCraftExtraCache) return;
+            slot = nbtCraftSlot;
+            cachedExtra = nbtCraftExtraCache;
+            ++nbtCraftCandidateCount;
+            if (nbtCraftDiagnosticRemaining > 0) {
+                --nbtCraftDiagnosticRemaining;
+                writeDiagnostic = true;
+            }
+        }
+        if (!nbtTestEndpointAllowed()) return;
+        try {
+            std::lock_guard decodeLock(itemDecodeMutex);
+            bedrock::RelayPacketEvent decoded(
+                packetVersion,
+                event,
+                itemProtocolVariables,
+                true,
+                true // Craft matching needs descriptors, not nested NBT trees.
+            );
+            auto& params = decoded.decodedParams();
+            const auto transactionIt = params.find("transaction");
+            if (transactionIt == params.end() ||
+                transactionIt->second.kind !=
+                    bedrock::ProtoDefValue::Kind::Object) {
+                return;
+            }
+            auto actionsIt = transactionIt->second.objectValue.find("actions");
+            if (actionsIt == transactionIt->second.objectValue.end() ||
+                actionsIt->second.kind !=
+                    bedrock::ProtoDefValue::Kind::Array) {
+                if (writeDiagnostic) {
+                    push(
+                        "nbt_craft_candidate",
+                        "slot=" + slot + " match=no_actions",
+                        "DEBUG",
+                        "nbt"
+                    );
+                }
+                return;
+            }
+            auto* actions = &actionsIt->second;
+            if (writeDiagnostic) {
+                push(
+                    "nbt_craft_candidate",
+                    "slot=" + slot + " " +
+                        describeNbtCraftActions(*actions),
+                    "DEBUG",
+                    "nbt"
+                );
+            }
+
+            const auto transactionType = objectString(
+                transactionIt->second,
+                "transaction_type"
+            );
+            if (!transactionType.empty() && transactionType != "normal") {
+                return;
+            }
+
+            bedrock::ProtoDefValue* generatedItem = nullptr;
+            int64_t generatedNetworkId = 0;
+            for (auto& action : actions->arrayValue) {
+                if (action.kind != bedrock::ProtoDefValue::Kind::Object ||
+                    !isAetherCraftResultSource(action)) {
+                    continue;
+                }
+                const auto oldItemIt = action.objectValue.find("old_item");
+                const auto newItemIt = action.objectValue.find("new_item");
+                auto* oldItem = oldItemIt == action.objectValue.end()
+                    ? nullptr
+                    : &oldItemIt->second;
+                auto* newItem = newItemIt == action.objectValue.end()
+                    ? nullptr
+                    : &newItemIt->second;
+                if (!itemIsPresent(oldItem) || itemIsPresent(newItem)) {
+                    continue;
+                }
+                generatedItem = oldItem;
+                generatedNetworkId = packetInteger(
+                    generatedItem->get("network_id")
+                ).value_or(0);
+                break;
+            }
+            if (generatedItem == nullptr || generatedNetworkId == 0) return;
+
+            std::string generatedName;
+            {
+                std::lock_guard lock(mutex);
+                const auto known = itemNames.find(generatedNetworkId);
+                if (known != itemNames.end()) generatedName = known->second;
+            }
+            if (!isShulkerName(generatedName)) {
+                push(
+                    "nbt_craft_skipped",
+                    "slot=" + slot + " reason=result_not_shulker" +
+                        " networkId=" + std::to_string(generatedNetworkId) +
+                        " name=" + generatedName,
+                    "DEBUG",
+                    "nbt"
+                );
+                return;
+            }
+
+            bedrock::ProtoDefValue* destinationItem = nullptr;
+            std::size_t destinationSlot = 0;
+            for (auto& action : actions->arrayValue) {
+                if (action.kind != bedrock::ProtoDefValue::Kind::Object ||
+                    objectString(action, "source_type") != "container" ||
+                    objectString(action, "inventory_id") != "inventory") {
+                    continue;
+                }
+                const auto oldItemIt = action.objectValue.find("old_item");
+                const auto newItemIt = action.objectValue.find("new_item");
+                auto* oldItem = oldItemIt == action.objectValue.end()
+                    ? nullptr
+                    : &oldItemIt->second;
+                auto* newItem = newItemIt == action.objectValue.end()
+                    ? nullptr
+                    : &newItemIt->second;
+                if (itemIsPresent(oldItem) || !itemIsPresent(newItem)) {
+                    continue;
+                }
+                destinationItem = newItem;
+                destinationSlot = static_cast<std::size_t>(std::max<int64_t>(
+                    0,
+                    packetInteger(action.get("slot")).value_or(0)
+                ));
+                break;
+            }
+            if (destinationItem == nullptr) return;
+
+            // Match the DLL Aether path: build one completed stack from the
+            // genuine crafting-result side, attach the armed NBT, and use
+            // that same completed descriptor on both transaction actions.
+            auto completedItem = *generatedItem;
+            completedItem.objectValue["extra"] = *cachedExtra;
+            *generatedItem = completedItem;
+            *destinationItem = std::move(completedItem);
+
+            bedrock::ProtoDefPacketEncoder encoder(
+                packetVersion,
+                itemProtocolVariables
+            );
+            auto payload = encoder.encodePacket(
+                "inventory_transaction",
+                bedrock::ProtoDefValue::object(params)
+            );
+            auto replacement = bedrock::VersionedMcpeCodec::forVersion(
+                packetVersion
+            ).packetCodec().makePacketByName(
+                "inventory_transaction",
+                payload
+            );
+            event.replace(std::move(replacement));
+            {
+                std::lock_guard lock(mutex);
+                nbtCraftDiagnosticRemaining = 0;
+                ++nbtCraftRewriteCount;
+            }
+            push(
+                "nbt_craft_rewritten",
+                "slot=" + slot +
+                    " result=" + generatedName +
+                    " destinationSlot=" + std::to_string(destinationSlot) +
+                    " actions=" + std::to_string(actions->arrayValue.size()) +
+                    " mode=aether_file_continuous",
+                "INFO",
+                "nbt"
+            );
+        } catch (const std::exception& error) {
+            push(
+                "nbt_craft_rewrite_failed",
+                "slot=" + slot + " error=" + safeMessage(error.what()),
+                "ERROR",
+                "nbt"
+            );
+        } catch (...) {
+            push(
+                "nbt_craft_rewrite_failed",
+                "slot=" + slot + " error=unknown native exception",
+                "ERROR",
+                "nbt"
+            );
+        }
     }
 
     static bedrock::ProtoDefValue legacyAutomationAction(
@@ -6634,12 +7603,154 @@ struct RelayState {
         );
     }
 
+    void recordDepositClick(const bedrock::ShulkerDeposit::Click& click) {
+        bool chest = false;
+        {
+            std::lock_guard lock(blockRegistryMutex);
+            if (blockRegistry) {
+                const auto* block = blockRegistry->blockByRuntimeId(static_cast<int32_t>(click.runtimeId));
+                chest = block && (block->name == "chest" || block->name == "trapped_chest" ||
+                    block->name == "minecraft:chest" || block->name == "minecraft:trapped_chest");
+            }
+        }
+        std::lock_guard lock(depositMutex);
+        depositChestClick = chest ? std::make_optional(click) : std::nullopt;
+        depositChestClickAt = steadyMilliseconds();
+    }
+
+    void observeDepositPacket(const bedrock::VersionedGamePacket& packet, bool serverbound) noexcept {
+        const auto& name = packet.name;
+        try {
+            if (serverbound && name == "inventory_transaction") {
+                std::optional<bedrock::ShulkerDeposit::Click> click;
+                {
+                    std::lock_guard lock(depositMutex);
+                    if (!shulkerDeposit.supported) return;
+                    click = shulkerDeposit.observeTransaction(packet.payload);
+                }
+                if (click) recordDepositClick(*click);
+                return;
+            }
+            if (serverbound && name == "item_stack_request") {
+                std::lock_guard lock(depositMutex);
+                shulkerDeposit.manualInteraction();
+                return;
+            }
+            if (name == "container_close" && !packet.payload.empty()) {
+                std::lock_guard lock(depositMutex);
+                shulkerDeposit.close(packet.payload.front());
+                return;
+            }
+            if (!serverbound && name == "change_dimension") {
+                std::lock_guard lock(depositMutex);
+                shulkerDeposit.resetSession();
+                depositChestClick.reset();
+                return;
+            }
+            if (!serverbound && (name == "inventory_content" || name == "inventory_slot")) {
+                bedrock::VersionedPayloadCursor cursor(packet.payload);
+                const auto window = cursor.readVarUInt();
+                std::lock_guard lock(depositMutex);
+                if (!shulkerDeposit.supported || (window != 0 &&
+                    window != shulkerDeposit.window)) return;
+                shulkerDeposit.observeInventory(packet.payload, name == "inventory_content",
+                    steadyMilliseconds());
+            }
+        } catch (const std::exception& error) {
+            std::lock_guard lock(depositMutex);
+            // Fail closed, without canceling or modifying the game packet.
+            shulkerDeposit.inventoryReady = false;
+            shulkerDeposit.halt("Не удалось проверить слоты. Переоткройте инвентарь");
+        }
+    }
+
+    void configureDeposit(bool enabled, bool hotbar, int intervalMs) {
+        std::lock_guard lock(depositMutex);
+        shulkerDeposit.configure(enabled, hotbar, steadyMilliseconds(), intervalMs);
+    }
+
+    bedrock::JsRuntimeValue depositSnapshot() const {
+        using Value = bedrock::JsRuntimeValue;
+        std::lock_guard lock(depositMutex);
+        return Value::object({
+            {"supported", Value::boolean(shulkerDeposit.supported)},
+            {"enabled", Value::boolean(shulkerDeposit.enabled)},
+            {"pending", Value::boolean(shulkerDeposit.pending.has_value())},
+            {"legacy", Value::boolean(!shulkerDeposit.authoritative)},
+            {"sent", Value::number(shulkerDeposit.sent)},
+            {"confirmed", Value::number(shulkerDeposit.confirmed)},
+            {"intervalMs", Value::number(shulkerDeposit.intervalMs)},
+            {"status", Value::string(shulkerDeposit.status)},
+            {"cacheBytes", Value::number(static_cast<double>(shulkerDeposit.cachedBytes()))}
+        });
+    }
+
+    void maybeInjectDeposit(const std::string& version, bedrock::BedrockRelayPacketEvent& event) noexcept {
+        if (event.canceled || !event.replacements.empty() ||
+            (event.packet.name != "player_auth_input" && event.packet.name != "move_player")) return;
+        // Serialize with other automation before taking the deposit lock.
+        {
+            std::lock_guard lock(mutex);
+            if (areaFillRunning || pendingAutomationRequestId != 0 ||
+                automationInventorySessionOpen || automationInventoryOpenRequested) return;
+        }
+        try {
+            std::unique_lock lock(depositMutex);
+            auto plan = shulkerDeposit.poll(steadyMilliseconds());
+            if (!plan) return;
+            bedrock::VersionedGamePacket move;
+            if (plan->authoritative) {
+                using Value = bedrock::ProtoDefValue;
+                auto destination = automationStackSlot("container", plan->destination, 0);
+                if (plan->dynamicId) {
+                    destination.objectValue["slot_type"].objectValue["dynamic_container_id"] =
+                        Value::uinteger(*plan->dynamicId);
+                }
+                move = makeAreaProtocolPacket(version, "item_stack_request", Value::object({
+                    {"requests", Value::array({Value::object({
+                        {"request_id", Value::integer(plan->requestId)},
+                        {"actions", Value::array({Value::object({
+                            {"type_id", Value::string("place")},
+                            {"count", Value::uinteger(plan->item.item.count)},
+                            {"source", automationStackSlot("hotbar_and_inventory", plan->source,
+                                plan->item.item.stackId)},
+                            {"destination", std::move(destination)}
+                        })})},
+                        {"custom_names", Value::array({})},
+                        {"cause", Value::string("chat_public")}
+                    })})}
+                }));
+            } else {
+                move = bedrock::VersionedMcpeCodec::forVersion(version).packetCodec()
+                    .makePacketByName("inventory_transaction", bedrock::ShulkerDeposit::legacyPayload(*plan));
+            }
+            std::vector<bedrock::VersionedGamePacket> packets;
+            packets.reserve(2);
+            packets.push_back(event.packet);
+            packets.push_back(std::move(move));
+            event.replace(std::move(packets));
+            const auto message = "window=" + std::to_string(plan->window) +
+                " source=" + std::to_string(plan->source) +
+                " destination=" + std::to_string(plan->destination) +
+                " itemBytes=" + std::to_string(plan->item.wire->size()) +
+                (plan->authoritative ? " mode=stack_request" : " mode=legacy_prediction");
+            lock.unlock();
+            push("shulker_deposit_move", message, "INFO", "shulker_deposit");
+        } catch (const std::exception&) {
+            std::lock_guard lock(depositMutex);
+            shulkerDeposit.clientUpdate.reset();
+            shulkerDeposit.halt("Не удалось отправить перенос. Переоткройте сундук");
+            shulkerDeposit.inventoryReady = false;
+        }
+    }
+
     void observeDecodedGameplayPacket(
         const std::string& version,
         bedrock::BedrockRelayPacketEvent& event,
         bool serverbound
     ) noexcept {
         const auto& name = event.packet.name;
+        observeDepositPacket(event.packet, serverbound);
         if (!serverbound && (name == "correct_player_move_prediction" || name == "move_player")) {
             bool controlling = false;
             {
@@ -6675,9 +7786,10 @@ struct RelayState {
             automationInventoryWindowId = bedrock::ProtoDefValue::null();
             automationInventoryWindowType = bedrock::ProtoDefValue::null();
         }
-        if (!serverbound && name == "item_registry") {
+        if (!serverbound &&
+            (name == "start_game" || name == "item_registry")) {
             observeItemRegistry(version, event.packet);
-            return;
+            if (name == "item_registry") return;
         }
         if (!serverbound && name == "container_open") {
             try {
@@ -6690,6 +7802,19 @@ struct RelayState {
                 );
                 const auto* windowId = decoded.value("window_id");
                 const auto* windowType = decoded.value("window_type");
+                {
+                    std::lock_guard lock(depositMutex);
+                    const auto id = event.packet.payload.empty() ? 0 : event.packet.payload.front();
+                    const auto distance = depositChestClick ?
+                        std::abs(decoded.getInt("coordinates.x", INT32_MIN) - depositChestClick->x) +
+                        std::abs(decoded.getInt("coordinates.z", INT32_MIN) - depositChestClick->z) : INT64_MAX;
+                    const bool matchingClick = depositChestClick && distance <= 1 &&
+                        steadyMilliseconds() - depositChestClickAt < 5000 &&
+                        decoded.getInt("coordinates.y", INT32_MIN) == depositChestClick->y;
+                    shulkerDeposit.open(id, matchingClick &&
+                        decoded.getString("window_type", "") == "container", steadyMilliseconds(), distance == 1);
+                    depositChestClick.reset();
+                }
                 if (windowId != nullptr && windowType != nullptr) {
                     std::lock_guard lock(mutex);
                     const bool automationOwned =
@@ -6730,6 +7855,12 @@ struct RelayState {
             try {
                 std::lock_guard decodeLock(itemDecodeMutex);
                 bedrock::RelayPacketEvent decoded(version, event);
+                {
+                    std::lock_guard lock(depositMutex);
+                    shulkerDeposit.resetSession();
+                    shulkerDeposit.authoritative = decoded.getBool("server_authoritative_inventory", true);
+                    depositChestClick.reset();
+                }
                 configureBlockRuntimeIds(decoded.getBool(
                     "block_network_ids_are_hashes",
                     true
@@ -6746,6 +7877,9 @@ struct RelayState {
             playerInventory.clear();
             playerInventoryReady = false;
             selectedHotbarSlot = -1;
+            nbtCraftArmed = false;
+            nbtCraftDiagnosticRemaining = 0;
+            nbtCraftExtraCache.reset();
             pendingAutomationRequestId = 0;
             pendingAutomationNetworkId = 0;
             pendingAutomationStackId = 0;
@@ -6979,13 +8113,67 @@ struct RelayState {
             name == "mob_effect";
         if (!relevant) return;
 
+        // Other players' held/armour items cannot update our equipment. Read
+        // their leading runtime ID before any item/NBT decode or packet copy.
+        if (!serverbound &&
+            (name == "mob_equipment" || name == "mob_armor_equipment")) {
+            try {
+                const auto camera = entityPositions.cameraSnapshot();
+                bedrock::VersionedPayloadCursor cursor(event.packet.payload);
+                if (camera.runtimeId != 0 &&
+                    cursor.readVarULong() != camera.runtimeId) return;
+            } catch (...) {
+                return;
+            }
+        }
+
+        // The overlay only tracks the player's fixed inventory, offhand and
+        // armour. Peeking the leading WindowID avoids fully materialising a
+        // multi-megabyte chest/shulker NBT tree merely to discover that the
+        // packet belongs to a foreign container. The original packet is still
+        // forwarded to Minecraft unchanged by the relay.
+        if (!serverbound &&
+            (name == "inventory_content" || name == "inventory_slot")) {
+            try {
+                bedrock::VersionedPayloadCursor cursor(event.packet.payload);
+                const auto windowId = cursor.readVarUInt();
+                if (windowId != 0 && windowId != 119 && windowId != 120) {
+                    return;
+                }
+                if (event.packet.payload.size() >
+                    MaximumTrackedInventoryPacketBytes) {
+                    if (name == "inventory_content" && windowId == 0) {
+                        std::lock_guard lock(mutex);
+                        playerInventory.clear();
+                        playerInventoryReady = false;
+                        automationStatus =
+                            "Большой инвентарь передан без разбора";
+                    }
+                    push(
+                        "inventory_buffer_bypass",
+                        "packet=" + name +
+                            " windowId=" + std::to_string(windowId) +
+                            " bytes=" + std::to_string(
+                                event.packet.payload.size()
+                            ) + " forwarded_raw=true",
+                        "DEBUG",
+                        "packet"
+                    );
+                    return;
+                }
+            } catch (...) {
+                return;
+            }
+        }
+
         try {
             std::lock_guard decodeLock(itemDecodeMutex);
             bedrock::RelayPacketEvent decoded(
                 version,
                 event,
                 itemProtocolVariables,
-                true
+                true,
+                event.packet.payload.size() > StructuredItemPacketBytes
             );
             if (!serverbound && name == "item_stack_response") {
                 const auto* responses = decoded.value("responses");
@@ -7020,6 +8208,29 @@ struct RelayState {
                               bedrock::PacketValue::Kind::String &&
                           status->stringValue == "ok") ||
                          (numericStatus && numericValue(status) == 0));
+                    {
+                        std::lock_guard lock(depositMutex);
+                        int32_t destinationStackId = 0;
+                        if (shulkerDeposit.pending && shulkerDeposit.pending->requestId == requestId) {
+                            const auto* containers = response.get("containers");
+                            if (containers && containers->kind == bedrock::PacketValue::Kind::Array) {
+                                for (const auto& container : containers->arrayValue) {
+                                    const auto* type = container.get("slot_type");
+                                    const auto* id = type ? type->get("container_id") : nullptr;
+                                    if (!id || (id->stringValue != "container" && numericValue(id) != 7)) continue;
+                                    const auto* slots = container.get("slots");
+                                    if (!slots || slots->kind != bedrock::PacketValue::Kind::Array) continue;
+                                    for (const auto& slot : slots->arrayValue) {
+                                        if (numericValue(slot.get("slot")) == shulkerDeposit.pending->destination &&
+                                            numericValue(slot.get("count")) == shulkerDeposit.pending->item.item.count) {
+                                            destinationStackId = static_cast<int32_t>(numericValue(slot.get("item_stack_id")));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        shulkerDeposit.response(requestId, accepted, steadyMilliseconds(), destinationStackId);
+                    }
                     std::lock_guard lock(mutex);
                     if (areaFillRefillPending &&
                         areaFillRefillRequestId == requestId) {
@@ -7296,13 +8507,27 @@ struct RelayState {
                 }
                 std::vector<EquipmentItem> inventory;
                 inventory.reserve(items->arrayValue.size());
+                int32_t heldSlot = -1;
+                {
+                    std::lock_guard lock(mutex);
+                    heldSlot = selectedHotbarSlot;
+                }
                 for (std::size_t index = 0;
                      index < items->arrayValue.size(); ++index) {
-                    inventory.push_back(decodedItem(
+                    auto item = decodedItem(
                         version,
                         decoded,
                         "input[" + std::to_string(index) + "]"
-                    ));
+                    );
+                    // A nested shulker may contain tens of thousands of
+                    // ProtoDef nodes. Keep its light slot metadata only; the
+                    // complete held item is tracked separately via
+                    // MobEquipment for .nbt copy/.nbt save.
+                    if (isShulkerName(item.name) &&
+                        static_cast<int32_t>(index) != heldSlot) {
+                        item.transactionItem = {};
+                    }
+                    inventory.push_back(std::move(item));
                 }
                 std::lock_guard lock(mutex);
                 playerInventory = std::move(inventory);
@@ -7363,6 +8588,15 @@ struct RelayState {
                 windowId == "inventory") {
                 const auto slot = decoded.getUInt("slot", 999);
                 auto item = decodedItem(version, decoded, "item");
+                int32_t heldSlot = -1;
+                {
+                    std::lock_guard lock(mutex);
+                    heldSlot = selectedHotbarSlot;
+                }
+                if (isShulkerName(item.name) &&
+                    static_cast<int32_t>(slot) != heldSlot) {
+                    item.transactionItem = {};
+                }
                 std::lock_guard lock(mutex);
                 // A single InventorySlot packet is only a delta. Never treat
                 // it as a complete inventory: automation must first observe a
@@ -7427,6 +8661,11 @@ struct RelayState {
     }
 
     void clearGameplayTelemetry() {
+        {
+            std::lock_guard lock(depositMutex);
+            shulkerDeposit.resetSession();
+            depositChestClick.reset();
+        }
         minecraftUiBlocked.store(false, std::memory_order_relaxed);
         resetMiniMapWorld(0);
         std::lock_guard lock(mutex);
@@ -7434,6 +8673,9 @@ struct RelayState {
         playerInventory.clear();
         playerInventoryReady = false;
         selectedHotbarSlot = -1;
+        nbtCraftArmed = false;
+        nbtCraftDiagnosticRemaining = 0;
+        nbtCraftExtraCache.reset();
         pendingAutomationRequestId = 0;
         pendingAutomationNetworkId = 0;
         pendingAutomationStackId = 0;
@@ -8014,6 +9256,24 @@ bedrock::JsRuntimeValue snapshotValue(
         {"playerInventorySlots", bedrock::JsRuntimeValue::number(
             static_cast<double>(state->playerInventory.size())
         )},
+        {"nbtCraftArmed", bedrock::JsRuntimeValue::boolean(
+            state->nbtCraftArmed
+        )},
+        {"nbtCraftSlot", bedrock::JsRuntimeValue::string(
+            state->nbtCraftSlot
+        )},
+        {"nbtTransferDirectory", bedrock::JsRuntimeValue::string(
+            state->nbtTransferDirectory.string()
+        )},
+        {"nbtCopyCount", bedrock::JsRuntimeValue::number(
+            static_cast<double>(state->nbtCopyCount)
+        )},
+        {"nbtCraftRewriteCount", bedrock::JsRuntimeValue::number(
+            static_cast<double>(state->nbtCraftRewriteCount)
+        )},
+        {"nbtCraftCandidateCount", bedrock::JsRuntimeValue::number(
+            static_cast<double>(state->nbtCraftCandidateCount)
+        )},
         {"automationPending", bedrock::JsRuntimeValue::boolean(
             state->pendingAutomationRequestId != 0 ||
             state->automationInventoryOpenRequested ||
@@ -8028,6 +9288,7 @@ bedrock::JsRuntimeValue snapshotValue(
         {"automationStatus", bedrock::JsRuntimeValue::string(
             state->automationStatus
         )},
+        {"shulkerDeposit", state->depositSnapshot()},
         {"areaFill", state->areaFillSnapshotValueLocked()},
         {"playerHealthKnown", bedrock::JsRuntimeValue::boolean(
             state->playerHealthKnown
@@ -8760,13 +10021,18 @@ public:
         const std::string& destinationHost,
         uint16_t destinationPort,
         const std::string& version,
-        const std::filesystem::path& cacheDirectory
+        const std::filesystem::path& cacheDirectory,
+        const std::string& cacheProfile = {}
     ) {
         bedrock::RelayOptions options;
         options.version = version;
         options.host = "0.0.0.0";
         options.port = 19132;
+#if defined(BEDROCK_RELAY_WINDOWS)
+        options.motd = "CPE Relay Windows";
+#else
         options.motd = "CPE Relay Android";
+#endif
         // Keep one overlap slot so a new Minecraft transport can replace a
         // stale Android UDP session before its timeout expires.
         options.maxPlayers = 2;
@@ -8779,10 +10045,14 @@ public:
         options.downstreamRaknetTimeoutMs = 120'000;
         options.upstreamRaknetTimeoutMs = 120'000;
         options.logging = false;
+        // Prefer latency/CPU over maximum compression on the phone. The
+        // MCPE framing and negotiated encryption remain unchanged.
+        options.compressionLevel = 1;
         // The mobile relay has raw packet observers, not packet editors.
         // Preserve backend extensions byte-for-byte instead of disconnecting
         // when a server uses a newer optional packet field.
         options.parseErrorPolicy = bedrock::RelayParseErrorPolicy::ForwardRaw;
+        options.validateUnhandledPackets = false;
         options.enableChunkCaching = false;
         options.levelChunkRetentionMaximumBytes =
             AndroidLevelChunkRetentionMaximumBytes;
@@ -8790,13 +10060,26 @@ public:
         options.destination.port = destinationPort;
         options.destination.offline = false;
         options.profilesFolder = cacheDirectory;
+#if defined(BEDROCK_RELAY_WINDOWS)
+        if (!cacheProfile.empty()) {
+            // Local profile selection changes only the cache key, never JWT identity claims.
+            options.profilesFolder = bedrock::AuthCacheFactory([cacheDirectory, cacheProfile](bedrock::AuthCacheFactoryOptions cache) {
+                cache.username = cacheProfile;
+                return bedrock::makeFileAuthCache(cacheDirectory, std::move(cache));
+            });
+        }
+#endif
         // The autonomous Android application supports the standard device-code
         // flow and never falls back to the process-based MSAL/curl paths.
         options.flow = "live";
         options.advanced.httpClientFactory = [](auto queue) {
+#if defined(BEDROCK_RELAY_WINDOWS)
+            return std::make_shared<cpe::WindowsTokenHttpClient>(std::move(queue));
+#else
             return std::make_shared<AndroidXboxTokenHttpClient>(
                 std::move(queue)
             );
+#endif
         };
 
         auto state = state_;
@@ -8828,6 +10111,7 @@ public:
                         (1024u * 1024u)
                 ) +
                 " nativeBuild=" + std::string(NativeBuildType) +
+                " rawUnhandledPackets=true itemNbt=binary_cache compressionLevel=1" +
                 " compilerOptimized=" +
                 (NativeCompilerOptimized ? "true" : "false"),
             "INFO",
@@ -9070,10 +10354,43 @@ public:
         relay->live().onServerbound([this, state, version](
             bedrock::BedrockRelayPacketEvent& event
         ) {
+            if (const auto response = state->handleNbtCommand(
+                    version,
+                    event
+                )) {
+                queueNbtFeedback(*response);
+                return;
+            }
+            state->maybeRewriteNbtCraft(version, event);
+            if (!event.replacements.empty()) {
+                // Craft replacement returns early, but the slot index still
+                // needs the final completed item (without decoding its NBT).
+                for (const auto& packet : event.replacements) state->observeDepositPacket(packet, true);
+                return;
+            }
             bool positionObserved = false;
             if (event.packet.name == "player_auth_input") {
                 try {
-                    bedrock::RelayPacketEvent decoded(version, event);
+                    bedrock::RelayPacketEvent decoded(
+                        version, event, {}, false,
+                        event.packet.payload.size() > StructuredItemPacketBytes
+                    );
+                    if (decoded.getString("transaction.data.action_type", "") == "click_block") {
+                        state->recordDepositClick({
+                            static_cast<int32_t>(decoded.getInt("transaction.data.block_position.x", 0)),
+                            static_cast<int32_t>(decoded.getInt("transaction.data.block_position.y", 0)),
+                            static_cast<int32_t>(decoded.getInt("transaction.data.block_position.z", 0)),
+                            static_cast<uint32_t>(decoded.getUInt("transaction.data.block_runtime_id", 0))
+                        });
+                    }
+                    const auto* manualRequest = decoded.value("item_stack_request");
+                    const auto* manualActions = decoded.value("transaction.actions");
+                    if ((manualRequest && manualRequest->kind == bedrock::PacketValue::Kind::Object) ||
+                        (manualActions && manualActions->kind == bedrock::PacketValue::Kind::Array &&
+                            !manualActions->arrayValue.empty())) {
+                        std::lock_guard lock(state->depositMutex);
+                        state->shulkerDeposit.manualInteraction();
+                    }
                     constexpr double Missing =
                         std::numeric_limits<double>::quiet_NaN();
                     const double forwardX = decoded.getDouble(
@@ -9146,6 +10463,8 @@ public:
                 syncAreaFillDownstreamMovement();
             } else {
                 state->maybeInjectAutomation(version, event);
+                state->maybeInjectDeposit(version, event);
+                queueDepositUpdates(event.sessionId);
             }
             if (isResourcePackTransportPacket(event.packet.name)) {
                 const auto sampleIndex =
@@ -9186,6 +10505,7 @@ public:
         ) {
             state->entityPositions.observeClientbound(event.packet);
             state->observeDecodedGameplayPacket(version, event, false);
+            queueDepositUpdates(event.sessionId);
             state->enqueueMiniMapChunk(version, event.packet);
             if (event.packet.name == "update_block" ||
                 event.packet.name == "update_block_synced") {
@@ -10600,6 +11920,104 @@ private:
     bool loginWatchdogStopping_ = false;
     std::thread loginWatchdogThread_;
 
+    void queueDepositUpdates(const std::string& sessionId) noexcept {
+        try {
+            std::optional<bedrock::ShulkerDeposit::Plan> update;
+            {
+                std::lock_guard lock(state_->depositMutex);
+                update = std::move(state_->shulkerDeposit.clientUpdate);
+                state_->shulkerDeposit.clientUpdate.reset();
+            }
+            if (!update) return;
+            std::optional<bedrock::BedrockServerConnection> downstream;
+            {
+                std::lock_guard lock(schematicMarkerMutex_);
+                if (schematicDownstreamSessionId_ != sessionId) return;
+                downstream = schematicDownstream_;
+            }
+            if (!downstream) return;
+            const auto codec = bedrock::VersionedMcpeCodec::forVersion(state_->version);
+            std::vector<bedrock::VersionedGamePacket> packets;
+            packets.reserve(2);
+            packets.push_back(codec.packetCodec().makePacketByName("inventory_slot",
+                bedrock::ShulkerDeposit::slotPayload(0, update->source, nullptr, {}, update->sourceContainer)));
+            packets.push_back(codec.packetCodec().makePacketByName("inventory_slot",
+                bedrock::ShulkerDeposit::slotPayload(update->window, update->destination,
+                    update->item.wire.get(), update->dynamicId, update->destinationContainer)));
+            std::lock_guard relayLock(relayMutex_);
+            std::lock_guard depositLock(state_->depositMutex);
+            if (state_->shulkerDeposit.generation != update->generation ||
+                state_->shulkerDeposit.window != update->window) return;
+            if (!relay_ || !relay_->live().queueClientboundPackets(*downstream, packets)) {
+                state_->shulkerDeposit.halt("Клиент не получил обновление слотов. Переоткройте сундук");
+            }
+        } catch (const std::exception&) {
+            std::lock_guard lock(state_->depositMutex);
+            state_->shulkerDeposit.halt("Ошибка обновления слотов. Переоткройте сундук");
+        }
+    }
+
+    void queueNbtFeedback(const std::string& message) noexcept {
+        try {
+            std::optional<bedrock::BedrockServerConnection> downstream;
+            {
+                std::lock_guard markerLock(schematicMarkerMutex_);
+                downstream = schematicDownstream_;
+            }
+            if (!downstream.has_value()) {
+                state_->push(
+                    "nbt_feedback_skipped",
+                    "downstream session is unavailable",
+                    "WARN",
+                    "nbt"
+                );
+                return;
+            }
+            using Value = bedrock::ProtoDefValue;
+            bedrock::ProtoDefPacketEncoder encoder(state_->version);
+            auto payload = encoder.encodePacket(
+                "text",
+                Value::object({
+                    {"type", Value::string("system")},
+                    {"needs_translation", Value::boolean(false)},
+                    {"message", Value::string("[CPE NBT] " + message)},
+                    {"xuid", Value::string("")},
+                    {"platform_chat_id", Value::string("")},
+                    {"filtered_message", Value::string("")}
+                })
+            );
+            auto packet = bedrock::VersionedMcpeCodec::forVersion(
+                state_->version
+            ).packetCodec().makePacketByName("text", payload);
+            std::lock_guard relayLock(relayMutex_);
+            if (!relay_ || !relay_->live().queueClientboundPackets(
+                    *downstream,
+                    {std::move(packet)}
+                )) {
+                state_->push(
+                    "nbt_feedback_skipped",
+                    "Minecraft clientbound queue rejected the message",
+                    "WARN",
+                    "nbt"
+                );
+            }
+        } catch (const std::exception& error) {
+            state_->push(
+                "nbt_feedback_failed",
+                safeMessage(error.what()),
+                "WARN",
+                "nbt"
+            );
+        } catch (...) {
+            state_->push(
+                "nbt_feedback_failed",
+                "unknown native exception",
+                "WARN",
+                "nbt"
+            );
+        }
+    }
+
     bool queueSchematicPacketsBatched(
         const bedrock::BedrockServerConnection& downstream,
         const std::vector<bedrock::VersionedGamePacket>& packets
@@ -10971,6 +12389,12 @@ private:
 
 std::mutex controllerMutex;
 std::shared_ptr<RelayController> controller;
+#if defined(BEDROCK_RELAY_WINDOWS)
+// Never start/join threads while Windows holds the DLL loader lock.
+std::shared_ptr<RelayState> currentState;
+} // namespace
+#include <cpe/desktop_api.inc>
+#else
 std::shared_ptr<RelayState> currentState = std::make_shared<RelayState>();
 
 void initializeJavaBridge(JNIEnv* environment, jclass bridgeClass) {
@@ -11076,6 +12500,12 @@ Java_com_m9chko_bedrockrelay_NativeBridge_startRelay(
         state->destinationHost = destinationHost;
         state->destinationPort = static_cast<uint16_t>(destinationPortValue);
         state->version = version;
+        state->shulkerDeposit.supported = bedrock::ShulkerDeposit::supports(version);
+        state->configureDeposit(configuredShulkerDeposit.load(), configuredShulkerDepositHotbar.load(),
+            configuredShulkerDepositIntervalMs.load());
+        state->nbtTransferDirectory =
+            std::filesystem::path(cacheDirectory).parent_path() / "NBT";
+        std::filesystem::create_directories(state->nbtTransferDirectory);
         state->relayStartedAt = unixMilliseconds();
         state->running = true;
         if (!minecraftDataDirectory.empty()) {
@@ -11177,6 +12607,66 @@ Java_com_m9chko_bedrockrelay_NativeBridge_stopRelay(
     if (previous) previous->stop();
 }
 
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_m9chko_bedrockrelay_NativeBridge_armNbtCraft(
+    JNIEnv* environment,
+    jclass,
+    jstring slotValue
+) {
+    try {
+        const auto slot = fromJavaString(environment, slotValue);
+        std::shared_ptr<RelayState> state;
+        {
+            std::lock_guard lock(controllerMutex);
+            state = currentState;
+        }
+        return toJavaString(
+            environment,
+            state == nullptr
+                ? "Relay не запущен."
+                : state->armNbtCraftFromFile(slot)
+        );
+    } catch (const std::exception& error) {
+        return toJavaString(environment, safeMessage(error.what()));
+    }
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_m9chko_bedrockrelay_NativeBridge_stopNbtCraft(
+    JNIEnv* environment,
+    jclass
+) {
+    std::shared_ptr<RelayState> state;
+    {
+        std::lock_guard lock(controllerMutex);
+        state = currentState;
+    }
+    return toJavaString(
+        environment,
+        state == nullptr
+            ? "Relay не запущен."
+            : state->stopNbtCraftMode()
+    );
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_m9chko_bedrockrelay_NativeBridge_nbtCraftStatus(
+    JNIEnv* environment,
+    jclass
+) {
+    std::shared_ptr<RelayState> state;
+    {
+        std::lock_guard lock(controllerMutex);
+        state = currentState;
+    }
+    return toJavaString(
+        environment,
+        state == nullptr
+            ? "Relay не запущен"
+            : state->nbtCraftModeStatus()
+    );
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_m9chko_bedrockrelay_NativeBridge_configureRuntime(
     JNIEnv*,
@@ -11221,6 +12711,22 @@ Java_com_m9chko_bedrockrelay_NativeBridge_configureRuntime(
             clampedRadius
         );
     }
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_m9chko_bedrockrelay_NativeBridge_configureShulkerDeposit(
+    JNIEnv*, jclass, jboolean enabled, jboolean hotbar, jint intervalMs
+) {
+    configuredShulkerDeposit.store(enabled == JNI_TRUE);
+    configuredShulkerDepositHotbar.store(hotbar == JNI_TRUE);
+    const int clampedInterval = bedrock::ShulkerDeposit::clampIntervalMs(intervalMs);
+    configuredShulkerDepositIntervalMs.store(clampedInterval);
+    std::shared_ptr<RelayState> state;
+    {
+        std::lock_guard lock(controllerMutex);
+        state = currentState;
+    }
+    if (state) state->configureDeposit(enabled == JNI_TRUE, hotbar == JNI_TRUE, clampedInterval);
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -11756,3 +13262,4 @@ Java_com_m9chko_bedrockrelay_NativeBridge_pollEvents(
         jsonString(bedrock::JsRuntimeValue::array(std::move(events)))
     );
 }
+#endif // BEDROCK_RELAY_WINDOWS

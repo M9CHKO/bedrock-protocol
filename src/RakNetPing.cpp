@@ -1,4 +1,5 @@
 #include "bedrock/RakNetPing.hpp"
+#include "bedrock/detail/PlatformSocket.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -6,12 +7,6 @@
 #include <cstring>
 #include <random>
 
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <sys/select.h>
-#include <netdb.h>
-#include <unistd.h>
-#include <arpa/inet.h>
 
 namespace bedrock {
 
@@ -280,11 +275,12 @@ RakNetPongInfo RakNetPinger::ping(
     result.host = host;
     result.port = port;
 
-    int sock = -1;
+    detail::Socket sock = detail::invalidSocket;
     struct addrinfo hints {};
     struct addrinfo* res = nullptr;
 
     try {
+        detail::ensureSockets();
         // The selected raknet-native Client starts an AF_INET socket and first
         // resolves every host as IPv4. Even dual-stack hostnames therefore use
         // their first IPv4 result. Its SystemAddress helper maps ::1 to the IPv4
@@ -324,20 +320,13 @@ RakNetPongInfo RakNetPinger::ping(
 
         sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 
-        if (sock < 0) {
+        if (sock == detail::invalidSocket) {
             result.error = "socket() failed";
             if (res) freeaddrinfo(res);
             return result;
         }
 
-        const int broadcast = 1;
-        (void) setsockopt(
-            sock,
-            SOL_SOCKET,
-            SO_BROADCAST,
-            &broadcast,
-            sizeof(broadcast)
-        );
+        detail::enableBroadcast(sock);
 
         auto packet = buildUnconnectedPing();
 
@@ -345,7 +334,7 @@ RakNetPongInfo RakNetPinger::ping(
             // RakPeer::Ping returns false on a send/address failure, but the
             // native binding ignores that return value and still waits for its
             // ordinary timeout.
-            (void) sendto(
+            (void) detail::sendDatagram(
                 sock,
                 packet.data(),
                 packet.size(),
@@ -367,7 +356,7 @@ RakNetPongInfo RakNetPinger::ping(
             if (now >= deadline) {
                 result.timedOut = true;
                 result.error = "Ping timed out";
-                close(sock);
+                detail::closeSocket(sock);
                 return result;
             }
 
@@ -385,33 +374,26 @@ RakNetPongInfo RakNetPinger::ping(
             fd_set readfds;
             FD_ZERO(&readfds);
             FD_SET(sock, &readfds);
-            const int ready = select(sock + 1, &readfds, nullptr, nullptr, &tv);
+            const int ready = select(detail::selectWidth(sock), &readfds, nullptr, nullptr, &tv);
             if (ready < 0) {
-                if (errno == EINTR) continue;
+                if (detail::socketInterrupted()) continue;
                 result.error = "select() failed";
-                close(sock);
+                detail::closeSocket(sock);
                 return result;
             }
             if (ready == 0) {
                 result.timedOut = true;
                 result.error = "Ping timed out";
-                close(sock);
+                detail::closeSocket(sock);
                 return result;
             }
 
             std::vector<uint8_t> buf(4096);
-            const ssize_t received = recvfrom(
-                sock,
-                buf.data(),
-                buf.size(),
-                0,
-                nullptr,
-                nullptr
-            );
+            const auto received = detail::receiveDatagram(sock, buf.data(), buf.size());
             if (received <= 0) {
-                if (received < 0 && errno == EINTR) continue;
+                if (received < 0 && detail::socketInterrupted()) continue;
                 result.error = "recvfrom() failed";
-                close(sock);
+                detail::closeSocket(sock);
                 return result;
             }
 
@@ -423,12 +405,12 @@ RakNetPongInfo RakNetPinger::ping(
                 continue;
             }
 
-            close(sock);
+            detail::closeSocket(sock);
             return parsed;
         }
     } catch (const std::exception& e) {
-        if (sock >= 0) {
-            close(sock);
+        if (sock != detail::invalidSocket) {
+            detail::closeSocket(sock);
         }
 
         if (res) {

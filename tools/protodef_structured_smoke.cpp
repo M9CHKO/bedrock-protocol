@@ -10,6 +10,7 @@
 #include <bedrock/protodef/ProtoDefWriter.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <iostream>
 #include <limits>
@@ -500,6 +501,90 @@ bool checkItemStructuralMarkers() {
     return ok;
 }
 
+bool checkOpaqueItemNbt() {
+    const std::string version = "1.21.100";
+    const auto variables = bedrock::makeProtoDefVariableStore();
+    variables->setVariable("ShieldItemID", 513);
+    const auto codec = bedrock::VersionedPacketCodec::forVersion(version);
+    bedrock::ProtoDefPacketEncoder encoder(version, variables);
+    try {
+        bedrock::BedrockRelayPacketEvent seed;
+        seed.packet = codec.decodeFullPacket(unhex(
+            "3200001d00008208010000000012000000000000000000007b00000000000000"
+        ));
+        bedrock::RelayPacketEvent original(version, seed, variables, true);
+        auto params = original.decodedParams();
+        using Nbt = bedrock::NbtValue;
+        const auto leaf = Nbt::compound({
+            {"Name", Nbt::string("minecraft:stone")},
+            {"Count", Nbt::byte(64)},
+            {"Damage", Nbt::shortInteger(0)}
+        });
+        const auto nested = Nbt::compound({
+            {"Name", Nbt::string("minecraft:shulker_box")},
+            {"tag", Nbt::compound({
+                {"Items", Nbt::list(bedrock::NbtTagType::Compound,
+                    std::vector<Nbt>(27, leaf))}
+            })}
+        });
+        const auto tag = bedrock::nbtDocumentToProtoDefValue({"", Nbt::compound({
+            {"Items", Nbt::list(bedrock::NbtTagType::Compound,
+                std::vector<Nbt>(27, nested))}
+        })});
+        auto& extra = params.at("item").objectValue.at("extra");
+        extra.objectValue["has_nbt"] = Value::string("true");
+        extra.objectValue["nbt"] = Value::object({
+            {"version", Value::uinteger(1)}, {"nbt", tag}
+        });
+        bedrock::BedrockRelayPacketEvent event;
+        event.packet = codec.makePacketByName("inventory_slot",
+            encoder.encodePacket("inventory_slot", Value::object(params)));
+        const auto started = std::chrono::steady_clock::now();
+        for (int i = 0; i < 20; ++i) {
+            bedrock::RelayPacketEvent raw(version, event, variables, true, true);
+            const auto* bytes = raw.value("item.extra.nbt.nbt");
+            if (!bytes || bytes->kind != Value::Kind::Bytes ||
+                bytes->bytesValue.size() < 16 * 1024) {
+                throw std::runtime_error("large nested tag was materialized");
+            }
+            if (!sameBytes("opaque nested item round-trip",
+                    encoder.encodePacket("inventory_slot",
+                        Value::object(raw.decodedParams())), event.packet.payload)) return false;
+            if (i == 0) {
+                bedrock::PacketFieldCursor cursor(bytes->bytesValue);
+                bedrock::ProtoDefReader reader(cursor);
+                const auto restored = bedrock::readProtoDefNbt(
+                    reader, bedrock::BedrockNbtEncoding::LittleEndian);
+                if (reader.remaining() != 0 ||
+                    !(bedrock::protoDefValueToNbtDocument(restored) ==
+                        bedrock::protoDefValueToNbtDocument(tag))) {
+                    throw std::runtime_error("explicit NBT copy lost nested contents");
+                }
+            }
+        }
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        std::cout << "[OPAQUE-ITEM] bytes=" << event.packet.fullPacket.size()
+                  << " roundTrips=20 elapsedMs=" << elapsed << "\n";
+        // Raw preservation must still reject truncated NBT, not cache a partial
+        // tag and later manufacture a corrupt item during crafting.
+        auto truncated = event;
+        truncated.packet.payload.resize(truncated.packet.payload.size() / 2);
+        bool rejected = false;
+        try {
+            bedrock::RelayPacketEvent bad(version, truncated, variables, true, true);
+            (void) bad.decodedParams();
+        } catch (const std::exception&) {
+            rejected = true;
+        }
+        if (!rejected) throw std::runtime_error("truncated opaque NBT accepted");
+        return true;
+    } catch (const std::exception& error) {
+        std::cerr << "[FAIL] opaque item NBT: " << error.what() << "\n";
+        return false;
+    }
+}
+
 } // namespace
 
 int main() {
@@ -509,6 +594,7 @@ int main() {
     ok = checkPlayerAuthInputBitflagsRoundTrip() && ok;
     ok = checkBufferAndRelayReconstruction() && ok;
     ok = checkItemStructuralMarkers() && ok;
+    ok = checkOpaqueItemNbt() && ok;
     if (!ok) return 1;
     std::cout << "[PROTODEF-STRUCTURED] counts, parent paths, bitflags, binary fields, options, arrays, and relay reconstruction ok\n";
     return 0;

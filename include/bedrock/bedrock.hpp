@@ -67,8 +67,11 @@
 #include <utility>
 #include <vector>
 
+#if defined(_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <netdb.h>
-#if !defined(_WIN32)
 #include <netinet/in.h>
 #endif
 
@@ -2886,6 +2889,11 @@ struct RelayOptions {
     // initialization while allowing frontends to tune each transport side.
     int downstreamRaknetTimeoutMs = 30'000;
     int upstreamRaknetTimeoutMs = 30'000;
+    // Raw-only consumers may bypass schema validation entirely. Palette
+    // packets still update session variables, and structured handlers always
+    // retain the normal strict decode/error policy. Opt-in for transparent
+    // relays that must not walk large inventories just to forward their bytes.
+    bool validateUnhandledPackets = true;
 
     // A single root offline value is the common case and applies to both
     // sides. destination.offline exists only as an explicit upstream override.
@@ -2919,14 +2927,16 @@ public:
         std::string version,
         BedrockRelayPacketEvent& event,
         ProtoDefVariableStorePtr variables = {},
-        bool strictDecode = false
+        bool strictDecode = false,
+        bool preserveNbtBytes = false
     ) : direction(event.direction),
         sessionId(event.sessionId),
         name(event.packet.name),
         packet(event.packet),
         version_(std::move(version)),
         variables_(variables ? std::move(variables) : makeProtoDefVariableStore()),
-        strictDecode_(strictDecode) {
+        strictDecode_(strictDecode),
+        preserveNbtBytes_(preserveNbtBytes) {
         if (name == "start_game" || name == "item_registry") {
             ensureDecoded();
         }
@@ -3090,6 +3100,7 @@ private:
     std::string version_;
     ProtoDefVariableStorePtr variables_;
     bool strictDecode_ = false;
+    bool preserveNbtBytes_ = false;
     mutable bool decoded_ = false;
     bool mutated_ = false;
     mutable PacketObject originalParams_;
@@ -3102,6 +3113,7 @@ private:
 
         auto* self = const_cast<RelayPacketEvent*>(this);
         ProtoDefPacketDecoder decoder(version_, variables_);
+        decoder.setPreserveNbtBytes(preserveNbtBytes_);
         const auto fields = strictDecode_
             ? decoder.decodePacketStrict(packet.name, packet.payload)
             : decoder.decodePacket(packet.name, packet.payload);
@@ -4243,7 +4255,9 @@ private:
                 // or newly appended resource-pack field.  The packet ID and
                 // original bytes have already been framed by the MCPE codec;
                 // with no structured consumer there is nothing to decode.
-                if (isOpaqueResourcePackTransportPacket(event.packet.name)) {
+                if (isOpaqueResourcePackTransportPacket(event.packet.name) ||
+                    (!options_.validateUnhandledPackets &&
+                     !detail::packetCarriesItemPalette(event.packet.name))) {
                     return;
                 }
                 ProtoDefPacketDecoder decoder(

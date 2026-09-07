@@ -2456,7 +2456,11 @@ std::vector<VersionedGamePacket> BedrockLiveRelay::applyHandlers(
     if (!event.replacements.empty()) {
         return std::move(event.replacements);
     }
-    return { std::move(event.packet) };
+    // initializer_list elements are const and would copy both packet buffers
+    // even with std::move. Transfer ownership explicitly.
+    std::vector<VersionedGamePacket> result;
+    result.push_back(std::move(event.packet));
+    return result;
 }
 
 } // namespace bedrock

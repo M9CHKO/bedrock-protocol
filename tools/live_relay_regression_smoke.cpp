@@ -2044,10 +2044,12 @@ bool checkResourcePackServerboundOrdering() {
     return ok;
 }
 
-bool checkForwardRawPolicy() {
+bool checkForwardRawPolicy(bool rawOnly = false) {
     const std::string version = "1.21.100";
     const auto codec = bedrock::VersionedMcpeCodec::forVersion(version);
-    const auto unknown = codec.packetCodec().makePacketById(
+    const auto unknown = rawOnly ? codec.packetCodec().makePacketByName(
+        "inventory_content", std::vector<uint8_t>(6u * 1024u * 1024u, 0xff)
+    ) : codec.packetCodec().makePacketById(
         0x3feu,
         {0xde, 0xad, 0xbe, 0xef, 0x80, 0x01}
     );
@@ -2078,6 +2080,7 @@ bool checkForwardRawPolicy() {
 
     auto options = relayOptions(upstream.boundPort(), true);
     options.parseErrorPolicy = bedrock::RelayParseErrorPolicy::ForwardRaw;
+    options.validateUnhandledPackets = !rawOnly;
     bedrock::Relay relay(std::move(options));
     std::atomic<int> joins {0};
     std::atomic<int> parseErrors {0};
@@ -2095,8 +2098,14 @@ bool checkForwardRawPolicy() {
             parseErrorMismatch = true;
         }
     });
-    relay.onClientbound([&](bedrock::RelayPacketEvent& event) {
-        if (event.name == unknown.name) ++unknownStructuredCallbacks;
+    if (!rawOnly) {
+        relay.onClientbound([&](bedrock::RelayPacketEvent& event) {
+            if (event.name == unknown.name) ++unknownStructuredCallbacks;
+        });
+    }
+    std::atomic<int> rawCallbacks {0};
+    relay.live().onClientbound([&](bedrock::BedrockRelayPacketEvent& event) {
+        if (event.packet.fullPacket == unknown.fullPacket) ++rawCallbacks;
     });
     relay.onError([&](const std::string& message) {
         errors.add("relay", message);
@@ -2143,7 +2152,8 @@ bool checkForwardRawPolicy() {
     }
     if (ready) upstream.sendPacket(target, unknown);
     const bool rawForwarded = ready && waitFor([&]() {
-        return unknownPackets.load() == 1 && parseErrors.load() == 1;
+        return unknownPackets.load() == 1 &&
+            parseErrors.load() == (rawOnly ? 0 : 1);
     });
     ok &= check(rawForwarded, "forward_raw did not forward the unknown packet");
     ok &= check(!unknownBytesMismatch.load(), "forward_raw changed packet bytes");
@@ -2161,7 +2171,9 @@ bool checkForwardRawPolicy() {
         }),
         "valid packet after forward_raw was not delivered"
     );
-    ok &= check(parseErrors.load() == 1, "parse error was reported more than once");
+    ok &= check(parseErrors.load() == (rawOnly ? 0 : 1),
+        "raw-only packet unexpectedly parsed / parse-error count changed");
+    ok &= check(rawCallbacks.load() == 1, "raw observer not called exactly once");
     ok &= check(
         relay.live().sessionCount() == 1 &&
             relay.live().upstreamCount() == 1 &&
@@ -2567,6 +2579,7 @@ int main() {
     ok = checkMapFloodAndItemOrdering() && ok;
     ok = checkResourcePackServerboundOrdering() && ok;
     ok = checkForwardRawPolicy() && ok;
+    ok = checkForwardRawPolicy(true) && ok;
     ok = checkClientboundInjectionBatch() && ok;
     ok = checkDownstreamCloseLifecycle() && ok;
     if (ok) std::cout << "[LIVE-RELAY-REGRESSION-SMOKE] OK\n";

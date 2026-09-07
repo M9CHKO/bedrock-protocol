@@ -72,6 +72,10 @@ public:
         collectFields_ = collectFields;
     }
 
+    void setPreserveNbtBytes(bool preserve) {
+        preserveNbtBytes_ = preserve;
+    }
+
     // Validation paths may need a tiny subset of decoded scalar values for
     // connection state (currently the item palette's shield runtime ID), but
     // retaining every field of a large packet is prohibitively expensive.
@@ -225,6 +229,21 @@ private:
     };
 
     bool collectFields_ = true;
+    bool preserveNbtBytes_ = false;
+
+    ProtoDefValue readNbtValue(
+        ProtoDefReader& reader,
+        BedrockNbtEncoding encoding
+    ) const {
+        if (!preserveNbtBytes_) return readProtoDefNbt(reader, encoding);
+        const auto start = reader.offset();
+        // Validate the boundary without allocating a tree or JSON strings.
+        skipProtoDefNbt(reader, encoding);
+        return ProtoDefValue::bytes(std::vector<uint8_t>(
+            reader.data().begin() + start,
+            reader.data().begin() + reader.offset()
+        ));
+    }
     FieldObserver fieldObserver_;
     mutable std::unordered_map<
         std::string,
@@ -1319,7 +1338,7 @@ private:
                 }
                 reader.rewindTo(before);
                 if (collectFields_) {
-                    values.push_back(readProtoDefNbt(
+                    values.push_back(readNbtValue(
                         reader,
                         BedrockNbtEncoding::LittleVarInt
                     ));
@@ -1332,7 +1351,8 @@ private:
             }
             if (collectFields_) {
                 field.structuredValue = ProtoDefValue::array(std::move(values));
-                field.value = ProtoDefJson::stringify(*field.structuredValue);
+                field.value = preserveNbtBytes_ ? "<nbtLoop bytes>"
+                    : ProtoDefJson::stringify(*field.structuredValue);
             } else {
                 field.value = "<nbtLoop>";
             }
@@ -1425,22 +1445,24 @@ private:
                 std::to_string(z);
         } else if (typeName == "native" || typeName == "nbt") {
             if (collectFields_) {
-                field.structuredValue = readProtoDefNbt(
+                field.structuredValue = readNbtValue(
                     reader,
                     BedrockNbtEncoding::LittleVarInt
                 );
-                field.value = ProtoDefJson::stringify(*field.structuredValue);
+                field.value = preserveNbtBytes_ ? "<nbt bytes>"
+                    : ProtoDefJson::stringify(*field.structuredValue);
             } else {
                 skipProtoDefNbt(reader, BedrockNbtEncoding::LittleVarInt);
                 field.value = typeName == "native" ? "<native>" : "<nbt>";
             }
         } else if (typeName == "lnbt") {
             if (collectFields_) {
-                field.structuredValue = readProtoDefNbt(
+                field.structuredValue = readNbtValue(
                     reader,
                     BedrockNbtEncoding::LittleEndian
                 );
-                field.value = ProtoDefJson::stringify(*field.structuredValue);
+                field.value = preserveNbtBytes_ ? "<lnbt bytes>"
+                    : ProtoDefJson::stringify(*field.structuredValue);
             } else {
                 skipProtoDefNbt(reader, BedrockNbtEncoding::LittleEndian);
                 field.value = "<lnbt>";

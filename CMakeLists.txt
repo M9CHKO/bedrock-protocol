@@ -12,6 +12,7 @@ option(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS "Build command-line helpers: bedrock, be
 option(BEDROCK_PROTOCOL_CPP_BUILD_BOT "Build local bot that links bedrock_protocol" ON)
 option(BEDROCK_PROTOCOL_CPP_BUILD_EXAMPLES "Build example bots" ON)
 option(BEDROCK_PROTOCOL_CPP_INSTALL "Enable install rules" ON)
+option(BEDROCK_PROTOCOL_CPP_BUILD_WINDOWS_APP "Build the Windows desktop relay bridge" OFF)
 
 if(ANDROID)
     # Android's NDK exposes zlib as a platform library. OpenSSL is supplied by
@@ -138,6 +139,17 @@ add_library(bedrock_protocol
 )
 add_library(BedrockProtocol::bedrock_protocol ALIAS bedrock_protocol)
 add_library(Bedrock::bedrock ALIAS bedrock_protocol)
+
+if(BEDROCK_PROTOCOL_CPP_BUILD_WINDOWS_APP)
+    if(NOT WIN32)
+        message(FATAL_ERROR "The Windows desktop bridge requires a native Windows toolchain")
+    endif()
+    add_library(cpe_relay_windows SHARED android/relay-app/app/src/main/cpp/native_bridge.cpp)
+    target_compile_definitions(cpe_relay_windows PRIVATE BEDROCK_RELAY_WINDOWS=1 NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_include_directories(cpe_relay_windows PRIVATE windows/relay-app/native)
+    target_link_libraries(cpe_relay_windows PRIVATE BedrockProtocol::bedrock_protocol winhttp)
+    set_target_properties(cpe_relay_windows PROPERTIES PREFIX "")
+endif()
 
 # Backward compatible target name for old local tests.
 add_library(bedrock_core ALIAS bedrock_protocol)
@@ -292,6 +304,8 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
 
     add_executable(server-outbound-queue-smoke tools/server_outbound_queue_smoke.cpp)
     target_link_libraries(server-outbound-queue-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+    add_executable(shulker-deposit-smoke tools/shulker_deposit_smoke.cpp)
+    target_link_libraries(shulker-deposit-smoke PRIVATE BedrockProtocol::bedrock_protocol)
 
     add_executable(create-client-factory-smoke tools/create_client_factory_smoke.cpp)
     target_link_libraries(create-client-factory-smoke PRIVATE BedrockProtocol::bedrock_protocol)
@@ -471,6 +485,7 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
         add_test(NAME ping-api-smoke COMMAND ping-api-smoke)
         add_test(NAME create-server-factory-smoke COMMAND create-server-factory-smoke)
         add_test(NAME server-outbound-queue-smoke COMMAND server-outbound-queue-smoke)
+        add_test(NAME shulker-deposit-smoke COMMAND shulker-deposit-smoke)
         add_test(NAME create-client-factory-smoke COMMAND create-client-factory-smoke)
         add_test(NAME legacy-encryption-smoke COMMAND legacy-encryption-smoke)
         add_test(NAME chunk-smoke COMMAND chunk-smoke)

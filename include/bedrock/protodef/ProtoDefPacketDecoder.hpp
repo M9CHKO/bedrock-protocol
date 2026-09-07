@@ -57,6 +57,12 @@ public:
         return variables_;
     }
 
+    // Keep NBT wire bytes for envelope-only item observers. Explicit NBT
+    // editors can decode them on demand; ordinary callers remain structured.
+    void setPreserveNbtBytes(bool preserve) {
+        preserveNbtBytes_ = preserve;
+    }
+
     std::vector<ProtoDefField> decodePacket(
         const std::string& packetName,
         const std::vector<uint8_t>& payload
@@ -118,6 +124,7 @@ private:
     std::string version_;
     ProtocolTypeTsvIndex typeIndex_;
     ProtoDefVariableStorePtr variables_;
+    bool preserveNbtBytes_ = false;
 
     std::vector<ProtoDefField> decodePacketImpl(
         const std::string& packetName,
@@ -155,6 +162,7 @@ private:
         });
         decoder.setVariables(variables_->snapshot());
         decoder.setCollectFields(collectFields);
+        decoder.setPreserveNbtBytes(preserveNbtBytes_);
 
         const bool streamItemPalette =
             !collectFields && detail::packetCarriesItemPalette(packetName);
