@@ -80,6 +80,10 @@ public final class RelayService extends Service {
     public static final String KEY_MINIMAP_Y = "mini_map_y";
     public static final String KEY_AUTO_ARMOR = "auto_armor";
     public static final String KEY_AUTO_TOTEM = "auto_totem";
+    public static final String KEY_SHULKER_DEPOSIT_ENABLED = "shulker_deposit_enabled";
+    public static final String KEY_SHULKER_DEPOSIT_HOTBAR = "shulker_deposit_hotbar";
+    public static final String KEY_SHULKER_DEPOSIT_BUTTON = "shulker_deposit_button";
+    public static final String KEY_SHULKER_DEPOSIT_INTERVAL_MS = "shulker_deposit_interval_ms";
     public static final String KEY_AREA_FILL_ENABLED = "area_fill_enabled";
     public static final String KEY_AREA_FILL_POINTS = "area_fill_points";
     public static final String KEY_AREA_FILL_HEIGHT = "area_fill_height";
@@ -157,6 +161,8 @@ public final class RelayService extends Service {
         "com.m9chko.bedrockrelay.action.RELOAD_SCHEMATIC";
     public static final String ACTION_IMPORT_SCHEMATIC_DOCUMENT =
         "com.m9chko.bedrockrelay.action.IMPORT_SCHEMATIC_DOCUMENT";
+    public static final String ACTION_IMPORT_NBT_DOCUMENT =
+        "com.m9chko.bedrockrelay.action.IMPORT_NBT_DOCUMENT";
     public static final String EXTRA_SCHEMATIC_URI = "schematic_uri";
     public static final String EXTRA_SCHEMATIC_NAME = "schematic_name";
     public static final String EXTRA_HOST = "host";
@@ -186,6 +192,13 @@ public final class RelayService extends Service {
     private final AtomicBoolean schematicSnapshotInFlight =
         new AtomicBoolean(false);
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final LatestValueDispatcher<JSONObject> overlaySnapshots =
+        new LatestValueDispatcher<>(mainHandler::post, state -> {
+            if (this.serviceStopping) return;
+            updateOverlayChunkStatus(state);
+            updateOverlayEquipment(state);
+            updateOverlayGameplayStatus(state);
+        });
 
     private SharedPreferences preferences;
     private PowerManager.WakeLock wakeLock;
@@ -197,7 +210,10 @@ public final class RelayService extends Service {
     private ThreatAnalysisOverlayController threatOverlayController;
     private SchematicOverlayController schematicOverlayController;
     private AreaFillOverlayController areaFillOverlayController;
+    private ShulkerDepositOverlayController depositOverlayController;
+    private volatile boolean depositButtonSessionVisible;
     private SchematicRepository schematicRepository;
+    private NbtTransferRepository nbtTransferRepository;
     private volatile boolean serviceStopping;
     private volatile boolean overlayShouldBeVisible;
     private volatile boolean overlayWindowsVisible;
@@ -251,6 +267,7 @@ public final class RelayService extends Service {
             entityOverlayController
         );
         schematicRepository = new SchematicRepository(this);
+        nbtTransferRepository = new NbtTransferRepository(this);
         schematicOverlayController = new SchematicOverlayController(
             this,
             preferences,
@@ -260,6 +277,8 @@ public final class RelayService extends Service {
             this,
             preferences
         );
+        depositOverlayController = new ShulkerDepositOverlayController(
+            this, preferences, () -> applyRuntimeOptions(true));
         reloadSchematicModel();
         // Marker encoding and queueing must never delay the relay packet
         // callback or camera polling. Fixed delay also prevents backlogs.
@@ -292,8 +311,10 @@ public final class RelayService extends Service {
             return START_NOT_STICKY;
         }
         if (ACTION_RELOAD_SCHEMATIC.equals(action) ||
-            ACTION_IMPORT_SCHEMATIC_DOCUMENT.equals(action)) {
+            ACTION_IMPORT_SCHEMATIC_DOCUMENT.equals(action) ||
+            ACTION_IMPORT_NBT_DOCUMENT.equals(action)) {
             final boolean importDocument = ACTION_IMPORT_SCHEMATIC_DOCUMENT.equals(action);
+            final boolean importNbt = ACTION_IMPORT_NBT_DOCUMENT.equals(action);
             final String uriValue = intent.getStringExtra(EXTRA_SCHEMATIC_URI);
             final String sourceName = intent.getStringExtra(EXTRA_SCHEMATIC_NAME);
             // Even this existence check can wait on a native lock. Never do
@@ -310,6 +331,7 @@ public final class RelayService extends Service {
                 mainHandler.post(() -> {
                     if (serviceStopping) return;
                     if (!active) stopSelf(startId);
+                    else if (importNbt) importNbtDocument(uriValue, sourceName);
                     else if (importDocument) importSchematicDocument(uriValue, sourceName);
                     else reloadSchematicModel();
                 });
@@ -371,6 +393,7 @@ public final class RelayService extends Service {
         overlaySessionReady = false;
         overlayShouldBeVisible = false;
         if (overlayController != null) overlayController.destroy();
+        if (depositOverlayController != null) depositOverlayController.destroy();
         if (entityOverlayController != null) {
             entityOverlayController.hideImmediately();
         }
@@ -752,6 +775,77 @@ public final class RelayService extends Service {
         });
     }
 
+    private void importNbtDocument(String uriValue, String sourceName) {
+        if (uriValue == null || uriValue.trim().isEmpty()) {
+            if (overlayController != null) {
+                overlayController.updateNbtTransferStatus(
+                    "Не выбран файл NBT",
+                    true
+                );
+            }
+            return;
+        }
+        String safeName = sourceName == null || sourceName.trim().isEmpty()
+            ? "imported.qznbt"
+            : sourceName.trim();
+        if (overlayController != null) {
+            overlayController.updateNbtTransferStatus(
+                "Загружаем " + safeName + "…",
+                false
+            );
+        }
+        final NbtTransferRepository repository = nbtTransferRepository;
+        schematicExecutor.execute(() -> {
+            try (InputStream input = getContentResolver().openInputStream(
+                Uri.parse(uriValue)
+            )) {
+                NbtTransferRepository.Entry entry =
+                    repository.importFile(input, safeName);
+                String result = NativeBridge.armNbtCraft(entry.slot);
+                if (result.contains("не найден") || result.contains("повреждён") ||
+                    result.contains("только") || result.contains("не запущен")) {
+                    throw new IllegalStateException(result);
+                }
+                DiagnosticsLog.append(
+                    this,
+                    "INFO",
+                    "nbt",
+                    "Imported NBT file=" + entry.fileName +
+                        " slot=" + entry.slot +
+                        " bytes=" + entry.sizeBytes +
+                        " continuous=true"
+                );
+                mainHandler.post(() -> {
+                    if (overlayController != null) {
+                        overlayController.updateNbtTransferStatus(result, false);
+                    }
+                    Toast.makeText(
+                        this,
+                        "NBT загружено: " + entry.slot,
+                        Toast.LENGTH_SHORT
+                    ).show();
+                });
+            } catch (Throwable error) {
+                DiagnosticsLog.appendError(
+                    this,
+                    "nbt",
+                    "In-game NBT import failed",
+                    error
+                );
+                String message = error.getMessage();
+                String visible = message == null || message.trim().isEmpty()
+                    ? "Не удалось загрузить NBT"
+                    : message;
+                mainHandler.post(() -> {
+                    if (overlayController != null) {
+                        overlayController.updateNbtTransferStatus(visible, true);
+                    }
+                    Toast.makeText(this, visible, Toast.LENGTH_LONG).show();
+                });
+            }
+        });
+    }
+
     private void handleEvent(JSONObject event) {
         String type = event.optString("type", "");
         if ("msa_code".equals(type)) {
@@ -873,9 +967,7 @@ public final class RelayService extends Service {
         overlaySessionReady = running && upstreamReady &&
             downstreamConnections > 0;
         setOverlayVisible(overlaySessionReady);
-        updateOverlayChunkStatus(state);
-        updateOverlayEquipment(state);
-        updateOverlayGameplayStatus(state);
+        overlaySnapshots.offer(state);
         if (!running) {
             return;
         }
@@ -913,6 +1005,7 @@ public final class RelayService extends Service {
         if (!authCode.isEmpty()) {
             return;
         }
+        String previousStatus = notificationStatus;
         if (state.optBoolean("upstreamReady", false)) {
             notificationStatus = "Relay подключён к серверу";
         } else if (state.optInt("downstreamConnections", 0) > 0) {
@@ -920,9 +1013,10 @@ public final class RelayService extends Service {
         } else if (state.optBoolean("listening", false)) {
             notificationStatus = "Relay готов: 127.0.0.1:19132";
         }
-        refreshNotification();
+        if (!notificationStatus.equals(previousStatus)) refreshNotification();
     }
 
+    // Called only by the coalesced main-thread snapshot delivery.
     private void updateOverlayChunkStatus(JSONObject state) {
         if (overlayController == null && chunkOverlayController == null) return;
         final boolean retentionEnabled = state.optBoolean(
@@ -973,7 +1067,7 @@ public final class RelayService extends Service {
             "retainedLevelChunkParseFailures",
             0
         ) + state.optLong("chunkPublisherDecodeFailures", 0);
-        mainHandler.post(() -> {
+        {
             if (overlayController != null) {
                 overlayController.updateChunkStatus(
                     retentionEnabled,
@@ -1006,20 +1100,23 @@ public final class RelayService extends Service {
                     parseFailures
                 );
             }
-        });
+        }
     }
 
     private void updateOverlayEquipment(JSONObject state) {
         if (equipmentOverlayController == null) return;
         final JSONArray equipment = state.optJSONArray("equipment");
         final long revision = state.optLong("equipmentRevision", 0);
-        mainHandler.post(() -> equipmentOverlayController.update(
+        equipmentOverlayController.update(
             equipment,
             revision
-        ));
+        );
     }
 
     private void updateOverlayGameplayStatus(JSONObject state) {
+        JSONObject deposit = state.optJSONObject("shulkerDeposit");
+        if (depositOverlayController != null) depositOverlayController.update(deposit);
+        if (overlayController != null) overlayController.updateDepositStatus(deposit);
         if (threatOverlayController != null) {
             threatOverlayController.updatePlayerState(state);
         }
@@ -1038,7 +1135,7 @@ public final class RelayService extends Service {
         final long mapDecoded = state.optLong("miniMapDecodedChunks", 0);
         final long mapFailures = state.optLong("miniMapDecodeFailures", 0);
         final JSONObject areaFill = state.optJSONObject("areaFill");
-        mainHandler.post(() -> {
+        {
             overlayController.updateAutomationStatus(
                 automationStatus,
                 inventoryReady,
@@ -1051,7 +1148,7 @@ public final class RelayService extends Service {
             if (areaFillOverlayController != null) {
                 areaFillOverlayController.update(areaFill);
             }
-        });
+        }
     }
 
     private void stopRelayAndSelf() {
@@ -1291,6 +1388,10 @@ public final class RelayService extends Service {
         boolean miniMapRound = preferences.getBoolean(KEY_MINIMAP_ROUND, true);
         boolean autoArmor = preferences.getBoolean(KEY_AUTO_ARMOR, false);
         boolean autoTotem = preferences.getBoolean(KEY_AUTO_TOTEM, false);
+        boolean shulkerDeposit = preferences.getBoolean(KEY_SHULKER_DEPOSIT_ENABLED, false);
+        boolean shulkerDepositHotbar = preferences.getBoolean(KEY_SHULKER_DEPOSIT_HOTBAR, false);
+        int shulkerDepositInterval = ShulkerDepositSettings.clampInterval(preferences.getInt(
+            KEY_SHULKER_DEPOSIT_INTERVAL_MS, ShulkerDepositSettings.DEFAULT_INTERVAL_MS));
         boolean areaFillEnabled = preferences.getBoolean(
             KEY_AREA_FILL_ENABLED,
             false
@@ -1458,6 +1559,7 @@ public final class RelayService extends Service {
                     areaFillButtonScale
                 );
             }
+            if (depositOverlayController != null) depositOverlayController.configure();
         });
         try {
             commandExecutor.execute(() -> {
@@ -1474,6 +1576,8 @@ public final class RelayService extends Service {
                         miniMap,
                         schematicEnabled
                     );
+                    NativeBridge.configureShulkerDeposit(shulkerDeposit, shulkerDepositHotbar,
+                        shulkerDepositInterval);
                     NativeBridge.configureAreaFill(
                         areaFillEnabled,
                         areaFillPoints,
@@ -1547,6 +1651,16 @@ public final class RelayService extends Service {
     }
 
     private void reconcileOverlayVisibility() {
+        // Independent of minecraftUiBlocked: this button must remain usable
+        // while a chest is open, but disappear on disconnect/background/stop.
+        boolean depositVisible = overlayShouldBeVisible && !serviceStopping;
+        if (depositButtonSessionVisible != depositVisible) {
+            depositButtonSessionVisible = depositVisible;
+            mainHandler.post(() -> {
+                if (depositOverlayController != null) depositOverlayController.setSessionVisible(
+                    overlayShouldBeVisible && !serviceStopping);
+            });
+        }
         boolean visible = overlayShouldBeVisible && !minecraftUiBlocked;
         boolean changed = overlayWindowsVisible != visible;
         overlayWindowsVisible = visible;

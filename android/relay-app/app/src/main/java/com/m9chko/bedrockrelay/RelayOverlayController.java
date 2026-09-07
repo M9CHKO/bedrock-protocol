@@ -56,6 +56,8 @@ final class RelayOverlayController {
     private TextView chunkStatus;
     private TextView miniMapStatus;
     private TextView automationStatus;
+    private TextView depositStatus;
+    private String statusDepositText = "Выключено";
     private TextView areaFillStatus;
     private TextView pageTitle;
     private TextView backButton;
@@ -100,6 +102,8 @@ final class RelayOverlayController {
     private String statusAreaFillText = "Добавьте точки области";
     private String schematicImportStatus = "";
     private boolean schematicImportError;
+    private String nbtTransferStatus = "";
+    private boolean nbtTransferError;
 
     RelayOverlayController(
         Context context,
@@ -120,6 +124,14 @@ final class RelayOverlayController {
     void updateSchematicImportStatus(String value, boolean error) {
         schematicImportStatus = value == null ? "" : value;
         schematicImportError = error;
+        if ("schematics".equals(currentPage) && pageContent != null) {
+            showPage("schematics");
+        }
+    }
+
+    void updateNbtTransferStatus(String value, boolean error) {
+        nbtTransferStatus = value == null ? "" : value;
+        nbtTransferError = error;
         if ("schematics".equals(currentPage) && pageContent != null) {
             showPage("schematics");
         }
@@ -218,6 +230,7 @@ final class RelayOverlayController {
         chunkStatus = null;
         miniMapStatus = null;
         automationStatus = null;
+        depositStatus = null;
         areaFillStatus = null;
         pageTitle = null;
         backButton = null;
@@ -325,6 +338,7 @@ final class RelayOverlayController {
         chunkStatus = null;
         miniMapStatus = null;
         automationStatus = null;
+        depositStatus = null;
         areaFillStatus = null;
         logText = null;
         backButton.setVisibility("home".equals(page) ? View.INVISIBLE : View.VISIBLE);
@@ -920,6 +934,10 @@ final class RelayOverlayController {
         SchematicRepository repository = new SchematicRepository(context);
         SchematicSourceFolder sourceFolder = new SchematicSourceFolder(context);
         SchematicSourceFolder.ScanResult folder = sourceFolder.scan();
+        SchematicSourceFolder.ScanResult nbtFolder =
+            sourceFolder.scanNbtTransfers();
+        List<NbtTransferRepository.Entry> nbtEntries =
+            new NbtTransferRepository(context).list();
         List<SchematicRepository.Entry> entries = repository.list();
         SchematicRepository.Entry active = null;
         for (SchematicRepository.Entry entry : entries) {
@@ -984,6 +1002,127 @@ final class RelayOverlayController {
         status.setBackground(statusBackground());
         root.addView(status, margins(-1, -2, 0, dp(4), 0, dp(7)));
 
+        root.addView(sectionHeader("NBT ШАЛКЕРА"));
+        String nativeNbtStatus;
+        try {
+            nativeNbtStatus = NativeBridge.nbtCraftStatus();
+        } catch (Throwable error) {
+            nativeNbtStatus = "Relay ещё не готов";
+        }
+        TextView nbtStatus = text(
+            nativeNbtStatus + "\nПосле выбора режим действует на все ручные " +
+                "крафты шалкера, пока вы его не отключите.",
+            9,
+            true
+        );
+        nbtStatus.setTextColor(0xff82e6b1);
+        nbtStatus.setPadding(dp(10), dp(8), dp(10), dp(8));
+        nbtStatus.setBackground(statusBackground());
+        root.addView(nbtStatus, margins(-1, -2, 0, 0, 0, dp(5)));
+
+        if (!nbtTransferStatus.isEmpty()) {
+            TextView transferStatus = text(nbtTransferStatus, 9, true);
+            transferStatus.setTextColor(
+                nbtTransferError ? 0xffff8e99 : 0xff68ddff
+            );
+            transferStatus.setPadding(dp(9), dp(7), dp(9), dp(7));
+            transferStatus.setBackground(statusBackground());
+            root.addView(transferStatus, margins(-1, -2, 0, 0, 0, dp(5)));
+        }
+
+        root.addView(schematicAction("ОТКЛЮЧИТЬ NBT-КРАФТ", () -> {
+            try {
+                updateNbtTransferStatus(NativeBridge.stopNbtCraft(), false);
+            } catch (Throwable error) {
+                updateNbtTransferStatus("Не удалось отключить NBT", true);
+            }
+        }), margins(-1, -2, 0, 0, 0, dp(6)));
+
+        int savedNbtShown = 0;
+        for (NbtTransferRepository.Entry entry : nbtEntries) {
+            if (savedNbtShown++ >= 16) break;
+            LinearLayout nbtCard = new LinearLayout(context);
+            nbtCard.setOrientation(LinearLayout.VERTICAL);
+            nbtCard.setPadding(dp(10), dp(7), dp(10), dp(7));
+            nbtCard.setBackground(cardBackground(false));
+            TextView nbtName = text(entry.slot, 10, true);
+            nbtName.setTextColor(0xffe7eef8);
+            nbtCard.addView(nbtName);
+            TextView nbtDetail = text(
+                (entry.desktopFormat ? "QZNBTF02 с ПК" : "Сохранён в Android") +
+                    " • " + formatBytes(entry.sizeBytes),
+                8,
+                false
+            );
+            nbtDetail.setTextColor(0xff8495a8);
+            nbtDetail.setPadding(0, dp(2), 0, dp(5));
+            nbtCard.addView(nbtDetail);
+            nbtCard.addView(schematicAction("ИСПОЛЬЗОВАТЬ НЕПРЕРЫВНО", () -> {
+                try {
+                    String result = NativeBridge.armNbtCraft(entry.slot);
+                    updateNbtTransferStatus(
+                        result,
+                        result.contains("не найден") ||
+                            result.contains("повреждён") ||
+                            result.contains("только")
+                    );
+                } catch (Throwable error) {
+                    updateNbtTransferStatus("Не удалось загрузить NBT", true);
+                }
+            }), new LinearLayout.LayoutParams(-1, dp(34)));
+            root.addView(nbtCard, margins(-1, -2, 0, 0, 0, dp(5)));
+        }
+
+        if (!nbtFolder.entries.isEmpty()) {
+            TextView nbtFolderHint = text(
+                "NBT в подключённой папке • нажмите, чтобы скопировать в " +
+                    "приложение и сразу включить",
+                9,
+                true
+            );
+            nbtFolderHint.setTextColor(0xffc79aff);
+            root.addView(nbtFolderHint, margins(-1, -2, 0, dp(2), 0, dp(5)));
+        }
+        int sourceNbtShown = 0;
+        for (SchematicSourceFolder.SourceEntry entry : nbtFolder.entries) {
+            if (sourceNbtShown++ >= 16) break;
+            LinearLayout nbtSourceCard = new LinearLayout(context);
+            nbtSourceCard.setOrientation(LinearLayout.VERTICAL);
+            nbtSourceCard.setPadding(dp(10), dp(7), dp(10), dp(7));
+            nbtSourceCard.setBackground(cardBackground(false));
+            TextView name = text(entry.name, 10, true);
+            name.setTextColor(0xffe7eef8);
+            nbtSourceCard.addView(name);
+            TextView detail = text(
+                entry.relativePath + " • " + formatBytes(entry.sizeBytes),
+                8,
+                false
+            );
+            detail.setTextColor(0xff8495a8);
+            detail.setPadding(0, dp(2), 0, dp(5));
+            nbtSourceCard.addView(detail);
+            nbtSourceCard.addView(schematicAction("ЗАГРУЗИТЬ И ВКЛЮЧИТЬ", () -> {
+                nbtTransferStatus = "Загружаем " + entry.name + "…";
+                nbtTransferError = false;
+                showPage("schematics");
+                try {
+                    context.startService(new Intent(context, RelayService.class)
+                        .setAction(RelayService.ACTION_IMPORT_NBT_DOCUMENT)
+                        .putExtra(
+                            RelayService.EXTRA_SCHEMATIC_URI,
+                            entry.uri.toString()
+                        )
+                        .putExtra(RelayService.EXTRA_SCHEMATIC_NAME, entry.name));
+                } catch (Throwable error) {
+                    updateNbtTransferStatus(
+                        "Не удалось запустить загрузку NBT",
+                        true
+                    );
+                }
+            }), new LinearLayout.LayoutParams(-1, dp(34)));
+            root.addView(nbtSourceCard, margins(-1, -2, 0, 0, 0, dp(5)));
+        }
+
         root.addView(sectionHeader("ФАЙЛЫ НА ТЕЛЕФОНЕ"));
         TextView folderStatus = text(
             folder.configured
@@ -991,8 +1130,8 @@ final class RelayOverlayController {
                     (folder.errorMessage.isEmpty()
                         ? folder.entries.size() + " совместимых файлов"
                         : folder.errorMessage)
-                : "Выберите папку один раз. После этого схемы можно " +
-                    "импортировать здесь, не закрывая Minecraft и сервер.",
+                : "Выберите папку один раз. После этого схемы и NBT можно " +
+                    "загружать здесь, не закрывая Minecraft и сервер.",
             9,
             true
         );
@@ -1006,7 +1145,9 @@ final class RelayOverlayController {
         root.addView(folderStatus, margins(-1, -2, 0, dp(2), 0, dp(6)));
 
         root.addView(schematicAction(
-            folder.configured ? "СМЕНИТЬ ПАПКУ СХЕМ" : "ВЫБРАТЬ ПАПКУ СХЕМ",
+            folder.configured
+                ? "СМЕНИТЬ ПАПКУ СХЕМ И NBT"
+                : "ВЫБРАТЬ ПАПКУ СХЕМ И NBT",
             () -> {
                 Intent intent = new Intent(context, MainActivity.class)
                     .setAction(MainActivity.ACTION_CHOOSE_SCHEMATIC_FOLDER)
@@ -1474,6 +1615,44 @@ final class RelayOverlayController {
     }
 
     private void buildAutomationPage(LinearLayout root) {
+        root.addView(toggle("Авторазгрузка шалкеров в сундук",
+            RelayService.KEY_SHULKER_DEPOSIT_ENABLED, false));
+        root.addView(toggle("Разгружать также хотбар",
+            RelayService.KEY_SHULKER_DEPOSIT_HOTBAR, false));
+        root.addView(toggle("Плавающая кнопка (видна в сундуках)",
+            RelayService.KEY_SHULKER_DEPOSIT_BUTTON, true));
+        int speedProgress = ShulkerDepositSettings.progressForInterval(preferences.getInt(
+            RelayService.KEY_SHULKER_DEPOSIT_INTERVAL_MS, ShulkerDepositSettings.DEFAULT_INTERVAL_MS));
+        TextView speedLabel = settingLabel("Скорость разгрузки\n" + ShulkerDepositSettings.label(
+            ShulkerDepositSettings.intervalForProgress(speedProgress)));
+        root.addView(speedLabel);
+        SeekBar speedSlider = slider(0, ShulkerDepositSettings.MAX_PROGRESS, speedProgress);
+        speedSlider.setMinimumHeight(dp(48));
+        speedSlider.setContentDescription("Скорость разгрузки шалкеров: вправо быстрее");
+        speedSlider.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            private boolean dragging;
+            @Override public void onProgressChanged(SeekBar slider, int progress, boolean fromUser) {
+                int interval = ShulkerDepositSettings.intervalForProgress(progress);
+                speedLabel.setText("Скорость разгрузки\n" + ShulkerDepositSettings.label(interval));
+                if (fromUser && !dragging) saveInt(RelayService.KEY_SHULKER_DEPOSIT_INTERVAL_MS, interval);
+            }
+            @Override public void onStartTrackingTouch(SeekBar slider) { dragging = true; }
+            @Override public void onStopTrackingTouch(SeekBar slider) {
+                dragging = false;
+                saveInt(RelayService.KEY_SHULKER_DEPOSIT_INTERVAL_MS,
+                    ShulkerDepositSettings.intervalForProgress(slider.getProgress()));
+            }
+        });
+        root.addView(speedSlider);
+        root.addView(text("Вправо — быстрее · 30–3000 мс, шаг 10 мс. Для тяжёлых нестедов — 1000 мс. " +
+            "Пауза меняется после отпускания ползунка; ожидание сервера может её увеличить.", 10, false));
+        depositStatus = text(statusDepositText, 10, true);
+        root.addView(depositStatus, margins(-1, -2, 0, dp(5), 0, dp(7)));
+        root.addView(text("Откройте обычный или двойной сундук: шалкеры займут только пустые слоты. " +
+            "Закрытие или ручное перемещение останавливает разгрузку. " +
+            "Кнопка перетаскивается; удержание показывает статус. Вложенный NBT не разбирается. " +
+            "Legacy-сервер: переносы с выбранной паузой и клиентским отображением, без отдельного подтверждения; " +
+            "при серверной коррекции — остановка.", 10, false));
         root.addView(toggle(
             "Авто-тотем в левую руку",
             RelayService.KEY_AUTO_TOTEM,
@@ -1492,8 +1671,8 @@ final class RelayOverlayController {
         TextView note = text(
             "Тотем и лучшая броня ищутся во всём уже синхронизированном " +
                 "инвентаре, а перемещение подтверждается сервером. Во время " +
-                "сундука, шалкера, инвентаря или чата автоматизация " +
-                "приостанавливается.",
+                "сундука, шалкера, инвентаря или чата авто-броня и авто-тотем " +
+                "приостанавливаются.",
             10,
             false
         );
@@ -1901,6 +2080,15 @@ final class RelayOverlayController {
         statusMiniMapDecoded = decodedChunks;
         statusMiniMapFailures = decodeFailures;
         refreshMiniMapStatus();
+    }
+
+    void updateDepositStatus(JSONObject value) {
+        if (value == null) return;
+        statusDepositText = value.optString("status", "") + "\nОтправлено: " +
+            value.optInt("sent", 0) + "; подтверждено: " + value.optInt("confirmed", 0);
+        if (depositStatus != null && !statusDepositText.contentEquals(depositStatus.getText())) {
+            depositStatus.setText(statusDepositText);
+        }
     }
 
     void updateAutomationStatus(

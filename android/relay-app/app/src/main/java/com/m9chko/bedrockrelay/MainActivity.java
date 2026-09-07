@@ -33,6 +33,7 @@ import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
+import android.widget.SeekBar;
 import android.widget.Spinner;
 import android.widget.Switch;
 import android.widget.TextView;
@@ -108,6 +109,7 @@ public final class MainActivity extends Activity {
     private boolean activityResumed;
     private final ExecutorService uiWorker = Executors.newSingleThreadExecutor();
     private final java.util.Map<String, Switch> moduleSwitches = new java.util.HashMap<>();
+    private SeekBar depositSpeedSlider;
     private LinearLayout connectionPage;
     private LinearLayout logsPage;
     private TextView connectionTab;
@@ -191,6 +193,9 @@ public final class MainActivity extends Activity {
         for (java.util.Map.Entry<String, Switch> entry : moduleSwitches.entrySet()) {
             entry.getValue().setChecked(preferences.getBoolean(entry.getKey(), entry.getValue().isChecked()));
         }
+        if (depositSpeedSlider != null) depositSpeedSlider.setProgress(
+            ShulkerDepositSettings.progressForInterval(preferences.getInt(
+                RelayService.KEY_SHULKER_DEPOSIT_INTERVAL_MS, ShulkerDepositSettings.DEFAULT_INTERVAL_MS)));
         if (pendingOverlayRelayStart && Settings.canDrawOverlays(this)) {
             continuePendingOverlayStart();
         }
@@ -390,17 +395,46 @@ public final class MainActivity extends Activity {
         addModule(content, "Автозаполнение", "Точки и запуск выбираются в игре", RelayService.KEY_AREA_FILL_ENABLED, false);
         addModule(content, "Авто-тотем", "Пополнение левой руки из инвентаря", RelayService.KEY_AUTO_TOTEM, false);
         addModule(content, "Авто-броня", "Выбор снаряжения из инвентаря", RelayService.KEY_AUTO_ARMOR, false);
+        addModule(content, "Разгрузка шалкеров", "Автоматически в свободные слоты открытого сундука", RelayService.KEY_SHULKER_DEPOSIT_ENABLED, false);
+        addModule(content, "Разгружать хотбар", "Включая шалкеры в нижних 9 слотах", RelayService.KEY_SHULKER_DEPOSIT_HOTBAR, false);
+        addModule(content, "Кнопка разгрузки", "Не скрывается в сундуках · перетаскивается", RelayService.KEY_SHULKER_DEPOSIT_BUTTON, true);
+        addDepositSpeed(content);
         addModule(content, "Удержание чанков", "Больше загруженного мира · расход памяти", RelayService.KEY_CHUNK_RETENTION, false);
         LinearLayout schematics = card();
-        schematics.addView(sectionLabel("СХЕМЫ"));
-        schematics.addView(text("Библиотека построек", 18, true));
-        TextView formats = text("mcstructure · nbt · litematic · schem · schematic", 12, false);
+        schematics.addView(sectionLabel("СХЕМЫ И NBT"));
+        schematics.addView(text("Библиотека построек и шалкеров", 18, true));
+        TextView formats = text(
+            "mcstructure · nbt · litematic · schem · schematic · qznbt",
+            12,
+            false
+        );
         formats.setTextColor(RelayUi.MUTED);
         schematics.addView(formats, margins(-1, -2, 0, dp(6), 0, dp(12)));
+        SchematicSourceFolder.ScanResult schematicFiles =
+            schematicSourceFolder.scan();
+        SchematicSourceFolder.ScanResult nbtFiles =
+            schematicSourceFolder.scanNbtTransfers();
+        TextView folderState = text(
+            schematicFiles.configured
+                ? "Папка: " + schematicFiles.folderName + " · схем " +
+                    schematicFiles.entries.size() + " · NBT " +
+                    nbtFiles.entries.size()
+                : "Папка ещё не выбрана. Её можно подключить до запуска игры.",
+            12,
+            false
+        );
+        folderState.setTextColor(
+            schematicFiles.configured ? RelayUi.SUCCESS : RelayUi.MUTED
+        );
+        schematics.addView(folderState, margins(-1, -2, 0, 0, 0, dp(10)));
         Button importSchematic = secondaryButton("Импортировать схему");
         importSchematic.setOnClickListener(view -> openSchematicPicker());
         schematics.addView(importSchematic, margins(-1, -2, 0, 0, 0, dp(8)));
-        Button folder = secondaryButton("Выбрать папку со схемами");
+        Button folder = secondaryButton(
+            schematicFiles.configured
+                ? "Сменить папку схем и NBT"
+                : "Выбрать папку схем и NBT"
+        );
         folder.setOnClickListener(view -> openSchematicFolderPicker());
         schematics.addView(folder, margins(-1, -2, 0, 0, 0, 0));
         content.addView(schematics, margins(-1, -2, 0, dp(8), 0, dp(12)));
@@ -501,6 +535,49 @@ public final class MainActivity extends Activity {
         row.addView(toggle);
         row.setOnClickListener(view -> toggle.setChecked(!toggle.isChecked()));
         content.addView(row, margins(-1, -2, 0, 0, 0, dp(8)));
+    }
+
+    private void addDepositSpeed(LinearLayout content) {
+        LinearLayout speedCard = card();
+        speedCard.addView(text("Скорость разгрузки шалкеров", 15, true));
+        int progress = ShulkerDepositSettings.progressForInterval(preferences.getInt(
+            RelayService.KEY_SHULKER_DEPOSIT_INTERVAL_MS, ShulkerDepositSettings.DEFAULT_INTERVAL_MS));
+        TextView label = text(ShulkerDepositSettings.label(
+            ShulkerDepositSettings.intervalForProgress(progress)), 12, false);
+        speedCard.addView(label, margins(-1, -2, 0, dp(8), 0, 0));
+        depositSpeedSlider = new SeekBar(this);
+        depositSpeedSlider.setMax(ShulkerDepositSettings.MAX_PROGRESS);
+        depositSpeedSlider.setProgress(progress);
+        depositSpeedSlider.setMinimumHeight(dp(48));
+        depositSpeedSlider.setProgressTintList(ColorStateList.valueOf(RelayUi.ACCENT));
+        depositSpeedSlider.setThumbTintList(ColorStateList.valueOf(RelayUi.ACCENT));
+        depositSpeedSlider.setContentDescription("Скорость разгрузки шалкеров: вправо быстрее");
+        depositSpeedSlider.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            private boolean dragging;
+            @Override public void onProgressChanged(SeekBar slider, int value, boolean fromUser) {
+                int interval = ShulkerDepositSettings.intervalForProgress(value);
+                label.setText(ShulkerDepositSettings.label(interval));
+                if (fromUser && !dragging) save(interval); // keyboard/accessibility
+            }
+            @Override public void onStartTrackingTouch(SeekBar slider) { dragging = true; }
+            @Override public void onStopTrackingTouch(SeekBar slider) {
+                dragging = false;
+                save(ShulkerDepositSettings.intervalForProgress(slider.getProgress()));
+            }
+            private void save(int interval) {
+                if (preferences.getInt(RelayService.KEY_SHULKER_DEPOSIT_INTERVAL_MS,
+                    ShulkerDepositSettings.DEFAULT_INTERVAL_MS) == interval) return;
+                preferences.edit().putInt(RelayService.KEY_SHULKER_DEPOSIT_INTERVAL_MS, interval).apply();
+                if (relayRunning) startService(new Intent(MainActivity.this, RelayService.class)
+                    .setAction(RelayService.ACTION_APPLY_SETTINGS));
+            }
+        });
+        speedCard.addView(depositSpeedSlider, new LinearLayout.LayoutParams(-1, -2));
+        TextView note = text("Вправо — быстрее · 30–3000 мс, шаг 10 мс. Для тяжёлых нестедов начните с 1000 мс. " +
+            "Ожидание сервера может увеличить паузу. Применяется после отпускания ползунка.", 12, false);
+        note.setTextColor(RelayUi.MUTED);
+        speedCard.addView(note);
+        content.addView(speedCard, margins(-1, -2, 0, 0, 0, dp(8)));
     }
 
     private LinearLayout column() {
@@ -774,7 +851,7 @@ public final class MainActivity extends Activity {
                     Intent.FLAG_GRANT_READ_URI_PERMISSION
                 );
                 schematicSourceFolder.saveTree(tree);
-                toast("Папка схем подключена");
+                toast("Папка схем и NBT подключена");
             } catch (Throwable error) {
                 DiagnosticsLog.appendError(
                     this,

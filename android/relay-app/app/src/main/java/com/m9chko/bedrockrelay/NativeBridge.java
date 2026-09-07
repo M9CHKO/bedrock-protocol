@@ -21,6 +21,13 @@ public final class NativeBridge {
     public static native void stopRelay();
     public static native void refreshAreaFillMarkers();
 
+    /** Selects one saved NBT file for every following manual shulker craft. */
+    public static native String armNbtCraft(String slot);
+
+    public static native String stopNbtCraft();
+
+    public static native String nbtCraftStatus();
+
     public static native void configureRuntime(
         boolean detailedLogging,
         boolean chunkRetentionEnabled,
@@ -39,6 +46,8 @@ public final class NativeBridge {
         int requiredPoints,
         int height
     );
+
+    public static native void configureShulkerDeposit(boolean enabled, boolean includeHotbar, int intervalMs);
 
     public static native String areaFillSnapshot();
 

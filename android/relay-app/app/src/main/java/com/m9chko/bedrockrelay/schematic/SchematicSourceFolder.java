@@ -59,6 +59,15 @@ public final class SchematicSourceFolder {
     }
 
     public ScanResult scan() {
+        return scan(false);
+    }
+
+    /** Files understood by the desktop/Android shulker NBT transfer flow. */
+    public ScanResult scanNbtTransfers() {
+        return scan(true);
+    }
+
+    private ScanResult scan(boolean nbtTransfers) {
         Uri tree = treeUri();
         if (tree == null) {
             return new ScanResult(false, "", new ArrayList<>(), "");
@@ -66,7 +75,7 @@ public final class SchematicSourceFolder {
         List<SourceEntry> entries = new ArrayList<>();
         try {
             String rootId = DocumentsContract.getTreeDocumentId(tree);
-            scanDirectory(tree, rootId, "", 0, entries);
+            scanDirectory(tree, rootId, "", 0, entries, nbtTransfers);
             entries.sort(Comparator
                 .comparingLong((SourceEntry value) -> value.modifiedAtMs)
                 .reversed()
@@ -102,7 +111,8 @@ public final class SchematicSourceFolder {
         String documentId,
         String parentPath,
         int depth,
-        List<SourceEntry> entries
+        List<SourceEntry> entries,
+        boolean nbtTransfers
     ) {
         if (depth > MAX_DEPTH || entries.size() >= MAX_FILES) return;
         Uri children = DocumentsContract.buildChildDocumentsUriUsingTree(
@@ -126,9 +136,12 @@ public final class SchematicSourceFolder {
                         childId,
                         relative,
                         depth + 1,
-                        entries
+                        entries,
+                        nbtTransfers
                     );
-                } else if (isSupportedFileName(name)) {
+                } else if (nbtTransfers
+                    ? isNbtTransferFileName(name)
+                    : isSupportedFileName(name)) {
                     Uri document = DocumentsContract.buildDocumentUriUsingTree(
                         tree,
                         childId
@@ -168,6 +181,12 @@ public final class SchematicSourceFolder {
         return value.endsWith(".mcstructure") || value.endsWith(".nbt") ||
             value.endsWith(".litematic") || value.endsWith(".schem") ||
             value.endsWith(".schematic");
+    }
+
+    public static boolean isNbtTransferFileName(String name) {
+        if (name == null) return false;
+        String value = name.toLowerCase(Locale.ROOT).trim();
+        return value.endsWith(".qznbt") || value.endsWith(".cpenbt.json");
     }
 
     private static String safeName(String value) {
