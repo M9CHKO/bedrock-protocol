@@ -5,12 +5,15 @@ namespace CpeRelay.Windows;
 
 internal sealed class FloatingDepositForm : Form
 {
+    private DateTime errorUntil;
+    internal void ShowError(string message){detail.Text=message;errorUntil=DateTime.UtcNow.AddSeconds(6);}
     [DllImport("user32.dll")] private static extern bool SetWindowPos(IntPtr window, IntPtr after, int x, int y, int cx, int cy, uint flags);
     [DllImport("user32.dll")] private static extern bool ReleaseCapture();
     [DllImport("user32.dll")] private static extern IntPtr SendMessage(IntPtr window, int message, IntPtr wparam, IntPtr lparam);
     private readonly RelayButton button = new() { Dock = DockStyle.Fill, Text = "Разгрузка · ВЫКЛ" };
     private readonly Label detail = new() { Dock = DockStyle.Bottom, Height = 51, ForeColor = Theme.Muted, Padding = new Padding(8, 2, 8, 2) };
     private readonly bool autoCraft;
+    private readonly bool maps;
     private bool commandPending;
     internal Action? Toggle;
     protected override bool ShowWithoutActivation => true;
@@ -18,9 +21,10 @@ internal sealed class FloatingDepositForm : Form
     {
         get { var value = base.CreateParams; value.ExStyle |= 0x08000000 | 0x00000080; return value; }
     }
-    internal FloatingDepositForm(bool autoCraft = false)
+    internal FloatingDepositForm(bool autoCraft = false, bool maps = false)
     {
         this.autoCraft = autoCraft;
+        this.maps = maps;
         Text = autoCraft ? "CPE · Авто 2" : "CPE · Разгрузка";
         FormBorderStyle = FormBorderStyle.None;
         BackColor = Theme.Sidebar;
@@ -29,6 +33,7 @@ internal sealed class FloatingDepositForm : Form
         Size = new Size(340, 121);
         Location = new Point(Screen.PrimaryScreen!.WorkingArea.Right - Width - 30, 120);
         if (autoCraft) { Top = 270; Height = 151; detail.Height = 81; button.Text = "Авто 2 · СТАРТ"; }
+        if(maps){Top=440;Height=151;detail.Height=81;button.Text="Карты ZIP · СТАРТ";Text="CPE · Карты ZIP";}
         Font = new Font("Segoe UI", 10);
         var handle = new Label { Text = "⋮⋮  CPE RELAY — перетащить", Dock = DockStyle.Top, Height = 24,
             ForeColor = Theme.Muted, BackColor = Theme.Sidebar, TextAlign = ContentAlignment.MiddleCenter };
@@ -38,6 +43,10 @@ internal sealed class FloatingDepositForm : Form
     }
     internal void UpdateIndicators(JsonElement state, bool requested)
     {
+        if(maps){bool present=state.TryGetProperty("mapQueue",out var q);bool active=present&&q.Flag("busy");
+            button.Enabled=!commandPending&&(active||(present&&q.Flag("loaded")&&state.Flag("upstreamReady")));
+            button.Text=active?"Карты ZIP · СТОП":"Карты ZIP · СТАРТ";
+            if(DateTime.UtcNow>=errorUntil)detail.Text=present?q.Text("status")+"\nФайлов: "+q.GetProperty("completed")+" / "+q.GetProperty("total")+" · Карт: "+q.GetProperty("maps"):"Загрузите ZIP в модуле карт";return;}
         if (autoCraft)
         {
             bool present = state.TryGetProperty("autoCraftStore", out var craft);

@@ -28,6 +28,9 @@ final class ShulkerDepositOverlayController {
     private String status = "Откройте сундук";
     private int sent;
     private final boolean autoCraft;
+    private final boolean mapQueue;
+    private boolean mapLoaded;
+    private int mapTotal;
     private boolean running;
     private boolean busy;
     private int crafted;
@@ -41,7 +44,12 @@ final class ShulkerDepositOverlayController {
 
     ShulkerDepositOverlayController(Context context, SharedPreferences preferences,
             Runnable settingsChanged, boolean autoCraft) {
+        this(context,preferences,settingsChanged,autoCraft,false);
+    }
+    ShulkerDepositOverlayController(Context context, SharedPreferences preferences,
+            Runnable settingsChanged, boolean autoCraft,boolean mapQueue) {
         this.context = context;
+        this.mapQueue=mapQueue;
         this.autoCraft = autoCraft;
         this.preferences = preferences;
         this.settingsChanged = settingsChanged;
@@ -68,6 +76,7 @@ final class ShulkerDepositOverlayController {
         running = value.optBoolean("running", false);
         busy = value.optBoolean("busy", false);
         status = value.optString("status", status);
+        if(mapQueue){sent=value.optInt("completed");crafted=value.optInt("maps");template=value.optString("file");mapTotal=value.optInt("total");boolean loaded=value.optBoolean("loaded");if(loaded!=mapLoaded){mapLoaded=loaded;configure();}}
         if (autoCraft && sessionVisible && !busy && !status.equals(previousStatus)) {
             android.widget.Toast.makeText(context, status, android.widget.Toast.LENGTH_LONG).show();
         }
@@ -75,8 +84,8 @@ final class ShulkerDepositOverlayController {
     }
 
     void configure() {
-        if (shouldShow(sessionVisible, preferences.getBoolean(
-                autoCraft ? RelayService.KEY_AUTO_CRAFT_STORE_BUTTON : RelayService.KEY_SHULKER_DEPOSIT_BUTTON, true))) addWindow();
+        if ((!mapQueue||mapLoaded) && shouldShow(sessionVisible, preferences.getBoolean(
+                mapQueue ? "map_queue_button" : autoCraft ? RelayService.KEY_AUTO_CRAFT_STORE_BUTTON : RelayService.KEY_SHULKER_DEPOSIT_BUTTON, true))) addWindow();
         else removeWindow();
         refreshText();
     }
@@ -118,8 +127,8 @@ final class ShulkerDepositOverlayController {
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
             PixelFormat.TRANSLUCENT);
         params.gravity = Gravity.TOP | Gravity.START;
-        params.x = preferences.getInt(autoCraft ? "auto2_button_x" : KEY_X, dp(autoCraft ? 140 : 12));
-        params.y = preferences.getInt(autoCraft ? "auto2_button_y" : KEY_Y, dp(310));
+        params.x = preferences.getInt(mapQueue?"maps_button_x":autoCraft ? "auto2_button_x" : KEY_X, dp(mapQueue?260:autoCraft ? 140 : 12));
+        params.y = preferences.getInt(mapQueue?"maps_button_y":autoCraft ? "auto2_button_y" : KEY_Y, dp(310));
         // Minecraft is usually landscape; keep a new/saved button onscreen.
         params.x = Math.max(0, Math.min(params.x, context.getResources().getDisplayMetrics().widthPixels - dp(110)));
         params.y = Math.max(0, Math.min(params.y, context.getResources().getDisplayMetrics().heightPixels - dp(70)));
@@ -160,8 +169,8 @@ final class ShulkerDepositOverlayController {
                         }
                         return true;
                     case MotionEvent.ACTION_UP:
-                        if (dragged) preferences.edit().putInt(autoCraft ? "auto2_button_x" : KEY_X, params.x)
-                            .putInt(autoCraft ? "auto2_button_y" : KEY_Y, params.y).apply();
+                        if (dragged) preferences.edit().putInt(mapQueue?"maps_button_x":autoCraft ? "auto2_button_x" : KEY_X, params.x)
+                            .putInt(mapQueue?"maps_button_y":autoCraft ? "auto2_button_y" : KEY_Y, params.y).apply();
                         else if (event.getEventTime() - downTime >= ViewConfiguration.getLongPressTimeout()) view.performLongClick();
                         else view.performClick();
                         return true;
@@ -178,6 +187,7 @@ final class ShulkerDepositOverlayController {
         String label = autoCraft ? (busy ? (running ? "Авто 2: СТОП" : "Авто 2: завершение") +
             "\nКрафт: " + crafted + " · В сундук: " + sent : "Авто 2: СТАРТ") :
             enabled ? "Разгрузка: ВКЛ\nОтправлено: " + sent : "Разгрузка: ВЫКЛ";
+        if(mapQueue)label=(busy?"Карты ZIP: СТОП":"Карты ZIP: СТАРТ")+"\n"+sent+" / "+mapTotal+" · Карт: "+crafted;
         if (label.contentEquals(button.getText())) return;
         button.setText(label);
         button.setContentDescription(label + (autoCraft ? ". NBT: " + template : "") +

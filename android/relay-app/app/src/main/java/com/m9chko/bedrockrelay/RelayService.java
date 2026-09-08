@@ -213,6 +213,7 @@ public final class RelayService extends Service {
     private AreaFillOverlayController areaFillOverlayController;
     private ShulkerDepositOverlayController depositOverlayController;
     private ShulkerDepositOverlayController autoCraftOverlayController;
+    private ShulkerDepositOverlayController mapQueueOverlayController;
     private volatile boolean depositButtonSessionVisible;
     private SchematicRepository schematicRepository;
     private NbtTransferRepository nbtTransferRepository;
@@ -290,6 +291,12 @@ public final class RelayService extends Service {
             });
         }, true);
         reloadSchematicModel();
+        mapQueueOverlayController=new ShulkerDepositOverlayController(this,preferences,()->{
+            if(!serviceStopping)commandExecutor.execute(()->{try{
+                JSONObject result=new JSONObject(NativeBridge.mapQueueCommand("{\"op\":\"toggle\"}"));
+                if(result.has("error")){String error=result.optString("error");new android.os.Handler(android.os.Looper.getMainLooper()).post(()->android.widget.Toast.makeText(this,error,android.widget.Toast.LENGTH_LONG).show());}
+            }catch(Exception error){DiagnosticsLog.appendError(this,"maps","Could not toggle map queue",error);}});
+        },true,true);
         // Marker encoding and queueing must never delay the relay packet
         // callback or camera polling. Fixed delay also prevents backlogs.
         markerPollExecutor.scheduleWithFixedDelay(() -> {
@@ -405,6 +412,7 @@ public final class RelayService extends Service {
         if (overlayController != null) overlayController.destroy();
         if (depositOverlayController != null) depositOverlayController.destroy();
         if (autoCraftOverlayController != null) autoCraftOverlayController.destroy();
+        if(mapQueueOverlayController!=null)mapQueueOverlayController.destroy();
         if (entityOverlayController != null) {
             entityOverlayController.hideImmediately();
         }
@@ -511,6 +519,7 @@ public final class RelayService extends Service {
             // next Application instance can then distinguish an abrupt relay
             // death from a normal user stop even on Android 8/9.
             preferences.edit().putBoolean(KEY_RELAY_ACTIVE, true).commit();
+            MapQueueControls.apply(preferences,true);
             notificationStatus = "Relay готов: 127.0.0.1:19132";
             refreshNotification();
         } catch (Throwable error) {
@@ -1128,6 +1137,7 @@ public final class RelayService extends Service {
         JSONObject deposit = state.optJSONObject("shulkerDeposit");
         if (depositOverlayController != null) depositOverlayController.update(deposit);
         if (autoCraftOverlayController != null) autoCraftOverlayController.update(state.optJSONObject("autoCraftStore"));
+        if(mapQueueOverlayController!=null)mapQueueOverlayController.update(state.optJSONObject("mapQueue"));
         if (overlayController != null) overlayController.updateDepositStatus(deposit);
         if (threatOverlayController != null) {
             threatOverlayController.updatePlayerState(state);
@@ -1597,6 +1607,8 @@ public final class RelayService extends Service {
                         shulkerDepositInterval);
                     NativeBridge.configureAutoCraftStore(preferences.getBoolean(KEY_AUTO_CRAFT_STORE_BUTTON, true),
                         autoCraftInterval, autoCraftWindowPause);
+                    PlatformSettingsControls.apply(preferences);
+                    MapQueueControls.apply(preferences,false);
                     NativeBridge.configureAreaFill(
                         areaFillEnabled,
                         areaFillPoints,
@@ -1680,6 +1692,7 @@ public final class RelayService extends Service {
                     overlayShouldBeVisible && !serviceStopping);
                 if (autoCraftOverlayController != null) autoCraftOverlayController.setSessionVisible(
                     overlayShouldBeVisible && !serviceStopping);
+                if(mapQueueOverlayController!=null)mapQueueOverlayController.setSessionVisible(overlayShouldBeVisible&&!serviceStopping);
             });
         }
         boolean visible = overlayShouldBeVisible && !minecraftUiBlocked;

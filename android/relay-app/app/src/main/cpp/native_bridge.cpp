@@ -7,6 +7,9 @@
 #include <bedrock/relay/AreaFillGeometry.hpp>
 #include <bedrock/relay/ShulkerDeposit.hpp>
 #include <bedrock/relay/AutoCraftStore.hpp>
+#include <bedrock/relay/PlatformBuilder.hpp>
+#include <bedrock/relay/MapArchive.hpp>
+#include <bedrock/relay/MapShulkerQueue.hpp>
 #include <bedrock/generated/GeneratedProtocolTypes.hpp>
 #include <bedrock/nbt/BedrockNbt.hpp>
 #include <bedrock/protodef/ProtoDefNbt.hpp>
@@ -1187,6 +1190,7 @@ struct RelayState {
     std::atomic<bool> miniMapEnabled {false};
     std::atomic<bool> schematicEnabled {false};
     std::atomic<bool> areaFillEnabled {false};
+    std::atomic<bool> platformWorldTracking {true};
     std::atomic<bool> schematicWorldTrackingActive {false};
     std::atomic<uint64_t> schematicTotalBlocks {0};
     std::atomic<uint64_t> schematicCorrectBlocks {0};
@@ -2316,7 +2320,7 @@ struct RelayState {
         // complete 192-block square could exhaust a mobile process during a
         // long session, so retain the nearest working set and let compact
         // minimap tiles preserve already-rendered surroundings.
-        const bool autoCraftOnly = autoCraftWorldTracking.load() &&
+        const bool autoCraftOnly = (autoCraftWorldTracking.load() || platformWorldTracking.load()) &&
             !schematicEnabled.load() && !areaFillEnabled.load() && !miniMapEnabled.load();
         while (schematicColumns.size() > (autoCraftOnly ? 9u : MaximumDecodedWorldColumns)) {
             auto farthest = schematicColumns.begin();
@@ -2871,7 +2875,7 @@ struct RelayState {
             }
             if (enabledChanged) ++areaFillRevision;
         }
-        const bool tracking = enabled || autoCraftWorldTracking.load() ||
+        const bool tracking = enabled || platformWorldTracking.load() || autoCraftWorldTracking.load() ||
             schematicEnabled.load(std::memory_order_relaxed);
         const bool wasTracking = schematicWorldTrackingActive.exchange(
             tracking,
@@ -3025,6 +3029,7 @@ struct RelayState {
     }
 
     bedrock::JsRuntimeValue toggleAreaFill() noexcept {
+        const bool builderActive=platformBusy() || mapBusy();
         std::lock_guard lock(mutex);
         if (areaFillRunning) {
             areaFillRunning = false;
@@ -3032,6 +3037,10 @@ struct RelayState {
             areaFillRouteWaypointKnown = false;
             areaFillStatus = "Остановлено пользователем";
             ++areaFillRevision;
+            return areaFillSnapshotValueLocked();
+        }
+        if (builderActive) {
+            areaFillStatus="Сначала остановите PlatformBuilder";
             return areaFillSnapshotValueLocked();
         }
         if (!areaFillEnabled.load(std::memory_order_relaxed)) {
@@ -3407,7 +3416,7 @@ struct RelayState {
             }
             // Auto 2 only needs the 3x3 nearby columns. Do not copy or decode
             // the rest of the view distance just to locate a workbench.
-            if (autoCraftWorldTracking.load() && !schematicEnabled.load() &&
+            if ((autoCraftWorldTracking.load() || platformWorldTracking.load()) && !schematicEnabled.load() &&
                 !areaFillEnabled.load() && !miniMapEnabled.load() &&
                 packet.name == "level_chunk" && (!camera.known || distanceSquared > 2)) return;
             MiniMapChunkJob incoming {
@@ -3788,7 +3797,7 @@ struct RelayState {
             const int32_t chunkZ = packet.originZ + entry.dz;
             // The envelope origin need not be inside the nearby 3x3 area:
             // relative entry offsets may still point to the player's chunk.
-            if (autoCraftWorldTracking.load() && !schematicEnabled.load() &&
+            if ((autoCraftWorldTracking.load() || platformWorldTracking.load()) && !schematicEnabled.load() &&
                 !areaFillEnabled.load() && !miniMapEnabled.load() &&
                 (!camera.known || packet.dimension != miniMapDimension.load() ||
                  std::abs(int64_t(chunkX)-cameraChunkX)>1 ||
@@ -4071,7 +4080,7 @@ struct RelayState {
                 std::shared_ptr<bedrock::BedrockChunkColumn> column;
                 try {
                     column = std::make_shared<bedrock::BedrockChunkColumn>(
-                        (autoCraftWorldTracking.load() && !schematicEnabled.load() &&
+                        ((autoCraftWorldTracking.load() || platformWorldTracking.load()) && !schematicEnabled.load() &&
                          !areaFillEnabled.load() && !miniMapEnabled.load())
                         ? bedrock::BedrockLevelChunkCodec::decodeNoCacheBlockSectionsFallback(packet, airRuntimeId)
                         : bedrock::BedrockLevelChunkCodec::decodeNoCacheColumn(
@@ -7669,6 +7678,9 @@ struct RelayState {
         );
     }
 
+    #include "platform_bridge.inc"
+    #include "map_queue_bridge.inc"
+
     bool autoCraftBusy() const {
         std::lock_guard lock(depositMutex);
         return autoCraftStore.busy() || autoCraftTableRestore.has_value();
@@ -7782,6 +7794,7 @@ struct RelayState {
     }
 
     void toggleAutoCraftStore() {
+        const bool builderActive=platformBusy() || mapBusy();
         uint64_t revision;
         {
             std::lock_guard lock(depositMutex);
@@ -7795,12 +7808,12 @@ struct RelayState {
             }
             revision = autoCraftStore.revision;
         }
-        bool otherAutomation = false;
+        bool otherAutomation = builderActive;
         std::shared_ptr<const bedrock::ProtoDefValue> extra;
         std::string templateName;
         {
             std::lock_guard lock(mutex);
-            otherAutomation = areaFillRunning || pendingAutomationRequestId != 0 ||
+            otherAutomation = otherAutomation || areaFillRunning || pendingAutomationRequestId != 0 ||
                 automationInventorySessionOpen || automationInventoryOpenRequested;
             if (nbtCraftArmed) extra = nbtCraftExtraCache;
             templateName = nbtCraftSlot;
@@ -9113,6 +9126,8 @@ struct RelayState {
     }
 
     void clearGameplayTelemetry() {
+        {std::lock_guard lock(platformMutex);platformBuilder.reset();platformClientPackets.clear();}
+        {std::lock_guard lock(mapQueueMutex);mapQueue.resetSession();mapScreenWindow=-1;mapClientPackets.clear();++mapArchiveRevision;}
         {
             std::lock_guard lock(depositMutex);
             autoCraftStore.reset(shulkerDeposit);
@@ -9207,7 +9222,7 @@ struct RelayState {
             miniMap,
             std::memory_order_relaxed
         );
-        const bool tracking = schematic || autoCraftWorldTracking.load() ||
+        const bool tracking = schematic || platformWorldTracking.load() || autoCraftWorldTracking.load() ||
             areaFillEnabled.load(std::memory_order_relaxed);
         const bool wasTracking = schematicWorldTrackingActive.exchange(
             tracking,
@@ -9468,6 +9483,8 @@ bedrock::JsRuntimeValue snapshotValue(
     const std::shared_ptr<RelayState>& state,
     std::optional<bool> ok = std::nullopt
 ) {
+    auto platform = state->platformSnapshot(); // never under the main-state lock
+    auto maps = state->mapSnapshot();
     std::lock_guard lock(state->mutex);
     static constexpr std::array<std::string_view, 6> EquipmentSlots {
         "hand", "offhand", "helmet", "chestplate", "leggings", "boots"
@@ -9747,6 +9764,8 @@ bedrock::JsRuntimeValue snapshotValue(
         )},
         {"shulkerDeposit", state->depositSnapshot()},
         {"autoCraftStore", state->autoCraftSnapshot()},
+        {"platformBuilder", std::move(platform)},
+        {"mapQueue", std::move(maps)},
         {"areaFill", state->areaFillSnapshotValueLocked()},
         {"playerHealthKnown", bedrock::JsRuntimeValue::boolean(
             state->playerHealthKnown
@@ -10812,6 +10831,20 @@ public:
         relay->live().onServerbound([this, state, version](
             bedrock::BedrockRelayPacketEvent& event
         ) {
+            if (event.packet.name == "text") {
+                try {
+                    bedrock::RelayPacketEvent decoded(version,event);
+                    std::istringstream in(decoded.getString("message",""));
+                    std::string command, op; int index=0; in>>command>>op>>index;
+                    if(command==".start" || command==".stop" || command==".platform") {
+                        event.cancel();
+                        if(command==".start")op="start";else if(command==".stop")op="stop";
+                        auto result=state->platformCommand(bedrock::JsRuntimeValue::object({
+                            {"op",bedrock::JsRuntimeValue::string(op)},{"index",bedrock::JsRuntimeValue::number(index)}}));
+                        queueNbtFeedback(stringProperty(result,"status"));return;
+                    }
+                } catch(const std::exception& e) {queueNbtFeedback(safeMessage(e.what()));return;}
+            }
             if (const auto response = state->handleNbtCommand(
                     version,
                     event
@@ -10821,7 +10854,7 @@ public:
             }
             // Auto 2 owns a frozen template and must observe manual crafting
             // before the independent .nbt craft rewriter can consume it.
-            if (!state->autoCraftBusy()) state->maybeRewriteNbtCraft(version, event);
+            if (!state->autoCraftBusy() && !state->platformBusy() && !state->mapBusy()) state->maybeRewriteNbtCraft(version, event);
             if (!event.replacements.empty()) {
                 // Craft replacement returns early, but the slot index still
                 // needs the final completed item (without decoding its NBT).
@@ -10913,6 +10946,13 @@ public:
                 state->entityPositions.observeServerbound(event.packet);
             }
             state->observeDecodedGameplayPacket(version, event, true);
+            state->observePlatform(event, true);
+            state->observeMapQueue(event, true);
+            if(state->injectMapQueue(event)) {queuePlatformUpdates(event.sessionId,true);return;}
+            if (state->injectPlatform(event)) {
+                queuePlatformUpdates(event.sessionId);
+                return;
+            }
             // Auto 2 owns inventory/container traffic until its final close.
             // Do not interleave equipment swaps or area-fill placement with it.
             const bool autoCraftOwnsPacket = state->autoCraftBusy();
@@ -10974,6 +11014,8 @@ public:
         ) {
             state->entityPositions.observeClientbound(event.packet);
             state->observeDecodedGameplayPacket(version, event, false);
+            state->observePlatform(event, false);
+            state->observeMapQueue(event, false);
             queueDepositUpdates(event.sessionId);
             state->enqueueMiniMapChunk(version, event.packet);
             if (event.packet.name == "update_block" ||
@@ -12427,6 +12469,34 @@ private:
     bool loginWatchdogStopping_ = false;
     std::thread loginWatchdogThread_;
 
+    void queuePlatformUpdates(const std::string& sessionId,bool maps=false) noexcept {
+        try {
+            std::vector<bedrock::VersionedGamePacket> packets;
+            bedrock::AutoCraftStore::Target target;
+            if(maps){std::lock_guard lock(state_->mapQueueMutex);packets.swap(state_->mapClientPackets);target=state_->mapCloseTarget;}
+            else {std::lock_guard lock(state_->platformMutex);packets.swap(state_->platformClientPackets);target=state_->platformWindowTarget;}
+            if(packets.empty())return;
+            bool restore=false;
+            const size_t original=packets.size();
+            for(size_t i=0;i<original;++i)if(packets[i].name=="container_close") {
+                const auto plan=state_->autoCraftClosePackets(packets[i],target);
+                if(plan.restoreTable) {restore=true;packets.insert(packets.end(),plan.packets.begin()+1,plan.packets.end());}
+            }
+            std::optional<bedrock::BedrockServerConnection> downstream;
+            {std::lock_guard lock(schematicMarkerMutex_);if(schematicDownstreamSessionId_==sessionId)downstream=schematicDownstream_;}
+            if(!downstream || !queueSchematicPacketsBatched(*downstream,packets))
+                throw std::runtime_error("Minecraft не принял обновление строителя");
+            if(restore) {
+                std::lock_guard lock(state_->depositMutex);
+                state_->autoCraftTableRestore=RelayState::AutoCraftTableRestore{target,sessionId,
+                    steadyMilliseconds()+RelayState::AutoCraftTableRestore::DelayMs,++state_->autoCraftTableRestoreSequence,false};
+            }
+        } catch(const std::exception& e) {
+            if(maps){std::lock_guard lock(state_->mapQueueMutex);state_->mapQueue.pause(safeMessage(e.what()));}
+            else {std::lock_guard lock(state_->platformMutex);state_->platformBuilder.pause(safeMessage(e.what()));}
+        }
+    }
+
     void queueAutoCraftUpdates(const std::string& sessionId) noexcept {
         try {
             restoreAutoCraftTable();
@@ -13007,6 +13077,30 @@ jstring toJavaString(JNIEnv* environment, const std::string& value) {
 extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
     javaVm = vm;
     return JNI_VERSION_1_6;
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_m9chko_bedrockrelay_NativeBridge_mapQueueCommand(JNIEnv* env,jclass,jstring value) {
+    try {
+        auto json=fromJavaString(env,value);if(json.size()>8192)throw std::runtime_error("Слишком длинная команда");
+        std::shared_ptr<RelayState> state;{std::lock_guard lock(controllerMutex);state=currentState;}
+        if(!state)throw std::runtime_error("Сначала запустите реле");
+        return toJavaString(env,jsonString(state->mapCommand(bedrock::JsRuntimeJson::parse(json))));
+    }catch(const std::exception& e){return toJavaString(env,jsonString(bedrock::JsRuntimeValue::object({{"error",bedrock::JsRuntimeValue::string(safeMessage(e.what()))}})));}
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_m9chko_bedrockrelay_NativeBridge_platformCommand(JNIEnv* env,jclass,jstring value) {
+    try {
+        auto json=fromJavaString(env,value);
+        if(json.size()>8192)throw std::runtime_error("Слишком длинная команда");
+        std::shared_ptr<RelayState> state;
+        {std::lock_guard lock(controllerMutex);state=currentState;}
+        if(!state)throw std::runtime_error("Сначала запустите реле");
+        return toJavaString(env,jsonString(state->platformCommand(bedrock::JsRuntimeJson::parse(json))));
+    } catch(const std::exception& e) {
+        return toJavaString(env,jsonString(bedrock::JsRuntimeValue::object({{"status",bedrock::JsRuntimeValue::string(safeMessage(e.what()))}})));
+    }
 }
 
 extern "C" JNIEXPORT jstring JNICALL

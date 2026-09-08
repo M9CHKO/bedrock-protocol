@@ -273,6 +273,50 @@ static void verifyNativeIntegration() {
     state.clearGameplayTelemetry();
     require(!state.autoCraftTableRestore,"disconnect clears delayed restoration without carrying it into a new session");
 }
+static void verifyPlatformIntegration() {
+    for(const auto& version:{std::string("1.21.2"),std::string("1.21.100")}) {
+        RelayState state;state.version=version;state.loadBlockRegistry("data/minecraft-data/bedrock/1.21.100");state.configureBlockRuntimeIds(false);
+        state.itemProtocolVariables->setVariable("ShieldItemID",513);
+        const auto air=state.actualAirRuntimeId(),quartz=*state.schematicRuntimeId("minecraft:quartz_block"),glow=*state.schematicRuntimeId("minecraft:glowstone");
+        for(int x=-4;x<=4;++x)for(int y=61;y<=67;++y)for(int z=-4;z<=4;++z)
+            state.schematicBlockOverrides[{0,x,y,z}]={y==62?(x==0?glow:quartz):air,0,0};
+        bedrock::ProtoDefWriter seed;seed.varuint64(123);seed.f32le(.5f);seed.f32le(64.62f);seed.f32le(.5f);seed.f32le(0);seed.f32le(0);seed.f32le(0);
+        auto codec=bedrock::VersionedPacketCodec::forVersion(version);
+        state.entityPositions.observeServerbound(codec.makePacketByName("move_player",seed.take()));
+        auto& b=state.platformBuilder;b.version(version);b.palette({{1,"quartz_block"},{2,"glowstone"},{3,"chest"},{4,"crafting_table"}});
+        bedrock::ProtoDefWriter inv;inv.varuint32(0);inv.varuint32(36);
+        for(int i=0;i<36;++i) {if(i<4)inv.bytes(*item(i+1,64).wire);else inv.zigzag32(0);}
+        if(b.modern){inv.u8(12);inv.u8(0);inv.zigzag32(0);}b.inventory(inv.take(),true,0);
+        b.start(state.platformCamera(),[&](auto p){return state.platformBlock(p);},steadyMilliseconds());
+        require(b.busy(),"platform starts with native camera/world");
+        auto vec2=[](double x,double z){return V::object({{"x",V::floating(x)},{"z",V::floating(z)}});};
+        auto input=V::object({{"pitch",V::floating(0)},{"yaw",V::floating(0)},{"head_yaw",V::floating(0)},
+            {"position",RelayState::areaVec3(.5,64.62,.5)},{"move_vector",vec2(0,0)},{"input_data",V::object({
+                {"item_interact",V::boolean(false)},{"block_action",V::boolean(false)},{"item_stack_request",V::boolean(false)},{"client_predicted_vehicle",V::boolean(false)}})},
+            {"input_mode",V::string("mouse")},{"play_mode",V::string("normal")},{"interaction_model",V::string("classic")},
+            {"interact_rotation",vec2(0,0)},{"tick",V::uinteger(100)},{"delta",RelayState::areaVec3(0,0,0)},
+            {"analogue_move_vector",vec2(0,0)},{"camera_orientation",RelayState::areaVec3(-1,0,0)},{"raw_move_vector",vec2(0,0)}});
+        bedrock::ProtoDefPacketEncoder encoder(version,state.itemProtocolVariables);
+        const auto packet=codec.makePacketByName("player_auth_input",encoder.encodePacket("player_auth_input",input));
+        bool moved=false;
+        for(int i=0;i<10 && !moved;++i) {
+            bedrock::BedrockRelayPacketEvent event;event.packet=packet;
+            require(state.injectPlatform(event),"platform owns movement while menus may be open");
+            require(!event.replacements.empty(),"production movement encoded");
+            for(auto& p:event.replacements)bedrock::ProtoDefPacketDecoder(version,state.itemProtocolVariables).validatePacketStrict(p.name,p.payload);
+            for(auto& p:state.platformClientPackets) {
+                bedrock::ProtoDefPacketDecoder(version,state.itemProtocolVariables).validatePacketStrict(p.name,p.payload);
+                if(p.name=="move_player")moved=true;
+            }
+            state.platformClientPackets.clear();
+        }
+        require(moved && b.busy(),"native walking emits valid local camera sync in both protocols");
+        input.objectValue["input_data"].objectValue["block_action"]=V::boolean(true);
+        input.objectValue["block_action"]=V::array({});
+        bedrock::BedrockRelayPacketEvent manual;manual.packet=codec.makePacketByName("player_auth_input",encoder.encodePacket("player_auth_input",input));
+        state.injectPlatform(manual);require(!b.busy() && manual.replacements.empty(),"manual action detected before automation poll/send");
+    }
+}
 int main() {
     try {
         for (const auto& version : {std::string("1.21.2"),std::string("1.21.100")}) {
@@ -470,7 +514,20 @@ int main() {
             m.configureTiming(-1,0); require(m.craftIntervalMs==100 && m.windowPauseMs==300,"native timing lower bounds");
             m.configureTiming(INT_MAX,INT_MAX); require(m.craftIntervalMs==5000 && m.windowPauseMs==3000,"native timing upper bounds");
         }
+        // Shared maps adapter: configuration and inactive GUI tracking must not
+        // invoke networking or interfere with ordinary manual containers.
+        {
+            RelayState state;state.version="1.21.100";
+            state.mapCommand(bedrock::JsRuntimeValue::object({{"op",bedrock::JsRuntimeValue::string("configure")},{"hold",bedrock::JsRuntimeValue::number(2)},{"transfer",bedrock::JsRuntimeValue::number(0)}}));
+            require(state.mapQueue.timing.hold==300&&state.mapQueue.timing.transfer==500,"map timing API clamps unsafe values");
+            auto event=containerOpen(state.version,255,1,1,64,1);state.observeMapQueue(event,false);
+            require(state.mapScreenWindow==255&&!state.mapBusy(),"map module remembers manually opened workbench without starting");
+            event.packet=bedrock::VersionedPacketCodec::forVersion(state.version).makePacketByName("container_close",{255,1,0});
+            state.observeMapQueue(event,true);require(state.mapScreenWindow==255,"client-only close keeps map preflight blocked");
+            state.observeMapQueue(event,false);require(state.mapScreenWindow==-1,"server close releases map preflight guard");
+        }
         verifyNativeIntegration();
+        verifyPlatformIntegration();
         std::cout<<"Auto 2: "<<checks<<" checks passed\n";
         return 0;
     } catch(const std::exception& e) {std::cerr<<"FAIL: "<<e.what()<<"\n";return 1;}

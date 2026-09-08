@@ -1,7 +1,7 @@
 param(
     [string]$Toolchain = 'C:\D\bedrock-protocol-cpp\_deps\msys64\ucrt64',
     [switch]$SkipNative,
-    [string]$PackageName = 'CPE-Relay-Windows-1.1.0-x64'
+    [string]$PackageName = 'CPE-Relay-Windows-1.3.0-x64'
 )
 $ErrorActionPreference = 'Stop'
 $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))

@@ -24,6 +24,7 @@ internal static class SelfTest
             Require(AppSettings.ClampInterval(-1) == 30 && AppSettings.ClampInterval(5000) == 3000, "Speed bounds: 30–3000 ms");
             Require(AppSettings.ValidSlot("Weathertop_End_Nested") && !AppSettings.ValidSlot("../test") && !AppSettings.ValidSlot(new string('x', 33)), "Safe NBT slot names");
             AutoCraftUiTests.Run(output, Require);
+            MapQueueUiTests.Run(output, Require);
             using (var form = new MainForm(preview: true))
             {
                 form.StartPosition = FormStartPosition.Manual; form.Location = new Point(-15000, -15000);
@@ -85,6 +86,14 @@ internal static class SelfTest
                         minecraftDataDirectory = Directory.Exists(data) ? data : "", authProfile = "Player 123" });
                     Require(state.Flag("running") && state.Flag("listening"), $"Native relay starts for {version} with Unicode data path");
                     Require(state.Flag("pingOk"), $"Native Winsock loopback verification for {version}");
+                    var builder=RelayBackend.Invoke(new { action="platform", op="configure", chunks=10, lanes=3, gapChunks=2, turnSide=-1, placeMs=50 });
+                    Require(!builder.Flag("running") && builder.GetProperty("chests").ValueKind==JsonValueKind.Array, $"PlatformBuilder settings and chest list on {version}");
+                    builder=RelayBackend.Invoke(new { action="platform", op="start" });
+                    Require(!builder.Flag("running"), "Builder refuses to move without a connected player/inventory");
+                    builder=RelayBackend.Invoke(new { action="platform", op="record" });
+                    Require(builder.Flag("recording"), "Record is armed without decoding inventory");
+                    builder=RelayBackend.Invoke(new { action="platform", op="stop" });
+                    Require(!builder.Flag("recording") && !builder.Flag("running"), "Stop cancels recording and builder");
                     Require(state.GetProperty("shulkerDeposit").Flag("supported"), $"Deposit compatibility gate for {version}");
                     var craft = state.GetProperty("autoCraftStore");
                     Require(!craft.Flag("busy") && craft.GetProperty("craftIntervalMs").GetInt32() == 100 &&
@@ -132,5 +141,33 @@ internal static class SelfTest
             return 1;
         }
         finally { if (!args.Contains("--preview-only") && !args.Contains("--shutdown-only")) { try { RelayBackend.Invoke(new { action = "stop" }); } catch { } } }
+    }
+}
+
+internal static class MapQueueUiTests
+{
+    private static T Field<T>(object obj,string name)=>(T)obj.GetType().GetField(name,System.Reflection.BindingFlags.NonPublic|System.Reflection.BindingFlags.Instance)!.GetValue(obj)!;
+    internal static void Run(string output,Action<bool,string> require)
+    {
+        var legacy=JsonSerializer.Deserialize<AppSettings>("{}")!;
+        require(legacy.MapArchive=="" && legacy.MapTiming.Count==0,"Old settings do not enable maps or load a ZIP");
+        using var backend=new RelayBackend();
+        using var panel=new MapQueuePanel(backend,new AppSettings{MapTiming=new(){{"transfer",-1},{"timeout",200000},{"hold",0}}});
+        var fields=Field<Dictionary<string,NumericUpDown>>(panel,"fields");
+        require(fields.Count==11 && fields["transfer"].Value==500 && fields["hold"].Value==300 && fields["timeout"].Value==120000,"Eleven independent map timings with safe bounds");
+        using var host=new Form{Size=new Size(850,850),Location=new Point(-15000,-15000),StartPosition=FormStartPosition.Manual,BackColor=Theme.Background,Font=new Font("Segoe UI",10),AutoScroll=true};
+        host.Controls.Add(panel);Theme.Inputs(host);host.Show();Application.DoEvents();
+        panel.Update(JsonSerializer.SerializeToElement(new{busy=false,loaded=true,status="ZIP готов. Файлов: 200",file="0001.qznbt",completed=0,total=200,maps=0}));
+        require(panel.Loaded,"Map panel displays imported archive without starting");
+        using(var bitmap=new Bitmap(host.Width,host.Height)){host.DrawToBitmap(bitmap,new Rectangle(Point.Empty,host.Size));bitmap.Save(Path.Combine(output,"maps-settings.png"));}
+        using var floating=new FloatingDepositForm(maps:true);floating.Location=new Point(-15000,-15000);
+        floating.UpdateIndicators(JsonSerializer.SerializeToElement(new{running=true,upstreamReady=true,mapQueue=new{busy=true,loaded=true,status="Показываю карту 3 / 27",completed=10,total=200,maps=2}}),true);
+        floating.UpdateVisibility(true,true);
+        require(floating.Visible&&floating.TopMost&&Field<RelayButton>(floating,"button").Text.Contains("СТОП")&&Field<Label>(floating,"detail").Text.Contains("10 / 200"),"Separate floating map button and counters");
+        using(var bitmap=new Bitmap(floating.Width,floating.Height)){floating.DrawToBitmap(bitmap,new Rectangle(Point.Empty,floating.Size));bitmap.Save(Path.Combine(output,"maps-floating.png"));}
+        floating.ShowError("Закройте текущее окно");
+        floating.UpdateIndicators(JsonSerializer.SerializeToElement(new{running=false}),true);
+        require(Field<Label>(floating,"detail").Text.Contains("Закройте"),"Map start error remains visible across snapshot refresh");
+        host.Close();floating.Close();
     }
 }

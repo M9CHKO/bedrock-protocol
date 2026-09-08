@@ -52,6 +52,8 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public final class MainActivity extends Activity {
+    public static final String ACTION_IMPORT_MAP_ZIP="com.m9chko.bedrockrelay.action.IMPORT_MAP_ZIP";
+    private static final int MAP_ZIP_REQUEST=105;
     public static final String ACTION_IMPORT_TEXTURE_PACK =
         "com.m9chko.bedrockrelay.action.IMPORT_TEXTURE_PACK";
     public static final String ACTION_IMPORT_SCHEMATIC =
@@ -394,6 +396,8 @@ public final class MainActivity extends Activity {
         addModule(content, "Снаряжение", "Руки, броня и прочность", RelayService.KEY_EQUIPMENT_HUD, false);
         addModule(content, "Анализ угроз", "Предупреждения о приближении мобов", RelayService.KEY_THREAT_ANALYSIS, false);
         content.addView(sectionLabel("СТРОИТЕЛЬСТВО И АВТОМАТИЗАЦИЯ"));
+        content.addView(new PlatformSettingsControls(this, preferences));
+        content.addView(new MapQueueControls(this,preferences));
         addModule(content, "Автозаполнение", "Точки и запуск выбираются в игре", RelayService.KEY_AREA_FILL_ENABLED, false);
         addModule(content, "Авто-тотем", "Пополнение левой руки из инвентаря", RelayService.KEY_AUTO_TOTEM, false);
         addModule(content, "Авто-броня", "Выбор снаряжения из инвентаря", RelayService.KEY_AUTO_ARMOR, false);
@@ -823,6 +827,7 @@ public final class MainActivity extends Activity {
         Intent data
     ) {
         super.onActivityResult(requestCode, resultCode, data);
+        if(requestCode==MAP_ZIP_REQUEST && resultCode==RESULT_OK && data!=null && data.getData()!=null){MapQueueControls.importZip(this,preferences,data.getData());return;}
         if (requestCode == OVERLAY_PERMISSION_REQUEST) {
             continuePendingOverlayStart();
         } else if (requestCode == TEXTURE_PACK_REQUEST &&
@@ -878,6 +883,7 @@ public final class MainActivity extends Activity {
 
     private void maybeOpenImportPicker(Intent intent) {
         if (intent == null) return;
+        if(ACTION_IMPORT_MAP_ZIP.equals(intent.getAction())){intent.setAction(null);handler.post(()->{Intent picker=new Intent(Intent.ACTION_OPEN_DOCUMENT).setType("application/zip").addCategory(Intent.CATEGORY_OPENABLE);startActivityForResult(picker,MAP_ZIP_REQUEST);});return;}
         if (ACTION_IMPORT_TEXTURE_PACK.equals(intent.getAction())) {
             intent.setAction(null);
             handler.post(this::openTexturePackPicker);

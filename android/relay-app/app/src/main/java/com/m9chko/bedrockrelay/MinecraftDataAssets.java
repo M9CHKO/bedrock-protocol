@@ -22,7 +22,7 @@ final class MinecraftDataAssets {
 
     static String prepareNativeDirectory(Context context, String version)
         throws IOException {
-        if (!PACKAGED_VERSION.equals(version)) return "";
+        if (!PACKAGED_VERSION.equals(version) && !"1.21.2".equals(version)) return "";
         File directory = new File(
             context.getFilesDir(),
             "minecraft-data/" + version + "-apk-" + BuildConfig.VERSION_CODE

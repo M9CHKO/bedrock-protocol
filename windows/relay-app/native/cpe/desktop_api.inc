@@ -127,6 +127,8 @@ DesktopValue desktopCall(const DesktopValue& request) {
         return events;
     }
     if (!state) throw std::runtime_error("Сначала запустите реле");
+    if (action == "platform") return state->platformCommand(request);
+    if (action == "maps") return state->mapCommand(request);
     if (action == "auto2.toggle") {
         if (!configuredAutoCraftStore.load() && !state->autoCraftBusy())
             throw std::runtime_error("Включите Авто 2 в разделе «Модули»");

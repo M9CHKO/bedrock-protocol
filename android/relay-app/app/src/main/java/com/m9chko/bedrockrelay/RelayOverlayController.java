@@ -1615,6 +1615,8 @@ final class RelayOverlayController {
     }
 
     private void buildAutomationPage(LinearLayout root) {
+        root.addView(new PlatformSettingsControls(context, preferences));
+        root.addView(new MapQueueControls(context,preferences));
         root.addView(toggle("Автоматизация 2 · плавающая кнопка", RelayService.KEY_AUTO_CRAFT_STORE_BUTTON, true));
         root.addView(settingLabel("Авто 2: крафт шалкеров с выбранным NBT → ближайшие сундуки → повтор. " +
             "Встаньте у верстака и сундуков (до 4 блоков), закройте меню и нажмите СТАРТ. " +

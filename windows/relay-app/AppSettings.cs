@@ -21,6 +21,9 @@ internal sealed class AppSettings
     public bool Logging { get; set; }
     public bool FloatingButton { get; set; } = true;
     public bool Auto2 { get; set; } = true;
+    public Dictionary<string, decimal> Platform { get; set; } = new();
+    public Dictionary<string, int> MapTiming { get; set; } = new();
+    public string MapArchive { get; set; } = "";
     public int CraftIntervalMs { get; set; } = 1000;
     public int WindowPauseMs { get; set; } = 700;
     public int IntervalMs { get; set; } = 1000;
@@ -34,6 +37,8 @@ internal sealed class AppSettings
         {
             var value = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(SettingsFile)) ?? new();
             value.IntervalMs = ClampInterval(value.IntervalMs);
+            value.Platform ??= new();
+            value.MapTiming ??= new();
             value.CraftIntervalMs = ClampCraftInterval(value.CraftIntervalMs);
             value.WindowPauseMs = ClampWindowPause(value.WindowPauseMs);
             value.Port = Math.Clamp(value.Port, 1, 65535);

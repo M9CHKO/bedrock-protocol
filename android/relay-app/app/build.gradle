@@ -19,6 +19,9 @@ tasks.register("generateMinecraftDataAssets") {
     def collisions = new File(minecraftDataSource, "blockCollisionShapes.json")
     def javaToBedrock = new File(minecraftDataSource, "blocksJ2B.json")
     inputs.files(blocks, states, collisions, javaToBedrock)
+    inputs.files(["blocks", "blockStates", "blockCollisionShapes"].collect {
+        file("${rootProject.projectDir}/../../data/minecraft-data/bedrock/1.21.0/${it}.json")
+    })
     outputs.dir(generatedMinecraftAssets)
 
     doLast {
@@ -27,6 +30,11 @@ tasks.register("generateMinecraftDataAssets") {
             "minecraft-data/${minecraftDataVersion}"
         )
         project.delete(generatedMinecraftAssets)
+        project.copy {
+            from file("${rootProject.projectDir}/../../data/minecraft-data/bedrock/1.21.0")
+            include "blocks.json", "blockStates.json", "blockCollisionShapes.json"
+            into new File(generatedMinecraftAssets, "minecraft-data/1.21.2")
+        }
         destination.mkdirs()
         [blocks, states, collisions].each { source ->
             project.copy {
@@ -90,8 +98,8 @@ android {
         applicationId "com.m9chko.bedrockrelay"
         minSdk 26
         targetSdk 36
-        versionCode 64
-        versionName "1.3.15"
+        versionCode 66
+        versionName "1.5.0"
 
         ndk {
             abiFilters "arm64-v8a"

@@ -17,6 +17,8 @@ public final class NativeBridge {
     );
 
     public static native String supportedVersions();
+    public static native String platformCommand(String json);
+    public static native String mapQueueCommand(String json);
 
     public static native void stopRelay();
     public static native void refreshAreaFillMarkers();

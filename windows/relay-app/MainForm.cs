@@ -8,6 +8,9 @@ internal sealed class MainForm : Form
 {
     private readonly RelayBackend backend;
     private readonly AppSettings settings;
+    private readonly PlatformPanel platformPanel;
+    private readonly MapQueuePanel mapPanel;
+    private readonly FloatingDepositForm floatingMaps = new(maps:true);
     private readonly FloatingDepositForm floating = new();
     private readonly FloatingDepositForm floatingAuto2 = new(autoCraft: true);
     private readonly System.Windows.Forms.Timer pollTimer = new() { Interval = 500 };
@@ -66,7 +69,9 @@ internal sealed class MainForm : Form
         backend = testBackend ?? new RelayBackend();
         lifecycleTest = testBackend != null;
         settings = preview ? new AppSettings() : AppSettings.Load();
-        Text = "CPE Relay — Windows 1.1.0";
+        platformPanel = new PlatformPanel(backend, settings);
+        mapPanel = new MapQueuePanel(backend,settings);
+        Text = "CPE Relay — Windows 1.3.0";
         AutoScaleMode = AutoScaleMode.Dpi;
         Font = new Font("Segoe UI", 10);
         Size = new Size(1080, 790); MinimumSize = new Size(860, 700);
@@ -83,7 +88,7 @@ internal sealed class MainForm : Form
             var button = new RelayButton { Text = names[i], Navigation = true, Width = 194, Height = 51, Margin = new Padding(0, 0, 0, 7) };
             button.Click += (_, _) => SelectPage(page); navigation.Add(button); nav.Controls.Add(button);
         }
-        var signature = new Label { Text = "LOCAL RELAY\nWindows x64  /  1.1.0", Dock = DockStyle.Bottom, Height = 52, ForeColor = Theme.Muted, Padding = new Padding(13, 8, 0, 0), Font = new Font("Segoe UI", 9) };
+        var signature = new Label { Text = "LOCAL RELAY\nWindows x64  /  1.3.0", Dock = DockStyle.Bottom, Height = 52, ForeColor = Theme.Muted, Padding = new Padding(13, 8, 0, 0), Font = new Font("Segoe UI", 9) };
         sidebar.Controls.Add(nav); sidebar.Controls.Add(signature); sidebar.Controls.Add(brand);
         var footer = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 77, Padding = new Padding(26, 12, 0, 0), BackColor = Theme.Sidebar, WrapContents = false };
         footer.Controls.AddRange([start, stop, status, memory]);
@@ -113,17 +118,20 @@ internal sealed class MainForm : Form
         stop.Click += async (_, _) => await StopRelay();
         floating.Toggle = () => deposit.Checked = !deposit.Checked;
         floatingAuto2.Toggle = async () => await ToggleAuto2();
+        floatingMaps.Toggle = async () => await mapPanel.Command("toggle");
+        mapPanel.CommandFailed = floatingMaps.ShowError;
         auto2Toggle.Click += async (_, _) => await ToggleAuto2();
         configTimer.Tick += async (_, _) => { configTimer.Stop(); await ApplySettings(); };
         pollTimer.Tick += async (_, _) => await Poll();
         overlayTimer.Tick += (_, _) => {
             floating.UpdateVisibility(running && !closing && !stopping, floatingEnabled.Checked);
             floatingAuto2.UpdateVisibility(running && !closing && !stopping, floatingEnabled.Checked && (auto2.Checked || auto2Busy));
+            floatingMaps.UpdateVisibility(running&&!closing&&!stopping,floatingEnabled.Checked&&mapPanel.Loaded);
         };
         if (!preview) overlayTimer.Start();
         Shown += async (_, _) => { if (!preview) await Initialize(); };
         FormClosing += OnClosing;
-        FormClosed += (_, _) => { pollTimer.Dispose(); configTimer.Dispose(); overlayTimer.Dispose(); floating.Dispose(); floatingAuto2.Dispose(); backend.Dispose(); };
+        FormClosed += (_, _) => { pollTimer.Dispose(); configTimer.Dispose(); overlayTimer.Dispose(); floating.Dispose(); floatingAuto2.Dispose(); floatingMaps.Dispose(); backend.Dispose(); };
         RefreshFiles(); SetBusy(false);
     }
 
@@ -272,6 +280,8 @@ internal sealed class MainForm : Form
     {
         var tab = new Panel(); var body = Stack(); tab.Controls.Add(body);
         Heading(body, "Меньше действий.", "Настройте разгрузку и снаряжение под свой темп игры.");
+        Card(body, Section("PLATFORM BUILDER  /  СТРОИТЕЛЬСТВО"), platformPanel);
+        Card(body, Section("КАРТЫ ИЗ ZIP  /  ОТДЕЛЬНАЯ ОЧЕРЕДЬ"), mapPanel);
         var resetCraft = Button("Сбросить паузы");
         resetCraft.Click += (_, _) => { craftSpeed.Value = 80; windowSpeed.Value = 23; };
         Card(body, Section("АВТО 2  /  ВЕРСТАК → СУНДУКИ"), auto2, Row(auto2Toggle, resetCraft), auto2Status,
@@ -400,7 +410,9 @@ internal sealed class MainForm : Form
                 authProfile = settings.AuthProfile,
                 minecraftDataDirectory = data });
             if (closing || operation != lifecycle) return;
+            await platformPanel.Configure();
             UpdateState(result); AddLog("Реле запущено. В Minecraft подключитесь к 127.0.0.1:19132.");
+            try{await mapPanel.Configure(load:true);}catch(Exception e){AddLog("Библиотека карт: "+e.Message);}
         }
         catch (Exception error) { if (!closing && operation == lifecycle) { running = false; status.Text = "Ошибка запуска"; ShowError(error); } }
         finally { if (operation == lifecycle) { starting = false; SetBusy(false); } }
@@ -409,7 +421,7 @@ internal sealed class MainForm : Form
     {
         if (closing || stopping) return;
         ++lifecycle; stopping = true;
-        pollTimer.Stop(); configTimer.Stop(); floating.Hide(); floatingAuto2.Hide();
+        pollTimer.Stop(); configTimer.Stop(); floating.Hide(); floatingAuto2.Hide(); floatingMaps.Hide();
         SetBusy(true); status.Text = "Остановка…";
         try
         {
@@ -462,6 +474,9 @@ internal sealed class MainForm : Form
             depositStatus.Text = value.Flag("supported") ? value.Text("status") + "  ·  Отправлено: " + value.GetProperty("sent") + "  ·  Подтверждено: " + value.GetProperty("confirmed") : "Авторазгрузка недоступна для выбранного формата пакетов.";
         floating.UpdateIndicators(state, deposit.Checked);
         UpdateAuto2(state.TryGetProperty("autoCraftStore", out var craft) ? craft : default);
+        platformPanel.Update(state.TryGetProperty("platformBuilder", out var platform) ? platform : default);
+        mapPanel.Update(state.TryGetProperty("mapQueue",out var maps)?maps:default);
+        floatingMaps.UpdateIndicators(state,true);
         floatingAuto2.UpdateIndicators(state, auto2.Checked);
         if (!busy) SetBusy(false);
     }
@@ -577,7 +592,7 @@ internal sealed class MainForm : Form
         if ((preview && !lifecycleTest) || closeAllowed) return;
         e.Cancel = true;
         if (closing) return;
-        closing = true; ++lifecycle; pollTimer.Stop(); configTimer.Stop(); floating.Hide(); floatingAuto2.Hide(); Hide(); Enabled = false;
+        closing = true; ++lifecycle; pollTimer.Stop(); configTimer.Stop(); floating.Hide(); floatingAuto2.Hide(); floatingMaps.Hide(); Hide(); Enabled = false;
         // A failed settings write must never skip shutdown, nor keep a window open.
         Task save = Task.CompletedTask;
         if (!preview)

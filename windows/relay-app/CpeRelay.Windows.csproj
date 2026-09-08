@@ -7,7 +7,7 @@
     <Nullable>enable</Nullable>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <AssemblyName>CPE-Relay</AssemblyName>
-    <Version>1.1.0</Version>
+    <Version>1.3.0</Version>
     <PlatformTarget>x64</PlatformTarget>
   </PropertyGroup>
   <ItemGroup Condition="'$(RelayBundleDir)' != ''">
