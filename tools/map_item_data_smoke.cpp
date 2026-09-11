@@ -418,6 +418,26 @@ bool reportedFullMapRoundTrip(
         ok &= fieldEquals("texture.pixels.$count", "16384");
         ok &= fieldEquals("texture.pixels[16383]", "4294967295");
 
+        const auto observedFields = decoder.decodePacketForObservationStrict(
+            "clientbound_map_item_data",
+            payload
+        );
+        ok &= check(
+            observedFields.size() <=
+                bedrock::PacketMemoryPolicy::MaximumObservedFields,
+            label + ": observation decode retained too many fields"
+        );
+        ok &= check(
+            field(observedFields, "texture.width") != nullptr &&
+                field(observedFields, "texture.pixels.$count") != nullptr,
+            label + ": bounded observation lost map metadata"
+        );
+        ok &= check(
+            field(observedFields, "texture.pixels[16383]") == nullptr,
+            label + ": bounded observation retained the full pixel array"
+        );
+        decoder.validatePacketStrict("clientbound_map_item_data", payload);
+
         const auto codec = bedrock::VersionedPacketCodec::forVersion(version);
         bedrock::BedrockRelayPacketEvent rawEvent;
         rawEvent.packet = codec.makePacketByName(

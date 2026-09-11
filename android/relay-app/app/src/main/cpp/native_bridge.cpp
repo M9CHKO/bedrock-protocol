@@ -76,8 +76,12 @@ constexpr std::size_t MaximumMiniMapTiles = 768;
 constexpr std::size_t MaximumNbtTransferFileBytes = 8u * 1024u * 1024u;
 constexpr std::size_t MaximumNbtTransferNodes = 100'000;
 constexpr std::size_t MaximumNbtTransferDepth = 32;
-constexpr std::size_t MaximumTrackedInventoryPacketBytes = 256u * 1024u;
-constexpr std::size_t StructuredItemPacketBytes = 16u * 1024u;
+// Keep the Android and Windows frontends on the same limits as the shared C++
+// packet layer. The Windows native relay compiles this same bridge source.
+constexpr std::size_t MaximumTrackedInventoryPacketBytes =
+    bedrock::PacketMemoryPolicy::MaximumTrackedInventoryPacketBytes;
+constexpr std::size_t StructuredItemPacketBytes =
+    bedrock::PacketMemoryPolicy::StructuredItemPacketBytes;
 
 std::atomic<bool> configuredDetailedLogging {true};
 std::atomic<bool> configuredChunkRetention {false};

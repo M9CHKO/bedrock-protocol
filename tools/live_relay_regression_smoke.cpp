@@ -1358,6 +1358,7 @@ bool checkMapFloodAndItemOrdering() {
     std::atomic<int> joins {0};
     std::atomic<int> parseErrors {0};
     std::atomic<int> serverboundCallbacks {0};
+    std::atomic<int> rawClientboundCallbacks {0};
     std::mutex diagnosticsMutex;
     std::vector<std::string> diagnostics;
     relay.onJoin([&](bedrock::RelayPlayer&, bedrock::BedrockNetworkClient&) {
@@ -1365,6 +1366,20 @@ bool checkMapFloodAndItemOrdering() {
     });
     relay.onServerbound([&](bedrock::RelayPacketEvent&) {
         ++serverboundCallbacks;
+    });
+    relay.onClientbound([&](bedrock::RelayPacketEvent& event) {
+        if (event.name == "start_game" ||
+            event.name == "item_registry" ||
+            event.name == "creative_content" ||
+            event.name == "inventory_content" ||
+            event.name == "clientbound_map_item_data" ||
+            event.name == "inventory_slot" ||
+            event.name == "mob_equipment" ||
+            event.name == "add_item_entity") {
+            // Deliberately inspect only the raw envelope. Large wildcard
+            // relay observers must not force a decoded map/NBT tree.
+            ++rawClientboundCallbacks;
+        }
     });
     relay.onParseError([&](const bedrock::RelayParseError&) {
         ++parseErrors;
@@ -1517,7 +1532,30 @@ bool checkMapFloodAndItemOrdering() {
         errors.add("downstream", message);
     });
 
+    const auto observedRegistryFields = bedrock::ProtoDefPacketDecoder(version)
+        .decodePacketForObservationStrict(
+            "item_registry",
+            relayRegistry.payload
+        );
+    const bool observedRegistrySkippedNbt = std::any_of(
+        observedRegistryFields.begin(),
+        observedRegistryFields.end(),
+        [](const bedrock::ProtoDefField& field) {
+            return field.value == "<nbt omitted>" &&
+                !field.structuredValue.has_value();
+        }
+    );
+
     bool ok = true;
+    ok &= check(
+        observedRegistryFields.size() <=
+            bedrock::PacketMemoryPolicy::MaximumObservedFields,
+        "observation item_registry retained an unbounded field tree"
+    );
+    ok &= check(
+        observedRegistrySkippedNbt,
+        "observation item_registry materialized component NBT"
+    );
     ok &= check(
         registryDecodeElapsed < 2s,
         "full 1.21.100 item_registry strict decode exceeded two seconds"
@@ -1621,6 +1659,10 @@ bool checkMapFloodAndItemOrdering() {
             slots.load() == 1 && itemBearingPackets.load() == 4;
     }, 20s);
     ok &= check(floodDelivered, "map flood or following inventory item stalled");
+    ok &= check(
+        rawClientboundCallbacks.load() == static_cast<int>(expected.size()),
+        "raw-only clientbound handler missed the map/item burst"
+    );
     if (floodDelivered) {
         std::cerr << "[item-map-burst] packets=" << expected.size()
                   << " sequence_delivery_ms=" << sequenceDeliveryMs.load()

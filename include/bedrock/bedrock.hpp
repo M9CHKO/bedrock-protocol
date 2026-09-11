@@ -2424,7 +2424,10 @@ private:
             if (!shouldDecode) return out;
 
             try {
-                auto fields = state->decoder->decodePacket(packet.name, packet.payload);
+                auto fields = state->decoder->decodePacketForObservation(
+                    packet.name,
+                    packet.payload
+                );
                 for (const auto& field : fields) {
                     // ProtoDef's diagnostic field form retains mapper values
                     // as `numeric/name`. JavaScript packet params expose only
@@ -2936,9 +2939,19 @@ public:
         version_(std::move(version)),
         variables_(variables ? std::move(variables) : makeProtoDefVariableStore()),
         strictDecode_(strictDecode),
-        preserveNbtBytes_(preserveNbtBytes) {
+        preserveNbtBytes_(
+            preserveNbtBytes ||
+            PacketMemoryPolicy::shouldKeepItemNbtOpaque(
+                event.packet.name,
+                event.packet.payload.size()
+            )
+        ) {
         if (name == "start_game" || name == "item_registry") {
-            ensureDecoded();
+            // These packets update connection-scoped item variables even when
+            // a raw-only relay callback never asks for decoded parameters.
+            // Do not eagerly construct their large editable parameter tree.
+            ProtoDefPacketDecoder decoder(version_, variables_);
+            decoder.updatePacketVariables(name, packet.payload);
         }
     }
 
@@ -3848,7 +3861,11 @@ private:
                     !clientboundDestinationHandlers_.empty()
                 : !serverboundHandlers_.empty() ||
                     !serverboundDestinationHandlers_.empty();
-        if (hasDirectionHandlers) {
+        if (hasDirectionHandlers &&
+            !PacketMemoryPolicy::shouldDecodeRelayParamsLazily(
+                event.packet.name,
+                event.packet.payload.size()
+            )) {
             (void) event.decodedParams();
         }
 
@@ -4274,6 +4291,25 @@ private:
                 return;
             }
 
+            const bool lazyParams =
+                PacketMemoryPolicy::shouldDecodeRelayParamsLazily(
+                    event.packet.name,
+                    event.packet.payload.size()
+                );
+            if (lazyParams) {
+                // Preserve strict malformed-packet behavior without retaining
+                // the decoded tree. A handler that explicitly calls value(),
+                // get() or decodedParams() still receives the lossless form.
+                ProtoDefPacketDecoder decoder(
+                    options_.version,
+                    packetVariables
+                );
+                decoder.validatePacketStrict(
+                    event.packet.name,
+                    event.packet.payload
+                );
+            }
+
             wrapped = std::make_unique<RelayPacketEvent>(
                 options_.version,
                 event,
@@ -4282,7 +4318,9 @@ private:
             );
             // Structured handlers receive fields only after a complete strict
             // decode. The low-level event still owns the untouched raw packet.
-            (void) wrapped->decodedParams();
+            if (!lazyParams) {
+                (void) wrapped->decodedParams();
+            }
         } catch (const std::exception& error) {
             const auto policy = effectiveParseErrorPolicy();
             RelayParseError parseError {

@@ -982,7 +982,7 @@ void BedrockNetworkClient::sendPacket(const VersionedGamePacket& packet) {
 void BedrockNetworkClient::sendBuffer(const std::vector<uint8_t>& buffer, bool immediate) {
     auto packet = session_.packetCodec().decodeFullPacket(buffer);
     if (packet.name == "start_game" || packet.name == "item_registry") {
-        (void) packetDecoder_.decodePacket(packet.name, packet.payload);
+        packetDecoder_.updatePacketVariables(packet.name, packet.payload);
     }
     if (immediate) {
         sendPacket(packet);
@@ -1652,13 +1652,14 @@ void BedrockNetworkClient::handlePacket(const VersionedGamePacket& packet) {
         // pre-dispatch region; framing, decompression, internal handlers, and
         // user event callbacks remain uncaught at the transport boundary.
         if (packet.name == "network_settings" ||
-            packet.name == "server_to_client_handshake" ||
-            packet.name == "start_game" ||
-            packet.name == "item_registry") {
+            packet.name == "server_to_client_handshake") {
             decodedFields = packetDecoder_.decodePacket(packet.name, packet.payload);
             if (packet.name == "server_to_client_handshake") {
                 serverHandshakeToken = findFieldValue(decodedFields, "token");
             }
+        } else if (packet.name == "start_game" ||
+                   packet.name == "item_registry") {
+            packetDecoder_.updatePacketVariables(packet.name, packet.payload);
         }
         if (packet.name == "start_game") {
             (void) VersionedPayloadReader::readStartGame(packet);
@@ -2668,7 +2669,7 @@ void BedrockNetworkClient::sendLocalPlayerInitialized(uint64_t runtimeEntityId) 
 void BedrockNetworkClient::sendPackets(const std::vector<VersionedGamePacket>& packets) {
     for (const auto& packet : packets) {
         if (packet.name == "start_game" || packet.name == "item_registry") {
-            (void) packetDecoder_.decodePacket(packet.name, packet.payload);
+            packetDecoder_.updatePacketVariables(packet.name, packet.payload);
         }
     }
     std::lock_guard<std::mutex> lock(sendMutex_);

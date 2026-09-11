@@ -12,6 +12,7 @@ public:
     static uint32_t makeHeader(uint32_t packetId, uint8_t senderSubId = 0, uint8_t targetSubId = 0);
 
     static GamePacket decodePacket(const std::vector<uint8_t>& fullPacket);
+    static GamePacket decodePacket(std::vector<uint8_t>&& fullPacket);
     static DecodedBatch decodeBatch(const std::vector<uint8_t>& framedPackets);
 
     static std::vector<uint8_t> encodePacket(

@@ -8,11 +8,13 @@
 #include <bedrock/protodef/ProtoDefField.hpp>
 #include <bedrock/protodef/ProtoDefPacketVariables.hpp>
 #include <bedrock/protodef/ProtoDefReader.hpp>
+#include <bedrock/protocol/PacketMemoryPolicy.hpp>
 
 #include <optional>
 #include <memory>
 #include <cstdint>
 #include <exception>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -81,6 +83,60 @@ public:
         return decodePacketImpl(packetName, payload, false, true);
     }
 
+    // Bounded decode for packet events, bots and inspectors. It still walks
+    // the complete schema, but caps retained fields and validates/skips large
+    // item NBT. Use decodePacketStrict() when an editable lossless tree is
+    // explicitly required.
+    std::vector<ProtoDefField> decodePacketForObservation(
+        const std::string& packetName,
+        const std::vector<uint8_t>& payload
+    ) const {
+        return decodePacketImpl(
+            packetName,
+            payload,
+            true,
+            true,
+            nullptr,
+            PacketMemoryPolicy::observedFieldLimit(
+                packetName,
+                payload.size()
+            ),
+            PacketMemoryPolicy::shouldKeepItemNbtOpaque(
+                packetName,
+                payload.size()
+            ),
+            PacketMemoryPolicy::shouldOmitStructuredBlobs(
+                packetName,
+                payload.size()
+            )
+        );
+    }
+
+    std::vector<ProtoDefField> decodePacketForObservationStrict(
+        const std::string& packetName,
+        const std::vector<uint8_t>& payload
+    ) const {
+        return decodePacketImpl(
+            packetName,
+            payload,
+            false,
+            true,
+            nullptr,
+            PacketMemoryPolicy::observedFieldLimit(
+                packetName,
+                payload.size()
+            ),
+            PacketMemoryPolicy::shouldKeepItemNbtOpaque(
+                packetName,
+                payload.size()
+            ),
+            PacketMemoryPolicy::shouldOmitStructuredBlobs(
+                packetName,
+                payload.size()
+            )
+        );
+    }
+
     // Validate the same strict schema boundary without retaining a structured
     // field tree. Transparent relays use this before raw forwarding when no
     // packet handler requested decoded parameters.
@@ -131,7 +187,11 @@ private:
         const std::vector<uint8_t>& payload,
         bool bestEffort,
         bool collectFields = true,
-        std::vector<std::pair<int64_t, std::string>>* itemPalette = nullptr
+        std::vector<std::pair<int64_t, std::string>>* itemPalette = nullptr,
+        std::size_t maximumCollectedFields =
+            std::numeric_limits<std::size_t>::max(),
+        bool skipNbtValues = false,
+        bool skipStructuredBlobs = false
     ) const {
         auto typeJson = resolveType("packet_" + packetName);
         if (!typeJson.has_value()) {
@@ -162,7 +222,10 @@ private:
         });
         decoder.setVariables(variables_->snapshot());
         decoder.setCollectFields(collectFields);
+        decoder.setMaximumCollectedFields(maximumCollectedFields);
         decoder.setPreserveNbtBytes(preserveNbtBytes_);
+        decoder.setSkipNbtValues(skipNbtValues);
+        decoder.setSkipStructuredBlobs(skipStructuredBlobs);
 
         const bool streamItemPalette =
             !collectFields && detail::packetCarriesItemPalette(packetName);

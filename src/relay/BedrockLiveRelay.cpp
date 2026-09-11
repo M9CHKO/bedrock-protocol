@@ -1874,7 +1874,7 @@ void BedrockLiveRelay::diagnosePacket(
                     packet.payload
                 );
             } else {
-                fields = decoder.decodePacketStrict(
+                fields = decoder.decodePacketForObservationStrict(
                     packet.name,
                     packet.payload
                 );

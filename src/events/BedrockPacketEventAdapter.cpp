@@ -20,7 +20,10 @@ BedrockPacketEvent BedrockPacketEventAdapter::fromGamePacket(
 
     try {
         bedrock::ProtoDefPacketDecoder protoDecoder(minecraftVersion, std::move(variables));
-        auto protoFields = protoDecoder.decodePacket(packet.name, packet.payload);
+        auto protoFields = protoDecoder.decodePacketForObservation(
+            packet.name,
+            packet.payload
+        );
 
         for (const auto& field : protoFields) {
             BedrockPacketEventField out;
