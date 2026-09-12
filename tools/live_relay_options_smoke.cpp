@@ -98,6 +98,7 @@ bedrock::RelayOptions relayOptions(
     options.enableChunkCaching = true;
     options.omitParseErrors = omitParseErrors;
     options.throttleMapItemData = true;
+    options.mapFlushIntervalMs = 75;
     options.mapPacketsPerFlush = 3;
     options.mapBytesPerFlush = 384u * 1024u;
     options.maxMapQueuePackets = 3072;
@@ -383,6 +384,7 @@ bool runParsePolicy(bool omitParseErrors) {
     const auto& liveOptions = relay.live().options();
     ok &= check(
         liveOptions.throttleMapItemData &&
+            liveOptions.mapFlushIntervalMs == 75 &&
             liveOptions.mapPacketsPerFlush == 3 &&
             liveOptions.mapBytesPerFlush == 384u * 1024u &&
             liveOptions.maxMapQueuePackets == 3072 &&

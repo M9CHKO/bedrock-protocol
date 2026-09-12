@@ -110,6 +110,7 @@ int main() {
     relayOptions.upstream.offline = true;
     relayOptions.upstream.connectTimeoutMs = 1500;
     relayOptions.throttleMapItemData = true;
+    relayOptions.mapFlushIntervalMs = 20;
     relayOptions.mapPacketsPerFlush = 2;
     relayOptions.mapBytesPerFlush = 64u * 1024u;
     relayOptions.maxMapQueuePackets = 4096;
@@ -189,8 +190,8 @@ int main() {
         observedSnapshot = observed;
     }
     ok &= check(
-        gameplayReceived.load() && mapsBeforeGameplay.load() < 64,
-        "gameplay packet waited behind the complete map backlog"
+        gameplayReceived.load() && mapsBeforeGameplay.load() <= 2,
+        "queued gameplay was not prioritized ahead of map batches"
     );
     ok &= check(observedSnapshot.size() == 64, "missing or duplicate maps");
     for (std::size_t i = 0; i < observedSnapshot.size(); ++i) {

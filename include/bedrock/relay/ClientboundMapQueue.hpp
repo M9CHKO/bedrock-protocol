@@ -6,15 +6,18 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include <zlib.h>
+
 namespace bedrock {
 
 struct ClientboundMapQueueLimits {
-    std::size_t packetsPerFlush = 4;
-    std::size_t bytesPerFlush = 512u * 1024u;
+    std::size_t packetsPerFlush = 1;
+    std::size_t bytesPerFlush = 128u * 1024u;
     std::size_t maximumPackets = 4096;
     std::size_t maximumBytes = 256u * 1024u * 1024u;
 };
@@ -37,11 +40,22 @@ struct ClientboundMapQueueBatch {
 };
 
 // A session-owned, wire-preserving queue for map updates. Backlogged entries
-// retain only the complete encoded packet, not a second copy of its 128x128
-// pixel payload. The payload view is reconstructed only for the small batch
-// currently being passed to the downstream server.
+// retain a losslessly compressed copy of the complete encoded packet when it
+// saves space, rather than expanding the 128x128 pixels into decoded values.
+// The exact full packet and payload view are reconstructed only for the small
+// batch currently being passed to the downstream server.
 class ClientboundMapQueue {
 public:
+    struct PreparedEntry {
+        std::uint32_t packetId = 0;
+        std::string name;
+        std::string paramsType;
+        std::vector<std::uint8_t> storedPacket;
+        std::size_t wireBytes = 0;
+        std::size_t payloadOffset = 0;
+        bool compressed = false;
+    };
+
     explicit ClientboundMapQueue(ClientboundMapQueueLimits limits = {})
         : limits_(normalize(limits)) {}
 
@@ -57,27 +71,55 @@ public:
         );
     }
 
-    bool canEnqueue(const VersionedGamePacket& packet) const noexcept {
-        const auto bytes = packet.fullPacket.size();
+    PreparedEntry prepare(const VersionedGamePacket& packet) const {
+        PreparedEntry entry;
+        entry.packetId = packet.packetId;
+        entry.name = packet.name;
+        entry.paramsType = packet.paramsType;
+        entry.wireBytes = packet.fullPacket.size();
+        entry.payloadOffset = packet.fullPacket.size() >= packet.payload.size()
+            ? packet.fullPacket.size() - packet.payload.size()
+            : packet.fullPacket.size();
+        entry.storedPacket = packet.fullPacket;
+
+        if (!packet.fullPacket.empty()) {
+            const auto bound = compressBound(
+                static_cast<uLong>(packet.fullPacket.size())
+            );
+            std::vector<std::uint8_t> compressed(bound);
+            uLongf compressedBytes = bound;
+            const auto result = compress2(
+                reinterpret_cast<Bytef*>(compressed.data()),
+                &compressedBytes,
+                reinterpret_cast<const Bytef*>(packet.fullPacket.data()),
+                static_cast<uLong>(packet.fullPacket.size()),
+                Z_BEST_SPEED
+            );
+            if (result == Z_OK && compressedBytes < packet.fullPacket.size()) {
+                compressed.resize(static_cast<std::size_t>(compressedBytes));
+                entry.storedPacket = std::move(compressed);
+                entry.compressed = true;
+            }
+        }
+        return entry;
+    }
+
+    bool canEnqueue(const PreparedEntry& entry) const noexcept {
+        const auto bytes = entry.storedPacket.size();
         // A single packet larger than the configured byte limit must still be
         // forwarded on its own rather than being dropped forever.
         if (entries_.empty()) return true;
         return entries_.size() < limits_.maximumPackets &&
-            retainedWireBytes_ <= limits_.maximumBytes &&
-            bytes <= limits_.maximumBytes - retainedWireBytes_;
+            retainedStorageBytes_ <= limits_.maximumBytes &&
+            bytes <= limits_.maximumBytes - retainedStorageBytes_;
     }
 
-    void enqueue(const VersionedGamePacket& packet) {
-        Entry entry;
-        entry.packetId = packet.packetId;
-        entry.name = packet.name;
-        entry.paramsType = packet.paramsType;
-        entry.fullPacket = packet.fullPacket;
-        entry.payloadOffset = packet.fullPacket.size() >= packet.payload.size()
-            ? packet.fullPacket.size() - packet.payload.size()
-            : packet.fullPacket.size();
+    bool canEnqueue(const VersionedGamePacket& packet) const {
+        return canEnqueue(prepare(packet));
+    }
 
-        retainedWireBytes_ += entry.fullPacket.size();
+    void enqueue(PreparedEntry entry) {
+        retainedStorageBytes_ += entry.storedPacket.size();
         entries_.push_back(std::move(entry));
         ++stats_.enqueued;
         refreshQueueStats();
@@ -91,6 +133,10 @@ public:
         );
     }
 
+    void enqueue(const VersionedGamePacket& packet) {
+        enqueue(prepare(packet));
+    }
+
     ClientboundMapQueueBatch takeFlush(bool pressure = false) {
         ClientboundMapQueueBatch batch;
         if (entries_.empty()) return batch;
@@ -98,7 +144,7 @@ public:
         const auto packetLimit = limits_.packetsPerFlush;
         const auto byteLimit = limits_.bytesPerFlush;
         while (!entries_.empty() && batch.packets.size() < packetLimit) {
-            const auto nextBytes = entries_.front().fullPacket.size();
+            const auto nextBytes = entries_.front().wireBytes;
             if (!batch.packets.empty() &&
                 nextBytes > byteLimit - std::min(byteLimit, batch.wireBytes)) {
                 break;
@@ -106,9 +152,9 @@ public:
 
             auto entry = std::move(entries_.front());
             entries_.pop_front();
-            retainedWireBytes_ -= nextBytes;
+            retainedStorageBytes_ -= entry.storedPacket.size();
             batch.wireBytes += nextBytes;
-            batch.packets.push_back(std::move(entry).restore());
+            batch.packets.push_back(restore(std::move(entry)));
         }
         if (pressure && !batch.packets.empty()) {
             ++stats_.pressureFlushes;
@@ -128,7 +174,7 @@ public:
     ClientboundMapQueueStats clear() noexcept {
         const auto snapshot = stats_;
         entries_.clear();
-        retainedWireBytes_ = 0;
+        retainedStorageBytes_ = 0;
         stats_ = {};
         return snapshot;
     }
@@ -138,28 +184,6 @@ public:
     }
 
 private:
-    struct Entry {
-        std::uint32_t packetId = 0;
-        std::string name;
-        std::string paramsType;
-        std::vector<std::uint8_t> fullPacket;
-        std::size_t payloadOffset = 0;
-
-        VersionedGamePacket restore() && {
-            VersionedGamePacket packet;
-            packet.packetId = packetId;
-            packet.name = std::move(name);
-            packet.paramsType = std::move(paramsType);
-            packet.fullPacket = std::move(fullPacket);
-            const auto offset = std::min(payloadOffset, packet.fullPacket.size());
-            packet.payload.assign(
-                packet.fullPacket.begin() + static_cast<std::ptrdiff_t>(offset),
-                packet.fullPacket.end()
-            );
-            return packet;
-        }
-    };
-
     static ClientboundMapQueueLimits normalize(
         ClientboundMapQueueLimits limits
     ) noexcept {
@@ -172,12 +196,45 @@ private:
 
     void refreshQueueStats() noexcept {
         stats_.queuedPackets = entries_.size();
-        stats_.queuedBytes = retainedWireBytes_;
+        stats_.queuedBytes = retainedStorageBytes_;
+    }
+
+    static VersionedGamePacket restore(PreparedEntry entry) {
+        VersionedGamePacket packet;
+        packet.packetId = entry.packetId;
+        packet.name = std::move(entry.name);
+        packet.paramsType = std::move(entry.paramsType);
+        if (entry.compressed) {
+            packet.fullPacket.resize(entry.wireBytes);
+            uLongf restoredBytes = static_cast<uLongf>(packet.fullPacket.size());
+            const auto result = uncompress(
+                reinterpret_cast<Bytef*>(packet.fullPacket.data()),
+                &restoredBytes,
+                reinterpret_cast<const Bytef*>(entry.storedPacket.data()),
+                static_cast<uLong>(entry.storedPacket.size())
+            );
+            if (result != Z_OK || restoredBytes != entry.wireBytes) {
+                throw std::runtime_error(
+                    "clientbound map queue decompression failed"
+                );
+            }
+        } else {
+            packet.fullPacket = std::move(entry.storedPacket);
+        }
+        const auto offset = std::min(
+            entry.payloadOffset,
+            packet.fullPacket.size()
+        );
+        packet.payload.assign(
+            packet.fullPacket.begin() + static_cast<std::ptrdiff_t>(offset),
+            packet.fullPacket.end()
+        );
+        return packet;
     }
 
     ClientboundMapQueueLimits limits_;
-    std::deque<Entry> entries_;
-    std::size_t retainedWireBytes_ = 0;
+    std::deque<PreparedEntry> entries_;
+    std::size_t retainedStorageBytes_ = 0;
     ClientboundMapQueueStats stats_;
 };
 

@@ -1467,6 +1467,25 @@ public:
         sendPacketsInternal(connection, packets, compression, true);
     }
 
+    // Flush already queued gameplay before writing a low-priority payload.
+    // Keeping the outer outbound lock across both operations prevents a map
+    // update from overtaking chat, movement responses, or chunk data that was
+    // already waiting for the next batching tick.
+    void sendLowPriorityPackets(
+        const BedrockServerConnection& connection,
+        const std::vector<VersionedGamePacket>& packets,
+        VersionedMcpeCompression compression = VersionedMcpeCompression::Automatic
+    ) {
+        if (packets.empty()) return;
+        const auto session = sessionSnapshot(connection);
+        if (!session) return;
+        std::lock_guard<std::recursive_mutex> outboundLock(
+            session->outboundMutex
+        );
+        sendQueued(connection);
+        sendPacketsInternal(connection, packets, compression, true);
+    }
+
     void disconnect(
         const BedrockServerConnection& connection,
         const std::string& reason = "Server closed",

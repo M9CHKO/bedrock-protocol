@@ -67,11 +67,12 @@ struct BedrockLiveRelayOptions {
     bool useDownstreamDisplayNameForUpstreamUsername = false;
     VersionedMcpeCompression clientboundCompression = VersionedMcpeCompression::Automatic;
     // Map pixels are intentionally lower priority than gameplay state. Every
-    // map is retained and forwarded, but only this many packets/bytes are
-    // admitted to the ordinary downstream queue during one scheduler tick.
+    // map is retained and forwarded, but only this many packets/bytes are sent
+    // after queued gameplay during one independent map scheduler tick.
     bool throttleMapItemData = true;
-    std::size_t mapPacketsPerFlush = 4;
-    std::size_t mapBytesPerFlush = 512u * 1024u;
+    int mapFlushIntervalMs = 100;
+    std::size_t mapPacketsPerFlush = 1;
+    std::size_t mapBytesPerFlush = 128u * 1024u;
     std::size_t maxMapQueuePackets = 4096;
     std::size_t maxMapQueueBytes = 256u * 1024u * 1024u;
     // Bound every downstream MCPE batch before compression and encryption.

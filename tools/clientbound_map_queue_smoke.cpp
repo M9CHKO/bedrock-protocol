@@ -13,7 +13,9 @@
 
 namespace {
 
-constexpr std::size_t payloadBytes = 16u * 1024u;
+constexpr std::size_t payloadBytes = BEDROCK_MAP_STRESS_COUNT > 0
+    ? 81950u
+    : 16u * 1024u;
 
 bedrock::VersionedGamePacket mapPacket(std::uint32_t sequence) {
     bedrock::VersionedGamePacket packet;
@@ -66,11 +68,12 @@ bool runCount(std::size_t count) {
     for (std::size_t sequence = 0; sequence < count; ++sequence) {
         auto packet = mapPacket(static_cast<std::uint32_t>(sequence));
         queue.recordReceived(packet.fullPacket.size());
-        if (!queue.canEnqueue(packet)) {
+        auto prepared = queue.prepare(packet);
+        if (!queue.canEnqueue(prepared)) {
             return check(false, "unexpected hard-limit pressure at " +
                 std::to_string(sequence) + "/" + std::to_string(count));
         }
-        queue.enqueue(packet);
+        queue.enqueue(std::move(prepared));
     }
 
     std::vector<std::uint32_t> observed;
@@ -112,6 +115,12 @@ bool runCount(std::size_t count) {
     ok &= check(stats.queuedPackets == 0 && stats.queuedBytes == 0,
         "queue did not drain completely");
     ok &= check(stats.peakQueuePackets == count, "peak packet count mismatch");
+#if BEDROCK_MAP_STRESS_COUNT > 0
+    ok &= check(
+        stats.peakQueueBytes < count * (payloadBytes + 2),
+        "3600-map queue did not use compact storage"
+    );
+#endif
     return ok;
 }
 
@@ -125,13 +134,20 @@ bool runPressureCase() {
     auto first = mapPacket(1);
     auto second = mapPacket(2);
     auto third = mapPacket(3);
-    queue.enqueue(first);
-    queue.enqueue(second);
-    bool ok = check(!queue.canEnqueue(third), "hard limit was not enforced");
+    queue.enqueue(queue.prepare(first));
+    queue.enqueue(queue.prepare(second));
+    auto preparedThird = queue.prepare(third);
+    bool ok = check(
+        !queue.canEnqueue(preparedThird),
+        "hard limit was not enforced"
+    );
     auto pressure = queue.takeFlush(true);
     queue.markForwarded(pressure);
-    ok &= check(queue.canEnqueue(third), "pressure flush did not make room");
-    queue.enqueue(third);
+    ok &= check(
+        queue.canEnqueue(preparedThird),
+        "pressure flush did not make room"
+    );
+    queue.enqueue(std::move(preparedThird));
     auto tail = queue.takeFlush();
     queue.markForwarded(tail);
     const auto stats = queue.stats();

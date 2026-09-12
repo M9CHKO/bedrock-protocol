@@ -1188,9 +1188,10 @@ BedrockLiveRelayOptions BedrockLiveRelay::normalizeOptions(BedrockLiveRelayOptio
     // resource_packs_info/resource_pack_stack to the downstream client.
     options.server.autoResourcePacks = false;
     options.skipClientboundResourcePacks = false;
-    if (options.mapPacketsPerFlush == 0) options.mapPacketsPerFlush = 4;
+    if (options.mapFlushIntervalMs <= 0) options.mapFlushIntervalMs = 100;
+    if (options.mapPacketsPerFlush == 0) options.mapPacketsPerFlush = 1;
     if (options.mapBytesPerFlush == 0) {
-        options.mapBytesPerFlush = 512u * 1024u;
+        options.mapBytesPerFlush = 128u * 1024u;
     }
     if (options.maxMapQueuePackets == 0) options.maxMapQueuePackets = 4096;
     if (options.maxMapQueueBytes == 0) {
@@ -2414,6 +2415,7 @@ void BedrockLiveRelay::forwardClientbound(
     if (options_.throttleMapItemData &&
         packet.name == "clientbound_map_item_data") {
         ensureMapQueueScheduler();
+        auto preparedMap = session->mapQueue.prepare(packet);
         bool pressureReported = false;
         for (;;) {
             bool admitted = false;
@@ -2426,8 +2428,8 @@ void BedrockLiveRelay::forwardClientbound(
                     session->downstreamPhase != RelayDownstreamPhase::Game) {
                     return;
                 }
-                if (session->mapQueue.canEnqueue(packet)) {
-                    session->mapQueue.enqueue(packet);
+                if (session->mapQueue.canEnqueue(preparedMap)) {
+                    session->mapQueue.enqueue(std::move(preparedMap));
                     admitted = true;
                 } else {
                     session->mapQueuePressure = true;
@@ -2452,13 +2454,13 @@ void BedrockLiveRelay::forwardClientbound(
             session->mapQueueSpaceCv.wait_for(
                 lock,
                 std::chrono::milliseconds(std::max(
-                    options_.server.batchingInterval,
+                    options_.mapFlushIntervalMs,
                     1
                 )) * 2,
                 [&]() {
                     return !relaySessionAcceptsPackets(*session) ||
                         session->downstreamPhase != RelayDownstreamPhase::Game ||
-                        session->mapQueue.canEnqueue(packet);
+                        session->mapQueue.canEnqueue(preparedMap);
                 }
             );
             if (!relaySessionAcceptsPackets(*session) ||
@@ -2535,10 +2537,9 @@ void BedrockLiveRelay::ensureMapQueueScheduler() {
 }
 
 void BedrockLiveRelay::runMapQueueScheduler() {
-    const auto milliseconds = options_.server.batchingInterval == 0
-        ? 20
-        : std::max(options_.server.batchingInterval, 1);
-    const auto interval = std::chrono::milliseconds(milliseconds);
+    const auto interval = std::chrono::milliseconds(
+        std::max(options_.mapFlushIntervalMs, 1)
+    );
     std::unique_lock<std::mutex> lock(mapQueueSchedulerMutex_);
     while (!mapQueueSchedulerStopping_) {
         if (mapQueueSchedulerCv_.wait_for(lock, interval, [this]() {
@@ -2596,31 +2597,35 @@ bool BedrockLiveRelay::flushSessionMapQueue(
     ClientboundMapQueueBatch batch;
     BedrockServerConnection downstream;
     {
-        // This lock spans removal and downstream admission, preserving map
-        // order even when the periodic and hard-limit paths race.
+        // The single scheduler preserves map order. Keep this lock only while
+        // touching relay state: a rejected RakNet write may synchronously run
+        // the downstream-close callback, which must be able to acquire the
+        // same lock to reset the session without self-deadlocking.
         std::lock_guard<std::mutex> mapLock(session->mapDispatchMutex);
-        {
-            std::lock_guard<std::mutex> lock(session->mutex);
-            if (!relaySessionAcceptsPackets(*session) ||
-                session->downstreamPhase != RelayDownstreamPhase::Game ||
-                session->mapQueue.empty()) {
-                return false;
-            }
-            downstream = session->downstream;
-            pressure = pressure || session->mapQueuePressure;
-            session->mapQueuePressure = false;
-            batch = session->mapQueue.takeFlush(pressure);
-            session->mapQueueSpaceCv.notify_all();
+        std::lock_guard<std::mutex> lock(session->mutex);
+        if (!relaySessionAcceptsPackets(*session) ||
+            session->downstreamPhase != RelayDownstreamPhase::Game ||
+            session->mapQueue.empty()) {
+            return false;
         }
-        if (batch.packets.empty()) return false;
+        downstream = session->downstream;
+        pressure = pressure || session->mapQueuePressure;
+        session->mapQueuePressure = false;
+        batch = session->mapQueue.takeFlush(pressure);
+        session->mapQueueSpaceCv.notify_all();
+    }
+    if (batch.packets.empty()) return false;
 
-        server_->queuePackets(
-            downstream,
-            batch.packets,
-            options_.clientboundCompression
-        );
-        {
-            std::lock_guard<std::mutex> lock(session->mutex);
+    server_->sendLowPriorityPackets(
+        downstream,
+        batch.packets,
+        options_.clientboundCompression
+    );
+    {
+        std::lock_guard<std::mutex> mapLock(session->mapDispatchMutex);
+        std::lock_guard<std::mutex> lock(session->mutex);
+        if (relaySessionAcceptsPackets(*session) &&
+            session->downstreamPhase == RelayDownstreamPhase::Game) {
             session->mapQueue.markForwarded(batch);
         }
     }

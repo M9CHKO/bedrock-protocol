@@ -10537,10 +10537,12 @@ public:
         // MCPE framing and negotiated encryption remain unchanged.
         options.compressionLevel = 1;
         // A map wall may arrive as thousands of 128x128 updates. Retain every
-        // image, but admit only a small slice to Minecraft on each relay tick.
+        // image, but send one low-priority map at a time so it cannot occupy
+        // the reliable RakNet stream ahead of chat, chunks, or movement.
         options.throttleMapItemData = true;
-        options.mapPacketsPerFlush = 4;
-        options.mapBytesPerFlush = 512u * 1024u;
+        options.mapFlushIntervalMs = 100;
+        options.mapPacketsPerFlush = 1;
+        options.mapBytesPerFlush = 128u * 1024u;
         options.maxMapQueuePackets = 4096;
         options.maxMapQueueBytes = 256u * 1024u * 1024u;
         options.maxPacketsPerBatch = 16;
@@ -10609,7 +10611,8 @@ public:
                 ) +
                 " nativeBuild=" + std::string(NativeBuildType) +
                 " rawUnhandledPackets=true itemNbt=binary_cache compressionLevel=1" +
-                " mapPacketsPerFlush=4 mapBytesPerFlush=524288" +
+                " mapFlushIntervalMs=100 mapPacketsPerFlush=1" +
+                " mapBytesPerFlush=131072 mapPriority=low" +
                 " compilerOptimized=" +
                 (NativeCompilerOptimized ? "true" : "false"),
             "INFO",
