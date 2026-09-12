@@ -381,7 +381,7 @@ public final class RelayService extends Service {
             this,
             "INFO",
             "service",
-            "Start requested: local=0.0.0.0:19132 destination=" +
+            "Start requested: local=127.0.0.1:19132 destination=" +
                 host + ":" + port
                 + " version=" + version
         );

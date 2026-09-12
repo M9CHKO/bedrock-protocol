@@ -2911,6 +2911,16 @@ struct RelayOptions {
     std::size_t maxMapQueueBytes = 256u * 1024u * 1024u;
     std::size_t maxBatchPayloadBytes = 512u * 1024u;
     std::size_t maxPacketsPerBatch = 16;
+    bool throttleClientboundVisualBursts = true;
+    int visualBurstWindowMs = 30'000;
+    int visualInitialDelayMs = 1'500;
+    int visualFlushIntervalMs = 150;
+    std::size_t visualPacketsPerFlush = 4;
+    std::size_t visualBytesPerFlush = 64u * 1024u;
+    bool prioritizeServerboundActions = true;
+    // Mirrors BedrockLiveRelayOptions and is appended for aggregate-source
+    // compatibility with older RelayOptions initializers.
+    bool queueClientboundLevelChunksUntilStartGame = true;
 
     // A single root offline value is the common case and applies to both
     // sides. destination.offline exists only as an explicit upstream override.
@@ -4458,6 +4468,17 @@ private:
         out.maxMapQueueBytes = options.maxMapQueueBytes;
         out.maxBatchPayloadBytes = options.maxBatchPayloadBytes;
         out.maxPacketsPerBatch = options.maxPacketsPerBatch;
+        out.throttleClientboundVisualBursts =
+            options.throttleClientboundVisualBursts;
+        out.visualBurstWindowMs = options.visualBurstWindowMs;
+        out.visualInitialDelayMs = options.visualInitialDelayMs;
+        out.visualFlushIntervalMs = options.visualFlushIntervalMs;
+        out.visualPacketsPerFlush = options.visualPacketsPerFlush;
+        out.visualBytesPerFlush = options.visualBytesPerFlush;
+        out.prioritizeServerboundActions =
+            options.prioritizeServerboundActions;
+        out.queueClientboundLevelChunksUntilStartGame =
+            options.queueClientboundLevelChunksUntilStartGame;
         return out;
     }
 };

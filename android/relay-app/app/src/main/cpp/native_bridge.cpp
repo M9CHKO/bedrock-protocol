@@ -10514,7 +10514,11 @@ public:
     ) {
         bedrock::RelayOptions options;
         options.version = version;
-        options.host = "0.0.0.0";
+        // This is an in-device relay. Binding only loopback prevents
+        // Minecraft from selecting the phone's Wi-Fi/LAN address, where its
+        // very large fragmented Login was observed repeatedly losing all but
+        // the first split fragment.
+        options.host = "127.0.0.1";
         options.port = 19132;
 #if defined(BEDROCK_RELAY_WINDOWS)
         options.motd = "CPE Relay Windows";
@@ -10540,8 +10544,8 @@ public:
         // image, but send one low-priority map at a time so it cannot occupy
         // the reliable RakNet stream ahead of chat, chunks, or movement.
         options.throttleMapItemData = true;
-        options.mapFlushIntervalMs = 500;
-        options.mapInitialDelayMs = 2500;
+        options.mapFlushIntervalMs = 1'500;
+        options.mapInitialDelayMs = 5'000;
         options.mapPacketsPerFlush = 1;
         options.mapBytesPerFlush = 128u * 1024u;
         options.mapMaxSendBufferBytes = 32u * 1024u;
@@ -10550,6 +10554,14 @@ public:
         options.maxMapQueueBytes = 256u * 1024u * 1024u;
         options.maxPacketsPerBatch = 16;
         options.maxBatchPayloadBytes = 512u * 1024u;
+        options.throttleClientboundVisualBursts = true;
+        options.visualBurstWindowMs = 30'000;
+        options.visualInitialDelayMs = 1'500;
+        options.visualFlushIntervalMs = 150;
+        options.visualPacketsPerFlush = 4;
+        options.visualBytesPerFlush = 64u * 1024u;
+        options.prioritizeServerboundActions = true;
+        options.queueClientboundLevelChunksUntilStartGame = false;
         // The mobile relay has raw packet observers, not packet editors.
         // Preserve backend extensions byte-for-byte instead of disconnecting
         // when a server uses a newer optional packet field.
@@ -10598,7 +10610,7 @@ public:
 
         state_->push(
             "relay_start",
-            "local=0.0.0.0:19132 destination=" + destinationHost + ":" +
+            "local=127.0.0.1:19132 destination=" + destinationHost + ":" +
                 std::to_string(destinationPort) +
                 " version=" + version +
                 " forceSingle=true replaceExisting=true" +
@@ -10614,10 +10626,15 @@ public:
                 ) +
                 " nativeBuild=" + std::string(NativeBuildType) +
                 " rawUnhandledPackets=true itemNbt=binary_cache compressionLevel=1" +
-                " mapFlushIntervalMs=500 mapInitialDelayMs=2500" +
+                " mapFlushIntervalMs=1500 mapInitialDelayMs=5000" +
                 " mapPacketsPerFlush=1 mapBytesPerFlush=131072" +
                 " mapMaxSendBufferBytes=32768" +
                 " mapMaxResendBufferBytes=98304 mapPriority=adaptive-low" +
+                " visualBurstWindowMs=30000 visualInitialDelayMs=1500" +
+                " visualFlushIntervalMs=150 visualPacketsPerFlush=4" +
+                " visualBytesPerFlush=65536" +
+                " serverboundActions=immediate-after-flush" +
+                " preStartChunkQueue=false" +
                 " compilerOptimized=" +
                 (NativeCompilerOptimized ? "true" : "false"),
             "INFO",
@@ -10833,6 +10850,10 @@ public:
                     "clientbound_equipment_packets=" +
                     std::to_string(
                         state->clientboundEquipmentPackets.load()
+                    ) +
+                    " forwarded_equipment_packets=" +
+                    std::to_string(
+                        state->clientboundEquipmentForwardedPackets.load()
                     ) +
                     " clientbound_map_packets=" +
                     std::to_string(state->clientboundMapPackets.load()) +

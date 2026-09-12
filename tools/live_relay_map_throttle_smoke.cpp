@@ -120,6 +120,12 @@ int main() {
     relayOptions.maxMapQueueBytes = 64u * 1024u * 1024u;
     relayOptions.maxPacketsPerBatch = 4;
     relayOptions.maxBatchPayloadBytes = 64u * 1024u;
+    relayOptions.throttleClientboundVisualBursts = true;
+    relayOptions.visualBurstWindowMs = 10'000;
+    relayOptions.visualInitialDelayMs = 100;
+    relayOptions.visualFlushIntervalMs = 20;
+    relayOptions.visualPacketsPerFlush = 4;
+    relayOptions.visualBytesPerFlush = 16u * 1024u;
 
     bedrock::BedrockLiveRelay relay(std::move(relayOptions));
     relay.onError([&](const std::string& error) {
@@ -141,6 +147,9 @@ int main() {
     std::vector<std::uint32_t> observed;
     std::atomic<bool> gameplayReceived {false};
     std::atomic<std::size_t> mapsBeforeGameplay {0};
+    std::vector<std::uint32_t> visualObserved;
+    std::atomic<bool> visualGameplayReceived {false};
+    std::atomic<std::size_t> visualsBeforeGameplay {0};
     downstream.on(
         "clientbound_map_item_data",
         [&](const bedrock::BedrockNetworkClientPacketEvent& event) {
@@ -154,8 +163,20 @@ int main() {
         "tick_sync",
         [&](const bedrock::BedrockNetworkClientPacketEvent&) {
             std::lock_guard<std::mutex> lock(observedMutex);
-            mapsBeforeGameplay = observed.size();
-            gameplayReceived = true;
+            if (visualObserved.size() < 40) {
+                visualsBeforeGameplay = visualObserved.size();
+                visualGameplayReceived = true;
+            } else {
+                mapsBeforeGameplay = observed.size();
+                gameplayReceived = true;
+            }
+        }
+    );
+    downstream.on(
+        "mob_equipment",
+        [&](const bedrock::BedrockNetworkClientPacketEvent& event) {
+            std::lock_guard<std::mutex> lock(observedMutex);
+            visualObserved.push_back(sequenceOf(event.packet));
         }
     );
     downstream.onError([&](const std::string& error) {
@@ -174,6 +195,35 @@ int main() {
         std::lock_guard<std::mutex> lock(upstreamMutex);
         target = upstreamConnection;
     }
+    std::vector<bedrock::VersionedGamePacket> visualBurst;
+    visualBurst.reserve(41);
+    for (std::uint32_t sequence = 0; sequence < 40; ++sequence) {
+        visualBurst.push_back(codec.packetCodec().makePacketByName(
+            "mob_equipment",
+            mapPacket(codec, sequence).payload
+        ));
+        if (sequence == 7) visualBurst.push_back(gameplay);
+    }
+    upstream.sendPackets(target, visualBurst);
+    ok &= check(waitFor([&]() {
+        std::lock_guard<std::mutex> lock(observedMutex);
+        return visualGameplayReceived.load() && visualObserved.size() == 40;
+    }), "visual burst queue did not drain or gameplay was lost");
+    {
+        std::lock_guard<std::mutex> lock(observedMutex);
+        ok &= check(
+            visualsBeforeGameplay.load() <= 4,
+            "ordinary gameplay was trapped behind the visual burst"
+        );
+        for (std::size_t i = 0; i < visualObserved.size(); ++i) {
+            ok &= check(
+                visualObserved[i] == i,
+                "visual burst order changed at " + std::to_string(i)
+            );
+            if (!ok) break;
+        }
+    }
+
     std::vector<bedrock::VersionedGamePacket> burst;
     burst.reserve(65);
     for (std::uint32_t sequence = 0; sequence < 64; ++sequence) {

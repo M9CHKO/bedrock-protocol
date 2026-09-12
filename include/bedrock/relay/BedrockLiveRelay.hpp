@@ -84,6 +84,22 @@ struct BedrockLiveRelayOptions {
     // Bound every downstream MCPE batch before compression and encryption.
     std::size_t maxBatchPayloadBytes = 512u * 1024u;
     std::size_t maxPacketsPerBatch = 16;
+    // Busy worlds can emit hundreds of equipment/item-entity updates in a
+    // single upstream tick.  Feeding that whole burst to a mobile renderer at
+    // once can freeze Minecraft even though RakNet and relay memory are
+    // healthy.  During the initial world-load window, pace only these visual
+    // packets; ordinary gameplay, chat and inventory responses remain on the
+    // normal queue.
+    bool throttleClientboundVisualBursts = true;
+    int visualBurstWindowMs = 30'000;
+    int visualInitialDelayMs = 1'500;
+    int visualFlushIntervalMs = 150;
+    std::size_t visualPacketsPerFlush = 4;
+    std::size_t visualBytesPerFlush = 64u * 1024u;
+    // Flush already queued movement before latency-sensitive actions and send
+    // the action immediately. This keeps chest, inventory and block actions
+    // responsive while a clientbound visual backlog is draining.
+    bool prioritizeServerboundActions = true;
 };
 
 namespace detail {
@@ -304,6 +320,9 @@ private:
     bool flushSessionMapQueue(
         const std::shared_ptr<Session>& session,
         bool pressure
+    );
+    bool flushSessionVisualQueue(
+        const std::shared_ptr<Session>& session
     );
     void stopMapQueueScheduler();
     void reportMapFlow(

@@ -108,6 +108,14 @@ bedrock::RelayOptions relayOptions(
     options.maxMapQueueBytes = 192u * 1024u * 1024u;
     options.maxBatchPayloadBytes = 448u * 1024u;
     options.maxPacketsPerBatch = 12;
+    options.throttleClientboundVisualBursts = true;
+    options.visualBurstWindowMs = 24'000;
+    options.visualInitialDelayMs = 900;
+    options.visualFlushIntervalMs = 125;
+    options.visualPacketsPerFlush = 5;
+    options.visualBytesPerFlush = 48u * 1024u;
+    options.prioritizeServerboundActions = true;
+    options.queueClientboundLevelChunksUntilStartGame = false;
     options.destination.host = "127.0.0.1";
     options.destination.port = upstreamPort;
     options.destination.offline = true;
@@ -394,7 +402,15 @@ bool runParsePolicy(bool omitParseErrors) {
             liveOptions.mapMaxSendBufferBytes == 24u * 1024u &&
             liveOptions.mapMaxResendBufferBytes == 80u * 1024u &&
             liveOptions.maxMapQueuePackets == 3072 &&
-            liveOptions.maxMapQueueBytes == 192u * 1024u * 1024u,
+            liveOptions.maxMapQueueBytes == 192u * 1024u * 1024u &&
+            liveOptions.throttleClientboundVisualBursts &&
+            liveOptions.visualBurstWindowMs == 24'000 &&
+            liveOptions.visualInitialDelayMs == 900 &&
+            liveOptions.visualFlushIntervalMs == 125 &&
+            liveOptions.visualPacketsPerFlush == 5 &&
+            liveOptions.visualBytesPerFlush == 48u * 1024u &&
+            liveOptions.prioritizeServerboundActions &&
+            !liveOptions.queueClientboundLevelChunksUntilStartGame,
         "map throttling options were not propagated to live relay"
     );
     ok &= check(
