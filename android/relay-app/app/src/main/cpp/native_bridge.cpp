@@ -428,6 +428,10 @@ bool shouldRecordEquipmentSample(uint64_t sampleIndex) {
     return sampleIndex <= 8 || sampleIndex % 128 == 0;
 }
 
+bool shouldRecordMapSample(uint64_t sampleIndex) {
+    return sampleIndex <= 4 || sampleIndex % 128 == 0;
+}
+
 bool isFlightPacket(std::string_view name) {
     return isItemInteractionBreadcrumb(name) ||
         name == "start_game" ||
@@ -1184,6 +1188,9 @@ struct RelayState {
     std::atomic<uint64_t> clientboundEquipmentPackets {0};
     std::atomic<uint64_t> clientboundEquipmentTransportPackets {0};
     std::atomic<uint64_t> clientboundEquipmentForwardedPackets {0};
+    std::atomic<uint64_t> clientboundMapPackets {0};
+    std::atomic<uint64_t> clientboundMapTransportPackets {0};
+    std::atomic<uint64_t> clientboundMapForwardedPackets {0};
     std::atomic<uint64_t> resourcePackPacketsSeen {0};
     std::atomic<uint64_t> resourcePackPacketsForwarded {0};
     std::atomic<bool> detailedLogging {true};
@@ -10529,6 +10536,15 @@ public:
         // Prefer latency/CPU over maximum compression on the phone. The
         // MCPE framing and negotiated encryption remain unchanged.
         options.compressionLevel = 1;
+        // A map wall may arrive as thousands of 128x128 updates. Retain every
+        // image, but admit only a small slice to Minecraft on each relay tick.
+        options.throttleMapItemData = true;
+        options.mapPacketsPerFlush = 4;
+        options.mapBytesPerFlush = 512u * 1024u;
+        options.maxMapQueuePackets = 4096;
+        options.maxMapQueueBytes = 256u * 1024u * 1024u;
+        options.maxPacketsPerBatch = 16;
+        options.maxBatchPayloadBytes = 512u * 1024u;
         // The mobile relay has raw packet observers, not packet editors.
         // Preserve backend extensions byte-for-byte instead of disconnecting
         // when a server uses a newer optional packet field.
@@ -10593,6 +10609,7 @@ public:
                 ) +
                 " nativeBuild=" + std::string(NativeBuildType) +
                 " rawUnhandledPackets=true itemNbt=binary_cache compressionLevel=1" +
+                " mapPacketsPerFlush=4 mapBytesPerFlush=524288" +
                 " compilerOptimized=" +
                 (NativeCompilerOptimized ? "true" : "false"),
             "INFO",
@@ -10634,6 +10651,14 @@ public:
                 sampleIndex =
                     state->clientboundEquipmentTransportPackets.fetch_add(1) + 1;
                 record = shouldRecordEquipmentSample(sampleIndex);
+            } else if (
+                event.kind ==
+                    bedrock::BedrockServerTransportEventKind::SendPacket &&
+                event.packetName == "clientbound_map_item_data"
+            ) {
+                sampleIndex =
+                    state->clientboundMapTransportPackets.fetch_add(1) + 1;
+                record = shouldRecordMapSample(sampleIndex);
             } else if ((event.kind ==
                             bedrock::BedrockServerTransportEventKind::DecodedPacket ||
                         event.kind ==
@@ -10728,6 +10753,9 @@ public:
             state->clientboundEquipmentPackets = 0;
             state->clientboundEquipmentTransportPackets = 0;
             state->clientboundEquipmentForwardedPackets = 0;
+            state->clientboundMapPackets = 0;
+            state->clientboundMapTransportPackets = 0;
+            state->clientboundMapForwardedPackets = 0;
             state->chunkPublisherPacketsObserved = 0;
             state->chunkPublisherPacketsRewritten = 0;
             state->chunkPublisherDecodeFailures = 0;
@@ -10797,6 +10825,12 @@ public:
                     "clientbound_equipment_packets=" +
                     std::to_string(
                         state->clientboundEquipmentPackets.load()
+                    ) +
+                    " clientbound_map_packets=" +
+                    std::to_string(state->clientboundMapPackets.load()) +
+                    " forwarded_map_packets=" +
+                    std::to_string(
+                        state->clientboundMapForwardedPackets.load()
                     ),
                 "INFO",
                 "lifecycle"
@@ -11152,6 +11186,9 @@ public:
                 sampleIndex =
                     state->clientboundEquipmentPackets.fetch_add(1) + 1;
                 sampled = shouldRecordEquipmentSample(sampleIndex);
+            } else if (event.packet.name == "clientbound_map_item_data") {
+                sampleIndex = state->clientboundMapPackets.fetch_add(1) + 1;
+                sampled = shouldRecordMapSample(sampleIndex);
             }
             if (sampled && isFlightPacket(event.packet.name)) {
                 state->recordFlight(
@@ -11260,6 +11297,12 @@ public:
                 sampleIndex =
                     state->clientboundEquipmentForwardedPackets.fetch_add(1) + 1;
                 record = record && shouldRecordEquipmentSample(sampleIndex);
+            } else if (event.direction ==
+                    bedrock::BedrockRelayDirection::Clientbound &&
+                event.packet.name == "clientbound_map_item_data") {
+                sampleIndex =
+                    state->clientboundMapForwardedPackets.fetch_add(1) + 1;
+                record = record && shouldRecordMapSample(sampleIndex);
             }
             if (record) {
                 auto breadcrumb = packetBreadcrumb(

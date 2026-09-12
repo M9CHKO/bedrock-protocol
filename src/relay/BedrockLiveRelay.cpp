@@ -37,6 +37,9 @@ void relayLogLine(const std::string& line) {
 }
 
 bool shouldLogRelayPacket(const std::string& direction, const std::string& name) {
+    // Map traffic has session-local aggregate diagnostics below. Sampling
+    // individual packets still creates dozens of log lines for a map wall.
+    if (name == "clientbound_map_item_data") return false;
     if (name == "player_auth_input" ||
         name == "move_entity" ||
         name == "move_player" ||
@@ -59,6 +62,21 @@ bool shouldLogRelayPacket(const std::string& direction, const std::string& name)
     }
 
     return true;
+}
+
+std::int64_t elapsedMilliseconds(
+    std::chrono::steady_clock::time_point then,
+    std::chrono::steady_clock::time_point now
+) noexcept {
+    if (then == std::chrono::steady_clock::time_point {}) return -1;
+    return std::chrono::duration_cast<std::chrono::milliseconds>(now - then)
+        .count();
+}
+
+std::string rakNetCloseReason(const std::string& reason) {
+    if (reason == "21") return "21(ID_DISCONNECTION_NOTIFICATION)";
+    if (reason == "22") return "22(ID_CONNECTION_LOST)";
+    return reason;
 }
 
 std::vector<std::string> jsonStringArrayField(const std::string& json, const std::string& key) {
@@ -525,10 +543,20 @@ enum class RelayUpstreamPhase {
 };
 
 struct BedrockLiveRelay::Session {
-    explicit Session(std::size_t retainedChunkMaximumBytes)
-        : retainedLevelChunks(retainedChunkMaximumBytes) {}
+    Session(
+        std::size_t retainedChunkMaximumBytes,
+        ClientboundMapQueueLimits mapLimits
+    )
+        : retainedLevelChunks(retainedChunkMaximumBytes),
+          mapQueue(mapLimits),
+          mapFlowStartedAt(std::chrono::steady_clock::now()),
+          mapFlowLastReportAt(mapFlowStartedAt),
+          lastUpstreamRxAt(mapFlowStartedAt),
+          lastUpstreamTxAt(mapFlowStartedAt) {}
 
     mutable std::mutex mutex;
+    mutable std::mutex mapDispatchMutex;
+    std::condition_variable mapQueueSpaceCv;
     std::string id;
     BedrockServerConnection downstream;
     BedrockNetworkClientOptions upstreamOptions;
@@ -539,6 +567,15 @@ struct BedrockLiveRelay::Session {
     std::vector<VersionedGamePacket> pendingClientbound;
     std::vector<VersionedGamePacket> heldClientboundLevelChunks;
     LevelChunkRetentionCache retainedLevelChunks;
+    ClientboundMapQueue mapQueue;
+    std::chrono::steady_clock::time_point mapFlowStartedAt {};
+    std::chrono::steady_clock::time_point mapFlowLastReportAt {};
+    std::uint64_t mapFlowLastReportedReceived = 0;
+    std::uint64_t mapFlowLastReportedForwarded = 0;
+    bool mapQueuePressure = false;
+    std::chrono::steady_clock::time_point lastUpstreamRxAt {};
+    std::chrono::steady_clock::time_point lastUpstreamTxAt {};
+    std::string lastUpstreamPacketName;
     std::chrono::steady_clock::time_point clientboundChunkReleaseAt {};
     BedrockRelayDownstreamProfile downstreamProfile;
     RelaySessionLifecycle lifecycle = RelaySessionLifecycle::Open;
@@ -603,6 +640,10 @@ ServerListenResult BedrockLiveRelay::listen() {
             .port = options_.server.port
         };
     }
+    {
+        std::lock_guard<std::mutex> lock(mapQueueSchedulerMutex_);
+        mapQueueSchedulerStopping_ = false;
+    }
 
     server_->onConnect([this](const BedrockServerConnection& connection) {
         const auto id = sessionId(connection);
@@ -627,7 +668,13 @@ ServerListenResult BedrockLiveRelay::listen() {
             }
             if (!rejected) {
                 session = std::make_shared<Session>(
-                    options_.levelChunkRetentionMaximumBytes
+                    options_.levelChunkRetentionMaximumBytes,
+                    ClientboundMapQueueLimits {
+                        .packetsPerFlush = options_.mapPacketsPerFlush,
+                        .bytesPerFlush = options_.mapBytesPerFlush,
+                        .maximumPackets = options_.maxMapQueuePackets,
+                        .maximumBytes = options_.maxMapQueueBytes
+                    }
                 );
                 session->id = id;
                 session->downstream = connection;
@@ -772,6 +819,8 @@ void BedrockLiveRelay::close(const std::string& reason) {
     if (!closed_.compare_exchange_strong(expected, true)) {
         return;
     }
+
+    stopMapQueueScheduler();
 
     std::vector<std::shared_ptr<Session>> sessions;
     {
@@ -957,6 +1006,14 @@ LevelChunkRetentionStats BedrockLiveRelay::levelChunkRetentionStats() const noex
     return out;
 }
 
+ClientboundMapQueueStats BedrockLiveRelay::mapQueueStats() const noexcept {
+    const auto session = primarySession();
+    if (!session) return {};
+    std::lock_guard<std::mutex> dispatchLock(session->mapDispatchMutex);
+    std::lock_guard<std::mutex> lock(session->mutex);
+    return session->mapQueue.stats();
+}
+
 bool BedrockLiveRelay::queueClientboundPackets(
     const BedrockServerConnection& connection,
     const std::vector<VersionedGamePacket>& packets
@@ -1131,6 +1188,20 @@ BedrockLiveRelayOptions BedrockLiveRelay::normalizeOptions(BedrockLiveRelayOptio
     // resource_packs_info/resource_pack_stack to the downstream client.
     options.server.autoResourcePacks = false;
     options.skipClientboundResourcePacks = false;
+    if (options.mapPacketsPerFlush == 0) options.mapPacketsPerFlush = 4;
+    if (options.mapBytesPerFlush == 0) {
+        options.mapBytesPerFlush = 512u * 1024u;
+    }
+    if (options.maxMapQueuePackets == 0) options.maxMapQueuePackets = 4096;
+    if (options.maxMapQueueBytes == 0) {
+        options.maxMapQueueBytes = 256u * 1024u * 1024u;
+    }
+    if (options.maxBatchPayloadBytes == 0) {
+        options.maxBatchPayloadBytes = 512u * 1024u;
+    }
+    if (options.maxPacketsPerBatch == 0) options.maxPacketsPerBatch = 16;
+    options.server.maxBatchPayloadBytes = options.maxBatchPayloadBytes;
+    options.server.maxPacketsPerBatch = options.maxPacketsPerBatch;
 
     options.upstream.autoResourcePackResponses = false;
     options.upstream.autoInitPlayer = false;
@@ -1427,7 +1498,12 @@ bool BedrockLiveRelay::resetRelaySession(
 ) {
     std::shared_ptr<BedrockNetworkClient> upstream;
     std::thread upstreamThread;
+    ClientboundMapQueueStats mapSummary;
     {
+        // Wait for any in-progress map batch admission before closing this
+        // session. Once lifecycle changes, the shared scheduler cannot admit
+        // another stale map packet into the downstream connection.
+        std::lock_guard<std::mutex> mapLock(session->mapDispatchMutex);
         std::lock_guard<std::mutex> lock(session->mutex);
         if (retainDownstream) {
             if (session->lifecycle != RelaySessionLifecycle::Open) {
@@ -1455,6 +1531,13 @@ bool BedrockLiveRelay::resetRelaySession(
         session->pendingPostSpawnServerbound.clear();
         session->pendingClientbound.clear();
         session->heldClientboundLevelChunks.clear();
+        mapSummary = session->mapQueue.clear();
+        session->mapQueuePressure = false;
+        session->mapQueueSpaceCv.notify_all();
+        session->mapFlowStartedAt = std::chrono::steady_clock::now();
+        session->mapFlowLastReportAt = session->mapFlowStartedAt;
+        session->mapFlowLastReportedReceived = 0;
+        session->mapFlowLastReportedForwarded = 0;
         session->clientboundChunkReleaseAt = {};
         session->clientboundStartGameSent = false;
         session->clientboundPlayerSpawnSeen = false;
@@ -1463,6 +1546,7 @@ bool BedrockLiveRelay::resetRelaySession(
             session->downstreamProfile = {};
         }
     }
+    reportMapFlowSummary(session, mapSummary, reason);
 
     // Packet handlers are serialized through this mutex. Marking the session
     // first makes newly arriving packets stop at applyHandlers(); taking the
@@ -1653,6 +1737,7 @@ void BedrockLiveRelay::startUpstream(const std::shared_ptr<Session>& session) {
         const auto session = weakSession.lock();
         if (!session) return;
         bool requestDisconnect = false;
+        std::string closeContext;
         {
             std::lock_guard<std::mutex> lock(session->mutex);
             if (session->upstream.get() == upstreamIdentity &&
@@ -1665,9 +1750,24 @@ void BedrockLiveRelay::startUpstream(const std::shared_ptr<Session>& session) {
                 session->upstreamDisconnectRequested = true;
                 requestDisconnect = true;
             }
+            const auto now = std::chrono::steady_clock::now();
+            const auto mapStats = session->mapQueue.stats();
+            std::ostringstream context;
+            context << "reason=" << rakNetCloseReason(reason)
+                    << " lastRxAgeMs="
+                    << elapsedMilliseconds(session->lastUpstreamRxAt, now)
+                    << " lastTxAgeMs="
+                    << elapsedMilliseconds(session->lastUpstreamTxAt, now)
+                    << " lastPacketName="
+                    << (session->lastUpstreamPacketName.empty()
+                            ? std::string("none")
+                            : session->lastUpstreamPacketName)
+                    << " mapQueuePackets=" << mapStats.queuedPackets
+                    << " mapQueueBytes=" << mapStats.queuedBytes;
+            closeContext = context.str();
         }
         if (requestDisconnect && !closed_.load()) {
-            emitError("[upstream closed] " + reason);
+            emitError("[upstream closed] " + closeContext);
             disconnectDownstream(
                 session->downstream,
                 "Backend server closed connection"
@@ -1685,6 +1785,13 @@ void BedrockLiveRelay::startUpstream(const std::shared_ptr<Session>& session) {
             std::lock_guard<std::mutex> lock(session->mutex);
             if (!relaySessionAcceptsPackets(*session) ||
                 session->upstream.get() != upstreamIdentity) return;
+            session->lastUpstreamRxAt = std::chrono::steady_clock::now();
+            session->lastUpstreamPacketName = event.packet.name;
+            if (event.packet.name == "clientbound_map_item_data") {
+                session->mapQueue.recordReceived(
+                    event.packet.fullPacket.size()
+                );
+            }
         }
         try {
             handleUpstreamPacket(session, event.packet);
@@ -2303,10 +2410,69 @@ void BedrockLiveRelay::forwardClientbound(
             << packetSummary(options_.server.version, packet);
         relayLogLine(out.str());
     }
+    bool currentDeferredToMapQueue = false;
+    if (options_.throttleMapItemData &&
+        packet.name == "clientbound_map_item_data") {
+        ensureMapQueueScheduler();
+        bool pressureReported = false;
+        for (;;) {
+            bool admitted = false;
+            {
+                std::lock_guard<std::mutex> mapLock(
+                    session->mapDispatchMutex
+                );
+                std::lock_guard<std::mutex> lock(session->mutex);
+                if (!relaySessionAcceptsPackets(*session) ||
+                    session->downstreamPhase != RelayDownstreamPhase::Game) {
+                    return;
+                }
+                if (session->mapQueue.canEnqueue(packet)) {
+                    session->mapQueue.enqueue(packet);
+                    admitted = true;
+                } else {
+                    session->mapQueuePressure = true;
+                }
+            }
+            if (admitted) break;
+
+            if (!pressureReported) {
+                pressureReported = true;
+                std::ostringstream out;
+                out << "[map-flow] session=" << session->id
+                    << " hardLimitBackpressure=true"
+                    << " maxQueuePackets=" << options_.maxMapQueuePackets
+                    << " maxQueueBytes=" << options_.maxMapQueueBytes;
+                relayLogLine(out.str());
+            }
+            // Apply real backpressure at the hard limit. Do not move the
+            // overflow into BedrockServer's queue in a tight loop: that would
+            // recreate the same burst under a different owner. The periodic
+            // map scheduler releases capacity at the configured gradual rate.
+            std::unique_lock<std::mutex> lock(session->mutex);
+            session->mapQueueSpaceCv.wait_for(
+                lock,
+                std::chrono::milliseconds(std::max(
+                    options_.server.batchingInterval,
+                    1
+                )) * 2,
+                [&]() {
+                    return !relaySessionAcceptsPackets(*session) ||
+                        session->downstreamPhase != RelayDownstreamPhase::Game ||
+                        session->mapQueue.canEnqueue(packet);
+                }
+            );
+            if (!relaySessionAcceptsPackets(*session) ||
+                session->downstreamPhase != RelayDownstreamPhase::Game) {
+                return;
+            }
+        }
+        currentDeferredToMapQueue = true;
+        reportMapFlow(session, false);
+    }
     // relay.js routes live upstream packets through Player#queue so packets
     // observed in one batching interval share one downstream MCPE batch.
     bool queued = false;
-    {
+    if (!currentDeferredToMapQueue) {
         std::lock_guard<std::mutex> lock(session->mutex);
         if (!relaySessionAcceptsPackets(*session) ||
             session->downstreamPhase != RelayDownstreamPhase::Game) return;
@@ -2354,6 +2520,199 @@ void BedrockLiveRelay::forwardClientbound(
                 );
             }
         }
+    }
+}
+
+void BedrockLiveRelay::ensureMapQueueScheduler() {
+    if (!options_.throttleMapItemData || closed_.load()) return;
+    std::lock_guard<std::mutex> lock(mapQueueSchedulerMutex_);
+    if (mapQueueSchedulerStopping_ || mapQueueSchedulerThread_.joinable()) {
+        return;
+    }
+    mapQueueSchedulerThread_ = std::thread([this]() {
+        runMapQueueScheduler();
+    });
+}
+
+void BedrockLiveRelay::runMapQueueScheduler() {
+    const auto milliseconds = options_.server.batchingInterval == 0
+        ? 20
+        : std::max(options_.server.batchingInterval, 1);
+    const auto interval = std::chrono::milliseconds(milliseconds);
+    std::unique_lock<std::mutex> lock(mapQueueSchedulerMutex_);
+    while (!mapQueueSchedulerStopping_) {
+        if (mapQueueSchedulerCv_.wait_for(lock, interval, [this]() {
+                return mapQueueSchedulerStopping_;
+            })) {
+            break;
+        }
+        lock.unlock();
+        flushMapQueues();
+        lock.lock();
+    }
+}
+
+void BedrockLiveRelay::flushMapQueues() {
+    std::vector<std::shared_ptr<Session>> sessions;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        sessions.reserve(sessions_.size());
+        for (const auto& [id, session] : sessions_) {
+            (void) id;
+            sessions.push_back(session);
+        }
+    }
+
+    for (const auto& session : sessions) {
+        try {
+            (void) flushSessionMapQueue(session, false);
+            reportMapFlow(session, false);
+        } catch (const std::exception& error) {
+            emitError(
+                "[map-flow] downstream queue failure session=" +
+                session->id + " error=" + error.what()
+            );
+            disconnectDownstream(
+                session->downstream,
+                "Map queue forwarding error"
+            );
+        } catch (...) {
+            emitError(
+                "[map-flow] downstream queue failure session=" +
+                session->id + " error=unknown native exception"
+            );
+            disconnectDownstream(
+                session->downstream,
+                "Map queue forwarding error"
+            );
+        }
+    }
+}
+
+bool BedrockLiveRelay::flushSessionMapQueue(
+    const std::shared_ptr<Session>& session,
+    bool pressure
+) {
+    ClientboundMapQueueBatch batch;
+    BedrockServerConnection downstream;
+    {
+        // This lock spans removal and downstream admission, preserving map
+        // order even when the periodic and hard-limit paths race.
+        std::lock_guard<std::mutex> mapLock(session->mapDispatchMutex);
+        {
+            std::lock_guard<std::mutex> lock(session->mutex);
+            if (!relaySessionAcceptsPackets(*session) ||
+                session->downstreamPhase != RelayDownstreamPhase::Game ||
+                session->mapQueue.empty()) {
+                return false;
+            }
+            downstream = session->downstream;
+            pressure = pressure || session->mapQueuePressure;
+            session->mapQueuePressure = false;
+            batch = session->mapQueue.takeFlush(pressure);
+            session->mapQueueSpaceCv.notify_all();
+        }
+        if (batch.packets.empty()) return false;
+
+        server_->queuePackets(
+            downstream,
+            batch.packets,
+            options_.clientboundCompression
+        );
+        {
+            std::lock_guard<std::mutex> lock(session->mutex);
+            session->mapQueue.markForwarded(batch);
+        }
+    }
+
+    for (const auto& map : batch.packets) {
+        emitForwarded(
+            session,
+            BedrockRelayDirection::Clientbound,
+            map
+        );
+    }
+    return true;
+}
+
+void BedrockLiveRelay::stopMapQueueScheduler() {
+    {
+        std::lock_guard<std::mutex> lock(mapQueueSchedulerMutex_);
+        mapQueueSchedulerStopping_ = true;
+    }
+    mapQueueSchedulerCv_.notify_all();
+    if (mapQueueSchedulerThread_.joinable() &&
+        mapQueueSchedulerThread_.get_id() != std::this_thread::get_id()) {
+        mapQueueSchedulerThread_.join();
+    }
+}
+
+void BedrockLiveRelay::reportMapFlow(
+    const std::shared_ptr<Session>& session,
+    bool force
+) {
+    ClientboundMapQueueStats stats;
+    std::uint64_t receivedDelta = 0;
+    std::uint64_t forwardedDelta = 0;
+    std::int64_t intervalMs = 0;
+    {
+        std::lock_guard<std::mutex> mapLock(session->mapDispatchMutex);
+        std::lock_guard<std::mutex> lock(session->mutex);
+        const auto now = std::chrono::steady_clock::now();
+        intervalMs = elapsedMilliseconds(session->mapFlowLastReportAt, now);
+        if (!force && intervalMs < 1000) return;
+        stats = session->mapQueue.stats();
+        if (stats.received == 0 && stats.enqueued == 0) return;
+        receivedDelta = stats.received -
+            session->mapFlowLastReportedReceived;
+        forwardedDelta = stats.forwarded -
+            session->mapFlowLastReportedForwarded;
+        session->mapFlowLastReportedReceived = stats.received;
+        session->mapFlowLastReportedForwarded = stats.forwarded;
+        session->mapFlowLastReportAt = now;
+    }
+    intervalMs = std::max<std::int64_t>(intervalMs, 1);
+    const auto receivedPerSec = receivedDelta * 1000u /
+        static_cast<std::uint64_t>(intervalMs);
+    const auto forwardedPerSec = forwardedDelta * 1000u /
+        static_cast<std::uint64_t>(intervalMs);
+    std::ostringstream out;
+    out << "[map-flow] session=" << session->id
+        << " received=" << stats.received
+        << " forwarded=" << stats.forwarded
+        << " queued=" << stats.queuedPackets
+        << " queuedBytes=" << stats.queuedBytes
+        << " receivedPerSec=" << receivedPerSec
+        << " forwardedPerSec=" << forwardedPerSec
+        << " peakQueuePackets=" << stats.peakQueuePackets
+        << " peakQueueBytes=" << stats.peakQueueBytes
+        << " largestMapPacket=" << stats.largestMapPacket;
+    if (options_.logging) relayLogLine(out.str());
+    if (options_.itemResourceDiagnostics && !options_.logging) {
+        emitDiagnostic(out.str());
+    }
+}
+
+void BedrockLiveRelay::reportMapFlowSummary(
+    const std::shared_ptr<Session>& session,
+    const ClientboundMapQueueStats& stats,
+    const std::string& reason
+) {
+    if (stats.received == 0 && stats.enqueued == 0) return;
+    std::ostringstream out;
+    out << "[map-flow-summary] session=" << session->id
+        << " reason=" << reason
+        << " received=" << stats.received
+        << " forwarded=" << stats.forwarded
+        << " remaining=" << stats.queuedPackets
+        << " remainingBytes=" << stats.queuedBytes
+        << " peakQueuePackets=" << stats.peakQueuePackets
+        << " peakQueueBytes=" << stats.peakQueueBytes
+        << " largestMapPacket=" << stats.largestMapPacket
+        << " pressureFlushes=" << stats.pressureFlushes;
+    if (options_.logging) relayLogLine(out.str());
+    if (options_.itemResourceDiagnostics && !options_.logging) {
+        emitDiagnostic(out.str());
     }
 }
 
@@ -2410,6 +2769,12 @@ void BedrockLiveRelay::forwardServerbound(
         upstream->sendPacket(packet);
     } else {
         upstream->sendBuffer(packet.fullPacket);
+    }
+    {
+        std::lock_guard<std::mutex> lock(session->mutex);
+        if (relaySessionAcceptsPackets(*session)) {
+            session->lastUpstreamTxAt = std::chrono::steady_clock::now();
+        }
     }
     emitForwarded(
         session,

@@ -97,6 +97,13 @@ bedrock::RelayOptions relayOptions(
     options.batchingInterval = 5;
     options.enableChunkCaching = true;
     options.omitParseErrors = omitParseErrors;
+    options.throttleMapItemData = true;
+    options.mapPacketsPerFlush = 3;
+    options.mapBytesPerFlush = 384u * 1024u;
+    options.maxMapQueuePackets = 3072;
+    options.maxMapQueueBytes = 192u * 1024u * 1024u;
+    options.maxBatchPayloadBytes = 448u * 1024u;
+    options.maxPacketsPerBatch = 12;
     options.destination.host = "127.0.0.1";
     options.destination.port = upstreamPort;
     options.destination.offline = true;
@@ -373,6 +380,20 @@ bool runParsePolicy(bool omitParseErrors) {
     );
     ok &= check(relay.live().options().enableChunkCaching,
                 "enableChunkCaching was not propagated to live relay");
+    const auto& liveOptions = relay.live().options();
+    ok &= check(
+        liveOptions.throttleMapItemData &&
+            liveOptions.mapPacketsPerFlush == 3 &&
+            liveOptions.mapBytesPerFlush == 384u * 1024u &&
+            liveOptions.maxMapQueuePackets == 3072 &&
+            liveOptions.maxMapQueueBytes == 192u * 1024u * 1024u,
+        "map throttling options were not propagated to live relay"
+    );
+    ok &= check(
+        liveOptions.server.maxBatchPayloadBytes == 448u * 1024u &&
+            liveOptions.server.maxPacketsPerBatch == 12,
+        "downstream batch limits were not propagated to the server"
+    );
     ok &= check(relay.options().omitParseErrors == omitParseErrors,
                 "omitParseErrors option changed during construction");
     ok &= check(!relayJoinMismatch.load(),

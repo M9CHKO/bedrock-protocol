@@ -10,6 +10,7 @@
 #include <iostream>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -17,7 +18,7 @@ namespace {
 
 constexpr uint32_t protocolVersion = 827;
 constexpr std::size_t mapPayloadSize = 81937;
-constexpr std::size_t mapPacketCount = 64;
+constexpr std::size_t defaultMapPacketCount = 64;
 constexpr std::size_t clientPacketPayloadSize = 95;
 constexpr std::size_t clientSplitPayloadSize = 4097;
 constexpr std::size_t clientPacketCount = 4096;
@@ -61,7 +62,20 @@ std::vector<uint8_t> encryptPayload(
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    std::size_t mapPacketCount = defaultMapPacketCount;
+    if (argc > 1) {
+        try {
+            mapPacketCount = std::stoull(argv[1]);
+        } catch (const std::exception&) {
+            std::cerr << "[RAKNET-ORDERED-ENCRYPTION-FLOOD] invalid map count\n";
+            return 2;
+        }
+        if (mapPacketCount == 0) {
+            std::cerr << "[RAKNET-ORDERED-ENCRYPTION-FLOOD] map count must be positive\n";
+            return 2;
+        }
+    }
     std::vector<uint8_t> key(32);
     for (std::size_t i = 0; i < key.size(); ++i) {
         key[i] = static_cast<uint8_t>(0x31u + i * 7u);
@@ -209,9 +223,10 @@ int main() {
                 } else if (!verification->matches()) {
                     clientFailure = verification->mismatchMessage();
                 } else {
-                    const auto expectedSize = clientReceived < mapPacketCount
-                        ? mapPayloadSize
-                        : std::size_t {37};
+                    const auto gameplayIndex = mapPacketCount / 2;
+                    const auto expectedSize = clientReceived == gameplayIndex
+                        ? std::size_t {37}
+                        : mapPayloadSize;
                     const auto expected = makePayload(clientReceived, expectedSize);
                     if (verification->packetPlaintext != expected) {
                         clientFailure =
@@ -271,26 +286,22 @@ int main() {
             ));
         }
     });
-    for (std::size_t sequence = 0; sequence < mapPacketCount; ++sequence) {
+    // Insert a small gameplay packet in the middle of map-sized traffic. It
+    // must remain ordered and must not corrupt either encryption counter.
+    for (std::size_t sequence = 0; sequence < expectedCount; ++sequence) {
+        const auto size = sequence == mapPacketCount / 2
+            ? std::size_t {37}
+            : mapPayloadSize;
         server.sendReliable(
             peer,
             encryptPayload(
                 *serverEncryptStream,
-                makePayload(sequence, mapPayloadSize),
+                makePayload(sequence, size),
                 sequence,
                 key
             )
         );
     }
-    server.sendReliable(
-        peer,
-        encryptPayload(
-            *serverEncryptStream,
-            makePayload(mapPacketCount, 37),
-            mapPacketCount,
-            key
-        )
-    );
     clientSender.join();
 
     {

@@ -29,6 +29,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <exception>
@@ -226,6 +227,10 @@ struct BedrockServerOptions {
     // Reliable-delivery inactivity timeout after RakNet connects. Appended to
     // preserve positional aggregate initialization of the original fields.
     int raknetTimeoutMs = 30'000;
+    // The uncompressed MCPE batch payload is split before compression and
+    // encryption. A packet larger than the byte limit is sent alone.
+    std::size_t maxBatchPayloadBytes = 512u * 1024u;
+    std::size_t maxPacketsPerBatch = 16;
 };
 
 // C++ lifecycle switches are intentionally separate from the ordinary
@@ -255,6 +260,8 @@ struct ServerOptions {
     int batchingInterval = 20;
 
     ServerAdvancedOptions advanced;
+    std::size_t maxBatchPayloadBytes = 512u * 1024u;
+    std::size_t maxPacketsPerBatch = 16;
 };
 
 class BedrockServer;
@@ -1413,20 +1420,21 @@ public:
         // may enqueue several already-bounded vectors during one batching
         // interval, so limiting only each queuePackets() call is insufficient:
         // the scheduler would otherwise merge them back into one large batch.
-        constexpr std::size_t MaximumPacketsPerBatch = 64;
-        constexpr std::size_t MaximumBytesPerBatch = 48 * 1024;
         std::size_t begin = 0;
         while (begin < queued.size()) {
             const auto compression = queued[begin].compression;
             std::size_t end = begin + 1;
-            std::size_t batchBytes =
-                queued[begin].packet.fullPacket.size() + 16;
+            std::size_t batchBytes = packetBatchContribution(
+                queued[begin].packet
+            );
             while (end < queued.size() &&
                    queued[end].compression == compression &&
-                   end - begin < MaximumPacketsPerBatch) {
-                const auto packetBytes =
-                    queued[end].packet.fullPacket.size() + 16;
-                if (batchBytes + packetBytes > MaximumBytesPerBatch) {
+                   end - begin < options_.maxPacketsPerBatch) {
+                const auto packetBytes = packetBatchContribution(
+                    queued[end].packet
+                );
+                if (batchBytes >= options_.maxBatchPayloadBytes ||
+                    packetBytes > options_.maxBatchPayloadBytes - batchBytes) {
                     break;
                 }
                 batchBytes += packetBytes;
@@ -1599,6 +1607,12 @@ private:
             throw std::runtime_error(
                 "Unknown compression algorithm: " + options.compressionAlgorithm
             );
+        }
+        if (options.maxBatchPayloadBytes == 0) {
+            options.maxBatchPayloadBytes = 512u * 1024u;
+        }
+        if (options.maxPacketsPerBatch == 0) {
+            options.maxPacketsPerBatch = 16;
         }
         return options;
     }
@@ -2087,6 +2101,42 @@ private:
         return std::chrono::milliseconds(std::max(options_.batchingInterval, 1));
     }
 
+    static std::size_t encodedVarUIntSize(std::size_t value) noexcept {
+        std::size_t bytes = 1;
+        while (value >= 0x80u) {
+            value >>= 7u;
+            ++bytes;
+        }
+        return bytes;
+    }
+
+    static std::size_t packetBatchContribution(
+        const VersionedGamePacket& packet
+    ) noexcept {
+        return encodedVarUIntSize(packet.fullPacket.size()) +
+            packet.fullPacket.size();
+    }
+
+    std::size_t boundedBatchEnd(
+        const std::vector<VersionedGamePacket>& packets,
+        std::size_t begin
+    ) const noexcept {
+        if (begin >= packets.size()) return begin;
+        std::size_t end = begin + 1;
+        std::size_t bytes = packetBatchContribution(packets[begin]);
+        while (end < packets.size() &&
+               end - begin < options_.maxPacketsPerBatch) {
+            const auto next = packetBatchContribution(packets[end]);
+            if (bytes >= options_.maxBatchPayloadBytes ||
+                next > options_.maxBatchPayloadBytes - bytes) {
+                break;
+            }
+            bytes += next;
+            ++end;
+        }
+        return end;
+    }
+
     void sendPacketsInternal(
         const BedrockServerConnection& connection,
         const std::vector<VersionedGamePacket>& packets,
@@ -2094,6 +2144,37 @@ private:
         bool processOutbound
     ) {
         if (packets.empty()) {
+            return;
+        }
+
+        const auto firstEnd = boundedBatchEnd(packets, 0);
+        if (firstEnd < packets.size()) {
+            // Serialize the complete split operation for this Player. Each
+            // recursive call handles exactly one bounded batch and therefore
+            // advances the encryption counter once, in original packet order.
+            const auto session = sessionSnapshot(connection);
+            if (!session) return;
+            std::lock_guard<std::recursive_mutex> outboundLock(
+                session->outboundMutex
+            );
+            std::size_t begin = 0;
+            while (begin < packets.size()) {
+                const auto end = boundedBatchEnd(packets, begin);
+                std::vector<VersionedGamePacket> batch;
+                batch.reserve(end - begin);
+                batch.insert(
+                    batch.end(),
+                    packets.begin() + static_cast<std::ptrdiff_t>(begin),
+                    packets.begin() + static_cast<std::ptrdiff_t>(end)
+                );
+                sendPacketsInternal(
+                    connection,
+                    batch,
+                    compression,
+                    processOutbound
+                );
+                begin = end;
+            }
             return;
         }
 
@@ -3855,6 +3936,8 @@ inline BedrockServerOptions expandServerOptions(ServerOptions options) {
     out.compressionAlgorithm = std::move(options.compressionAlgorithm);
     out.compressionLevel = options.compressionLevel;
     out.batchingInterval = options.batchingInterval;
+    out.maxBatchPayloadBytes = options.maxBatchPayloadBytes;
+    out.maxPacketsPerBatch = options.maxPacketsPerBatch;
     return out;
 }
 

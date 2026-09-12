@@ -2897,6 +2897,16 @@ struct RelayOptions {
     // retain the normal strict decode/error policy. Opt-in for transparent
     // relays that must not walk large inventories just to forward their bytes.
     bool validateUnhandledPackets = true;
+    // Large map walls can produce thousands of 128x128 updates in one burst.
+    // Keep all maps, but feed them to Minecraft gradually while ordinary
+    // gameplay packets continue through the normal downstream queue.
+    bool throttleMapItemData = true;
+    std::size_t mapPacketsPerFlush = 4;
+    std::size_t mapBytesPerFlush = 512u * 1024u;
+    std::size_t maxMapQueuePackets = 4096;
+    std::size_t maxMapQueueBytes = 256u * 1024u * 1024u;
+    std::size_t maxBatchPayloadBytes = 512u * 1024u;
+    std::size_t maxPacketsPerBatch = 16;
 
     // A single root offline value is the common case and applies to both
     // sides. destination.offline exists only as an explicit upstream override.
@@ -4395,6 +4405,8 @@ private:
         out.server.compressionLevel = options.compressionLevel;
         out.server.compressionThreshold = options.compressionThreshold;
         out.server.batchingInterval = options.batchingInterval;
+        out.server.maxBatchPayloadBytes = options.maxBatchPayloadBytes;
+        out.server.maxPacketsPerBatch = options.maxPacketsPerBatch;
 
         out.upstream.host = options.destination.host;
         out.upstream.port = options.destination.port;
@@ -4431,6 +4443,13 @@ private:
         out.forceSingle = options.forceSingle;
         out.replaceExisting = options.replaceExisting;
         out.useDownstreamDisplayNameForUpstreamUsername = options.offline;
+        out.throttleMapItemData = options.throttleMapItemData;
+        out.mapPacketsPerFlush = options.mapPacketsPerFlush;
+        out.mapBytesPerFlush = options.mapBytesPerFlush;
+        out.maxMapQueuePackets = options.maxMapQueuePackets;
+        out.maxMapQueueBytes = options.maxMapQueueBytes;
+        out.maxBatchPayloadBytes = options.maxBatchPayloadBytes;
+        out.maxPacketsPerBatch = options.maxPacketsPerBatch;
         return out;
     }
 };
