@@ -573,6 +573,8 @@ struct BedrockLiveRelay::Session {
     std::uint64_t mapFlowLastReportedReceived = 0;
     std::uint64_t mapFlowLastReportedForwarded = 0;
     bool mapQueuePressure = false;
+    bool mapInitialDelayApplied = false;
+    std::chrono::steady_clock::time_point mapNextSendAt {};
     std::chrono::steady_clock::time_point lastUpstreamRxAt {};
     std::chrono::steady_clock::time_point lastUpstreamTxAt {};
     std::string lastUpstreamPacketName;
@@ -1188,10 +1190,17 @@ BedrockLiveRelayOptions BedrockLiveRelay::normalizeOptions(BedrockLiveRelayOptio
     // resource_packs_info/resource_pack_stack to the downstream client.
     options.server.autoResourcePacks = false;
     options.skipClientboundResourcePacks = false;
-    if (options.mapFlushIntervalMs <= 0) options.mapFlushIntervalMs = 100;
+    if (options.mapFlushIntervalMs <= 0) options.mapFlushIntervalMs = 500;
+    if (options.mapInitialDelayMs < 0) options.mapInitialDelayMs = 0;
     if (options.mapPacketsPerFlush == 0) options.mapPacketsPerFlush = 1;
     if (options.mapBytesPerFlush == 0) {
         options.mapBytesPerFlush = 128u * 1024u;
+    }
+    if (options.mapMaxSendBufferBytes == 0) {
+        options.mapMaxSendBufferBytes = 32u * 1024u;
+    }
+    if (options.mapMaxResendBufferBytes == 0) {
+        options.mapMaxResendBufferBytes = 96u * 1024u;
     }
     if (options.maxMapQueuePackets == 0) options.maxMapQueuePackets = 4096;
     if (options.maxMapQueueBytes == 0) {
@@ -1534,6 +1543,8 @@ bool BedrockLiveRelay::resetRelaySession(
         session->heldClientboundLevelChunks.clear();
         mapSummary = session->mapQueue.clear();
         session->mapQueuePressure = false;
+        session->mapInitialDelayApplied = false;
+        session->mapNextSendAt = {};
         session->mapQueueSpaceCv.notify_all();
         session->mapFlowStartedAt = std::chrono::steady_clock::now();
         session->mapFlowLastReportAt = session->mapFlowStartedAt;
@@ -2429,6 +2440,14 @@ void BedrockLiveRelay::forwardClientbound(
                     return;
                 }
                 if (session->mapQueue.canEnqueue(preparedMap)) {
+                    if (!session->mapInitialDelayApplied) {
+                        session->mapInitialDelayApplied = true;
+                        session->mapNextSendAt =
+                            std::chrono::steady_clock::now() +
+                            std::chrono::milliseconds(
+                                options_.mapInitialDelayMs
+                            );
+                    }
                     session->mapQueue.enqueue(std::move(preparedMap));
                     admitted = true;
                 } else {
@@ -2608,10 +2627,45 @@ bool BedrockLiveRelay::flushSessionMapQueue(
             session->mapQueue.empty()) {
             return false;
         }
+        if (std::chrono::steady_clock::now() < session->mapNextSendAt) {
+            return false;
+        }
         downstream = session->downstream;
+    }
+
+    // RakNet ACKs are independent from Minecraft's renderer, so the fixed
+    // interval remains the primary client-load guard. Transport pressure is
+    // an additional signal: never add another fragmented map while reliable
+    // gameplay bytes are still queued or a previous burst is substantially
+    // unacknowledged.
+    const auto transport = server_->transportStatistics(downstream);
+    const bool transportBusy = transport.statisticsAvailable &&
+        (transport.sendBufferBytes > options_.mapMaxSendBufferBytes ||
+         transport.resendBufferBytes > options_.mapMaxResendBufferBytes);
+
+    {
+        std::lock_guard<std::mutex> mapLock(session->mapDispatchMutex);
+        std::lock_guard<std::mutex> lock(session->mutex);
+        if (!relaySessionAcceptsPackets(*session) ||
+            session->downstreamPhase != RelayDownstreamPhase::Game ||
+            session->mapQueue.empty()) {
+            return false;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now < session->mapNextSendAt) return false;
+        if (transportBusy) {
+            session->mapQueue.markTransportDeferred();
+            session->mapNextSendAt = now + std::chrono::milliseconds(
+                std::max(options_.mapFlushIntervalMs, 1)
+            );
+            return false;
+        }
         pressure = pressure || session->mapQueuePressure;
         session->mapQueuePressure = false;
         batch = session->mapQueue.takeFlush(pressure);
+        session->mapNextSendAt = now + std::chrono::milliseconds(
+            std::max(options_.mapFlushIntervalMs, 1)
+        );
         session->mapQueueSpaceCv.notify_all();
     }
     if (batch.packets.empty()) return false;
@@ -2692,6 +2746,7 @@ void BedrockLiveRelay::reportMapFlow(
         << " peakQueuePackets=" << stats.peakQueuePackets
         << " peakQueueBytes=" << stats.peakQueueBytes
         << " largestMapPacket=" << stats.largestMapPacket;
+    out << " transportDeferrals=" << stats.transportDeferrals;
     if (options_.logging) relayLogLine(out.str());
     if (options_.itemResourceDiagnostics && !options_.logging) {
         emitDiagnostic(out.str());
@@ -2715,6 +2770,7 @@ void BedrockLiveRelay::reportMapFlowSummary(
         << " peakQueueBytes=" << stats.peakQueueBytes
         << " largestMapPacket=" << stats.largestMapPacket
         << " pressureFlushes=" << stats.pressureFlushes;
+    out << " transportDeferrals=" << stats.transportDeferrals;
     if (options_.logging) relayLogLine(out.str());
     if (options_.itemResourceDiagnostics && !options_.logging) {
         emitDiagnostic(out.str());

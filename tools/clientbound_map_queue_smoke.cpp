@@ -143,6 +143,7 @@ bool runPressureCase() {
     );
     auto pressure = queue.takeFlush(true);
     queue.markForwarded(pressure);
+    queue.markTransportDeferred();
     ok &= check(
         queue.canEnqueue(preparedThird),
         "pressure flush did not make room"
@@ -152,6 +153,8 @@ bool runPressureCase() {
     queue.markForwarded(tail);
     const auto stats = queue.stats();
     ok &= check(stats.pressureFlushes == 1, "pressure counter mismatch");
+    ok &= check(stats.transportDeferrals == 1,
+        "transport deferral counter mismatch");
     ok &= check(stats.forwarded == 3, "pressure case lost a packet");
     return ok;
 }

@@ -2901,9 +2901,12 @@ struct RelayOptions {
     // Keep all maps, but feed them to Minecraft gradually while ordinary
     // gameplay packets continue through the normal downstream queue.
     bool throttleMapItemData = true;
-    int mapFlushIntervalMs = 100;
+    int mapFlushIntervalMs = 500;
+    int mapInitialDelayMs = 2500;
     std::size_t mapPacketsPerFlush = 1;
     std::size_t mapBytesPerFlush = 128u * 1024u;
+    std::size_t mapMaxSendBufferBytes = 32u * 1024u;
+    std::size_t mapMaxResendBufferBytes = 96u * 1024u;
     std::size_t maxMapQueuePackets = 4096;
     std::size_t maxMapQueueBytes = 256u * 1024u * 1024u;
     std::size_t maxBatchPayloadBytes = 512u * 1024u;
@@ -4446,8 +4449,11 @@ private:
         out.useDownstreamDisplayNameForUpstreamUsername = options.offline;
         out.throttleMapItemData = options.throttleMapItemData;
         out.mapFlushIntervalMs = options.mapFlushIntervalMs;
+        out.mapInitialDelayMs = options.mapInitialDelayMs;
         out.mapPacketsPerFlush = options.mapPacketsPerFlush;
         out.mapBytesPerFlush = options.mapBytesPerFlush;
+        out.mapMaxSendBufferBytes = options.mapMaxSendBufferBytes;
+        out.mapMaxResendBufferBytes = options.mapMaxResendBufferBytes;
         out.maxMapQueuePackets = options.maxMapQueuePackets;
         out.maxMapQueueBytes = options.maxMapQueueBytes;
         out.maxBatchPayloadBytes = options.maxBatchPayloadBytes;

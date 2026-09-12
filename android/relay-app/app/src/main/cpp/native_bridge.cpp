@@ -10540,9 +10540,12 @@ public:
         // image, but send one low-priority map at a time so it cannot occupy
         // the reliable RakNet stream ahead of chat, chunks, or movement.
         options.throttleMapItemData = true;
-        options.mapFlushIntervalMs = 100;
+        options.mapFlushIntervalMs = 500;
+        options.mapInitialDelayMs = 2500;
         options.mapPacketsPerFlush = 1;
         options.mapBytesPerFlush = 128u * 1024u;
+        options.mapMaxSendBufferBytes = 32u * 1024u;
+        options.mapMaxResendBufferBytes = 96u * 1024u;
         options.maxMapQueuePackets = 4096;
         options.maxMapQueueBytes = 256u * 1024u * 1024u;
         options.maxPacketsPerBatch = 16;
@@ -10611,8 +10614,10 @@ public:
                 ) +
                 " nativeBuild=" + std::string(NativeBuildType) +
                 " rawUnhandledPackets=true itemNbt=binary_cache compressionLevel=1" +
-                " mapFlushIntervalMs=100 mapPacketsPerFlush=1" +
-                " mapBytesPerFlush=131072 mapPriority=low" +
+                " mapFlushIntervalMs=500 mapInitialDelayMs=2500" +
+                " mapPacketsPerFlush=1 mapBytesPerFlush=131072" +
+                " mapMaxSendBufferBytes=32768" +
+                " mapMaxResendBufferBytes=98304 mapPriority=adaptive-low" +
                 " compilerOptimized=" +
                 (NativeCompilerOptimized ? "true" : "false"),
             "INFO",
@@ -12918,96 +12923,10 @@ private:
 
             const auto generation = pendingLogin_->generation;
             const auto deadline = pendingLogin_->deadline;
-            const bool watchFragmentedLogin =
-                pendingLogin_->stage == "request_network_settings";
-            const auto wakeAt = watchFragmentedLogin
-                ? std::min(
-                    deadline,
-                    std::chrono::steady_clock::now() +
-                        std::chrono::milliseconds(750)
-                )
-                : deadline;
-            if (loginWatchdogCv_.wait_until(lock, wakeAt, [this, generation]() {
+            if (loginWatchdogCv_.wait_until(lock, deadline, [this, generation]() {
                     return loginWatchdogStopping_ || !pendingLogin_ ||
                         pendingLogin_->generation != generation;
                 })) {
-                continue;
-            }
-
-            // A stale Minecraft UDP/RakNet socket can deliver the ~590 KiB
-            // Login packet with reliability sequence numbers belonging to a
-            // previous relay process. RakNet then counts the fragments as
-            // ignored forever: NetworkSettings was accepted, but Login can
-            // never be assembled. Detect that signature early and free the
-            // peer instead of making the user wait for the full watchdog.
-            if (watchFragmentedLogin &&
-                std::chrono::steady_clock::now() < deadline) {
-                const auto candidate = *pendingLogin_;
-                lock.unlock();
-                bedrock::RakNetServerPeerStatistics statistics;
-                {
-                    std::lock_guard relayLock(relayMutex_);
-                    if (relay_) {
-                        statistics = relay_->live().server()
-                            .transportStatistics(candidate.connection);
-                    }
-                }
-                lock.lock();
-                if (loginWatchdogStopping_) break;
-                if (!pendingLogin_ ||
-                    pendingLogin_->generation != generation) {
-                    continue;
-                }
-                const auto stageElapsed = std::chrono::duration_cast<
-                    std::chrono::milliseconds
-                >(
-                    std::chrono::steady_clock::now() -
-                        pendingLogin_->stageStartedAt
-                );
-                const bool poisonedFragmentStream =
-                    stageElapsed >= std::chrono::milliseconds(2'500) &&
-                    statistics.peerKnown && statistics.nativeActive &&
-                    statistics.statisticsAvailable &&
-                    statistics.userMessageBytesReceivedIgnored >=
-                        256ull * 1024ull &&
-                    statistics.userMessageBytesReceivedProcessed <
-                        64ull * 1024ull;
-                if (!poisonedFragmentStream) continue;
-
-                const auto poisoned = *pendingLogin_;
-                pendingLogin_.reset();
-                ++loginWatchdogGeneration_;
-                lock.unlock();
-                const auto visibleError =
-                    "Minecraft reused a stale local connection; reconnect "
-                    "to 127.0.0.1:19132";
-                {
-                    std::lock_guard stateLock(state_->mutex);
-                    state_->lastError = visibleError;
-                }
-                state_->push(
-                    "local_login_fragment_reset",
-                    "downstream_session=" + poisoned.sessionId +
-                        " last_stage=" + poisoned.stage +
-                        " elapsedMs=" + std::to_string(stageElapsed.count()) +
-                        " raknet={" +
-                        rakNetStatisticsBreadcrumb(statistics) +
-                        "}; closing stale fragmented login immediately so "
-                        "Minecraft can reconnect",
-                    "ERROR",
-                    "watchdog"
-                );
-                state_->flushFlight("local_login_fragment_reset", 48);
-                {
-                    std::lock_guard relayLock(relayMutex_);
-                    if (relay_) {
-                        relay_->live().disconnectDownstream(
-                            poisoned.connection,
-                            visibleError
-                        );
-                    }
-                }
-                lock.lock();
                 continue;
             }
 

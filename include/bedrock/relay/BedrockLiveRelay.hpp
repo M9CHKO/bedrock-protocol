@@ -68,11 +68,17 @@ struct BedrockLiveRelayOptions {
     VersionedMcpeCompression clientboundCompression = VersionedMcpeCompression::Automatic;
     // Map pixels are intentionally lower priority than gameplay state. Every
     // map is retained and forwarded, but only this many packets/bytes are sent
-    // after queued gameplay during one independent map scheduler tick.
+    // after queued gameplay during one independent map scheduler tick. The
+    // initial delay keeps a map wall from competing with the join inventory
+    // and chunk burst, while the transport limits pause maps behind unacked
+    // reliable gameplay traffic.
     bool throttleMapItemData = true;
-    int mapFlushIntervalMs = 100;
+    int mapFlushIntervalMs = 500;
+    int mapInitialDelayMs = 2500;
     std::size_t mapPacketsPerFlush = 1;
     std::size_t mapBytesPerFlush = 128u * 1024u;
+    std::size_t mapMaxSendBufferBytes = 32u * 1024u;
+    std::size_t mapMaxResendBufferBytes = 96u * 1024u;
     std::size_t maxMapQueuePackets = 4096;
     std::size_t maxMapQueueBytes = 256u * 1024u * 1024u;
     // Bound every downstream MCPE batch before compression and encryption.

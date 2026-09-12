@@ -27,6 +27,7 @@ struct ClientboundMapQueueStats {
     std::uint64_t enqueued = 0;
     std::uint64_t forwarded = 0;
     std::uint64_t pressureFlushes = 0;
+    std::uint64_t transportDeferrals = 0;
     std::size_t queuedPackets = 0;
     std::size_t queuedBytes = 0;
     std::size_t peakQueuePackets = 0;
@@ -165,6 +166,10 @@ public:
 
     void markForwarded(const ClientboundMapQueueBatch& batch) noexcept {
         stats_.forwarded += batch.packets.size();
+    }
+
+    void markTransportDeferred() noexcept {
+        ++stats_.transportDeferrals;
     }
 
     ClientboundMapQueueStats stats() const noexcept {

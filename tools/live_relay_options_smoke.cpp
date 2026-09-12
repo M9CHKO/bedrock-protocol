@@ -99,8 +99,11 @@ bedrock::RelayOptions relayOptions(
     options.omitParseErrors = omitParseErrors;
     options.throttleMapItemData = true;
     options.mapFlushIntervalMs = 75;
+    options.mapInitialDelayMs = 1250;
     options.mapPacketsPerFlush = 3;
     options.mapBytesPerFlush = 384u * 1024u;
+    options.mapMaxSendBufferBytes = 24u * 1024u;
+    options.mapMaxResendBufferBytes = 80u * 1024u;
     options.maxMapQueuePackets = 3072;
     options.maxMapQueueBytes = 192u * 1024u * 1024u;
     options.maxBatchPayloadBytes = 448u * 1024u;
@@ -385,8 +388,11 @@ bool runParsePolicy(bool omitParseErrors) {
     ok &= check(
         liveOptions.throttleMapItemData &&
             liveOptions.mapFlushIntervalMs == 75 &&
+            liveOptions.mapInitialDelayMs == 1250 &&
             liveOptions.mapPacketsPerFlush == 3 &&
             liveOptions.mapBytesPerFlush == 384u * 1024u &&
+            liveOptions.mapMaxSendBufferBytes == 24u * 1024u &&
+            liveOptions.mapMaxResendBufferBytes == 80u * 1024u &&
             liveOptions.maxMapQueuePackets == 3072 &&
             liveOptions.maxMapQueueBytes == 192u * 1024u * 1024u,
         "map throttling options were not propagated to live relay"

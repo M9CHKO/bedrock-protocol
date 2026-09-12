@@ -111,8 +111,11 @@ int main() {
     relayOptions.upstream.connectTimeoutMs = 1500;
     relayOptions.throttleMapItemData = true;
     relayOptions.mapFlushIntervalMs = 20;
+    relayOptions.mapInitialDelayMs = 0;
     relayOptions.mapPacketsPerFlush = 2;
     relayOptions.mapBytesPerFlush = 64u * 1024u;
+    relayOptions.mapMaxSendBufferBytes = 64u * 1024u * 1024u;
+    relayOptions.mapMaxResendBufferBytes = 64u * 1024u * 1024u;
     relayOptions.maxMapQueuePackets = 4096;
     relayOptions.maxMapQueueBytes = 64u * 1024u * 1024u;
     relayOptions.maxPacketsPerBatch = 4;
