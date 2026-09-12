@@ -10537,9 +10537,10 @@ public:
         options.downstreamRaknetTimeoutMs = 120'000;
         options.upstreamRaknetTimeoutMs = 120'000;
         options.logging = false;
-        // Prefer latency/CPU over maximum compression on the phone. The
-        // MCPE framing and negotiated encryption remain unchanged.
-        options.compressionLevel = 1;
+        // Keep large initial chunks compact. Level 1 expanded the first
+        // no-cache world batch enough to monopolize Android's reliable
+        // RakNet stream and starve gameplay traffic.
+        options.compressionLevel = 7;
         // A map wall may arrive as thousands of 128x128 updates. Retain every
         // image, but send one low-priority map at a time so it cannot occupy
         // the reliable RakNet stream ahead of chat, chunks, or movement.
@@ -10567,7 +10568,10 @@ public:
         // when a server uses a newer optional packet field.
         options.parseErrorPolicy = bedrock::RelayParseErrorPolicy::ForwardRaw;
         options.validateUnhandledPackets = false;
-        options.enableChunkCaching = false;
+        // Minecraft for Android supports the Bedrock blob cache. Advertise it
+        // upstream so large level_chunk packets can reference cached blobs
+        // instead of retransmitting the complete world payload.
+        options.enableChunkCaching = true;
         options.levelChunkRetentionMaximumBytes =
             AndroidLevelChunkRetentionMaximumBytes;
         options.destination.host = destinationHost;
@@ -10625,7 +10629,8 @@ public:
                         (1024u * 1024u)
                 ) +
                 " nativeBuild=" + std::string(NativeBuildType) +
-                " rawUnhandledPackets=true itemNbt=binary_cache compressionLevel=1" +
+                " rawUnhandledPackets=true itemNbt=binary_cache" +
+                " chunkCache=true compressionLevel=7" +
                 " mapFlushIntervalMs=1500 mapInitialDelayMs=5000" +
                 " mapPacketsPerFlush=1 mapBytesPerFlush=131072" +
                 " mapMaxSendBufferBytes=32768" +
@@ -11260,6 +11265,19 @@ public:
         relay->live().onForwarded([state, liveRelay](
             const bedrock::BedrockRelayPacketEvent& event
         ) {
+            if (event.direction ==
+                    bedrock::BedrockRelayDirection::Serverbound &&
+                event.packet.name == "client_cache_status") {
+                const bool enabled = !event.packet.payload.empty() &&
+                    event.packet.payload.front() != 0;
+                state->push(
+                    "client_cache_status",
+                    "forwardedToServer=true enabled=" +
+                        std::string(enabled ? "true" : "false"),
+                    "INFO",
+                    "chunks"
+                );
+            }
             if (isResourcePackTransportPacket(event.packet.name)) {
                 const auto sampleIndex =
                     state->resourcePackPacketsForwarded.fetch_add(
