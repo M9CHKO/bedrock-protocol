@@ -93,6 +93,16 @@ DesktopValue desktopCall(const DesktopValue& request) {
         const bool armor = desktopBool(request, "armor");
         const bool totem = desktopBool(request, "totem");
         const bool logging = desktopBool(request, "logging");
+        const bool hideMaps = false; // Windows always schedules map delivery, including legacy requests.
+        const bool hideEntities = desktopBool(request, "hideEntities");
+        const bool visualsChanged = configuredNoRenderMaps.load() != hideMaps || configuredNoRenderEntities.load() != hideEntities;
+        configuredNoRenderMaps = hideMaps;
+        configuredNoRenderEntities = hideEntities;
+        if (visualsChanged) {
+            std::shared_ptr<RelayController> active;
+            { std::lock_guard lock(controllerMutex); active = controller; }
+            if (active) active->configureNoRender(hideMaps, hideEntities);
+        }
         const int delay = bedrock::ShulkerDeposit::clampIntervalMs(desktopInt(request, "intervalMs", 1000));
         const bool auto2 = desktopBool(request, "auto2");
         const int craftMs = bedrock::AutoCraftStore::clampCraftInterval(desktopInt(request, "craftIntervalMs", 1000));

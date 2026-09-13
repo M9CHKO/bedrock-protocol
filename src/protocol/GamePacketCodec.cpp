@@ -4,7 +4,6 @@
 #include <bedrock/util/VarInt.hpp>
 
 #include <stdexcept>
-#include <utility>
 
 namespace bedrock {
 
@@ -15,10 +14,6 @@ uint32_t GamePacketCodec::makeHeader(uint32_t packetId, uint8_t senderSubId, uin
 }
 
 GamePacket GamePacketCodec::decodePacket(const std::vector<uint8_t>& fullPacket) {
-    return decodePacket(std::vector<uint8_t>(fullPacket));
-}
-
-GamePacket GamePacketCodec::decodePacket(std::vector<uint8_t>&& fullPacket) {
     size_t offset = 0;
 
     const uint32_t header = VarInt::readUnsignedVarInt(fullPacket, offset);
@@ -28,13 +23,10 @@ GamePacket GamePacketCodec::decodePacket(std::vector<uint8_t>&& fullPacket) {
     packet.senderSubId = static_cast<uint8_t>((header >> 10) & 0x03);
     packet.targetSubId = static_cast<uint8_t>((header >> 12) & 0x03);
     packet.name = PacketRegistry::nameOf(packet.packetId);
-    packet.fullPacket = std::move(fullPacket);
+    packet.fullPacket = fullPacket;
 
-    if (offset < packet.fullPacket.size()) {
-        packet.payload.assign(
-            packet.fullPacket.begin() + static_cast<long>(offset),
-            packet.fullPacket.end()
-        );
+    if (offset < fullPacket.size()) {
+        packet.payload.assign(fullPacket.begin() + static_cast<long>(offset), fullPacket.end());
     }
 
     return packet;
@@ -61,7 +53,7 @@ DecodedBatch GamePacketCodec::decodeBatch(const std::vector<uint8_t>& framedPack
         );
 
         offset += packetSize;
-        batch.packets.push_back(decodePacket(std::move(fullPacket)));
+        batch.packets.push_back(decodePacket(fullPacket));
     }
 
     return batch;

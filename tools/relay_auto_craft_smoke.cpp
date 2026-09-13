@@ -273,6 +273,35 @@ static void verifyNativeIntegration() {
     state.clearGameplayTelemetry();
     require(!state.autoCraftTableRestore,"disconnect clears delayed restoration without carrying it into a new session");
 }
+static void verifyMapPlacementIntegration() {
+    using J=bedrock::JsRuntimeValue;using Pos=bedrock::platform::Pos;
+    for(const auto& version:{std::string("1.21.2"),std::string("1.21.100")}){
+        RelayState state;state.version=version;state.loadBlockRegistry("data/minecraft-data/bedrock/1.21.100");state.configureBlockRuntimeIds(false);
+        const auto air=state.actualAirRuntimeId(),quartz=*state.schematicRuntimeId("minecraft:quartz_block");
+        const auto chest=*state.schematicRuntimeId("minecraft:chest"),table=*state.schematicRuntimeId("minecraft:crafting_table");
+        const Pos origin{-1008668,180,-223851};
+        for(int dx=-6;dx<=6;++dx)for(int dy=-2;dy<=3;++dy)for(int dz=-6;dz<=6;++dz)
+            state.schematicBlockOverrides[{0,origin.x+dx,origin.y+dy,origin.z+dz}]={dy==-1?quartz:air,0,0};
+        for(auto [dx,dz]:{std::pair{-1,-1},std::pair{-1,0},std::pair{-1,1},std::pair{0,-1},std::pair{0,1},std::pair{1,-1},std::pair{1,0}})
+            state.schematicBlockOverrides[{0,origin.x+dx,origin.y,origin.z+dz}]={chest,0,0};
+        state.schematicBlockOverrides[{0,origin.x-1,origin.y,origin.z}]={table,0,0};
+        bedrock::ProtoDefWriter seed;seed.varuint64(123);seed.f32le(origin.x+.5);seed.f32le(origin.y+1.62);seed.f32le(origin.z+.5);seed.f32le(0);seed.f32le(0);seed.f32le(0);
+        state.entityPositions.observeServerbound(bedrock::VersionedPacketCodec::forVersion(version).makePacketByName("move_player",seed.take()));
+        auto& q=state.mapQueue;q.slots.setVersion(version);q.slots.authoritative=false;q.slots.inventoryReady=true;
+        for(auto& s:q.slots.player)s=item(0,0);q.mapId=358;q.shulkerId=777;q.configureArchive(1);
+        auto reply=state.mapCommand(J::object({{"op",J::string("start")}}));
+        require(q.needsTemplate(),"map start searches diagonals through production world adapter");
+        require(q.box.x==origin.x+1&&q.box.y==origin.y&&q.box.z==origin.z+1,"native search picks only free diagonal at negative world coordinates");
+        state.mapCommand(J::object({{"op",J::string("stop")}}));
+        state.schematicBlockOverrides.clear();
+        state.schematicBlockOverrides[{0,origin.x-1,origin.y,origin.z}]={table,0,0};
+        state.schematicBlockOverrides[{0,origin.x,origin.y,origin.z-1}]={chest,0,0};
+        bool rejected=false;
+        try{state.mapCommand(J::object({{"op",J::string("start")}}));}
+        catch(const std::exception& e){rejected=std::string(e.what()).find("не получило блоки")!=std::string::npos;}
+        require(rejected&&!q.busy(),"unloaded platform gets explicit diagnostic without crafting or placement");
+    }
+}
 static void verifyPlatformIntegration() {
     for(const auto& version:{std::string("1.21.2"),std::string("1.21.100")}) {
         RelayState state;state.version=version;state.loadBlockRegistry("data/minecraft-data/bedrock/1.21.100");state.configureBlockRuntimeIds(false);
@@ -317,7 +346,49 @@ static void verifyPlatformIntegration() {
         state.injectPlatform(manual);require(!b.busy() && manual.replacements.empty(),"manual action detected before automation poll/send");
     }
 }
-int main() {
+// Optional read-only audit of a user archive through the real ZIP/QZNBTF02
+// reader and shared template adapter. The archive is not a test dependency.
+static void verifyMapArchive(const std::filesystem::path& path){
+    using N=bedrock::NbtValue;using T=bedrock::NbtTagType;
+    auto archive=std::make_shared<bedrock::MapArchive>();archive->open(path);
+    size_t totalMaps=0,maxImage=0;
+    RelayState state;state.version="1.21.100";state.itemProtocolVariables->setVariable("ShieldItemID",513);
+    state.mapArchive=archive;
+    for(size_t i=0;i<archive->entries.size();++i){
+        auto root=QazaqNbtTransferReader(archive->load(i)).readRoot();const auto* tag=root.find("tag");
+        require(tag&&tag->type==T::Compound,"archive has shulker tag");
+        auto ids=bedrock::MapShulkerQueue::templateMapIds(*tag);totalMaps+=ids.size();
+        // The host's lazy loading path, not a second test-only encoder.
+        state.mapQueue.resetSession();state.mapQueue.stage=bedrock::MapShulkerQueue::Stage::Idle;
+        state.mapQueue.configureArchive(archive->entries.size(),i);
+        auto& q=state.mapQueue;
+        q.slots.setVersion(state.version);q.slots.inventoryReady=true;q.slots.shulkerIds={777};
+        for(auto& s:q.slots.player)s=item(0,0);
+        q.slots.player[30]=item(601,2);q.slots.player[31]=item(55,1);
+        q.mapId=358;q.shulkerId=777;q.shulkerRuntime=123;q.craft.shellId=601;q.craft.chestId=55;
+        q.start({.5,65.62,.5,0,0,1ULL<<35,10,true},{0,64,2,100,1,false,2},
+            {{2,64,2,200,1,true,3}},{1,64,0,0,1,false,1},0);
+        require(q.needsTemplate(),"archive audit initializes complete startup context");
+        state.loadNextMapTemplate();const auto& prepared=state.mapQueue.prepared;
+        require(prepared.wire&&state.mapQueue.templateMaps==ids,"shared adapter loads archive template");
+        auto stream=bedrock::BinaryStream::view(*prepared.wire,prepared.item.extraBegin-prepared.item.begin);
+        require(stream.readU16LE()==65535&&stream.readU8()==1,"crafted shulker NBT prefix");
+        auto actual=bedrock::BedrockNbtCodec::read(stream,bedrock::BedrockNbtEncoding::LittleEndian);
+        require(actual.root==*tag,"all nested image bytes, legacy IDs and metadata preserved in craft");
+        for(const auto& entry:tag->find("Items")->listValue){
+            const auto& mapTag=*entry.find("tag");const auto* colors=mapTag.find("Colors");
+            require(colors&&colors->type==T::ByteArray,"archive map has opaque Colors bytes");
+            maxImage=std::max(maxImage,colors->byteArrayValue.size());
+            bedrock::BinaryStream encoded;bedrock::BedrockNbtCodec::write(encoded,{"",mapTag},bedrock::BedrockNbtEncoding::LittleEndian);
+            auto extra=V::object({{"has_nbt",V::string("true")},{"nbt",V::object({{"version",V::integer(1)},{"nbt",V::bytes(std::move(encoded.buffer()))}})},
+                {"can_place_on",V::array({})},{"can_destroy",V::array({})},{"blocking_tick",V::integer(0)}});
+            auto wireMap=state.prepareAutoCraftTemplate(extra,358,0);
+            require(bedrock::MapShulkerQueue::mapUuid(wireMap)==mapTag.find("map_uuid")->integerValue,"map UUID readable without decoding image");
+        }
+    }
+    std::cout<<"Archive: "<<archive->entries.size()<<" templates, "<<totalMaps<<" maps; largest Colors: "<<maxImage<<" bytes; all preserved\n";
+}
+int main(int argc,char** argv) {
     try {
         for (const auto& version : {std::string("1.21.2"),std::string("1.21.100")}) {
             S s; A m; setup(s,m,version);
@@ -525,9 +596,23 @@ int main() {
             event.packet=bedrock::VersionedPacketCodec::forVersion(state.version).makePacketByName("container_close",{255,1,0});
             state.observeMapQueue(event,true);require(state.mapScreenWindow==255,"client-only close keeps map preflight blocked");
             state.observeMapQueue(event,false);require(state.mapScreenWindow==-1,"server close releases map preflight guard");
+            state.mapArchive=std::make_shared<bedrock::MapArchive>();state.mapQueue.configureArchive(3,1);
+            state.mapQueue.stage=bedrock::MapShulkerQueue::Stage::Paused;state.mapScreenWindow=42;
+            state.mapClientPackets.push_back(event.packet);state.mapLoading=true;auto revision=state.mapArchiveRevision;
+            state.mapCommand(bedrock::JsRuntimeValue::object({{"op",bedrock::JsRuntimeValue::string("stop")}}));
+            require(!state.mapBusy()&&state.mapClientPackets.empty()&&state.mapArchiveRevision>revision,"explicit map stop discards queued packets and invalidates asynchronous template load");
+            require(state.mapScreenWindow==42&&state.mapQueue.index==1&&state.mapQueue.total==3&&state.mapLoading,"stop preserves actual GUI guard, progress and loader ownership");
+            state.mapCommand(bedrock::JsRuntimeValue::object({{"op",bedrock::JsRuntimeValue::string("clear")}}));
+            require(!state.mapArchive&&state.mapQueue.total==0&&state.mapQueue.index==0&&!state.mapBusy(),"clear unloads archive even during canceled loading");
+            require(state.mapQueue.timing.hold==300&&state.mapScreenWindow==42,"clear retains configured timing and does not pretend a GUI was closed");
+            state.mapCommand(bedrock::JsRuntimeValue::object({{"op",bedrock::JsRuntimeValue::string("clear")}}));
+            require(!state.mapQueue.canStart(),"clearing twice is safe and start requires another ZIP");
         }
         verifyNativeIntegration();
+        verifyMapPlacementIntegration();
         verifyPlatformIntegration();
+        if(argc==3&&std::string(argv[1])=="--map-archive")verifyMapArchive(std::filesystem::u8path(argv[2]));
+        else if(argc!=1)throw std::runtime_error("Usage: relay-auto-craft-smoke [--map-archive file.zip]");
         std::cout<<"Auto 2: "<<checks<<" checks passed\n";
         return 0;
     } catch(const std::exception& e) {std::cerr<<"FAIL: "<<e.what()<<"\n";return 1;}

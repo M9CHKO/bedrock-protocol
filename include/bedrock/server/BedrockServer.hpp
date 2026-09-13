@@ -29,7 +29,6 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <exception>
@@ -227,10 +226,6 @@ struct BedrockServerOptions {
     // Reliable-delivery inactivity timeout after RakNet connects. Appended to
     // preserve positional aggregate initialization of the original fields.
     int raknetTimeoutMs = 30'000;
-    // The uncompressed MCPE batch payload is split before compression and
-    // encryption. A packet larger than the byte limit is sent alone.
-    std::size_t maxBatchPayloadBytes = 512u * 1024u;
-    std::size_t maxPacketsPerBatch = 16;
 };
 
 // C++ lifecycle switches are intentionally separate from the ordinary
@@ -260,8 +255,6 @@ struct ServerOptions {
     int batchingInterval = 20;
 
     ServerAdvancedOptions advanced;
-    std::size_t maxBatchPayloadBytes = 512u * 1024u;
-    std::size_t maxPacketsPerBatch = 16;
 };
 
 class BedrockServer;
@@ -1340,6 +1333,7 @@ public:
         const VersionedGamePacket& packet,
         VersionedMcpeCompression compression = VersionedMcpeCompression::Automatic
     ) {
+        if (mapInterceptor_ && mapInterceptor_(connection, packet)) return;
         // Do not construct an initializer_list/vector of a multi-megabyte
         // packet merely to enqueue one item (each owns both raw buffers).
         const auto session = sessionSnapshot(connection);
@@ -1360,6 +1354,12 @@ public:
         VersionedMcpeCompression compression = VersionedMcpeCompression::Automatic
     ) {
         if (packets.empty()) return;
+        if (mapInterceptor_) {
+            // Apply the gate separately to every packet, including mixed batches
+            // and public sendBuffer()/queue() callers. No whole-batch bypass.
+            for (const auto& packet : packets) queuePacket(connection, packet, compression);
+            return;
+        }
         const auto session = sessionSnapshot(connection);
         if (!session) return;
         std::lock_guard<std::recursive_mutex> outboundLock(session->outboundMutex);
@@ -1420,21 +1420,20 @@ public:
         // may enqueue several already-bounded vectors during one batching
         // interval, so limiting only each queuePackets() call is insufficient:
         // the scheduler would otherwise merge them back into one large batch.
+        constexpr std::size_t MaximumPacketsPerBatch = 64;
+        constexpr std::size_t MaximumBytesPerBatch = 48 * 1024;
         std::size_t begin = 0;
         while (begin < queued.size()) {
             const auto compression = queued[begin].compression;
             std::size_t end = begin + 1;
-            std::size_t batchBytes = packetBatchContribution(
-                queued[begin].packet
-            );
+            std::size_t batchBytes =
+                queued[begin].packet.fullPacket.size() + 16;
             while (end < queued.size() &&
                    queued[end].compression == compression &&
-                   end - begin < options_.maxPacketsPerBatch) {
-                const auto packetBytes = packetBatchContribution(
-                    queued[end].packet
-                );
-                if (batchBytes >= options_.maxBatchPayloadBytes ||
-                    packetBytes > options_.maxBatchPayloadBytes - batchBytes) {
+                   end - begin < MaximumPacketsPerBatch) {
+                const auto packetBytes =
+                    queued[end].packet.fullPacket.size() + 16;
+                if (batchBytes + packetBytes > MaximumBytesPerBatch) {
                     break;
                 }
                 batchBytes += packetBytes;
@@ -1464,25 +1463,13 @@ public:
         const std::vector<VersionedGamePacket>& packets,
         VersionedMcpeCompression compression = VersionedMcpeCompression::Automatic
     ) {
-        sendPacketsInternal(connection, packets, compression, true);
-    }
-
-    // Flush already queued gameplay before writing a low-priority payload.
-    // Keeping the outer outbound lock across both operations prevents a map
-    // update from overtaking chat, movement responses, or chunk data that was
-    // already waiting for the next batching tick.
-    void sendLowPriorityPackets(
-        const BedrockServerConnection& connection,
-        const std::vector<VersionedGamePacket>& packets,
-        VersionedMcpeCompression compression = VersionedMcpeCompression::Automatic
-    ) {
-        if (packets.empty()) return;
-        const auto session = sessionSnapshot(connection);
-        if (!session) return;
-        std::lock_guard<std::recursive_mutex> outboundLock(
-            session->outboundMutex
-        );
-        sendQueued(connection);
+        if (mapInterceptor_) {
+            std::vector<VersionedGamePacket> ordinary;
+            for (const auto& packet : packets)
+                if (!mapInterceptor_(connection, packet)) ordinary.push_back(packet);
+            sendPacketsInternal(connection, ordinary, compression, true);
+            return;
+        }
         sendPacketsInternal(connection, packets, compression, true);
     }
 
@@ -1561,6 +1548,32 @@ private:
     friend BedrockServer createNativeServer(BedrockServerOptions options);
     friend struct BedrockServerTestAccess;
 
+    friend class BedrockLiveRelay;
+    // Installed once by the owning relay before listen(). The only bypass is
+    // the private scheduled-map sink below; public send/queue APIs are gated.
+    std::function<bool(const BedrockServerConnection&, const VersionedGamePacket&)> mapInterceptor_;
+    std::function<void(const BedrockServerConnection&)> outboundIdle_;
+    bool trySendScheduledMap(const BedrockServerConnection& connection,
+                             const VersionedGamePacket& packet,
+                             VersionedMcpeCompression compression) {
+        const auto session = sessionSnapshot(connection);
+        if (!session) return false;
+        std::unique_lock<std::recursive_mutex> outboundLock(session->outboundMutex, std::try_to_lock);
+        if (!outboundLock) return false;
+        {
+            std::lock_guard lock(session->mutex);
+            if (session->status == BedrockServerClientStatus::Disconnected ||
+                !session->queuedPackets.empty()) return false; // gameplay first
+        }
+        const auto pressure = transportStatistics(connection);
+        if (!pressure.statisticsAvailable || pressure.sendBufferBytes > 32 * 1024 ||
+            pressure.resendBufferBytes > 96 * 1024 || !hasWritablePlayer(connection)) return false;
+        // Compression and encryption happen here, under the very same lock as
+        // all ordinary batches. Nothing encrypted is stored in the map spool.
+        sendPacketsInternal(connection, {packet}, compression, false);
+        return true;
+    }
+
     BedrockServerOptions options_;
     ServerAdvertisement advertisement_;
     RakNetServer raknet_;
@@ -1626,12 +1639,6 @@ private:
             throw std::runtime_error(
                 "Unknown compression algorithm: " + options.compressionAlgorithm
             );
-        }
-        if (options.maxBatchPayloadBytes == 0) {
-            options.maxBatchPayloadBytes = 512u * 1024u;
-        }
-        if (options.maxPacketsPerBatch == 0) {
-            options.maxPacketsPerBatch = 16;
         }
         return options;
     }
@@ -2120,42 +2127,6 @@ private:
         return std::chrono::milliseconds(std::max(options_.batchingInterval, 1));
     }
 
-    static std::size_t encodedVarUIntSize(std::size_t value) noexcept {
-        std::size_t bytes = 1;
-        while (value >= 0x80u) {
-            value >>= 7u;
-            ++bytes;
-        }
-        return bytes;
-    }
-
-    static std::size_t packetBatchContribution(
-        const VersionedGamePacket& packet
-    ) noexcept {
-        return encodedVarUIntSize(packet.fullPacket.size()) +
-            packet.fullPacket.size();
-    }
-
-    std::size_t boundedBatchEnd(
-        const std::vector<VersionedGamePacket>& packets,
-        std::size_t begin
-    ) const noexcept {
-        if (begin >= packets.size()) return begin;
-        std::size_t end = begin + 1;
-        std::size_t bytes = packetBatchContribution(packets[begin]);
-        while (end < packets.size() &&
-               end - begin < options_.maxPacketsPerBatch) {
-            const auto next = packetBatchContribution(packets[end]);
-            if (bytes >= options_.maxBatchPayloadBytes ||
-                next > options_.maxBatchPayloadBytes - bytes) {
-                break;
-            }
-            bytes += next;
-            ++end;
-        }
-        return end;
-    }
-
     void sendPacketsInternal(
         const BedrockServerConnection& connection,
         const std::vector<VersionedGamePacket>& packets,
@@ -2163,37 +2134,6 @@ private:
         bool processOutbound
     ) {
         if (packets.empty()) {
-            return;
-        }
-
-        const auto firstEnd = boundedBatchEnd(packets, 0);
-        if (firstEnd < packets.size()) {
-            // Serialize the complete split operation for this Player. Each
-            // recursive call handles exactly one bounded batch and therefore
-            // advances the encryption counter once, in original packet order.
-            const auto session = sessionSnapshot(connection);
-            if (!session) return;
-            std::lock_guard<std::recursive_mutex> outboundLock(
-                session->outboundMutex
-            );
-            std::size_t begin = 0;
-            while (begin < packets.size()) {
-                const auto end = boundedBatchEnd(packets, begin);
-                std::vector<VersionedGamePacket> batch;
-                batch.reserve(end - begin);
-                batch.insert(
-                    batch.end(),
-                    packets.begin() + static_cast<std::ptrdiff_t>(begin),
-                    packets.begin() + static_cast<std::ptrdiff_t>(end)
-                );
-                sendPacketsInternal(
-                    connection,
-                    batch,
-                    compression,
-                    processOutbound
-                );
-                begin = end;
-            }
             return;
         }
 
@@ -2368,6 +2308,9 @@ private:
         for (const auto& player : players) {
             try {
                 sendQueued(player);
+                // No outbound/session lock is held here: map scheduling cannot
+                // invert the ordinary relay dispatch/encryption lock order.
+                if (outboundIdle_) outboundIdle_(player);
             } catch (const std::exception& error) {
                 emitTransport(
                     BedrockServerTransportEventKind::Error,
@@ -3955,8 +3898,6 @@ inline BedrockServerOptions expandServerOptions(ServerOptions options) {
     out.compressionAlgorithm = std::move(options.compressionAlgorithm);
     out.compressionLevel = options.compressionLevel;
     out.batchingInterval = options.batchingInterval;
-    out.maxBatchPayloadBytes = options.maxBatchPayloadBytes;
-    out.maxPacketsPerBatch = options.maxPacketsPerBatch;
     return out;
 }
 

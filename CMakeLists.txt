@@ -357,21 +357,18 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
 
     add_executable(live-relay-smoke tools/live_relay_smoke.cpp)
     target_link_libraries(live-relay-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+    add_executable(live-relay-remote-close-smoke tools/live_relay_remote_close_smoke.cpp)
+    target_link_libraries(live-relay-remote-close-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+    add_executable(map-request-queue-smoke tools/map_request_queue_smoke.cpp)
+    target_link_libraries(map-request-queue-smoke PRIVATE BedrockProtocol::bedrock_protocol)
+    add_executable(map-capacity-smoke tools/map_capacity_smoke.cpp)
+    target_link_libraries(map-capacity-smoke PRIVATE BedrockProtocol::bedrock_protocol)
 
     add_executable(live-relay-multi-client-smoke tools/live_relay_multi_client_smoke.cpp)
     target_link_libraries(live-relay-multi-client-smoke PRIVATE BedrockProtocol::bedrock_protocol)
 
     add_executable(live-relay-options-smoke tools/live_relay_options_smoke.cpp)
     target_link_libraries(live-relay-options-smoke PRIVATE BedrockProtocol::bedrock_protocol)
-
-    add_executable(
-        live-relay-map-throttle-smoke
-        tools/live_relay_map_throttle_smoke.cpp
-    )
-    target_link_libraries(
-        live-relay-map-throttle-smoke
-        PRIVATE BedrockProtocol::bedrock_protocol
-    )
 
     add_executable(
         live-relay-regression-smoke
@@ -425,29 +422,9 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
     target_link_libraries(world-iterators-smoke PRIVATE BedrockProtocol::bedrock_protocol)
 
     add_executable(map-item-data-smoke tools/map_item_data_smoke.cpp)
+    add_executable(no-render-smoke tools/no_render_smoke.cpp)
+    target_link_libraries(no-render-smoke PRIVATE BedrockProtocol::bedrock_protocol)
     target_link_libraries(map-item-data-smoke PRIVATE BedrockProtocol::bedrock_protocol)
-
-    add_executable(
-        clientbound-map-queue-smoke
-        tools/clientbound_map_queue_smoke.cpp
-    )
-    target_link_libraries(
-        clientbound-map-queue-smoke
-        PRIVATE BedrockProtocol::bedrock_protocol
-    )
-    add_executable(
-        clientbound-map-queue-stress
-        EXCLUDE_FROM_ALL
-        tools/clientbound_map_queue_smoke.cpp
-    )
-    target_compile_definitions(
-        clientbound-map-queue-stress
-        PRIVATE BEDROCK_MAP_STRESS_COUNT=3600
-    )
-    target_link_libraries(
-        clientbound-map-queue-stress
-        PRIVATE BedrockProtocol::bedrock_protocol
-    )
 
     add_executable(bedrock-block-registry-smoke tools/bedrock_block_registry_smoke.cpp)
     target_link_libraries(bedrock-block-registry-smoke PRIVATE BedrockProtocol::bedrock_protocol)
@@ -515,6 +492,8 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
         add_test(NAME nbt-codec-smoke COMMAND nbt-codec-smoke)
         add_test(NAME bedrock-nbt-file-smoke COMMAND bedrock-nbt-file-smoke)
         add_test(NAME protodef-nbt-smoke COMMAND protodef-nbt-smoke)
+        add_test(NAME no-render-smoke COMMAND no-render-smoke)
+        add_test(NAME no-render-live-smoke COMMAND no-render-smoke --live)
         add_test(NAME protodef-variables-smoke COMMAND protodef-variables-smoke)
         add_test(NAME protodef-structured-smoke COMMAND protodef-structured-smoke)
         add_test(NAME subchunk-packet-smoke COMMAND subchunk-packet-smoke)
@@ -553,10 +532,6 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
         )
         add_test(NAME world-iterators-smoke COMMAND world-iterators-smoke)
         add_test(NAME map-item-data-smoke COMMAND map-item-data-smoke)
-        add_test(
-            NAME clientbound-map-queue-smoke
-            COMMAND clientbound-map-queue-smoke
-        )
         add_test(NAME bedrock-block-registry-smoke COMMAND bedrock-block-registry-smoke)
         add_test(NAME bedrock-item-smoke COMMAND bedrock-item-smoke)
         add_test(NAME bedrock-registry-smoke COMMAND bedrock-registry-smoke)
@@ -580,12 +555,15 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
         )
         add_test(NAME network-client-smoke COMMAND network-client-smoke)
         add_test(NAME live-relay-smoke COMMAND live-relay-smoke)
+        add_test(NAME live-relay-remote-close-smoke COMMAND live-relay-remote-close-smoke)
+        set_tests_properties(live-relay-remote-close-smoke PROPERTIES TIMEOUT 120)
+        add_test(NAME map-request-queue-smoke COMMAND map-request-queue-smoke)
+        add_test(NAME map-capacity-smoke COMMAND map-capacity-smoke)
+        set_tests_properties(map-capacity-smoke PROPERTIES TIMEOUT 300)
+        add_test(NAME map-request-queue-live-smoke COMMAND map-request-queue-smoke --live)
+        set_tests_properties(map-request-queue-live-smoke PROPERTIES TIMEOUT 90)
         add_test(NAME live-relay-multi-client-smoke COMMAND live-relay-multi-client-smoke)
         add_test(NAME live-relay-options-smoke COMMAND live-relay-options-smoke)
-        add_test(
-            NAME live-relay-map-throttle-smoke
-            COMMAND live-relay-map-throttle-smoke
-        )
         add_test(NAME live-relay-regression-smoke COMMAND live-relay-regression-smoke)
         add_test(NAME public-header-smoke COMMAND public-header-smoke)
         add_test(NAME public-header-reverse-smoke COMMAND public-header-reverse-smoke)
@@ -617,7 +595,6 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
             entity-position-tracker-smoke
             world-iterators-smoke
             map-item-data-smoke
-            clientbound-map-queue-smoke
             bedrock-block-registry-smoke
             bedrock-item-smoke
             bedrock-registry-smoke
@@ -638,7 +615,6 @@ if(BEDROCK_PROTOCOL_CPP_BUILD_TOOLS)
             live-relay-smoke
             live-relay-multi-client-smoke
             live-relay-options-smoke
-            live-relay-map-throttle-smoke
             live-relay-regression-smoke
             public-header-smoke
             public-header-reverse-smoke

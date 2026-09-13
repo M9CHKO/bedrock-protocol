@@ -12,6 +12,7 @@ internal static class SelfTest
     {
         string output = args.Length > 1 ? Path.GetFullPath(args[1]) : Path.Combine(Path.GetTempPath(), "cpe-test-" + Guid.NewGuid());
         Directory.CreateDirectory(output);
+        LogStore.TestDirectory = output; // Never mix fault-injection logs with an active user's test.
         var checks = new List<string>();
         void Require(bool value, string name) { if (!value) throw new InvalidOperationException(name); checks.Add(name); }
         try
@@ -25,21 +26,36 @@ internal static class SelfTest
             Require(AppSettings.ValidSlot("Weathertop_End_Nested") && !AppSettings.ValidSlot("../test") && !AppSettings.ValidSlot(new string('x', 33)), "Safe NBT slot names");
             AutoCraftUiTests.Run(output, Require);
             MapQueueUiTests.Run(output, Require);
+            ModuleUiTests.Run(Require);
             using (var form = new MainForm(preview: true))
             {
                 form.StartPosition = FormStartPosition.Manual; form.Location = new Point(-15000, -15000);
                 form.Show(); Application.DoEvents();
-                for (int i = 0; i < 5; i++)
+                for (int i = 0; i < form.PageCount; i++)
                 {
                     form.SelectPage(i); form.PerformLayout(); Application.DoEvents();
                     using var bitmap = new Bitmap(form.Width, form.Height);
                     form.DrawToBitmap(bitmap, new Rectangle(Point.Empty, form.Size));
                     bitmap.Save(Path.Combine(output, $"screen-{i + 1}.png"));
                 }
-                for (int i = 0; i < 200; i++) form.SelectPage(i % 5);
+                form.SelectPage(3);
+                for (int i = 0; i < form.Modules.Count; i++)
+                {
+                    form.Modules.SelectModule(i); form.PerformLayout(); Application.DoEvents();
+                    using var bitmap = new Bitmap(form.Width, form.Height);
+                    form.DrawToBitmap(bitmap, new Rectangle(Point.Empty, form.Size));
+                    bitmap.Save(Path.Combine(output, $"module-{form.Modules.SelectedId}.png"));
+                }
+                form.Modules.ShowCatalog();
+                form.Size = form.MinimumSize; form.PerformLayout(); Application.DoEvents();
+                using (var bitmap = new Bitmap(form.Width, form.Height)) {
+                    form.DrawToBitmap(bitmap, new Rectangle(Point.Empty, form.Size));
+                    bitmap.Save(Path.Combine(output, "modules-minimum.png"));
+                }
+                for (int i = 0; i < 200; i++) { form.SelectPage(i % form.PageCount); form.Modules.SelectModule(i % form.Modules.Count); }
                 form.Close();
             }
-            checks.Add("All five screens render; 200 navigation switches");
+            checks.Add("All six screens and eight modules render; minimum-size layout; 200 navigation switches");
             Require(AuthProfiles.ValidName("Player 123") && !AuthProfiles.ValidName("../Player") && !AuthProfiles.ValidName("CON"), "Safe profile folder names");
             string cacheFixture = Path.Combine(output, "synthetic-cache"), profileRoot = Path.Combine(output, "synthetic-profiles");
             Directory.CreateDirectory(cacheFixture);
@@ -159,6 +175,8 @@ internal static class MapQueueUiTests
         host.Controls.Add(panel);Theme.Inputs(host);host.Show();Application.DoEvents();
         panel.Update(JsonSerializer.SerializeToElement(new{busy=false,loaded=true,status="ZIP готов. Файлов: 200",file="0001.qznbt",completed=0,total=200,maps=0}));
         require(panel.Loaded,"Map panel displays imported archive without starting");
+        var buttons=panel.Controls.OfType<FlowLayoutPanel>().SelectMany(row=>row.Controls.OfType<Button>()).ToArray();
+        require(buttons.Any(b=>b.Text=="Остановить / сбросить")&&buttons.Any(b=>b.Text=="Удалить ZIP"),"Map queue exposes explicit reset and unload ZIP buttons");
         using(var bitmap=new Bitmap(host.Width,host.Height)){host.DrawToBitmap(bitmap,new Rectangle(Point.Empty,host.Size));bitmap.Save(Path.Combine(output,"maps-settings.png"));}
         using var floating=new FloatingDepositForm(maps:true);floating.Location=new Point(-15000,-15000);
         floating.UpdateIndicators(JsonSerializer.SerializeToElement(new{running=true,upstreamReady=true,mapQueue=new{busy=true,loaded=true,status="Показываю карту 3 / 27",completed=10,total=200,maps=2}}),true);
@@ -168,6 +186,8 @@ internal static class MapQueueUiTests
         floating.ShowError("Закройте текущее окно");
         floating.UpdateIndicators(JsonSerializer.SerializeToElement(new{running=false}),true);
         require(Field<Label>(floating,"detail").Text.Contains("Закройте"),"Map start error remains visible across snapshot refresh");
+        panel.Update(JsonSerializer.SerializeToElement(new{busy=false,loaded=false,status="ZIP удалён из очереди",file="",completed=0,total=0,maps=0}));
+        require(!panel.Loaded&&!Field<bool>(panel,"busy")&&Field<Label>(panel,"status").Text.Contains("0 / 0"),"Clear snapshot removes loaded state, counters and busy flag");
         host.Close();floating.Close();
     }
 }

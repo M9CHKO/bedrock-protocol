@@ -1,24 +1,49 @@
 #pragma once
 #include <bedrock/relay/AutoCraftStore.hpp>
 #include <bedrock/relay/PlatformBuilder.hpp>
+#include <bedrock/relay/MapPlacement.hpp>
 #include <bedrock/nbt/BedrockNbt.hpp>
 #include <bedrock/BinaryStream.hpp>
 #include <map>
 
 namespace bedrock {
-// One ZIP entry at a time. No file I/O, network calls, NBT trees, or timers here.
+// One ZIP entry at a time. No file I/O, network calls, or image decoding here.
 // The host serializes callbacks and sends Output only after encoding succeeds.
 class MapShulkerQueue {
 public:
     using Slot=ShulkerDeposit::Slot; using Pos=platform::Pos; using Camera=PlatformBuilder::Camera;
     using World=PlatformBuilder::World; using Packet=PlatformBuilder::Packet;
     using Target=AutoCraftStore::Target;
+    static constexpr size_t MaximumMapWireBytes=1024u*1024u;
+    // QZNBTF02 exports may use Bedrock names or Nukkit's legacy item IDs.
+    // Validate identity without rewriting the item or its opaque PNG/NBT data.
+    static std::map<int,int64_t> templateMapIds(const NbtValue& tag){
+        const auto* items=tag.find("Items");
+        if(tag.type!=NbtTagType::Compound||!items||items->type!=NbtTagType::List||
+            items->listElementType!=NbtTagType::Compound||items->listValue.empty()||items->listValue.size()>27)
+            throw std::runtime_error("Нужен шалкер с картами непосредственно в его ячейках");
+        const auto integral=[](const NbtValue* v){return v&&(v->type==NbtTagType::Byte||v->type==NbtTagType::Short||v->type==NbtTagType::Int||v->type==NbtTagType::Long);};
+        std::map<int,int64_t> maps;
+        for(const auto& item:items->listValue){
+            const auto* name=item.find("Name");const auto* id=item.find("id");
+            const auto* slot=item.find("Slot");const auto* count=item.find("Count");const auto* data=item.find("tag");
+            const auto* uuid=data?data->find("map_uuid"):nullptr;
+            const bool named=name&&name->type==NbtTagType::String&&name->stringValue=="minecraft:filled_map";
+            const bool numbered=integral(id)&&id->integerValue==358;
+            if(item.type!=NbtTagType::Compound||(!named&&!numbered)||(name&&!named)||(id&&!numbered)||
+                !integral(slot)||slot->integerValue<0||slot->integerValue>26||!integral(count)||count->integerValue!=1||
+                !data||data->type!=NbtTagType::Compound||!uuid||uuid->type!=NbtTagType::Long||
+                !maps.emplace(int(slot->integerValue),uuid->integerValue).second)
+                throw std::runtime_error("Каждая ячейка должна содержать одну карту: Name=minecraft:filled_map или id=358, Slot=0..26 и map_uuid (Long)");
+        }
+        return maps;
+    }
     struct Timing {
         int craft=1000,open=700,close=700,place=500,transfer=600,hold=1500,breakMs=3500,pickup=1000,store=700,next=1000,timeout=30000;
         void clamp(){for(auto p:{&craft,&open,&close,&place,&transfer,&hold,&pickup,&store,&next})*p=std::clamp(*p,100,10000);
             transfer=std::max(transfer,500);hold=std::max(hold,300);breakMs=std::clamp(breakMs,3000,15000);timeout=std::clamp(timeout,10000,120000);}
     } timing;
-    enum class Stage {Idle,NeedTemplate,Crafting,AfterCraft,Place,PlaceWait,OpenBox,OpeningBox,Maps,Transfer,Closing,Hold,ReturnMap,Break,Digging,BreakWait,Pickup,FindChest,OpeningChest,Store,Next,Paused};
+    enum class Stage {Idle,NeedTemplate,Crafting,AfterCraft,Place,PlaceEquipped,PlaceWait,OpenBox,OpeningBox,Maps,Transfer,Closing,Hold,ReturnMap,Break,Digging,BreakWait,Pickup,FindChest,OpeningChest,Store,Next,Paused};
     Stage stage=Stage::Idle;
     std::string status="Загрузите ZIP с .qznbt",name;
     size_t index=0,total=0; unsigned mapsDone=0,stored=0;
@@ -52,17 +77,23 @@ public:
     void loaded(Slot item,std::map<int,int64_t> maps,std::string filename,uint64_t now){
         if(!needsTemplate())return;
         if(!item.wire || item.item.id!=shulkerId || maps.empty() || maps.size()>27)throw std::runtime_error("Шаблон должен содержать карты в 27 ячейках шалкера");
-        prepared=std::move(item);templateMaps=std::move(maps);name=std::move(filename);done.clear();mapsDone=0;currentMap=-1;resultSlot=-1;dropId=0;picked=false;
+        prepared=std::move(item);templateMaps=std::move(maps);name=std::move(filename);done.clear();mapsDone=0;currentMap=-1;resultSlot=-1;dropId=0;picked=false;craftConfirmed=false;
         slots.enabled=false;slots.stopped=false;craft.preparedResult=prepared;craft.resultId=shulkerId;craft.resultRuntime=shulkerRuntime;craft.templateName=name;
         craft.configureTiming(timing.craft,timing.open);craft.start(slots,{table,chests.front()},origin.x,origin.y,origin.z,now);
         if(!craft.busy()){pause(craft.status);return;}stage=Stage::Crafting;status="Крафт: "+name;
     }
     void pause(std::string reason){status=std::move(reason);stage=Stage::Paused;}
-    void stop(uint64_t now){
-        if(stage==Stage::Idle)return;
-        if(craft.busy()){craft.stop(slots,"Остановлено. Проверьте текущий шалкер",now);stopRequested=true;stage=Stage::Crafting;return;}
-        if(stage==Stage::OpeningBox||stage==Stage::OpeningChest){stopRequested=true;status="Ожидаю запрошенное окно перед остановкой";return;}
-        if(window>=0){stopRequested=true;closeTo(Stage::Idle,now);}else{stage=Stage::Idle;prepared={};watch.clear();status="Остановлено. Текущий NBT не отмечен завершённым";}
+    void stop(uint64_t /*now*/){
+        // Explicit cancellation must work even when a close/open ACK never
+        // arrives. Keep inventory and completed entries, never roll back an
+        // already-sent transaction or mark the interrupted entry complete.
+        craft.reset(slots);slots.close(slots.window);slots.enabled=false;
+        stage=afterClose=transferNext=Stage::Idle;window=-1;windowType=0;
+        hand=resultSlot=currentMap=pickedSlot=-1;nextAt=deadline=holdAt=dropId=0;
+        ready=closeSent=clientClosed=serverClosed=equippedMap=mapData=picked=stopRequested=craftConfirmed=false;
+        prepared={};templateMaps.clear();container.clear();watch.clear();queued.clear();done.clear();tried.clear();fullChests.clear();chests.clear();
+        table=box=openedTarget=destination={};name.clear();mapsDone=0;
+        status="Остановлено, состояние сброшено. Проверьте предметы и закройте окно вручную. Текущий файл не завершён";
     }
     void opened(int id,int type,Pos p,uint64_t now){
         if(stage==Stage::Crafting){craft.opened(slots,id,type,p.x,p.y,p.z,now);return;}
@@ -86,12 +117,22 @@ public:
     void inventory(const std::vector<uint8_t>& bytes,bool full,uint64_t now){
         auto inv=ShulkerDeposit::readInventory(bytes,full,slots.modern);
         if(inv.window!=0 && (window<0||inv.window!=uint32_t(window)))return;
-        if(inv.window==0){slots.observeInventory(bytes,full,now);if(stage==Stage::Crafting)craft.inventory(slots,inv,now);}
+        if(inv.window==0){
+            slots.observeInventory(bytes,full,now);
+            const auto first=full?0u:inv.slot;
+            if(first>slots.player.size()||inv.items.size()>slots.player.size()-first)return;
+            // Ingredient caching intentionally stays small in the other modules.
+            // Maps need their complete PNG-bearing wire item after server echoes too.
+            if(reserved())for(size_t i=0;i<inv.items.size();++i)retainMap(slots.player[first+i],bytes);
+            if(stage==Stage::Crafting)craft.inventory(slots,inv,now);
+            if((stage==Stage::Crafting||stage==Stage::AfterCraft)&&resultSlot>=int(first)&&
+                size_t(resultSlot-int(first))<inv.items.size())
+                craftConfirmed=sameShulker(slots.player[resultSlot],prepared);
+        }
         else {if(full){if(inv.items.size()!=27&&inv.items.size()!=54)throw std::runtime_error("Размер контейнера не поддержан");container.assign(inv.items.size(),{});ready=true;}
             auto first=full?0u:inv.slot;if(first>container.size()||inv.items.size()>container.size()-first)return;
-            for(size_t i=0;i<inv.items.size();++i){Slot item{inv.items[i],{},true};const auto n=item.item.end-item.item.begin;
-                if(item.item.id==mapId && n<=32768)item.wire=std::make_shared<const std::vector<uint8_t>>(bytes.begin()+item.item.begin,bytes.begin()+item.item.end);
-                container[first+i]=std::move(item);}}
+            for(size_t i=0;i<inv.items.size();++i)container[first+i]=Slot{inv.items[i],{},true};
+            for(size_t i=0;i<inv.items.size();++i)retainMap(container[first+i],bytes);}
         auto first=full?0u:inv.slot;
         for(size_t i=0;i<inv.items.size();++i){auto it=watch.find({int(inv.window),int(first+i)});if(it!=watch.end()&&!inv.items[i].same(it->second)){
                 pause("Сервер скорректировал перенос. Проверьте карту / шалкер; повтор не отправлен");return;}}
@@ -123,7 +164,8 @@ public:
             if(!craft.busy()){
                 if(stopRequested){stopRequested=false;stage=Stage::Idle;return out;}
                 if(resultSlot<0){pause(status);return out;}
-                stage=Stage::AfterCraft;nextAt=now+timing.close;
+                stage=Stage::AfterCraft;nextAt=now+timing.close;deadline=now+timing.timeout;
+                status="Жду созданный шалкер в инвентаре сервера";
             }return out;
         }
         if(now<nextAt)return out;
@@ -131,12 +173,22 @@ public:
             else if(now>=deadline)pause("Нет подтверждения закрытия окна");return out;}
         if(stage==Stage::OpeningBox||stage==Stage::OpeningChest||stage==Stage::PlaceWait||stage==Stage::BreakWait){if(now>=deadline)pause("Нет ответа сервера на действие — автоматический повтор запрещён");return out;}
         if(stage==Stage::Transfer){stage=transferNext;return out;}
-        if(stage==Stage::AfterCraft){if(resultSlot!=hand){move(out,0,resultSlot,0,hand,Stage::Place,now);return out;}stage=Stage::Place;}
-        if(stage==Stage::Place){
-            auto pos=Pos{box.x,box.y,box.z};auto b=world(pos),support=world({pos.x,pos.y-1,pos.z});
-            if(!b.known||!b.air||!support.known||!support.safeFloor){pause("Место рядом занято либо нет безопасной опоры");return out;}
-            if(slots.player[hand].item.id!=shulkerId||slots.player[hand].item.count!=1){pause("Созданный шалкер не в рабочей ячейке");return out;}
-            Target floor{pos.x,pos.y-1,pos.z,support.runtime,1};use(out,c,floor,hand,0);stage=Stage::PlaceWait;deadline=now+timing.timeout;status="Устанавливаю шалкер: жду UpdateBlock";return out;
+        if(stage==Stage::AfterCraft){
+            if(!craftConfirmed){if(now>=deadline)pause("Сервер не подтвердил созданный шалкер. Установка не отправлена; проверьте инвентарь");return out;}
+            if(resultSlot!=hand){move(out,0,resultSlot,0,hand,Stage::Place,now);return out;}stage=Stage::Place;
+        }
+        if(stage==Stage::Place||stage==Stage::PlaceEquipped){
+            auto pos=Pos{box.x,box.y,box.z};
+            const auto checked=MapPlacement::check(c,pos,world);
+            if(checked!=MapPlacement::Check::Ready){pause(MapPlacement::message(checked));return out;}
+            auto support=world({pos.x,pos.y-1,pos.z});
+            if(!sameShulker(slots.player[hand],prepared)){pause("Созданный шалкер не в рабочей ячейке либо его NBT изменился");return out;}
+            if(stage==Stage::Place){equip(out,c,hand);stage=Stage::PlaceEquipped;nextAt=now+180;status="Выбираю шалкер в руке перед установкой";return out;}
+            // As in the bot: settle equipment, then use-on with an actual
+            // inventory consumption action, not the empty-action open packet.
+            Target floor{pos.x,pos.y-1,pos.z,support.runtime,1};place(out,c,floor);
+            watch.erase({0,hand}); // server may consume the item BEFORE UpdateBlock
+            stage=Stage::PlaceWait;deadline=now+timing.timeout;status="Устанавливаю шалкер: жду UpdateBlock";return out;
         }
         if(stage==Stage::OpenBox){auto b=world({box.x,box.y,box.z});if(!b.known||b.name.find("shulker_box")==std::string::npos){pause("Шалкер на месте не найден");return out;}
             box.runtime=b.runtime;use(out,c,box,hand,0);stage=Stage::OpeningBox;deadline=now+timing.timeout;status="Открываю свой шалкер";return out;}
@@ -179,21 +231,52 @@ public:
     }
     bool templateDue(uint64_t now)const{return needsTemplate()&&now>=nextAt;}
     static std::optional<int64_t> mapUuid(const Slot& slot){
-        if(!slot.wire||slot.wire->size()>4096||slot.item.extraBegin<slot.item.begin)return {};
-        auto r=BinaryStream::view(*slot.wire,slot.item.extraBegin-slot.item.begin);
-        if(r.readU16LE()!=65535||r.readU8()!=1)return {};
-        auto root=BedrockNbtCodec::read(r,BedrockNbtEncoding::LittleEndian,{8,2048,128,256});
-        auto* id=root.root.find("map_uuid");if(!id||id->type!=NbtTagType::Long)return {};return id->integerValue;
+        if(!slot.wire||slot.wire->size()>MaximumMapWireBytes||slot.item.extraBegin<slot.item.begin)return {};
+        try {
+            auto r=BinaryStream::view(*slot.wire,slot.item.extraBegin-slot.item.begin);
+            if(r.readU16LE()!=65535||r.readU8()!=1||r.readU8()!=uint8_t(NbtTagType::Compound))return {};
+            const auto readName=[&](){const auto n=r.readU16LE();if(n>2048||n>r.remaining())throw std::runtime_error("Invalid NBT name");
+                std::string_view name(reinterpret_cast<const char*>(slot.wire->data()+r.offset()),n);r.seek(r.offset()+n);return name;};
+            readName();std::optional<int64_t> uuid;
+            // Skip Colors and other tags in-place. Never expand PNG bytes to a
+            // ProtoDef/NbtValue tree in the receive/transfer path.
+            for(size_t i=0;i<256;++i){const auto start=r.offset();const auto type=r.readU8();
+                if(type==uint8_t(NbtTagType::End))return uuid;
+                const auto name=readName();
+                if(name=="map_uuid"){if(uuid||type!=uint8_t(NbtTagType::Long))return {};uuid=r.readI64LE();}
+                else {r.seek(start);BedrockNbtCodec::skip(r,BedrockNbtEncoding::LittleEndian,{16,2048,MaximumMapWireBytes,4096});}
+            }
+        }catch(const std::exception&){}
+        return {};
     }
 private:
     Stage afterClose=Stage::Idle,transferNext=Stage::Idle;
     Camera origin;Target destination;
     int hand=-1,window=-1,windowType=0,resultSlot=-1,currentMap=-1,pickedSlot=-1;
     bool ready=false,closeSent=false,clientClosed=false,serverClosed=false,equippedMap=false,mapData=false,picked=false,stopRequested=false;
+    bool craftConfirmed=false;
     uint64_t nextAt=0,deadline=0,holdAt=0,dropId=0;
     std::vector<Slot> container;std::vector<Packet> queued;std::set<int> done;
     std::set<AutoCraftStore::Key> tried,fullChests;
     std::map<std::pair<int,int>,ShulkerDeposit::Item> watch;
+    static bool sameShulker(const Slot& a,const Slot& b){
+        if(!a.known||!a.wire||!b.wire||a.item.count!=1||!a.item.same(b.item))return false;
+        const auto offsetA=a.item.extraBegin-a.item.begin,offsetB=b.item.extraBegin-b.item.begin;
+        return offsetA<=a.wire->size()&&offsetB<=b.wire->size()&&a.wire->size()-offsetA==b.wire->size()-offsetB&&
+            std::equal(a.wire->begin()+offsetA,a.wire->end(),b.wire->begin()+offsetB);
+    }
+    void retainMap(Slot& slot,const std::vector<uint8_t>& bytes){
+        if(!mapId||slot.item.id!=mapId||!slot.item.present())return;
+        slot.wire.reset();
+        const auto& item=slot.item;
+        if(item.end<item.begin||item.end>bytes.size()||item.end-item.begin>MaximumMapWireBytes)
+            throw std::runtime_error("NBT одной карты превышает безопасный лимит 1 МиБ");
+        const auto size=item.end-item.begin;
+        auto used=slots.cachedBytes();for(const auto& s:container)if(s.wire)used+=s.wire->size();
+        if(used>ShulkerDeposit::MaximumCacheBytes-size)
+            throw std::runtime_error("Слишком много данных карт в открытом инвентаре (лимит 16 МиБ)");
+        slot.wire=std::make_shared<const std::vector<uint8_t>>(bytes.begin()+item.begin,bytes.begin()+item.end);
+    }
     Packet slotPacket(int id,int i,const Slot& s)const{return {"inventory_slot",ShulkerDeposit::slotPayload(id,uint8_t(i),s.wire.get(),{},255,slots.modern),true};}
     static Packet closePacket(int id,int type){ProtoDefWriter w;w.u8(id);w.u8(type);w.boolValue(true);return {"container_close",w.take(),true};}
     void closeTo(Stage next,uint64_t now){afterClose=next;stage=Stage::Closing;nextAt=now;closeSent=clientClosed=serverClosed=false;}
@@ -214,11 +297,21 @@ private:
     void equip(std::vector<Packet>& out,Camera c,int slot){ProtoDefWriter w;w.varuint64(c.runtime);w.bytes(AutoCraftStore::wire(slots.player.at(slot)));w.u8(slot);w.u8(slot);w.u8(0);
         auto payload=w.take();out.push_back({"mob_equipment",payload,false});out.push_back({"mob_equipment",std::move(payload),true});
         ProtoDefWriter select;select.varuint32(slot);select.u8(0);select.boolValue(true);out.push_back({"player_hotbar",select.take(),true});}
-    void use(std::vector<Packet>& out,Camera c,Target t,int slot,int action){equip(out,c,slot);ProtoDefWriter w;
-        w.zigzag32(0);w.varuint32(2);w.varuint32(0);w.varuint32(action);if(slots.modern)w.varuint32(1);
+    void use(std::vector<Packet>& out,Camera c,Target t,int slot,int action,bool placing=false){if(!placing)equip(out,c,slot);ProtoDefWriter w;
+        w.zigzag32(0);w.varuint32(2);w.varuint32(placing?1:0);
+        if(placing){w.varuint32(0);w.zigzag32(0);w.varuint32(slot);w.bytes(AutoCraftStore::wire(slots.player.at(slot)));w.zigzag32(0);}
+        w.varuint32(action);if(slots.modern)w.varuint32(1);
         w.zigzag32(t.x);w.varuint32(uint32_t(t.y));w.zigzag32(t.z);w.zigzag32(t.face);w.zigzag32(slot);w.bytes(AutoCraftStore::wire(slots.player.at(slot)));
         w.f32le(c.x);w.f32le(c.y);w.f32le(c.z);w.f32le(.5);w.f32le(1);w.f32le(.5);w.varuint32(t.runtime);if(slots.modern)w.varuint32(1);
         out.push_back({"inventory_transaction",w.take(),false});}
+    void place(std::vector<Packet>& out,Camera c,Target floor){
+        const auto action=[&](int id,Pos pos,Pos result,int face){ProtoDefWriter w;w.varuint64(c.runtime);w.zigzag32(id);
+            for(auto p:{pos,result}){w.zigzag32(p.x);w.varuint32(p.y);w.zigzag32(p.z);}w.zigzag32(face);out.push_back({"player_action",w.take(),false});};
+        action(28,{floor.x,floor.y,floor.z},{box.x,box.y,box.z},1);
+        ProtoDefWriter swing;swing.zigzag32(1);swing.varuint64(c.runtime);out.push_back({"animate",swing.take(),false});
+        use(out,c,floor,hand,0,true);
+        action(29,{box.x,box.y,box.z},{0,0,0},0);
+    }
     void playerAction(std::vector<Packet>& out,Camera c,int action){ProtoDefWriter w;w.varuint64(c.runtime);w.zigzag32(action);
         for(int i=0;i<2;++i){w.zigzag32(box.x);w.varuint32(box.y);w.zigzag32(box.z);}w.zigzag32(1);out.push_back({"player_action",w.take(),false});}
 };

@@ -76,14 +76,12 @@ constexpr std::size_t MaximumMiniMapTiles = 768;
 constexpr std::size_t MaximumNbtTransferFileBytes = 8u * 1024u * 1024u;
 constexpr std::size_t MaximumNbtTransferNodes = 100'000;
 constexpr std::size_t MaximumNbtTransferDepth = 32;
-// Keep the Android and Windows frontends on the same limits as the shared C++
-// packet layer. The Windows native relay compiles this same bridge source.
-constexpr std::size_t MaximumTrackedInventoryPacketBytes =
-    bedrock::PacketMemoryPolicy::MaximumTrackedInventoryPacketBytes;
-constexpr std::size_t StructuredItemPacketBytes =
-    bedrock::PacketMemoryPolicy::StructuredItemPacketBytes;
+constexpr std::size_t MaximumTrackedInventoryPacketBytes = 256u * 1024u;
+constexpr std::size_t StructuredItemPacketBytes = 16u * 1024u;
 
 std::atomic<bool> configuredDetailedLogging {true};
+std::atomic<bool> configuredNoRenderMaps {false};
+std::atomic<bool> configuredNoRenderEntities {false};
 std::atomic<bool> configuredChunkRetention {false};
 std::atomic<int> configuredRetainedRadiusChunks {24};
 std::atomic<bool> configuredAutoArmor {false};
@@ -426,10 +424,6 @@ bool shouldPublishResourcePackSample(
 
 bool shouldRecordEquipmentSample(uint64_t sampleIndex) {
     return sampleIndex <= 8 || sampleIndex % 128 == 0;
-}
-
-bool shouldRecordMapSample(uint64_t sampleIndex) {
-    return sampleIndex <= 4 || sampleIndex % 128 == 0;
 }
 
 bool isFlightPacket(std::string_view name) {
@@ -1188,9 +1182,6 @@ struct RelayState {
     std::atomic<uint64_t> clientboundEquipmentPackets {0};
     std::atomic<uint64_t> clientboundEquipmentTransportPackets {0};
     std::atomic<uint64_t> clientboundEquipmentForwardedPackets {0};
-    std::atomic<uint64_t> clientboundMapPackets {0};
-    std::atomic<uint64_t> clientboundMapTransportPackets {0};
-    std::atomic<uint64_t> clientboundMapForwardedPackets {0};
     std::atomic<uint64_t> resourcePackPacketsSeen {0};
     std::atomic<uint64_t> resourcePackPacketsForwarded {0};
     std::atomic<bool> detailedLogging {true};
@@ -10514,11 +10505,7 @@ public:
     ) {
         bedrock::RelayOptions options;
         options.version = version;
-        // This is an in-device relay. Binding only loopback prevents
-        // Minecraft from selecting the phone's Wi-Fi/LAN address, where its
-        // very large fragmented Login was observed repeatedly losing all but
-        // the first split fragment.
-        options.host = "127.0.0.1";
+        options.host = "0.0.0.0";
         options.port = 19132;
 #if defined(BEDROCK_RELAY_WINDOWS)
         options.motd = "CPE Relay Windows";
@@ -10537,41 +10524,15 @@ public:
         options.downstreamRaknetTimeoutMs = 120'000;
         options.upstreamRaknetTimeoutMs = 120'000;
         options.logging = false;
-        // Keep large initial chunks compact. Level 1 expanded the first
-        // no-cache world batch enough to monopolize Android's reliable
-        // RakNet stream and starve gameplay traffic.
-        options.compressionLevel = 7;
-        // A map wall may arrive as thousands of 128x128 updates. Retain every
-        // image, but send one low-priority map at a time so it cannot occupy
-        // the reliable RakNet stream ahead of chat, chunks, or movement.
-        options.throttleMapItemData = true;
-        options.mapFlushIntervalMs = 1'500;
-        options.mapInitialDelayMs = 5'000;
-        options.mapPacketsPerFlush = 1;
-        options.mapBytesPerFlush = 128u * 1024u;
-        options.mapMaxSendBufferBytes = 32u * 1024u;
-        options.mapMaxResendBufferBytes = 96u * 1024u;
-        options.maxMapQueuePackets = 4096;
-        options.maxMapQueueBytes = 256u * 1024u * 1024u;
-        options.maxPacketsPerBatch = 16;
-        options.maxBatchPayloadBytes = 512u * 1024u;
-        options.throttleClientboundVisualBursts = true;
-        options.visualBurstWindowMs = 30'000;
-        options.visualInitialDelayMs = 1'500;
-        options.visualFlushIntervalMs = 150;
-        options.visualPacketsPerFlush = 4;
-        options.visualBytesPerFlush = 64u * 1024u;
-        options.prioritizeServerboundActions = true;
-        options.queueClientboundLevelChunksUntilStartGame = false;
+        // Prefer latency/CPU over maximum compression on the phone. The
+        // MCPE framing and negotiated encryption remain unchanged.
+        options.compressionLevel = 1;
         // The mobile relay has raw packet observers, not packet editors.
         // Preserve backend extensions byte-for-byte instead of disconnecting
         // when a server uses a newer optional packet field.
         options.parseErrorPolicy = bedrock::RelayParseErrorPolicy::ForwardRaw;
         options.validateUnhandledPackets = false;
-        // Minecraft for Android supports the Bedrock blob cache. Advertise it
-        // upstream so large level_chunk packets can reference cached blobs
-        // instead of retransmitting the complete world payload.
-        options.enableChunkCaching = true;
+        options.enableChunkCaching = false;
         options.levelChunkRetentionMaximumBytes =
             AndroidLevelChunkRetentionMaximumBytes;
         options.destination.host = destinationHost;
@@ -10614,7 +10575,7 @@ public:
 
         state_->push(
             "relay_start",
-            "local=127.0.0.1:19132 destination=" + destinationHost + ":" +
+            "local=0.0.0.0:19132 destination=" + destinationHost + ":" +
                 std::to_string(destinationPort) +
                 " version=" + version +
                 " forceSingle=true replaceExisting=true" +
@@ -10629,17 +10590,9 @@ public:
                         (1024u * 1024u)
                 ) +
                 " nativeBuild=" + std::string(NativeBuildType) +
-                " rawUnhandledPackets=true itemNbt=binary_cache" +
-                " chunkCache=true compressionLevel=7" +
-                " mapFlushIntervalMs=1500 mapInitialDelayMs=5000" +
-                " mapPacketsPerFlush=1 mapBytesPerFlush=131072" +
-                " mapMaxSendBufferBytes=32768" +
-                " mapMaxResendBufferBytes=98304 mapPriority=adaptive-low" +
-                " visualBurstWindowMs=30000 visualInitialDelayMs=1500" +
-                " visualFlushIntervalMs=150 visualPacketsPerFlush=4" +
-                " visualBytesPerFlush=65536" +
-                " serverboundActions=immediate-after-flush" +
-                " preStartChunkQueue=false" +
+                " rawUnhandledPackets=true itemNbt=binary_cache compressionLevel=1" +
+                " mapPayload=intercept-only mapRate=8/s mapBytesPerSecond=655360 mapBurst=1 mapRamMiB=8 mapDiskMiB=512 mapStorage=paged" +
+                " mapRequests=scheduled mapRequestRate=8/s mapRequestsInFlight=2 mapRequestsHidden=paused mapRequestCapacity=4000 mapCapacity=4000" +
                 " compilerOptimized=" +
                 (NativeCompilerOptimized ? "true" : "false"),
             "INFO",
@@ -10654,6 +10607,11 @@ public:
             ))
         );
         auto* liveRelay = &relay->live();
+        liveRelay->setMapSpoolDirectory(cacheDirectory / "map-spool");
+        liveRelay->configureNoRender(configuredNoRenderMaps.load(), configuredNoRenderEntities.load());
+        liveRelay->onDiagnostic([state](const std::string& message) {
+            state->push("map_delivery", safeMessage(message), "INFO", "transport");
+        });
 
         relay->live().server().onTransport([this, state](
             const bedrock::BedrockServerTransportEvent& event
@@ -10681,14 +10639,6 @@ public:
                 sampleIndex =
                     state->clientboundEquipmentTransportPackets.fetch_add(1) + 1;
                 record = shouldRecordEquipmentSample(sampleIndex);
-            } else if (
-                event.kind ==
-                    bedrock::BedrockServerTransportEventKind::SendPacket &&
-                event.packetName == "clientbound_map_item_data"
-            ) {
-                sampleIndex =
-                    state->clientboundMapTransportPackets.fetch_add(1) + 1;
-                record = shouldRecordMapSample(sampleIndex);
             } else if ((event.kind ==
                             bedrock::BedrockServerTransportEventKind::DecodedPacket ||
                         event.kind ==
@@ -10783,9 +10733,6 @@ public:
             state->clientboundEquipmentPackets = 0;
             state->clientboundEquipmentTransportPackets = 0;
             state->clientboundEquipmentForwardedPackets = 0;
-            state->clientboundMapPackets = 0;
-            state->clientboundMapTransportPackets = 0;
-            state->clientboundMapForwardedPackets = 0;
             state->chunkPublisherPacketsObserved = 0;
             state->chunkPublisherPacketsRewritten = 0;
             state->chunkPublisherDecodeFailures = 0;
@@ -10855,16 +10802,6 @@ public:
                     "clientbound_equipment_packets=" +
                     std::to_string(
                         state->clientboundEquipmentPackets.load()
-                    ) +
-                    " forwarded_equipment_packets=" +
-                    std::to_string(
-                        state->clientboundEquipmentForwardedPackets.load()
-                    ) +
-                    " clientbound_map_packets=" +
-                    std::to_string(state->clientboundMapPackets.load()) +
-                    " forwarded_map_packets=" +
-                    std::to_string(
-                        state->clientboundMapForwardedPackets.load()
                     ),
                 "INFO",
                 "lifecycle"
@@ -11220,9 +11157,6 @@ public:
                 sampleIndex =
                     state->clientboundEquipmentPackets.fetch_add(1) + 1;
                 sampled = shouldRecordEquipmentSample(sampleIndex);
-            } else if (event.packet.name == "clientbound_map_item_data") {
-                sampleIndex = state->clientboundMapPackets.fetch_add(1) + 1;
-                sampled = shouldRecordMapSample(sampleIndex);
             }
             if (sampled && isFlightPacket(event.packet.name)) {
                 state->recordFlight(
@@ -11265,19 +11199,6 @@ public:
         relay->live().onForwarded([state, liveRelay](
             const bedrock::BedrockRelayPacketEvent& event
         ) {
-            if (event.direction ==
-                    bedrock::BedrockRelayDirection::Serverbound &&
-                event.packet.name == "client_cache_status") {
-                const bool enabled = !event.packet.payload.empty() &&
-                    event.packet.payload.front() != 0;
-                state->push(
-                    "client_cache_status",
-                    "forwardedToServer=true enabled=" +
-                        std::string(enabled ? "true" : "false"),
-                    "INFO",
-                    "chunks"
-                );
-            }
             if (isResourcePackTransportPacket(event.packet.name)) {
                 const auto sampleIndex =
                     state->resourcePackPacketsForwarded.fetch_add(
@@ -11344,12 +11265,6 @@ public:
                 sampleIndex =
                     state->clientboundEquipmentForwardedPackets.fetch_add(1) + 1;
                 record = record && shouldRecordEquipmentSample(sampleIndex);
-            } else if (event.direction ==
-                    bedrock::BedrockRelayDirection::Clientbound &&
-                event.packet.name == "clientbound_map_item_data") {
-                sampleIndex =
-                    state->clientboundMapForwardedPackets.fetch_add(1) + 1;
-                record = record && shouldRecordMapSample(sampleIndex);
             }
             if (record) {
                 auto breadcrumb = packetBreadcrumb(
@@ -11624,6 +11539,26 @@ public:
         state_->updateLevelChunkRetentionStats(
             relay_->live().levelChunkRetentionStats()
         );
+    }
+
+    void configureNoRender(bool maps, bool entities) noexcept {
+        try {
+            std::lock_guard lock(relayMutex_);
+            if (relay_) relay_->live().configureNoRender(maps, entities);
+            state_->push("no_render", "maps=" + std::string(maps ? "hidden" : "visible") +
+                " entities=" + (entities ? "hidden" : "visible"), "INFO", "visuals");
+        } catch (const std::exception& e) {
+            state_->push("no_render_error", safeMessage(e.what()), "ERROR", "visuals");
+        }
+    }
+
+    void pumpNoRender() noexcept {
+        try {
+            std::lock_guard lock(relayMutex_);
+            if (relay_) relay_->live().pumpNoRender();
+        } catch (const std::exception& e) {
+            state_->push("no_render_error", safeMessage(e.what()), "ERROR", "visuals");
+        }
     }
 
     bool replaceSchematicDebugMarkers(
@@ -12962,10 +12897,96 @@ private:
 
             const auto generation = pendingLogin_->generation;
             const auto deadline = pendingLogin_->deadline;
-            if (loginWatchdogCv_.wait_until(lock, deadline, [this, generation]() {
+            const bool watchFragmentedLogin =
+                pendingLogin_->stage == "request_network_settings";
+            const auto wakeAt = watchFragmentedLogin
+                ? std::min(
+                    deadline,
+                    std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(750)
+                )
+                : deadline;
+            if (loginWatchdogCv_.wait_until(lock, wakeAt, [this, generation]() {
                     return loginWatchdogStopping_ || !pendingLogin_ ||
                         pendingLogin_->generation != generation;
                 })) {
+                continue;
+            }
+
+            // A stale Minecraft UDP/RakNet socket can deliver the ~590 KiB
+            // Login packet with reliability sequence numbers belonging to a
+            // previous relay process. RakNet then counts the fragments as
+            // ignored forever: NetworkSettings was accepted, but Login can
+            // never be assembled. Detect that signature early and free the
+            // peer instead of making the user wait for the full watchdog.
+            if (watchFragmentedLogin &&
+                std::chrono::steady_clock::now() < deadline) {
+                const auto candidate = *pendingLogin_;
+                lock.unlock();
+                bedrock::RakNetServerPeerStatistics statistics;
+                {
+                    std::lock_guard relayLock(relayMutex_);
+                    if (relay_) {
+                        statistics = relay_->live().server()
+                            .transportStatistics(candidate.connection);
+                    }
+                }
+                lock.lock();
+                if (loginWatchdogStopping_) break;
+                if (!pendingLogin_ ||
+                    pendingLogin_->generation != generation) {
+                    continue;
+                }
+                const auto stageElapsed = std::chrono::duration_cast<
+                    std::chrono::milliseconds
+                >(
+                    std::chrono::steady_clock::now() -
+                        pendingLogin_->stageStartedAt
+                );
+                const bool poisonedFragmentStream =
+                    stageElapsed >= std::chrono::milliseconds(2'500) &&
+                    statistics.peerKnown && statistics.nativeActive &&
+                    statistics.statisticsAvailable &&
+                    statistics.userMessageBytesReceivedIgnored >=
+                        256ull * 1024ull &&
+                    statistics.userMessageBytesReceivedProcessed <
+                        64ull * 1024ull;
+                if (!poisonedFragmentStream) continue;
+
+                const auto poisoned = *pendingLogin_;
+                pendingLogin_.reset();
+                ++loginWatchdogGeneration_;
+                lock.unlock();
+                const auto visibleError =
+                    "Minecraft reused a stale local connection; reconnect "
+                    "to 127.0.0.1:19132";
+                {
+                    std::lock_guard stateLock(state_->mutex);
+                    state_->lastError = visibleError;
+                }
+                state_->push(
+                    "local_login_fragment_reset",
+                    "downstream_session=" + poisoned.sessionId +
+                        " last_stage=" + poisoned.stage +
+                        " elapsedMs=" + std::to_string(stageElapsed.count()) +
+                        " raknet={" +
+                        rakNetStatisticsBreadcrumb(statistics) +
+                        "}; closing stale fragmented login immediately so "
+                        "Minecraft can reconnect",
+                    "ERROR",
+                    "watchdog"
+                );
+                state_->flushFlight("local_login_fragment_reset", 48);
+                {
+                    std::lock_guard relayLock(relayMutex_);
+                    if (relay_) {
+                        relay_->live().disconnectDownstream(
+                            poisoned.connection,
+                            visibleError
+                        );
+                    }
+                }
+                lock.lock();
                 continue;
             }
 
@@ -13338,6 +13359,17 @@ Java_com_m9chko_bedrockrelay_NativeBridge_nbtCraftStatus(
             ? "Relay не запущен"
             : state->nbtCraftModeStatus()
     );
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_m9chko_bedrockrelay_NativeBridge_configureNoRender(
+    JNIEnv*, jclass, jboolean /*legacyMaps*/, jboolean entities
+) {
+    configuredNoRenderMaps = false; // Android map delivery is always automatic.
+    configuredNoRenderEntities = entities == JNI_TRUE;
+    std::shared_ptr<RelayController> activeController;
+    { std::lock_guard lock(controllerMutex); activeController = controller; }
+    if (activeController) activeController->configureNoRender(false, entities == JNI_TRUE);
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -13864,6 +13896,7 @@ Java_com_m9chko_bedrockrelay_NativeBridge_refreshAreaFillMarkers(JNIEnv*, jclass
         activeController = controller;
     }
     if (activeController) {
+        activeController->pumpNoRender();
         activeController->restoreAutoCraftTable();
         if (requested || configuredAreaFill.load(std::memory_order_relaxed))
             activeController->refreshAreaFillDebugMarkers();

@@ -27,10 +27,7 @@ public:
 
     void inspect(const GamePacket& packet) const {
         ProtoDefPacketDecoder decoder(minecraftVersion_, variables_);
-        auto fields = decoder.decodePacketForObservation(
-            packet.name,
-            packet.payload
-        );
+        auto fields = decoder.decodePacket(packet.name, packet.payload);
 
         std::cout << "[INSPECT] packet "
                   << packet.name

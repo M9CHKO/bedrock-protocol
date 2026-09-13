@@ -64,6 +64,14 @@ internal static class ShutdownTests
     }
     private static async Task RunAsync(string output, Action<bool, string> require)
     {
+        var flood = new List<string> { "[ERROR] initiating disconnect" };
+        flood.AddRange(Enumerable.Range(0, 768).Select(i => $"[DEBUG] flight {i} " + new string('x', 2048)));
+        string bounded = LogBatch.Build(flood);
+        require(bounded.Contains("[ERROR] initiating disconnect") && bounded.Length < 29000,
+            "Flight dump cannot evict initiating error from bounded UI/disk log");
+        var timestamped = JsonSerializer.SerializeToElement(new { timestampMs = 1000L, level = "INFO", type = "test", message = "timestamp" });
+        require(LogBatch.NativeEvent(timestamped).StartsWith(DateTimeOffset.FromUnixTimeMilliseconds(1000).ToLocalTime().ToString("HH:mm:ss.fff")),
+            "Flight records retain original event timestamp, not dump timestamp");
         // Exercise the real DLL in its child too, without taking the user's port
         // or starting any Microsoft/remote authentication session.
         using (var native = new RelayBackend())
@@ -130,6 +138,21 @@ internal static class ShutdownTests
             bound = await recover.Call(new { action = "test.bind" });
             require(bound.Flag("ok"), "Worker can restart after unexpected process exit");
             await recover.StopAsync();
+        }
+
+        using (var pollRecover = new RelayBackend(testWorker: true))
+        {
+            await pollRecover.Call(new { action = "test.bind", crashOnSnapshot = true });
+            var failure = await pollRecover.Poll();
+            require(failure is not null && !failure.Value.State.Flag("running") && failure.Value.State.Text("workerError").Length > 0 &&
+                failure.Value.Events.EnumerateArray().Any(e => e.Text("type") == "worker_exit" && e.Text("level") == "ERROR"),
+                "Background polling reports worker death instead of silently returning stopped");
+            var unchanged = await pollRecover.Poll();
+            require(unchanged is not null && unchanged.Value.State.Text("workerError").Length > 0 && unchanged.Value.Events.GetArrayLength() == 0,
+                "Worker failure persists in status without repeating log events");
+            bound = await pollRecover.Call(new { action = "test.bind" });
+            require(bound.Flag("ok"), "Restart after polling-detected worker failure");
+            await pollRecover.StopAsync();
         }
 
         string marker = Path.Combine(output, "owner-exit.json");

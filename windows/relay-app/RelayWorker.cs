@@ -47,6 +47,16 @@ internal sealed class WorkerSession : IDisposable
     private readonly Task ready;
     private int disposed, stopping;
     internal bool IsDisposed => Volatile.Read(ref disposed) != 0;
+    internal string Failure { get; private set; } = "";
+
+    private void RecordFailure()
+    {
+        if (Volatile.Read(ref stopping) != 0 || IsDisposed) return;
+        string code = "";
+        try { if (process.HasExited) code = $" Код выхода: 0x{unchecked((uint)process.ExitCode):X8}."; }
+        catch (InvalidOperationException) { }
+        Failure = "Рабочий процесс реле неожиданно завершился или потерял связь с окном." + code;
+    }
 
     internal WorkerSession(bool testWorker)
     {
@@ -104,6 +114,7 @@ internal sealed class WorkerSession : IDisposable
         }
         catch (Exception error) when (error is IOException or ObjectDisposedException)
         {
+            RecordFailure();
             Dispose();
             if (Volatile.Read(ref stopping) != 0) throw new OperationCanceledException();
             throw new IOException("Связь с ядром реле прервана. Можно запустить его снова.");
@@ -120,7 +131,12 @@ internal sealed class WorkerSession : IDisposable
             return (state, events);
         }
         catch (Exception error) when (error is IOException or ObjectDisposedException or OperationCanceledException)
-        { Dispose(); return null; }
+        {
+            RecordFailure(); Dispose();
+            if (Failure.Length == 0) return null;
+            return (JsonSerializer.SerializeToElement(new { running = false, workerError = Failure }),
+                JsonSerializer.SerializeToElement(new[] { new { type = "worker_exit", level = "ERROR", message = Failure } }));
+        }
         finally { gate.Release(); }
     }
     internal async Task<bool> StopAsync()
@@ -180,7 +196,7 @@ internal static class RelayWorker
             await pipe.ConnectAsync(10000).ConfigureAwait(false);
             if (!test) maintenance = Task.Run(() => Maintain(lifetime.Token));
             using var testSocket = test ? new UdpClient(new IPEndPoint(IPAddress.Loopback, 0)) : null;
-            bool hangOnStop = false;
+            bool hangOnStop = false, crashOnSnapshot = false;
             while (true)
             {
                 var request = await WorkerWire.Read(pipe, CancellationToken.None).ConfigureAwait(false);
@@ -188,8 +204,8 @@ internal static class RelayWorker
                 object response;
                 if (test)
                 {
-                    if (action == "test.bind") hangOnStop = request.Flag("hangOnStop");
-                    if (action == "test.crash") Environment.Exit(3);
+                    if (action == "test.bind") { hangOnStop = request.Flag("hangOnStop"); crashOnSnapshot = request.Flag("crashOnSnapshot"); }
+                    if (action == "test.crash" || (action == "snapshot" && crashOnSnapshot)) Environment.Exit(3);
                     if (action == "test.hang" || (action == "stop" && hangOnStop))
                     {
                         if (request.Text("readyEvent").StartsWith(@"Local\CpeRelayTest-", StringComparison.Ordinal))

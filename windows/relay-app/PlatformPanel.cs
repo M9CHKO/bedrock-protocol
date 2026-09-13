@@ -29,20 +29,22 @@ internal sealed class PlatformPanel : FlowLayoutPanel
         var row = new FlowLayoutPanel { AutoSize = true, Width = 730 };
         foreach (var (title, op) in new[] { ("Старт", "start"), ("Продолжить", "resume"), ("Стоп", "stop"), ("Настройки", "configure"), ("Записать сундук", "record") })
         {
-            var button = new Button { Text = title, AutoSize = true, ForeColor = Theme.Text, BackColor = Theme.Sidebar };
+            var button = new RelayButton { Text = title, AutoSize = true, Height = 40, MinimumSize = new Size(100,40),
+                Padding = new Padding(12,5,12,5), Margin = new Padding(0,3,8,6), Primary = op == "start" };
             button.Click += async (_, _) => await Command(op); row.Controls.Add(button);
         }
         Controls.Add(row); Controls.Add(state); Controls.Add(chests);
         Controls.SetChildIndex(row,1);
-        var remove = new Button { Text = "Удалить выбранную запись", AutoSize = true, ForeColor = Theme.Text, BackColor = Theme.Sidebar };
+        var remove = new RelayButton { Text = "Удалить выбранную запись", AutoSize = true, Height = 40,
+            MinimumSize = new Size(220,40), Padding = new Padding(12,5,12,5), Margin = new Padding(0,6,0,6) };
         remove.Click += async (_, _) => { if (chests.SelectedIndex >= 0) await Command("remove", chests.SelectedIndex + 1); };
         Controls.Add(remove);
     }
     private void AddText(string text) => Controls.Add(new Label { Text = text, AutoSize = true, MaximumSize = new Size(730, 0), ForeColor = Theme.Text });
     private void AddNumber(string key, string label, decimal fallback, decimal min, decimal max, int decimals = 0)
     {
-        var row = new FlowLayoutPanel { AutoSize = true, Width = 730 };
-        row.Controls.Add(new Label { Text = label, Width = 420, ForeColor = Theme.Text, Padding = new Padding(0, 5, 0, 0) });
+        var row = new FlowLayoutPanel { AutoSize = true, Width = 730, Margin = new Padding(0,4,0,4) };
+        row.Controls.Add(new Label { Text = label, Width = 420, ForeColor = Theme.Muted, Padding = new Padding(0, 5, 0, 0) });
         var input = new NumericUpDown { Minimum = min, Maximum = max, DecimalPlaces = decimals, Increment = decimals == 0 ? 1 : .01m, Width = 120 };
         input.Value = Math.Clamp(settings.Platform.GetValueOrDefault(key, fallback), min, max);
         fields[key] = input; row.Controls.Add(input); Controls.Add(row);

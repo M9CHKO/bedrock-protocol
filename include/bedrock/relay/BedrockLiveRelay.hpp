@@ -3,8 +3,8 @@
 #include <bedrock/client/BedrockNetworkClient.hpp>
 #include <bedrock/realms/BedrockRealms.hpp>
 #include <bedrock/relay/BedrockRelay.hpp>
-#include <bedrock/relay/ClientboundMapQueue.hpp>
 #include <bedrock/relay/LevelChunkRetentionCache.hpp>
+#include <bedrock/relay/MapDeliveryQueue.hpp>
 #include <bedrock/server/BedrockServer.hpp>
 
 #include <atomic>
@@ -66,40 +66,7 @@ struct BedrockLiveRelayOptions {
     // from destination.offline ?? relay.offline used for upstream auth mode.
     bool useDownstreamDisplayNameForUpstreamUsername = false;
     VersionedMcpeCompression clientboundCompression = VersionedMcpeCompression::Automatic;
-    // Map pixels are intentionally lower priority than gameplay state. Every
-    // map is retained and forwarded, but only this many packets/bytes are sent
-    // after queued gameplay during one independent map scheduler tick. The
-    // initial delay keeps a map wall from competing with the join inventory
-    // and chunk burst, while the transport limits pause maps behind unacked
-    // reliable gameplay traffic.
-    bool throttleMapItemData = true;
-    int mapFlushIntervalMs = 500;
-    int mapInitialDelayMs = 2500;
-    std::size_t mapPacketsPerFlush = 1;
-    std::size_t mapBytesPerFlush = 128u * 1024u;
-    std::size_t mapMaxSendBufferBytes = 32u * 1024u;
-    std::size_t mapMaxResendBufferBytes = 96u * 1024u;
-    std::size_t maxMapQueuePackets = 4096;
-    std::size_t maxMapQueueBytes = 256u * 1024u * 1024u;
-    // Bound every downstream MCPE batch before compression and encryption.
-    std::size_t maxBatchPayloadBytes = 512u * 1024u;
-    std::size_t maxPacketsPerBatch = 16;
-    // Busy worlds can emit hundreds of equipment/item-entity updates in a
-    // single upstream tick.  Feeding that whole burst to a mobile renderer at
-    // once can freeze Minecraft even though RakNet and relay memory are
-    // healthy.  During the initial world-load window, pace only these visual
-    // packets; ordinary gameplay, chat and inventory responses remain on the
-    // normal queue.
-    bool throttleClientboundVisualBursts = true;
-    int visualBurstWindowMs = 30'000;
-    int visualInitialDelayMs = 1'500;
-    int visualFlushIntervalMs = 150;
-    std::size_t visualPacketsPerFlush = 4;
-    std::size_t visualBytesPerFlush = 64u * 1024u;
-    // Flush already queued movement before latency-sensitive actions and send
-    // the action immediately. This keeps chest, inventory and block actions
-    // responsive while a clientbound visual backlog is draining.
-    bool prioritizeServerboundActions = true;
+    MapDeliveryOptions mapDelivery;
 };
 
 namespace detail {
@@ -186,7 +153,12 @@ public:
     // the cache is cleared on dimension/session changes and bounded by memory.
     void configureLevelChunkRetention(bool enabled, uint32_t radiusChunks);
     LevelChunkRetentionStats levelChunkRetentionStats() const noexcept;
-    ClientboundMapQueueStats mapQueueStats() const noexcept;
+
+    // Opt-in client-only module; the normal transport remains unchanged.
+    void configureNoRender(bool hideMaps, bool hideEntities);
+    void pumpNoRender();
+    // Set before listen(); Android/Windows pass their private cache directory.
+    void setMapSpoolDirectory(const std::filesystem::path& directory);
 
     // Queues an already encoded clientbound batch only for this relay's
     // existing downstream game session. The packets bypass relay handlers and
@@ -235,14 +207,14 @@ private:
     std::unordered_set<std::string> rejectedConnections_;
     std::string primarySessionId_;
     mutable std::recursive_mutex handlerDispatchMutex_;
+    bool noRenderAvailable_ = false;
+    bool noRenderMaps_ = false;
+    bool noRenderEntities_ = false;
+    void pumpMaps(const BedrockServerConnection& connection);
+    void reportMaps(const std::shared_ptr<Session>& session, bool final);
     mutable std::mutex levelChunkRetentionConfigMutex_;
     bool levelChunkRetentionEnabled_ = false;
     uint32_t retainedLevelChunkRadius_ = 24;
-
-    mutable std::mutex mapQueueSchedulerMutex_;
-    std::condition_variable mapQueueSchedulerCv_;
-    std::thread mapQueueSchedulerThread_;
-    bool mapQueueSchedulerStopping_ = false;
 
     std::atomic<bool> closed_ {true};
     std::atomic<bool> listening_ {false};
@@ -313,26 +285,6 @@ private:
     void forwardClientbound(
         const std::shared_ptr<Session>& session,
         const VersionedGamePacket& packet
-    );
-    void ensureMapQueueScheduler();
-    void runMapQueueScheduler();
-    void flushMapQueues();
-    bool flushSessionMapQueue(
-        const std::shared_ptr<Session>& session,
-        bool pressure
-    );
-    bool flushSessionVisualQueue(
-        const std::shared_ptr<Session>& session
-    );
-    void stopMapQueueScheduler();
-    void reportMapFlow(
-        const std::shared_ptr<Session>& session,
-        bool force
-    );
-    void reportMapFlowSummary(
-        const std::shared_ptr<Session>& session,
-        const ClientboundMapQueueStats& stats,
-        const std::string& reason
     );
     void retainClientboundLevelChunk(
         const std::shared_ptr<Session>& session,

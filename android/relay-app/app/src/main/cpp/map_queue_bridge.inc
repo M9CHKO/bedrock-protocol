@@ -8,8 +8,25 @@ bool mapLoading=false;
 int mapScreenWindow=-1;
 std::vector<bedrock::VersionedGamePacket> mapClientPackets;
 bedrock::AutoCraftStore::Target mapCloseTarget{};
+int mapLoggedStage=-1;
+std::string mapLoggedStatus;
+void traceMapQueueLocked(){
+    const int stage=int(mapQueue.stage);
+    if(stage==mapLoggedStage&&mapQueue.status==mapLoggedStatus)return;
+    mapLoggedStage=stage;mapLoggedStatus=mapQueue.status;
+    push("maps_state","stage="+std::to_string(stage)+" entry="+std::to_string(mapQueue.index)+
+        " hand="+std::to_string(mapQueue.heldIndex())+" box="+std::to_string(mapQueue.box.x)+","+
+        std::to_string(mapQueue.box.y)+","+std::to_string(mapQueue.box.z)+" status="+mapQueue.status,"INFO","automation");
+}
+void stopMapQueueLocked(){
+    ++mapArchiveRevision; // invalidate a ZIP entry currently loading off-thread
+    mapQueue.stop(steadyMilliseconds());mapClientPackets.clear();mapCloseTarget={};
+    // mapScreenWindow deliberately tracks the REAL GUI, including late opens.
+    // Resetting automation is not evidence that Minecraft has closed it.
+}
 bool mapBusy()const{std::lock_guard lock(mapQueueMutex);return mapQueue.reserved();}
-bedrock::JsRuntimeValue mapSnapshotLocked()const{
+bedrock::JsRuntimeValue mapSnapshotLocked(){
+    traceMapQueueLocked();
     using J=bedrock::JsRuntimeValue;
     return J::object({{"busy",J::boolean(mapQueue.reserved())},{"running",J::boolean(mapQueue.busy())},
         {"status",J::string(mapQueue.status)},{"file",J::string(mapQueue.name)},
@@ -26,17 +43,14 @@ void loadNextMapTemplate(){
         auto* name=root.find("Name");auto* tag=root.find("tag");
         if(!name||name->type!=bedrock::NbtTagType::String||!isShulkerName(name->stringValue)||!tag||tag->type!=bedrock::NbtTagType::Compound)
             throw std::runtime_error("В файле нет шалкера QZNBTF02");
-        const auto* items=tag->find("Items");
-        if(!items||items->type!=bedrock::NbtTagType::List||items->listValue.empty()||items->listValue.size()>27)
-            throw std::runtime_error("Нужен шалкер с картами непосредственно в его ячейках");
-        std::map<int,int64_t> maps;
-        for(auto& item:items->listValue){auto* n=item.find("Name");auto* slot=item.find("Slot");auto* count=item.find("Count");auto* t=item.find("tag");
-            auto* uuid=t?t->find("map_uuid"):nullptr;
-            if(!n||n->stringValue!="minecraft:filled_map"||!slot||slot->integerValue<0||slot->integerValue>26||!count||count->integerValue!=1||!uuid||uuid->type!=bedrock::NbtTagType::Long||!maps.emplace(int(slot->integerValue),uuid->integerValue).second)
-                throw std::runtime_error("Каждая занятая ячейка шаблона должна содержать одну filled_map с map_uuid (Long)");
-        }
+        auto maps=bedrock::MapShulkerQueue::templateMapIds(*tag);
+        // Colors contains PNG bytes. Keep NBT as a compact binary document;
+        // converting each byte into a ProtoDefValue multiplies peak memory.
+        bedrock::BinaryStream encodedTag;
+        bedrock::BedrockNbtCodec::write(encodedTag,{"",*tag},bedrock::BedrockNbtEncoding::LittleEndian,
+            {MaximumNbtTransferDepth,MaximumNbtTransferFileBytes,MaximumNbtTransferFileBytes,MaximumNbtTransferNodes});
         using V=bedrock::ProtoDefValue;
-        auto extra=V::object({{"has_nbt",V::string("true")},{"nbt",V::object({{"version",V::integer(1)},{"nbt",bedrock::nbtValueToProtoDefValue(*tag)}})},
+        auto extra=V::object({{"has_nbt",V::string("true")},{"nbt",V::object({{"version",V::integer(1)},{"nbt",V::bytes(std::move(encodedTag.buffer()))}})},
             {"can_place_on",V::array({})},{"can_destroy",V::array({})},{"blocking_tick",V::integer(0)}});
         auto prepared=prepareAutoCraftTemplate(extra,id,runtime);
         std::lock_guard lock(mapQueueMutex);mapLoading=false;
@@ -54,11 +68,12 @@ bedrock::JsRuntimeValue mapCommand(const bedrock::JsRuntimeValue& request){
         mapArchive=std::move(archive);++mapArchiveRevision;mapQueue.configureArchive(mapArchive->entries.size());return mapSnapshotLocked();
     }
     if(op=="start"||op=="toggle"){
-        {std::lock_guard lock(mapQueueMutex);if(mapQueue.reserved()){mapQueue.stop(steadyMilliseconds());return mapSnapshotLocked();}}
+        {std::lock_guard lock(mapQueueMutex);if(mapQueue.reserved()){stopMapQueueLocked();return mapSnapshotLocked();}}
         bool other=platformBusy()||autoCraftBusy();{std::lock_guard lock(mutex);other=other||areaFillRunning||pendingAutomationRequestId!=0;}
         if(other)throw std::runtime_error("Остановите строительство, Авто 2 и другие автоматизации");
         if(!nbtTestEndpointAllowed())throw std::runtime_error("NBT-крафт доступен только на портах 19132/19133");
-        auto c=platformCamera();using Target=bedrock::AutoCraftStore::Target;std::vector<Target> tables,chests;Target placement;bool place=false;
+        auto c=platformCamera();using Target=bedrock::AutoCraftStore::Target;std::vector<Target> tables,chests;
+        if(!bedrock::MapPlacement::validCamera(c))throw std::runtime_error("Жду позицию игрока от Minecraft");
         int px=int(std::floor(c.x)),py=int(std::floor(c.y-1.62+.01)),pz=int(std::floor(c.z));
         for(int x=px-6;x<=px+6;++x)for(int z=pz-6;z<=pz+6;++z)for(int y=py-2;y<=py+3;++y){
             double dx=x+.5-c.x,dy=y+.5-c.y,dz=z+.5-c.z;double distance=std::sqrt(dx*dx+dy*dy+dz*dz);
@@ -69,11 +84,18 @@ bedrock::JsRuntimeValue mapCommand(const bedrock::JsRuntimeValue& request){
                     if(p.known&&!p.air && !(int(std::floor(c.x+dx*t))==x&&int(std::floor(c.y+dy*t))==y&&int(std::floor(c.z+dz*t))==z)){clear=false;break;}}
                 if(clear){Target t{x,y,z,b.runtime,1,b.name!="crafting_table",distance};(t.chest?chests:tables).push_back(t);}}
         }
-        for(auto [dx,dz]:{std::pair{1,0},std::pair{-1,0},std::pair{0,1},std::pair{0,-1}}){
-            auto b=platformBlock({px+dx,py,pz+dz}),up=platformBlock({px+dx,py+1,pz+dz}),floor=platformBlock({px+dx,py-1,pz+dz});
-            if(!place&&b.known&&b.air&&up.known&&up.air&&floor.known&&floor.safeFloor){placement={px+dx,py,pz+dz,0,1,false,1};place=true;}}
         if(tables.empty()||chests.empty())throw std::runtime_error("Подойдите ближе: в радиусе 6 нужны верстак и сундук с доступной гранью в пределах 4.25 блока");
-        if(!place)throw std::runtime_error("Рядом нужна свободная ячейка с опорой и местом над шалкером");
+        const auto site=bedrock::MapPlacement::find(c,[this](auto p){return platformBlock(p);});
+        using Check=bedrock::MapPlacement::Check;
+        std::string detail="feet="+std::to_string(c.x)+","+std::to_string(c.y-1.62)+","+std::to_string(c.z)+
+            " ready="+std::to_string(site.count(Check::Ready))+" unknown="+std::to_string(site.count(Check::Unknown))+
+            " occupied="+std::to_string(site.count(Check::Occupied))+" noSupport="+std::to_string(site.count(Check::NoSupport))+
+            " occluded="+std::to_string(site.count(Check::Occluded))+" body="+std::to_string(site.count(Check::PlayerOverlap))+
+            " outOfRange="+std::to_string(site.count(Check::OutOfRange));
+        if(site.position)detail+=" selected="+std::to_string(site.position->x)+","+std::to_string(site.position->y)+","+std::to_string(site.position->z);
+        push("maps_placement_search",detail,site.position?"INFO":"WARN","automation");
+        if(!site.position)throw std::runtime_error(bedrock::MapPlacement::message(site));
+        Target placement{site.position->x,site.position->y,site.position->z,0,1,false,0};
         auto less=[](auto& a,auto& b){return a.distance<b.distance;};std::sort(tables.begin(),tables.end(),less);std::sort(chests.begin(),chests.end(),less);
         auto runtime=schematicRuntimeId("minecraft:undyed_shulker_box");
         std::lock_guard lock(mapQueueMutex);
@@ -82,7 +104,11 @@ bedrock::JsRuntimeValue mapCommand(const bedrock::JsRuntimeValue& request){
         mapQueue.start(c,tables.front(),std::move(chests),placement,steadyMilliseconds());return mapSnapshotLocked();
     }
     std::lock_guard lock(mapQueueMutex);
-    if(op=="stop")mapQueue.stop(steadyMilliseconds());
+    if(op=="stop")stopMapQueueLocked();
+    if(op=="clear"){
+        stopMapQueueLocked();mapArchive.reset();mapQueue.configureArchive(0);
+        mapQueue.status="ZIP удалён из очереди. Файл на диске сохранён. Загрузите новый ZIP";
+    }
     if(op=="configure"){
         auto& t=mapQueue.timing;
         for(auto [key,value]:{std::pair{"craft",&t.craft},{"open",&t.open},{"close",&t.close},{"place",&t.place},{"transfer",&t.transfer},{"hold",&t.hold},{"break",&t.breakMs},{"pickup",&t.pickup},{"store",&t.store},{"next",&t.next},{"timeout",&t.timeout}}){
@@ -126,11 +152,13 @@ bool injectMapQueue(bedrock::BedrockRelayPacketEvent& event)noexcept{
     if(event.canceled||!event.replacements.empty())return false;
     try{
         std::lock_guard lock(mapQueueMutex);if(!mapQueue.reserved())return false;
+        traceMapQueueLocked();
         if(event.packet.name!="player_auth_input"&&event.packet.name!="move_player")return true;
         if(event.packet.name=="player_auth_input"){
             bedrock::RelayPacketEvent d(version,event,itemProtocolVariables,true);
             if(d.getBool("input_data.item_interact",false)||d.getBool("input_data.block_action",false)||d.getBool("input_data.item_stack_request",false)){mapQueue.manual();return true;}}
         auto output=mapQueue.poll(platformCamera(),[this](auto p){return platformBlock(p);},steadyMilliseconds());
+        traceMapQueueLocked();
         if(output.empty())return true;
         auto codec=bedrock::VersionedMcpeCodec::forVersion(version);std::vector<bedrock::VersionedGamePacket> packets{event.packet};
         for(auto& p:output){auto encoded=codec.packetCodec().makePacketByName(p.name,p.payload);if(p.client)mapClientPackets.push_back(std::move(encoded));else packets.push_back(std::move(encoded));}

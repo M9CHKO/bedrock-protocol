@@ -72,27 +72,8 @@ public:
         collectFields_ = collectFields;
     }
 
-    // Observers and diagnostics must not retain one field object per map
-    // pixel or registry component. Decoding and schema validation continue
-    // after this limit; subsequent array elements reuse a compact [] context
-    // path so the context itself stays bounded too.
-    void setMaximumCollectedFields(std::size_t maximum) {
-        maximumCollectedFields_ = maximum;
-    }
-
     void setPreserveNbtBytes(bool preserve) {
         preserveNbtBytes_ = preserve;
-    }
-
-    // Event consumers normally only need the item envelope (runtime id,
-    // count, metadata and stack id). Validate and skip large NBT values rather
-    // than constructing an NBT tree, JSON string and field copy for each item.
-    void setSkipNbtValues(bool skip) {
-        skipNbtValues_ = skip;
-    }
-
-    void setSkipStructuredBlobs(bool skip) {
-        skipStructuredBlobs_ = skip;
     }
 
     // Validation paths may need a tiny subset of decoded scalar values for
@@ -249,10 +230,6 @@ private:
 
     bool collectFields_ = true;
     bool preserveNbtBytes_ = false;
-    bool skipNbtValues_ = false;
-    bool skipStructuredBlobs_ = false;
-    std::size_t maximumCollectedFields_ =
-        std::numeric_limits<std::size_t>::max();
 
     ProtoDefValue readNbtValue(
         ProtoDefReader& reader,
@@ -279,9 +256,7 @@ private:
         const ProtoDefField& field
     ) const {
         if (fieldObserver_) fieldObserver_(field);
-        if (collectFields_ && out.size() < maximumCollectedFields_) {
-            out.push_back(field);
-        }
+        if (collectFields_) out.push_back(field);
     }
 
     void appendField(
@@ -289,9 +264,7 @@ private:
         ProtoDefField&& field
     ) const {
         if (fieldObserver_) fieldObserver_(field);
-        if (collectFields_ && out.size() < maximumCollectedFields_) {
-            out.push_back(std::move(field));
-        }
+        if (collectFields_) out.push_back(std::move(field));
     }
 
     static std::string enumSizeBasedOnValuesLen(const ProtoDefContext& context) {
@@ -476,12 +449,7 @@ private:
             throw std::runtime_error("buffer negative count");
         }
 
-        std::vector<uint8_t> bytes;
-        if (skipStructuredBlobs_) {
-            reader.skip(static_cast<std::size_t>(count));
-        } else {
-            bytes = reader.readBytes(static_cast<std::size_t>(count));
-        }
+        auto bytes = reader.readBytes(static_cast<std::size_t>(count));
 
         ProtoDefField field;
         field.path = path.empty() ? "$buffer" : path;
@@ -491,9 +459,7 @@ private:
                 ? "buffer<count:" + *countRef + ">"
                 : "buffer<" + countType + ">";
         field.value = "<Buffer bytes:" + std::to_string(count) + ">";
-        if (!skipStructuredBlobs_) {
-            field.structuredValue = ProtoDefValue::bytes(std::move(bytes));
-        }
+        field.structuredValue = ProtoDefValue::bytes(std::move(bytes));
         field.offset = start;
         field.size = reader.offset() - start;
 
@@ -874,12 +840,13 @@ private:
         // accumulating thousands of itemstates[i].* keys. Relative sibling
         // references remain correct because each sequential element replaces
         // the previous value under the same compact path.
-        const std::string compactPath = path + "[]";
+        const bool compactValidation = !collectFields_;
+        const std::string validationPath = compactValidation
+            ? path + "[]"
+            : std::string();
         for (int64_t i = 0; i < count; ++i) {
-            const bool compactElement = !collectFields_ ||
-                out.size() >= maximumCollectedFields_;
-            std::string childPath = compactElement
-                ? compactPath
+            std::string childPath = compactValidation
+                ? validationPath
                 : path + "[" + std::to_string(i) + "]";
             try {
                 decode(*itemType, reader, childPath, out, context);
@@ -1355,13 +1322,7 @@ private:
                 std::to_string(reader.u8());
         } else if (typeName == "restBuffer" || typeName == "MapInfo") {
             const auto count = reader.remaining();
-            if (skipStructuredBlobs_) {
-                reader.skip(count);
-            } else {
-                field.structuredValue = ProtoDefValue::bytes(
-                    reader.readBytes(count)
-                );
-            }
+            field.structuredValue = ProtoDefValue::bytes(reader.readBytes(count));
             field.value = "<Buffer bytes:" + std::to_string(count) + ">";
         } else if (typeName == "byterot") {
             field.value = std::to_string(static_cast<double>(reader.u8()) * (360.0 / 256.0));
@@ -1376,7 +1337,7 @@ private:
                     break;
                 }
                 reader.rewindTo(before);
-                if (collectFields_ && !skipNbtValues_) {
+                if (collectFields_) {
                     values.push_back(readNbtValue(
                         reader,
                         BedrockNbtEncoding::LittleVarInt
@@ -1388,14 +1349,12 @@ private:
             if (!terminated) {
                 throw std::runtime_error("nbtLoop is missing its TAG_End terminator");
             }
-            if (collectFields_ && !skipNbtValues_) {
+            if (collectFields_) {
                 field.structuredValue = ProtoDefValue::array(std::move(values));
                 field.value = preserveNbtBytes_ ? "<nbtLoop bytes>"
                     : ProtoDefJson::stringify(*field.structuredValue);
             } else {
-                field.value = skipNbtValues_
-                    ? "<nbtLoop omitted>"
-                    : "<nbtLoop>";
+                field.value = "<nbtLoop>";
             }
         } else if (typeName == "u8" || typeName == "lu8" || typeName == "byte") {
             if (reader.remaining() < 1) {
@@ -1485,7 +1444,7 @@ private:
                 std::to_string(y) + "," +
                 std::to_string(z);
         } else if (typeName == "native" || typeName == "nbt") {
-            if (collectFields_ && !skipNbtValues_) {
+            if (collectFields_) {
                 field.structuredValue = readNbtValue(
                     reader,
                     BedrockNbtEncoding::LittleVarInt
@@ -1494,12 +1453,10 @@ private:
                     : ProtoDefJson::stringify(*field.structuredValue);
             } else {
                 skipProtoDefNbt(reader, BedrockNbtEncoding::LittleVarInt);
-                field.value = skipNbtValues_
-                    ? (typeName == "native" ? "<native omitted>" : "<nbt omitted>")
-                    : (typeName == "native" ? "<native>" : "<nbt>");
+                field.value = typeName == "native" ? "<native>" : "<nbt>";
             }
         } else if (typeName == "lnbt") {
-            if (collectFields_ && !skipNbtValues_) {
+            if (collectFields_) {
                 field.structuredValue = readNbtValue(
                     reader,
                     BedrockNbtEncoding::LittleEndian
@@ -1508,7 +1465,7 @@ private:
                     : ProtoDefJson::stringify(*field.structuredValue);
             } else {
                 skipProtoDefNbt(reader, BedrockNbtEncoding::LittleEndian);
-                field.value = skipNbtValues_ ? "<lnbt omitted>" : "<lnbt>";
+                field.value = "<lnbt>";
             }
         } else {
             if (resolver_) {

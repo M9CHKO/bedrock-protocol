@@ -77,10 +77,7 @@ int main() {
         // Keep the first timer tick well outside the synchronous onJoin
         // callback so this test deterministically separates manual and timed
         // flush boundaries even though the C++ scheduler owns its own thread.
-        .batchingInterval = 1000,
-        // Prove that splitting a queued flush keeps order and advances the
-        // encrypted batch counter exactly once per emitted slice.
-        .maxPacketsPerBatch = 2
+        .batchingInterval = 1000
     });
     server.onJoin([&](const bedrock::BedrockServerConnection& connection) {
         serverJoined = true;
@@ -115,7 +112,6 @@ int main() {
     std::atomic<bool> clientJoined {false};
     std::atomic<uint64_t> loginSuccessCounter {missingCounter};
     std::atomic<uint64_t> immediateCounter {missingCounter};
-    std::atomic<uint64_t> manualFirstBatchCounter {missingCounter};
     std::atomic<uint64_t> manualBatchCounter {missingCounter};
     std::atomic<uint64_t> timerBatchCounter {missingCounter};
     std::atomic<bool> packetsComplete {false};
@@ -141,7 +137,6 @@ int main() {
         const auto counter =
             bedrock::BedrockNetworkClientTestAccess::receiveCounter(client);
         if (count == 1) immediateCounter = counter;
-        if (count == 3) manualFirstBatchCounter = counter;
         if (count == 4) manualBatchCounter = counter;
         if (count == 5) {
             timerBatchCounter = counter;
@@ -199,15 +194,11 @@ int main() {
         "write() was not its own immediate encrypted batch"
     );
     ok &= check(
-        manualFirstBatchCounter.load() == loginCounter + 2,
-        "first bounded manual batch used the wrong encryption counter"
+        manualBatchCounter.load() == loginCounter + 2,
+        "queue/sendBuffer/queuePacket did not share one manual batch"
     );
     ok &= check(
-        manualBatchCounter.load() == loginCounter + 3,
-        "second bounded manual batch used the wrong encryption counter"
-    );
-    ok &= check(
-        timerBatchCounter.load() == loginCounter + 4,
+        timerBatchCounter.load() == loginCounter + 3,
         "periodic queue timer did not flush exactly one later batch"
     );
 

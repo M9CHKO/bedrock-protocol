@@ -68,7 +68,7 @@ internal sealed class RelayBackend : IDisposable
             selected = worker;
         }
         if (selected is null || selected.IsDisposed)
-            return (JsonSerializer.SerializeToElement(new { running = false }), JsonSerializer.SerializeToElement(Array.Empty<object>()));
+            return (JsonSerializer.SerializeToElement(new { running = false, workerError = selected?.Failure ?? "" }), JsonSerializer.SerializeToElement(Array.Empty<object>()));
         return await selected.Poll();
     }
 

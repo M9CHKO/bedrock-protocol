@@ -97,25 +97,6 @@ bedrock::RelayOptions relayOptions(
     options.batchingInterval = 5;
     options.enableChunkCaching = true;
     options.omitParseErrors = omitParseErrors;
-    options.throttleMapItemData = true;
-    options.mapFlushIntervalMs = 75;
-    options.mapInitialDelayMs = 1250;
-    options.mapPacketsPerFlush = 3;
-    options.mapBytesPerFlush = 384u * 1024u;
-    options.mapMaxSendBufferBytes = 24u * 1024u;
-    options.mapMaxResendBufferBytes = 80u * 1024u;
-    options.maxMapQueuePackets = 3072;
-    options.maxMapQueueBytes = 192u * 1024u * 1024u;
-    options.maxBatchPayloadBytes = 448u * 1024u;
-    options.maxPacketsPerBatch = 12;
-    options.throttleClientboundVisualBursts = true;
-    options.visualBurstWindowMs = 24'000;
-    options.visualInitialDelayMs = 900;
-    options.visualFlushIntervalMs = 125;
-    options.visualPacketsPerFlush = 5;
-    options.visualBytesPerFlush = 48u * 1024u;
-    options.prioritizeServerboundActions = true;
-    options.queueClientboundLevelChunksUntilStartGame = false;
     options.destination.host = "127.0.0.1";
     options.destination.port = upstreamPort;
     options.destination.offline = true;
@@ -392,32 +373,6 @@ bool runParsePolicy(bool omitParseErrors) {
     );
     ok &= check(relay.live().options().enableChunkCaching,
                 "enableChunkCaching was not propagated to live relay");
-    const auto& liveOptions = relay.live().options();
-    ok &= check(
-        liveOptions.throttleMapItemData &&
-            liveOptions.mapFlushIntervalMs == 75 &&
-            liveOptions.mapInitialDelayMs == 1250 &&
-            liveOptions.mapPacketsPerFlush == 3 &&
-            liveOptions.mapBytesPerFlush == 384u * 1024u &&
-            liveOptions.mapMaxSendBufferBytes == 24u * 1024u &&
-            liveOptions.mapMaxResendBufferBytes == 80u * 1024u &&
-            liveOptions.maxMapQueuePackets == 3072 &&
-            liveOptions.maxMapQueueBytes == 192u * 1024u * 1024u &&
-            liveOptions.throttleClientboundVisualBursts &&
-            liveOptions.visualBurstWindowMs == 24'000 &&
-            liveOptions.visualInitialDelayMs == 900 &&
-            liveOptions.visualFlushIntervalMs == 125 &&
-            liveOptions.visualPacketsPerFlush == 5 &&
-            liveOptions.visualBytesPerFlush == 48u * 1024u &&
-            liveOptions.prioritizeServerboundActions &&
-            !liveOptions.queueClientboundLevelChunksUntilStartGame,
-        "map throttling options were not propagated to live relay"
-    );
-    ok &= check(
-        liveOptions.server.maxBatchPayloadBytes == 448u * 1024u &&
-            liveOptions.server.maxPacketsPerBatch == 12,
-        "downstream batch limits were not propagated to the server"
-    );
     ok &= check(relay.options().omitParseErrors == omitParseErrors,
                 "omitParseErrors option changed during construction");
     ok &= check(!relayJoinMismatch.load(),

@@ -19,7 +19,13 @@ internal sealed class AppSettings
     public bool Armor { get; set; }
     public bool Totem { get; set; }
     public bool Logging { get; set; }
-    public bool FloatingButton { get; set; } = true;
+    public bool HideMaps { get; set; }
+    public bool HideEntities { get; set; }
+    public int InterfaceVersion { get; set; }
+    public bool FloatingButton { get; set; }
+    public bool FloatingDeposit { get; set; } = true;
+    public bool FloatingAutoCraft { get; set; } = true;
+    public bool FloatingMaps { get; set; } = true;
     public bool Auto2 { get; set; } = true;
     public Dictionary<string, decimal> Platform { get; set; } = new();
     public Dictionary<string, int> MapTiming { get; set; } = new();
@@ -31,11 +37,19 @@ internal sealed class AppSettings
     internal static int ClampInterval(int value) => Math.Clamp(value, 30, 3000);
     internal static int ClampCraftInterval(int value) => Math.Clamp(value, 100, 5000);
     internal static int ClampWindowPause(int value) => Math.Clamp(value, 300, 3000);
+    internal void UpgradeInterface()
+    {
+        HideMaps = false; // Windows map delivery is automatic, even with old saved settings.
+        if (InterfaceVersion >= 2) return;
+        FloatingButton = false;
+        InterfaceVersion = 2;
+    }
     internal static AppSettings Load()
     {
         try
         {
             var value = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(SettingsFile)) ?? new();
+            value.UpgradeInterface();
             value.IntervalMs = ClampInterval(value.IntervalMs);
             value.Platform ??= new();
             value.MapTiming ??= new();
@@ -59,6 +73,7 @@ internal sealed class AppSettings
 
 internal static class LogStore
 {
+    internal static string? TestDirectory { get; set; }
     private const int MaximumBytes = 256 * 1024;
     private static readonly Channel<string> Queue = Channel.CreateBounded<string>(new BoundedChannelOptions(256)
     { SingleReader = true, FullMode = BoundedChannelFullMode.DropOldest });
@@ -77,8 +92,9 @@ internal static class LogStore
         // Only sanitized native events/status text are passed here, never device codes or tokens.
         try
         {
-            Directory.CreateDirectory(AppSettings.DirectoryPath);
-            var path = Path.Combine(AppSettings.DirectoryPath, "relay.log");
+            var directory = TestDirectory ?? AppSettings.DirectoryPath;
+            Directory.CreateDirectory(directory);
+            var path = Path.Combine(directory, "relay.log");
             if (File.Exists(path) && new FileInfo(path).Length > MaximumBytes)
                 File.Move(path, path + ".previous", true);
             File.AppendAllText(path, line + Environment.NewLine);

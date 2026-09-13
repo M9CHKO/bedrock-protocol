@@ -2424,10 +2424,7 @@ private:
             if (!shouldDecode) return out;
 
             try {
-                auto fields = state->decoder->decodePacketForObservation(
-                    packet.name,
-                    packet.payload
-                );
+                auto fields = state->decoder->decodePacket(packet.name, packet.payload);
                 for (const auto& field : fields) {
                     // ProtoDef's diagnostic field form retains mapper values
                     // as `numeric/name`. JavaScript packet params expose only
@@ -2897,30 +2894,6 @@ struct RelayOptions {
     // retain the normal strict decode/error policy. Opt-in for transparent
     // relays that must not walk large inventories just to forward their bytes.
     bool validateUnhandledPackets = true;
-    // Large map walls can produce thousands of 128x128 updates in one burst.
-    // Keep all maps, but feed them to Minecraft gradually while ordinary
-    // gameplay packets continue through the normal downstream queue.
-    bool throttleMapItemData = true;
-    int mapFlushIntervalMs = 500;
-    int mapInitialDelayMs = 2500;
-    std::size_t mapPacketsPerFlush = 1;
-    std::size_t mapBytesPerFlush = 128u * 1024u;
-    std::size_t mapMaxSendBufferBytes = 32u * 1024u;
-    std::size_t mapMaxResendBufferBytes = 96u * 1024u;
-    std::size_t maxMapQueuePackets = 4096;
-    std::size_t maxMapQueueBytes = 256u * 1024u * 1024u;
-    std::size_t maxBatchPayloadBytes = 512u * 1024u;
-    std::size_t maxPacketsPerBatch = 16;
-    bool throttleClientboundVisualBursts = true;
-    int visualBurstWindowMs = 30'000;
-    int visualInitialDelayMs = 1'500;
-    int visualFlushIntervalMs = 150;
-    std::size_t visualPacketsPerFlush = 4;
-    std::size_t visualBytesPerFlush = 64u * 1024u;
-    bool prioritizeServerboundActions = true;
-    // Mirrors BedrockLiveRelayOptions and is appended for aggregate-source
-    // compatibility with older RelayOptions initializers.
-    bool queueClientboundLevelChunksUntilStartGame = true;
 
     // A single root offline value is the common case and applies to both
     // sides. destination.offline exists only as an explicit upstream override.
@@ -2963,19 +2936,9 @@ public:
         version_(std::move(version)),
         variables_(variables ? std::move(variables) : makeProtoDefVariableStore()),
         strictDecode_(strictDecode),
-        preserveNbtBytes_(
-            preserveNbtBytes ||
-            PacketMemoryPolicy::shouldKeepItemNbtOpaque(
-                event.packet.name,
-                event.packet.payload.size()
-            )
-        ) {
+        preserveNbtBytes_(preserveNbtBytes) {
         if (name == "start_game" || name == "item_registry") {
-            // These packets update connection-scoped item variables even when
-            // a raw-only relay callback never asks for decoded parameters.
-            // Do not eagerly construct their large editable parameter tree.
-            ProtoDefPacketDecoder decoder(version_, variables_);
-            decoder.updatePacketVariables(name, packet.payload);
+            ensureDecoded();
         }
     }
 
@@ -3885,11 +3848,7 @@ private:
                     !clientboundDestinationHandlers_.empty()
                 : !serverboundHandlers_.empty() ||
                     !serverboundDestinationHandlers_.empty();
-        if (hasDirectionHandlers &&
-            !PacketMemoryPolicy::shouldDecodeRelayParamsLazily(
-                event.packet.name,
-                event.packet.payload.size()
-            )) {
+        if (hasDirectionHandlers) {
             (void) event.decodedParams();
         }
 
@@ -4315,25 +4274,6 @@ private:
                 return;
             }
 
-            const bool lazyParams =
-                PacketMemoryPolicy::shouldDecodeRelayParamsLazily(
-                    event.packet.name,
-                    event.packet.payload.size()
-                );
-            if (lazyParams) {
-                // Preserve strict malformed-packet behavior without retaining
-                // the decoded tree. A handler that explicitly calls value(),
-                // get() or decodedParams() still receives the lossless form.
-                ProtoDefPacketDecoder decoder(
-                    options_.version,
-                    packetVariables
-                );
-                decoder.validatePacketStrict(
-                    event.packet.name,
-                    event.packet.payload
-                );
-            }
-
             wrapped = std::make_unique<RelayPacketEvent>(
                 options_.version,
                 event,
@@ -4342,9 +4282,7 @@ private:
             );
             // Structured handlers receive fields only after a complete strict
             // decode. The low-level event still owns the untouched raw packet.
-            if (!lazyParams) {
-                (void) wrapped->decodedParams();
-            }
+            (void) wrapped->decodedParams();
         } catch (const std::exception& error) {
             const auto policy = effectiveParseErrorPolicy();
             RelayParseError parseError {
@@ -4419,8 +4357,6 @@ private:
         out.server.compressionLevel = options.compressionLevel;
         out.server.compressionThreshold = options.compressionThreshold;
         out.server.batchingInterval = options.batchingInterval;
-        out.server.maxBatchPayloadBytes = options.maxBatchPayloadBytes;
-        out.server.maxPacketsPerBatch = options.maxPacketsPerBatch;
 
         out.upstream.host = options.destination.host;
         out.upstream.port = options.destination.port;
@@ -4457,28 +4393,6 @@ private:
         out.forceSingle = options.forceSingle;
         out.replaceExisting = options.replaceExisting;
         out.useDownstreamDisplayNameForUpstreamUsername = options.offline;
-        out.throttleMapItemData = options.throttleMapItemData;
-        out.mapFlushIntervalMs = options.mapFlushIntervalMs;
-        out.mapInitialDelayMs = options.mapInitialDelayMs;
-        out.mapPacketsPerFlush = options.mapPacketsPerFlush;
-        out.mapBytesPerFlush = options.mapBytesPerFlush;
-        out.mapMaxSendBufferBytes = options.mapMaxSendBufferBytes;
-        out.mapMaxResendBufferBytes = options.mapMaxResendBufferBytes;
-        out.maxMapQueuePackets = options.maxMapQueuePackets;
-        out.maxMapQueueBytes = options.maxMapQueueBytes;
-        out.maxBatchPayloadBytes = options.maxBatchPayloadBytes;
-        out.maxPacketsPerBatch = options.maxPacketsPerBatch;
-        out.throttleClientboundVisualBursts =
-            options.throttleClientboundVisualBursts;
-        out.visualBurstWindowMs = options.visualBurstWindowMs;
-        out.visualInitialDelayMs = options.visualInitialDelayMs;
-        out.visualFlushIntervalMs = options.visualFlushIntervalMs;
-        out.visualPacketsPerFlush = options.visualPacketsPerFlush;
-        out.visualBytesPerFlush = options.visualBytesPerFlush;
-        out.prioritizeServerboundActions =
-            options.prioritizeServerboundActions;
-        out.queueClientboundLevelChunksUntilStartGame =
-            options.queueClientboundLevelChunksUntilStartGame;
         return out;
     }
 };

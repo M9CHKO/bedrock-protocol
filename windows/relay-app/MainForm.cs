@@ -10,6 +10,8 @@ internal sealed class MainForm : Form
     private readonly AppSettings settings;
     private readonly PlatformPanel platformPanel;
     private readonly MapQueuePanel mapPanel;
+    private readonly MapStreamingModule mapStreaming = new();
+    private readonly ModuleCatalogPanel modules;
     private readonly FloatingDepositForm floatingMaps = new(maps:true);
     private readonly FloatingDepositForm floating = new();
     private readonly FloatingDepositForm floatingAuto2 = new(autoCraft: true);
@@ -33,8 +35,12 @@ internal sealed class MainForm : Form
     private readonly CheckBox hotbar = Check("Включать шалкеры из хотбара (слоты 1–9)");
     private readonly CheckBox armor = Check("Автоброня");
     private readonly CheckBox totem = Check("Автототем");
-    private readonly CheckBox floatingEnabled = Check("Панель поверх окон, в том числе Minecraft и сундуков");
+    private readonly CheckBox floatingEnabled = Check("Показывать плавающие панели поверх Minecraft");
+    private readonly CheckBox floatingDepositEnabled = Check("Разгрузка шалкеров");
+    private readonly CheckBox floatingAutoCraftEnabled = Check("Авто 2 · крафт и разгрузка");
+    private readonly CheckBox floatingMapsEnabled = Check("Крафт карт из ZIP");
     private readonly CheckBox detailed = Check("Подробный журнал");
+    private readonly CheckBox hideEntities = Check("Скрывать игроков, мобов и лежащие предметы");
     private readonly CheckBox auto2 = Check("Включить Авто 2 · крафт с NBT и разгрузка в сундуки");
     private readonly TrackBar craftSpeed = new() { Minimum = 0, Maximum = 98, TickStyle = TickStyle.None, Width = 734, Height = 48 };
     private readonly TrackBar windowSpeed = new() { Minimum = 0, Maximum = 27, TickStyle = TickStyle.None, Width = 734, Height = 48 };
@@ -69,30 +75,32 @@ internal sealed class MainForm : Form
         backend = testBackend ?? new RelayBackend();
         lifecycleTest = testBackend != null;
         settings = preview ? new AppSettings() : AppSettings.Load();
+        settings.UpgradeInterface();
         platformPanel = new PlatformPanel(backend, settings);
         mapPanel = new MapQueuePanel(backend,settings);
-        Text = "CPE Relay — Windows 1.3.0";
+        modules = new ModuleCatalogPanel(BuildModuleList());
+        Text = "CPE Relay — Windows 1.3.8 · Модули";
         AutoScaleMode = AutoScaleMode.Dpi;
         Font = new Font("Segoe UI", 10);
         Size = new Size(1080, 790); MinimumSize = new Size(860, 700);
         StartPosition = FormStartPosition.CenterScreen;
         BackColor = Theme.Background; ForeColor = Theme.Text;
-        Size = new Size(1210, 930); MinimumSize = new Size(1100, 810);
+        Size = new Size(1210, 930); MinimumSize = new Size(1120, 810);
         var sidebar = new Panel { Dock = DockStyle.Left, Width = 226, BackColor = Theme.Sidebar, Padding = new Padding(16, 0, 16, 20) };
         var brand = new BrandPanel();
         var nav = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false, Padding = new Padding(0, 12, 0, 0) };
-        string[] names = ["01    Подключение", "02    Профили", "03    Библиотека NBT", "04    Модули", "05    Журнал"];
+        string[] names = ["Подключение", "Профили", "Библиотека NBT", "Модули", "Настройки", "Журнал"];
         for (int i = 0; i < names.Length; i++)
         {
             int page = i;
             var button = new RelayButton { Text = names[i], Navigation = true, Width = 194, Height = 51, Margin = new Padding(0, 0, 0, 7) };
             button.Click += (_, _) => SelectPage(page); navigation.Add(button); nav.Controls.Add(button);
         }
-        var signature = new Label { Text = "LOCAL RELAY\nWindows x64  /  1.3.0", Dock = DockStyle.Bottom, Height = 52, ForeColor = Theme.Muted, Padding = new Padding(13, 8, 0, 0), Font = new Font("Segoe UI", 9) };
+        var signature = new Label { Text = "LOCAL RELAY\nWindows x64  /  1.3.8", Dock = DockStyle.Bottom, Height = 52, ForeColor = Theme.Muted, Padding = new Padding(13, 8, 0, 0), Font = new Font("Segoe UI", 9) };
         sidebar.Controls.Add(nav); sidebar.Controls.Add(signature); sidebar.Controls.Add(brand);
         var footer = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 77, Padding = new Padding(26, 12, 0, 0), BackColor = Theme.Sidebar, WrapContents = false };
         footer.Controls.AddRange([start, stop, status, memory]);
-        screens.AddRange([BuildConnection(), BuildProfiles(), BuildNbt(), BuildModules(), BuildLogs()]);
+        screens.AddRange([BuildConnection(), BuildProfiles(), BuildNbt(), modules, BuildSettings(), BuildLogs()]);
         foreach (var screen in screens) { screen.Dock = DockStyle.Fill; pages.Controls.Add(screen); }
         var workspace = new Panel { Dock = DockStyle.Fill }; workspace.Controls.Add(pages); workspace.Controls.Add(footer);
         Controls.Add(workspace); Controls.Add(sidebar);
@@ -105,6 +113,10 @@ internal sealed class MainForm : Form
         deposit.Checked = settings.Deposit; hotbar.Checked = settings.Hotbar; armor.Checked = settings.Armor;
         totem.Checked = settings.Totem; detailed.Checked = settings.Logging; floatingEnabled.Checked = settings.FloatingButton;
         auto2.Checked = settings.Auto2;
+        hideEntities.Checked = settings.HideEntities;
+        floatingDepositEnabled.Checked = settings.FloatingDeposit;
+        floatingAutoCraftEnabled.Checked = settings.FloatingAutoCraft;
+        floatingMapsEnabled.Checked = settings.FloatingMaps;
         craftSpeed.Value = (5000 - AppSettings.ClampCraftInterval(settings.CraftIntervalMs)) / 50;
         windowSpeed.Value = (3000 - AppSettings.ClampWindowPause(settings.WindowPauseMs)) / 100;
         UpdateCraftSpeed();
@@ -113,7 +125,9 @@ internal sealed class MainForm : Form
         speed.Value = (3000 - AppSettings.ClampInterval(settings.IntervalMs)) / 10;
         UpdateSpeed();
         speed.ValueChanged += (_, _) => { UpdateSpeed(); ScheduleConfig(); };
-        foreach (var check in new[] { deposit, hotbar, armor, totem, detailed, floatingEnabled, auto2 }) check.CheckedChanged += (_, _) => ScheduleConfig();
+        foreach (var check in new[] { deposit, hotbar, armor, totem, detailed, floatingEnabled,
+            floatingDepositEnabled, floatingAutoCraftEnabled, floatingMapsEnabled, auto2, hideEntities })
+            check.CheckedChanged += (_, _) => { UpdateFloatingPanels(); ScheduleConfig(); };
         start.Click += async (_, _) => await StartRelay();
         stop.Click += async (_, _) => await StopRelay();
         floating.Toggle = () => deposit.Checked = !deposit.Checked;
@@ -123,11 +137,7 @@ internal sealed class MainForm : Form
         auto2Toggle.Click += async (_, _) => await ToggleAuto2();
         configTimer.Tick += async (_, _) => { configTimer.Stop(); await ApplySettings(); };
         pollTimer.Tick += async (_, _) => await Poll();
-        overlayTimer.Tick += (_, _) => {
-            floating.UpdateVisibility(running && !closing && !stopping, floatingEnabled.Checked);
-            floatingAuto2.UpdateVisibility(running && !closing && !stopping, floatingEnabled.Checked && (auto2.Checked || auto2Busy));
-            floatingMaps.UpdateVisibility(running&&!closing&&!stopping,floatingEnabled.Checked&&mapPanel.Loaded);
-        };
+        overlayTimer.Tick += (_, _) => UpdateFloatingPanels();
         if (!preview) overlayTimer.Start();
         Shown += async (_, _) => { if (!preview) await Initialize(); };
         FormClosing += OnClosing;
@@ -142,6 +152,15 @@ internal sealed class MainForm : Form
             screens[i].Visible = i == index; navigation[i].Selected = i == index; navigation[i].Invalidate();
         }
         screens[index].BringToFront();
+    }
+    internal int PageCount => screens.Count;
+    internal ModuleCatalogPanel Modules => modules;
+    private void UpdateFloatingPanels()
+    {
+        bool active = !preview && running && !closing && !stopping;
+        floating.UpdateVisibility(active, floatingEnabled.Checked && floatingDepositEnabled.Checked);
+        floatingAuto2.UpdateVisibility(active, floatingEnabled.Checked && floatingAutoCraftEnabled.Checked && (auto2.Checked || auto2Busy));
+        floatingMaps.UpdateVisibility(active, floatingEnabled.Checked && floatingMapsEnabled.Checked && mapPanel.Loaded);
     }
     private static CheckBox Check(string text) => new ToggleCheckBox { Text = text, Margin = new Padding(0, 5, 0, 5) };
     private static Label Label(string text) => new() { Text = text, AutoSize = true, ForeColor = Theme.Muted, MaximumSize = new Size(748, 0), Margin = new Padding(0, 5, 0, 7) };
@@ -276,25 +295,26 @@ internal sealed class MainForm : Form
         Card(body, Section("БЫСТРЫЕ КОМАНДЫ"), Label(".nbt copy    ·    .nbt save имя    ·    .nbt craft имя    ·    .nbt off"));
         return tab;
     }
-    private Panel BuildModules()
+    private RelayModule[] BuildModuleList()
     {
-        var tab = new Panel(); var body = Stack(); tab.Controls.Add(body);
-        Heading(body, "Меньше действий.", "Настройте разгрузку и снаряжение под свой темп игры.");
-        Card(body, Section("PLATFORM BUILDER  /  СТРОИТЕЛЬСТВО"), platformPanel);
-        Card(body, Section("КАРТЫ ИЗ ZIP  /  ОТДЕЛЬНАЯ ОЧЕРЕДЬ"), mapPanel);
         var resetCraft = Button("Сбросить паузы");
         resetCraft.Click += (_, _) => { craftSpeed.Value = 80; windowSpeed.Value = 23; };
-        Card(body, Section("АВТО 2  /  ВЕРСТАК → СУНДУКИ"), auto2, Row(auto2Toggle, resetCraft), auto2Status,
-            craftSpeedLabel, craftSpeed, windowSpeedLabel, windowSpeed,
-            Label("Вправо — быстрее. Крафт: 100–5000 мс. Переходы: 300–3000 мс.\nПолные сундуки пропускаются весь запуск. При исчерпании ресурсов или места цикл завершится."),
-            Label("Включите NBT-крафт в библиотеке. Раковины и сундуки должны быть в инвентаре.\nВерстак и сундуки — в пределах 4 блоков. Закройте меню Minecraft и нажмите «Старт»."));
-        Card(body, Section("АВТОРАЗГРУЗКА ШАЛКЕРОВ"), deposit, hotbar, floatingEnabled,
-            Label("Откройте сундук: используются только свободные ячейки."), depositStatus);
         speed.Width = 734; speed.TickStyle = TickStyle.None;
-        Card(body, Section("СКОРОСТЬ"), speedLabel, speed, Label("Медленнее  ←                                                               →  Быстрее"),
-            Label("30–3000 мс между переносами. Для тяжёлых нестедов начните с 1000 мс.\nФактическая скорость зависит от подтверждений сервера."));
-        Card(body, Section("СНАРЯЖЕНИЕ"), armor, totem);
-        body.Controls.Add(Label("Плавающая кнопка остаётся в сундуках. Перемещайте её за верхнюю полоску.\nИспользуйте оконный или безрамочный Minecraft. Ручное перемещение приостанавливает\nразгрузку до повторного открытия сундука."));
+        return [mapStreaming, new NoRenderModule(hideEntities), new ZipMapsModule(mapPanel),
+            new PlatformBuilderModule(platformPanel),
+            new AutoCraftModule(auto2, auto2Toggle, resetCraft, auto2Status, craftSpeedLabel, craftSpeed, windowSpeedLabel, windowSpeed),
+            new DepositModule(deposit, hotbar, depositStatus, speedLabel, speed),
+            new ArmorModule(armor), new TotemModule(totem)];
+    }
+    private Panel BuildSettings()
+    {
+        var tab = new Panel(); var body = Stack(); tab.Controls.Add(body);
+        Heading(body, "Настройки", "Только нужные элементы поверх игры. Остальное — внутри своих модулей.");
+        Card(body, Section("ПЛАВАЮЩИЕ ПАНЕЛИ"), floatingEnabled,
+            Label("По умолчанию скрыты. Включение панелей не запускает модули и не меняет загрузку карт."),
+            floatingDepositEnabled, floatingAutoCraftEnabled, floatingMapsEnabled,
+            Label("Выберите нужные панели. Перемещайте их за верхнюю полоску.\nРаботают в оконном и безрамочном Minecraft, включая открытый сундук."));
+        Card(body, Section("КАРТЫ С СЕРВЕРА"), Label("Постепенная загрузка включена всегда. Максимум 4000 карт.\nСтарое состояние кнопки «Скрыть карты» больше не приостанавливает очередь."));
         return tab;
     }
     private Panel BuildLogs()
@@ -340,6 +360,10 @@ internal sealed class MainForm : Form
         settings.AuthProfile = profile.Text.Trim();
         settings.NbtDirectory = directory.Text; settings.Deposit = deposit.Checked; settings.Hotbar = hotbar.Checked;
         settings.Armor = armor.Checked; settings.Totem = totem.Checked; settings.Logging = detailed.Checked;
+        settings.HideMaps = false; settings.HideEntities = hideEntities.Checked;
+        settings.FloatingDeposit = floatingDepositEnabled.Checked;
+        settings.FloatingAutoCraft = floatingAutoCraftEnabled.Checked;
+        settings.FloatingMaps = floatingMapsEnabled.Checked;
         settings.FloatingButton = floatingEnabled.Checked; settings.IntervalMs = 3000 - speed.Value * 10;
         settings.Auto2 = auto2.Checked; settings.CraftIntervalMs = 5000 - craftSpeed.Value * 50;
         settings.WindowPauseMs = 3000 - windowSpeed.Value * 100;
@@ -353,6 +377,7 @@ internal sealed class MainForm : Form
             ReadSettings(); if (!preview) settings.Save();
             await backend.Call(new { action = "configure", deposit = settings.Deposit, hotbar = settings.Hotbar,
                 armor = settings.Armor, totem = settings.Totem, logging = settings.Logging, intervalMs = settings.IntervalMs,
+                hideMaps = false, hideEntities = settings.HideEntities,
                 auto2 = settings.Auto2, craftIntervalMs = settings.CraftIntervalMs, windowPauseMs = settings.WindowPauseMs });
             return !closing && !stopping;
         }
@@ -453,9 +478,9 @@ internal sealed class MainForm : Form
                     auth.Text = "Откройте microsoft.com/link и введите код: " + item.Text("userCode");
                     continue; // Device code must never enter persistent diagnostics.
                 }
-                messages.Add($"[{item.Text("level", "INFO")}] {item.Text("type")}: {item.Text("message")}");
+                messages.Add(LogBatch.NativeEvent(item));
             }
-            AddLogs(messages);
+            AddLogs(messages, timestamped: true);
             using var process = Process.GetCurrentProcess();
             memory.Text = $"Окно: {process.PrivateMemorySize64 / 1048576} МБ";
         }
@@ -466,7 +491,8 @@ internal sealed class MainForm : Form
     {
         running = state.Flag("running");
         upstreamReady = state.Flag("upstreamReady");
-        if (!busy) status.Text = !running ? "Реле остановлено" : state.Flag("upstreamReady") ? "Подключено к серверу" :
+        mapStreaming.UpdateConnection(running, upstreamReady);
+        if (!busy) status.Text = state.Text("workerError").Length > 0 ? "Ядро реле завершилось аварийно" : !running ? "Реле остановлено" : state.Flag("upstreamReady") ? "Подключено к серверу" :
             state.Flag("upstreamStarted") ? "Авторизация / подключение к серверу" : "Ожидание Minecraft";
         if (state.Flag("upstreamReady")) auth.Text = "Вход выполнен. Код больше не нужен.";
         nbtStatus.Text = state.Flag("nbtCraftArmed") ? "NBT-крафт активен: " + state.Text("nbtCraftSlot") : "NBT-крафт выключен";
@@ -559,20 +585,12 @@ internal sealed class MainForm : Form
     {
         AddLogs([text]);
     }
-    private void AddLogs(IReadOnlyList<string> messages)
+    private void AddLogs(IReadOnlyList<string> messages, bool timestamped = false)
     {
         if (messages.Count == 0) return;
-        var lines = new StringBuilder();
-        if (messages.Count > 128) lines.AppendLine($"{DateTime.Now:HH:mm:ss} Пропущено старых событий: {messages.Count - 128}");
-        foreach (var message in messages.Skip(Math.Max(0, messages.Count - 128)))
-        {
-            // Bound both text and work per UI tick; disk writes run on a bounded worker.
-            if (lines.Length > 28000) { lines.AppendLine("… остальные события скрыты"); break; }
-            var text = message.Length > 2000 ? message[..2000] : message;
-            lines.AppendLine($"{DateTime.Now:HH:mm:ss} {text}");
-        }
+        foreach (var message in messages) mapStreaming.Observe(message);
         if (log.TextLength > 64000) log.Text = log.Text[^32000..];
-        string batch = lines.ToString();
+        string batch = LogBatch.Build(messages, timestamped);
         log.AppendText(batch);
         LogStore.Append(batch);
     }
