@@ -62,6 +62,7 @@ final class RelayOverlayController {
     private TextView pageTitle;
     private TextView backButton;
     private LinearLayout pageContent;
+    private ScrollView pageScroll;
     private TextView logText;
     private String currentPage = "home";
     private ValueAnimator drawerAnimator;
@@ -138,6 +139,7 @@ final class RelayOverlayController {
     }
 
     void show() {
+        if (!InterfaceSettings.visible(preferences, InterfaceSettings.MENU)) { hide(); return; }
         if (windowRoot != null) return;
         if (!Settings.canDrawOverlays(context)) {
             if (!missingPermissionLogged) {
@@ -220,6 +222,7 @@ final class RelayOverlayController {
     }
 
     void hide() {
+        finishTextInput();
         LinearLayout root = windowRoot;
         if (drawerAnimator != null) {
             drawerAnimator.cancel();
@@ -235,6 +238,7 @@ final class RelayOverlayController {
         pageTitle = null;
         backButton = null;
         pageContent = null;
+        pageScroll = null;
         logText = null;
         currentPage = "home";
         windowParams = null;
@@ -279,15 +283,17 @@ final class RelayOverlayController {
 
     private View buildPanel() {
         BoundedScrollView scroll = new BoundedScrollView(context);
-        scroll.setBackground(panelBackground(dp(18)));
-        scroll.setElevation(dp(10));
-        scroll.setClipToOutline(true);
         scroll.setFillViewport(false);
-        scroll.setVerticalScrollBarEnabled(true);
+        scroll.setVerticalScrollBarEnabled(false);
+        pageScroll = scroll;
 
         LinearLayout panel = new LinearLayout(context);
         panel.setOrientation(LinearLayout.VERTICAL);
         panel.setPadding(dp(12), dp(10), dp(12), dp(14));
+        panel.setBackground(panelBackground(dp(18)));
+        panel.setElevation(dp(10));
+        panel.setClipToOutline(true);
+        panel.setTag("overlay-panel");
 
         LinearLayout header = new LinearLayout(context);
         header.setOrientation(LinearLayout.HORIZONTAL);
@@ -295,8 +301,10 @@ final class RelayOverlayController {
         backButton = text("‹", 25, true);
         backButton.setGravity(Gravity.CENTER);
         backButton.setBackground(actionBackground());
+        backButton.setTag("overlay-back");
+        backButton.setContentDescription("Все модули");
         backButton.setOnClickListener(view -> showPage("home"));
-        header.addView(backButton, new LinearLayout.LayoutParams(dp(38), dp(38)));
+        header.addView(backButton, new LinearLayout.LayoutParams(dp(48), dp(48)));
         pageTitle = text("CPE RELAY", 16, true);
         pageTitle.setPadding(dp(10), 0, 0, 0);
         header.addView(pageTitle, new LinearLayout.LayoutParams(
@@ -304,45 +312,61 @@ final class RelayOverlayController {
             ViewGroup.LayoutParams.WRAP_CONTENT,
             1f
         ));
-        TextView live = text("● LIVE", 10, true);
-        live.setTextColor(0xff73e49a);
+        TextView live = text("●", 12, true);
+        live.setContentDescription("Меню подключённой сессии");
+        live.setTextColor(RelayUi.SUCCESS);
         live.setPadding(dp(8), dp(5), dp(8), dp(5));
         live.setBackground(statusBackground());
         header.addView(live);
-        panel.addView(header, margins(-1, dp(42), 0, 0, 0, dp(8)));
+        panel.addView(header, margins(-1, dp(48), 0, 0, 0, dp(6)));
 
         pageContent = new LinearLayout(context);
         pageContent.setOrientation(LinearLayout.VERTICAL);
-        panel.addView(pageContent, new LinearLayout.LayoutParams(
+        scroll.addView(pageContent, new ScrollView.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT
         ));
         showPage("home");
 
-        scroll.addView(
-            panel,
-            new ScrollView.LayoutParams(
+        panel.addView(
+            scroll,
+            new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
             )
         );
-        return scroll;
+        return panel;
     }
 
     private void showPage(String page) {
         if (pageContent == null || pageTitle == null || backButton == null) {
             return;
         }
+        finishTextInput();
         currentPage = page;
+        if (pageScroll != null) pageScroll.scrollTo(0, 0);
         pageContent.removeAllViews();
+        pageContent.setTag("overlay-page-" + page);
         chunkStatus = null;
         miniMapStatus = null;
         automationStatus = null;
         depositStatus = null;
         areaFillStatus = null;
         logText = null;
-        backButton.setVisibility("home".equals(page) ? View.INVISIBLE : View.VISIBLE);
+        backButton.setVisibility("home".equals(page) ? View.GONE : View.VISIBLE);
         switch (page) {
+            case "map_streaming":
+                pageTitle.setText("Загрузка карт");
+                pageContent.addView(sectionHeader("ПОСТОЯННО АКТИВНО"));
+                pageContent.addView(text("До 4000 карт", 24, true));
+                pageContent.addView(settingLabel("Автоматическая очередь · до 8 обновлений и 512 КиБ/с. По одной карте за раз, без залпов."));
+                pageContent.addView(text("Обычные игровые пакеты имеют приоритет. Данные карт не пересылаются напрямую: 8 МиБ в памяти, до 512 МиБ на диске.", 12, false));
+                break;
+            case "no_render":
+                pageTitle.setText("NO RENDER");
+                pageContent.addView(toggle("Скрывать сущности", "no_render_enabled", false));
+                pageContent.addView(text("Выключите, чтобы вернуть сохранённое отображение игроков, мобов и предметов. Свой игрок, сундуки и шалкер-боксы не фильтруются.", 12, false));
+                break;
             case "outline":
                 pageTitle.setText("ОБВОДКА");
                 buildOutlinePage(pageContent);
@@ -359,9 +383,26 @@ final class RelayOverlayController {
                 pageTitle.setText("МИНИ-КАРТА");
                 buildMiniMapPage(pageContent);
                 break;
-            case "automation":
-                pageTitle.setText("АВТОМАТИЗАЦИЯ");
-                buildAutomationPage(pageContent);
+            case "platform":
+                pageTitle.setText("Платформа");
+                pageContent.addView(new PlatformSettingsControls(context, preferences));
+                break;
+            case "zip":
+                pageTitle.setText("Карты ZIP");
+                pageContent.addView(new MapQueueControls(context, preferences));
+                break;
+            case "craft":
+                pageTitle.setText("Автокрафт");
+                buildCraftPage(pageContent);
+                break;
+            case "deposit":
+                pageTitle.setText("Разгрузка");
+                buildDepositPage(pageContent);
+                break;
+            case "totem":
+            case "armor":
+                pageTitle.setText("totem".equals(page) ? "Авто-тотем" : "Авто-броня");
+                buildEquipmentAutomationPage(pageContent, "totem".equals(page));
                 break;
             case "area_fill":
                 pageTitle.setText("АВТОЗАПОЛНЕНИЕ");
@@ -385,75 +426,54 @@ final class RelayOverlayController {
                 buildHomePage(pageContent);
                 break;
         }
+        bindTextInputs(pageContent);
+    }
+
+    private void bindTextInputs(View view) {
+        if (view instanceof android.widget.EditText) {
+            android.widget.EditText input = (android.widget.EditText)view;
+            input.setImeOptions(android.view.inputmethod.EditorInfo.IME_ACTION_DONE);
+            input.setOnTouchListener((target, event) -> {
+                if (event.getActionMasked() == MotionEvent.ACTION_UP && windowParams != null) {
+                    // The overlay stays non-focusable during normal gameplay.
+                    // Only an explicit tap on an input field may open the IME.
+                    windowParams.flags &= ~WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
+                    updateWindowLayout();
+                    input.requestFocus();
+                    input.post(() -> {
+                        if (windowRoot == null || !input.hasFocus() || !input.isAttachedToWindow()) return;
+                        android.view.inputmethod.InputMethodManager ime = (android.view.inputmethod.InputMethodManager)
+                            context.getSystemService(Context.INPUT_METHOD_SERVICE);
+                        if (ime != null) ime.showSoftInput(input, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT);
+                    });
+                }
+                return false;
+            });
+            input.setOnEditorActionListener((target, action, event) -> {
+                if (action != android.view.inputmethod.EditorInfo.IME_ACTION_DONE) return false;
+                finishTextInput();
+                return true;
+            });
+        } else if (view instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup)view;
+            for (int i = 0; i < group.getChildCount(); ++i) bindTextInputs(group.getChildAt(i));
+        }
+    }
+
+    private void finishTextInput() {
+        if (windowRoot == null || windowParams == null ||
+            (windowParams.flags & WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE) != 0) return;
+        android.view.inputmethod.InputMethodManager ime = (android.view.inputmethod.InputMethodManager)
+            context.getSystemService(Context.INPUT_METHOD_SERVICE);
+        if (ime != null) ime.hideSoftInputFromWindow(windowRoot.getWindowToken(), 0);
+        View focused = windowRoot.findFocus();
+        if (focused != null) focused.clearFocus();
+        windowParams.flags |= WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
+        updateWindowLayout();
     }
 
     private void buildHomePage(LinearLayout root) {
-        TextView subtitle = text(
-            "Пакетный HUD работает отдельными слоями поверх Minecraft",
-            11,
-            false
-        );
-        subtitle.setTextColor(0xffaab8c8);
-        subtitle.setPadding(dp(2), 0, dp(2), dp(8));
-        root.addView(subtitle);
-        root.addView(sectionHeader("ВИЗУАЛИЗАЦИЯ"));
-        root.addView(menuCard(
-            "◎  ОБВОДКА",
-            "Игроки, мобы, предметы • цвета • толщина",
-            "outline"
-        ));
-        root.addView(menuCard(
-            "⚠  АНАЛИЗ УГРОЗ",
-            "Враждебные мобы • оценка урона • свой порог",
-            "threats"
-        ));
-        root.addView(menuCard(
-            "♢  СНАРЯЖЕНИЕ",
-            "Обе руки • броня • прочность • зачарования",
-            "equipment"
-        ));
-        root.addView(sectionHeader("КАРТА И МИР"));
-        root.addView(menuCard(
-            "⌖  МИНИ-КАРТА",
-            "Карта поверхности из пакетов чанков",
-            "minimap"
-        ));
-        root.addView(menuCard(
-            "▦  ЧАНКИ",
-            "Удержание и отдельный перемещаемый счётчик",
-            "chunks"
-        ));
-        root.addView(menuCard(
-            "⌂  СХЕМЫ",
-            "3D-проекция построек • слои • поворот • импорт NBT",
-            "schematics"
-        ));
-        root.addView(sectionHeader("АВТОМАТИЗАЦИЯ"));
-        root.addView(menuCard(
-            "⇄  АВТО-ЭКИПИРОВКА",
-            "Тотем в левую руку и лучшая броня",
-            "automation"
-        ));
-        root.addView(menuCard(
-            "▧  АВТОЗАПОЛНЕНИЕ",
-            "Область по точкам • блок из руки • автопроход",
-            "area_fill"
-        ));
-        root.addView(sectionHeader("ДИАГНОСТИКА"));
-        root.addView(menuCard(
-            "≡  ЖУРНАЛ",
-            "Запись полностью отключается одним переключателем",
-            "logs"
-        ));
-        TextView note = text(
-            "Точная привязка зависит от FOV и пакетной камеры. " +
-                "Захват экрана и вмешательство в процесс Minecraft не используются.",
-            10,
-            false
-        );
-        note.setTextColor(0xff8391a2);
-        note.setPadding(dp(3), dp(7), dp(3), 0);
-        root.addView(note);
+        root.addView(new OverlayModuleCatalog(context, this::showPage));
     }
 
     private View sectionHeader(String value) {
@@ -461,25 +481,6 @@ final class RelayOverlayController {
         header.setTextColor(RelayUi.ACCENT);
         header.setPadding(dp(4), dp(5), dp(3), dp(5));
         return header;
-    }
-
-    private View menuCard(String title, String subtitle, String page) {
-        LinearLayout card = new LinearLayout(context);
-        card.setOrientation(LinearLayout.VERTICAL);
-        card.setPadding(dp(13), dp(11), dp(13), dp(11));
-        card.setBackground(RelayUi.action(context, RelayUi.SURFACE, 14, RelayUi.BORDER));
-        TextView heading = text(title + "  ›", 15, true);
-        heading.setTextColor(0xffedf5ff);
-        card.addView(heading);
-        TextView detail = text(subtitle, 12, false);
-        detail.setTextColor(0xff9eacbc);
-        detail.setPadding(0, dp(3), 0, 0);
-        card.addView(detail);
-        card.setOnClickListener(view -> showPage(page));
-        card.setClickable(true);
-        card.setMinimumHeight(dp(64));
-        card.setLayoutParams(margins(-1, -2, 0, 0, 0, dp(7)));
-        return card;
     }
 
     private void buildOutlinePage(LinearLayout root) {
@@ -1614,22 +1615,33 @@ final class RelayOverlayController {
         }
     }
 
-    private void buildAutomationPage(LinearLayout root) {
-        root.addView(new PlatformSettingsControls(context, preferences));
-        root.addView(new MapQueueControls(context,preferences));
-        root.addView(toggle("Автоматизация 2 · плавающая кнопка", RelayService.KEY_AUTO_CRAFT_STORE_BUTTON, true));
-        root.addView(settingLabel("Авто 2: крафт шалкеров с выбранным NBT → ближайшие сундуки → повтор. " +
-            "Встаньте у верстака и сундуков (до 4 блоков), закройте меню и нажмите СТАРТ. " +
-            "Удерживайте кнопку для статуса. Паузы крафта и смены окон — ниже. " +
-            "Сначала выберите NBT-файл или .nbt craft имя. Шаблон фиксируется при старте. " +
-            "Сервер должен поддерживать legacy-инвентарь."));
+    private void buildCraftPage(LinearLayout root) {
+        root.addView(toggle("Разрешить автоматизацию", RelayService.KEY_AUTO_CRAFT_STORE_BUTTON, true));
+        root.addView(settingLabel("Выберите NBT в модуле «Схемы / NBT». Верстак и сундуки должны быть рядом (до 4 блоков). Нужна поддержка legacy-инвентаря сервером."));
+        Button start = RelayUi.button(context, "Старт / стоп", true);
+        start.setOnClickListener(view -> {
+            start.setEnabled(false);
+            // Native inventory work never runs on the overlay/UI thread.
+            MapQueueControls.WORKER.execute(() -> {
+                String result;
+                try { NativeBridge.toggleAutoCraftStore(); result = "Команда крафта отправлена"; }
+                catch (Throwable error) { result = "Не удалось изменить состояние крафта"; }
+                String message = result;
+                new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
+                    start.setEnabled(true);
+                    if (windowRoot != null) android.widget.Toast.makeText(context, message, android.widget.Toast.LENGTH_SHORT).show();
+                });
+            });
+        });
+        root.addView(start, margins(-1, -2, 0, dp(8), 0, dp(12)));
         root.addView(new AutoCraftSettingsControls(context, preferences, settingsChanged));
+    }
+
+    private void buildDepositPage(LinearLayout root) {
         root.addView(toggle("Авторазгрузка шалкеров в сундук",
             RelayService.KEY_SHULKER_DEPOSIT_ENABLED, false));
         root.addView(toggle("Разгружать также хотбар",
             RelayService.KEY_SHULKER_DEPOSIT_HOTBAR, false));
-        root.addView(toggle("Плавающая кнопка (видна в сундуках)",
-            RelayService.KEY_SHULKER_DEPOSIT_BUTTON, true));
         int speedProgress = ShulkerDepositSettings.progressForInterval(preferences.getInt(
             RelayService.KEY_SHULKER_DEPOSIT_INTERVAL_MS, ShulkerDepositSettings.DEFAULT_INTERVAL_MS));
         TextView speedLabel = settingLabel("Скорость разгрузки\n" + ShulkerDepositSettings.label(
@@ -1662,16 +1674,11 @@ final class RelayOverlayController {
             "Кнопка перетаскивается; удержание показывает статус. Вложенный NBT не разбирается. " +
             "Legacy-сервер: переносы с выбранной паузой и клиентским отображением, без отдельного подтверждения; " +
             "при серверной коррекции — остановка.", 10, false));
-        root.addView(toggle(
-            "Авто-тотем в левую руку",
-            RelayService.KEY_AUTO_TOTEM,
-            false
-        ));
-        root.addView(toggle(
-            "Автоматически надевать лучшую броню",
-            RelayService.KEY_AUTO_ARMOR,
-            false
-        ));
+    }
+
+    private void buildEquipmentAutomationPage(LinearLayout root, boolean totem) {
+        root.addView(toggle(totem ? "Авто-тотем в левую руку" : "Надевать лучшую броню",
+            totem ? RelayService.KEY_AUTO_TOTEM : RelayService.KEY_AUTO_ARMOR, false));
         automationStatus = text("", 10, true);
         automationStatus.setPadding(dp(10), dp(8), dp(10), dp(8));
         automationStatus.setBackground(statusBackground());
@@ -1691,7 +1698,7 @@ final class RelayOverlayController {
 
     private void buildAreaFillPage(LinearLayout root) {
         root.addView(toggle(
-            "Включить модуль и плавающую кнопку",
+            "Включить автозаполнение",
             RelayService.KEY_AREA_FILL_ENABLED,
             false
         ));
@@ -1990,10 +1997,16 @@ final class RelayOverlayController {
 
     private Switch toggle(String label, String key, boolean defaultValue) {
         Switch control = new Switch(context);
+        control.setTag("overlay-setting-" + key);
         control.setText(label);
         control.setTextSize(13);
         control.setMinHeight(dp(48));
-        control.setTextColor(Color.WHITE);
+        control.setTextColor(RelayUi.TEXT);
+        control.setSwitchPadding(dp(12));
+        control.setThumbTintList(new android.content.res.ColorStateList(
+            new int[][] {new int[] {android.R.attr.state_checked}, new int[0]},
+            new int[] {RelayUi.ACCENT, RelayUi.MUTED}));
+        control.setTrackTintList(android.content.res.ColorStateList.valueOf(RelayUi.BORDER));
         control.setChecked(preferences.getBoolean(key, defaultValue));
         control.setPadding(dp(1), dp(2), dp(1), dp(2));
         control.setOnCheckedChangeListener((button, checked) -> {
@@ -2016,6 +2029,9 @@ final class RelayOverlayController {
         slider.setMin(minimum);
         slider.setMax(maximum);
         slider.setProgress(value);
+        slider.setMinimumHeight(dp(48));
+        slider.setProgressTintList(android.content.res.ColorStateList.valueOf(RelayUi.ACCENT));
+        slider.setThumbTintList(android.content.res.ColorStateList.valueOf(RelayUi.ACCENT));
         slider.setPadding(0, 0, 0, 0);
         return slider;
     }
@@ -2338,6 +2354,7 @@ final class RelayOverlayController {
 
     private void animateDrawer(boolean open) {
         if (windowRoot == null || windowParams == null) return;
+        if (!open) finishTextInput();
         if (drawerAnimator != null) {
             drawerAnimator.cancel();
         }
@@ -2456,48 +2473,48 @@ final class RelayOverlayController {
 
     private GradientDrawable panelBackground(float radius) {
         GradientDrawable background = new GradientDrawable();
-        background.setColor(0xeb151a22);
+        background.setColor(0xf7101218);
         background.setCornerRadius(radius);
-        background.setStroke(dp(1), 0xff5f789d);
+        background.setStroke(dp(1), RelayUi.BORDER);
         return background;
     }
 
     private GradientDrawable tabBackground() {
         GradientDrawable background = new GradientDrawable();
-        background.setColor(0xf21b2330);
+        background.setColor(RelayUi.SURFACE);
         background.setCornerRadii(new float[] {
             0, 0,
             dp(16), dp(16),
             dp(16), dp(16),
             0, 0
         });
-        background.setStroke(dp(1), 0xff7f9bc4);
+        background.setStroke(dp(1), RelayUi.ACCENT);
         return background;
     }
 
     private GradientDrawable statusBackground() {
         GradientDrawable background = new GradientDrawable();
-        background.setColor(0x66101720);
+        background.setColor(RelayUi.SURFACE);
         background.setCornerRadius(dp(10));
-        background.setStroke(dp(1), 0x665f789d);
+        background.setStroke(dp(1), RelayUi.BORDER);
         return background;
     }
 
     private GradientDrawable actionBackground() {
         GradientDrawable background = new GradientDrawable();
-        background.setColor(0xff263446);
+        background.setColor(RelayUi.RAISED);
         background.setCornerRadius(dp(10));
-        background.setStroke(dp(1), 0x665f789d);
+        background.setStroke(dp(1), RelayUi.BORDER);
         return background;
     }
 
     private GradientDrawable cardBackground(boolean selected) {
         GradientDrawable background = new GradientDrawable();
-        background.setColor(selected ? 0xff24364a : 0xbb1d2734);
+        background.setColor(selected ? RelayUi.RAISED : RelayUi.SURFACE);
         background.setCornerRadius(dp(12));
         background.setStroke(
             dp(1),
-            selected ? 0xff4fd5ff : 0x554f6682
+            selected ? RelayUi.ACCENT : RelayUi.BORDER
         );
         return background;
     }
@@ -2556,11 +2573,11 @@ final class RelayOverlayController {
 
         @Override
         protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
-            int maximumHeight = Math.max(
-                dp(120),
+            int maximumHeight = Math.min(dp(520), Math.max(
+                dp(80),
                 context.getResources().getDisplayMetrics().heightPixels -
-                    dp(20)
-            );
+                    dp(176)
+            ));
             int boundedHeight = View.MeasureSpec.makeMeasureSpec(
                 maximumHeight,
                 View.MeasureSpec.AT_MOST

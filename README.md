@@ -7,8 +7,29 @@ installable arm64 APK: [Android relay app](android/relay-app/README.md).
 
 Current builds:
 
-- [Windows 1.1.0 — standalone x64 EXE](https://github.com/M9CHKO/bedrock-protocol/releases/tag/windows-v1.1.0), no ZIP or separate .NET install. [Instructions](windows/relay-app/README.txt).
-- [Android 1.3.15 — arm64 APK](https://github.com/M9CHKO/bedrock-protocol/releases/tag/android-v1.3.15), Android 8+; optimized Release, debug-signed. [SHA-256](android/relay-app/apk/CPE-Relay-v1.3.15-arm64-v8a-release-debug-signed.apk.sha256).
+- [Windows 1.3.9 — standalone x64 EXE](https://github.com/M9CHKO/bedrock-protocol/releases/tag/windows-v1.3.9-modules), modular UI and automatic map delivery. [Instructions](windows/relay-app/README.txt).
+- [Android 1.5.2-Modules — arm64 APK](https://github.com/M9CHKO/bedrock-protocol/releases/tag/android-v1.5.2-modules), Android 8+; optimized Release, debug-signed. [Install and usage](android/relay-app/README.md).
+
+### Automatic delivery of large map walls
+
+Both applications build the **same C++ relay library**, not separate map-path
+implementations. It intercepts map payloads before ordinary forwarding, merges
+updates per map ID on a disk worker, and sends rebuilt plaintext through one
+bounded scheduler: up to **4000 maps, 8 updates/s, 512 KiB/s**, one at a time.
+The byte rate is the restored setting, not the withdrawn 640 KiB/s experiment.
+Ordinary gameplay has priority; overload and parse errors never permit direct
+map-payload forwarding. A separate bounded request queue also paces map demand.
+
+The apps always load maps automatically. Entity No Render is independent;
+turning it off restores cached actors. Chest/shulker-box block-entity packets
+remain passthrough. The Android launcher and compact in-game drawer now open
+each feature in a separate module. Floating controls are opt-in under Settings.
+
+See [shared module source map](include/bedrock/relay/README.md),
+[limits and recovery behavior](docs/map-delivery.md), and
+[Android release notes](docs/android-1.5.2-modules.md). Queue submission counters
+do not prove Minecraft rendered every image, and no relay can guarantee a
+connection if the backend itself closes it.
 
 Both frontends include Auto 2 for Bedrock 1.21.2 and 1.21.100: craft shulkers
 with a selected NBT template, close the workbench, unload into nearby chests,

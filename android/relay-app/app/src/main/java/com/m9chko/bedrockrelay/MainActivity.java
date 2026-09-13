@@ -97,6 +97,9 @@ public final class MainActivity extends Activity {
     private boolean logVisible;
     private int selectedPage;
     private LinearLayout modulesPage;
+    private ModuleCatalogView moduleCatalog;
+    private LinearLayout settingsPage;
+    private TextView settingsTab;
     private TextView modulesTab;
     private TextView connectionBadge;
     private TextView latencyText;
@@ -133,6 +136,7 @@ public final class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         preferences = getSharedPreferences(RelayService.PREFERENCES, MODE_PRIVATE);
+        InterfaceSettings.upgrade(preferences);
         texturePack = new OfficialTexturePack(this);
         schematicRepository = new SchematicRepository(this);
         schematicSourceFolder = new SchematicSourceFolder(this);
@@ -160,6 +164,10 @@ public final class MainActivity extends Activity {
         setContentView(buildContent());
         showMainPage(savedInstanceState == null ? 0 : savedInstanceState.getInt("main_page", 0));
         if (savedInstanceState != null) {
+            String module = savedInstanceState.getString("selected_module");
+            if (module != null) moduleCatalog.openModule(module);
+        }
+        if (savedInstanceState != null) {
             hostInput.setText(savedInstanceState.getString("draft_host", hostInput.getText().toString()));
             portInput.setText(savedInstanceState.getString("draft_port", portInput.getText().toString()));
         }
@@ -176,6 +184,7 @@ public final class MainActivity extends Activity {
     @Override
     protected void onSaveInstanceState(Bundle outState) {
         outState.putInt("main_page", selectedPage);
+        outState.putString("selected_module", moduleCatalog.selectedModule());
         outState.putString("draft_host", hostInput.getText().toString());
         outState.putString("draft_port", portInput.getText().toString());
         outState.putBoolean("pending_overlay_start", pendingOverlayRelayStart);
@@ -265,9 +274,11 @@ public final class MainActivity extends Activity {
         connectionPage = buildConnectionPage();
         modulesPage = buildModulesPage();
         logsPage = buildLogsPage();
+        settingsPage = buildSettingsPage();
         pages.addView(connectionPage);
         pages.addView(modulesPage);
         pages.addView(logsPage);
+        pages.addView(settingsPage);
         shell.addView(pages, new LinearLayout.LayoutParams(-1, 0, 1));
 
         LinearLayout tabs = new LinearLayout(this);
@@ -276,13 +287,16 @@ public final class MainActivity extends Activity {
         connectionTab = tab("Подключение");
         modulesTab = tab("Модули");
         logsTab = tab("Журнал");
+        settingsTab = tab("Настройки");
         tabs.addView(connectionTab, new LinearLayout.LayoutParams(0, dp(50), 1));
         tabs.addView(modulesTab, new LinearLayout.LayoutParams(0, dp(50), 1));
         tabs.addView(logsTab, new LinearLayout.LayoutParams(0, dp(50), 1));
+        tabs.addView(settingsTab, new LinearLayout.LayoutParams(0, dp(50), 1));
         shell.addView(tabs, margins(-1, -2, 0, dp(8), 0, 0));
         connectionTab.setOnClickListener(view -> showMainPage(0));
         modulesTab.setOnClickListener(view -> showMainPage(1));
         logsTab.setOnClickListener(view -> showMainPage(2));
+        settingsTab.setOnClickListener(view -> showMainPage(3));
         shell.requestApplyInsets();
         return shell;
     }
@@ -385,34 +399,81 @@ public final class MainActivity extends Activity {
     }
 
     private LinearLayout buildModulesPage() {
-        LinearLayout content = column();
-        content.addView(text("Инструменты мира", 24, true), margins(-1, -2, 0, 0, 0, dp(6)));
-        TextView hint = text("Включи нужное здесь. Положение, цвет и точные параметры настраиваются через меню CPE в игре.", 13, false);
-        hint.setTextColor(RelayUi.MUTED);
-        content.addView(hint, margins(-1, -2, 0, 0, 0, dp(14)));
-        content.addView(sectionLabel("ОТОБРАЖЕНИЕ"));
-        addModule(content, "Обводка сущностей", "Игроки, мобы и предметы", RelayService.KEY_ENTITY_OUTLINES, true);
-        addModule(content, "Мини-карта", "Поверхность и твоя позиция", RelayService.KEY_MINIMAP, false);
-        addModule(content, "Снаряжение", "Руки, броня и прочность", RelayService.KEY_EQUIPMENT_HUD, false);
-        addModule(content, "Анализ угроз", "Предупреждения о приближении мобов", RelayService.KEY_THREAT_ANALYSIS, false);
-        content.addView(sectionLabel("СТРОИТЕЛЬСТВО И АВТОМАТИЗАЦИЯ"));
-        content.addView(new PlatformSettingsControls(this, preferences));
-        content.addView(new MapQueueControls(this,preferences));
-        addModule(content, "Автозаполнение", "Точки и запуск выбираются в игре", RelayService.KEY_AREA_FILL_ENABLED, false);
-        addModule(content, "Авто-тотем", "Пополнение левой руки из инвентаря", RelayService.KEY_AUTO_TOTEM, false);
-        addModule(content, "Авто-броня", "Выбор снаряжения из инвентаря", RelayService.KEY_AUTO_ARMOR, false);
-        addModule(content, "Разгрузка шалкеров", "Автоматически в свободные слоты открытого сундука", RelayService.KEY_SHULKER_DEPOSIT_ENABLED, false);
-        addModule(content, "Автоматизация 2", "Плавающая кнопка: шалкеры с выбранным NBT → сундуки. Верстак и сундуки рядом, без ходьбы. Удержание кнопки — статус", RelayService.KEY_AUTO_CRAFT_STORE_BUTTON, true);
-        LinearLayout craftCard = card();
+        moduleCatalog = new ModuleCatalogView(this);
+        LinearLayout maps = card();
+        maps.addView(sectionLabel("ПОСТОЯННО АКТИВНО"));
+        maps.addView(text("До 4000 карт", 25, true));
+        TextView mapNote = text("Карты появляются автоматически и постепенно. До 8 обновлений и 512 КиБ в секунду, не больше одной карты за раз. Обычные игровые пакеты имеют приоритет.\n\nХранилище: 8 МиБ в памяти и до 512 МиБ на диске. Прямой проход payload карт исключён.", 14, false);
+        mapNote.setTextColor(RelayUi.MUTED);
+        maps.addView(mapNote, margins(-1, -2, 0, dp(12), 0, 0));
+        moduleCatalog.addModule("map_streaming", "Загрузка карт", "Автоматическая очередь · до 4000 карт", maps);
+        LinearLayout noRender = column();
+        addModule(noRender, "Скрывать сущности", "Игроки, мобы и предметы. Выключение возвращает сохранённое отображение.", "no_render_enabled", false);
+        TextView note = text("Сундуки и шалкер-боксы не фильтруются. Карты всегда загружаются через отдельную очередь. Свой игрок и взаимодействие с миром остаются доступны.", 13, false);
+        note.setTextColor(RelayUi.MUTED);
+        noRender.addView(note);
+        moduleCatalog.addModule("no_render", "No Render", "Управление видимостью сущностей", noRender);
+        simpleModule("outline", "Обводка сущностей", "Игроки, мобы и предметы", RelayService.KEY_ENTITY_OUTLINES, true);
+        simpleModule("minimap", "Мини-карта", "Поверхность и твоя позиция", RelayService.KEY_MINIMAP, false);
+        simpleModule("equipment", "Снаряжение", "Руки, броня и прочность", RelayService.KEY_EQUIPMENT_HUD, false);
+        simpleModule("threat", "Анализ угроз", "Предупреждения о приближении мобов", RelayService.KEY_THREAT_ANALYSIS, false);
+        moduleCatalog.addModule("platform", "Строительство", "Настройки платформы и маршрута", new PlatformSettingsControls(this, preferences));
+        moduleCatalog.addModule("zip", "Карты из ZIP", "Отдельная автоматизация крафта .qznbt", new MapQueueControls(this, preferences));
+        simpleModule("fill", "Автозаполнение", "Точки и запуск выбираются через меню CPE в игре", RelayService.KEY_AREA_FILL_ENABLED, false);
+        simpleModule("totem", "Авто-тотем", "Пополнение левой руки из инвентаря", RelayService.KEY_AUTO_TOTEM, false);
+        simpleModule("armor", "Авто-броня", "Выбор снаряжения из инвентаря", RelayService.KEY_AUTO_ARMOR, false);
+        LinearLayout deposit = column();
+        addModule(deposit, "Разгружать шалкеры", "В свободные слоты открытого сундука", RelayService.KEY_SHULKER_DEPOSIT_ENABLED, false);
+        addModule(deposit, "Включать хотбар", "Разгружать также нижние 9 слотов", RelayService.KEY_SHULKER_DEPOSIT_HOTBAR, false);
+        addDepositSpeed(deposit);
+        moduleCatalog.addModule("deposit", "Разгрузка", "Шалкеры → сундук · скорость и слоты", deposit);
+        LinearLayout craft = column();
+        addModule(craft, "Разрешить автоматизацию", "Выбранный NBT → шалкеры → сундуки", RelayService.KEY_AUTO_CRAFT_STORE_BUTTON, true);
         autoCraftSettingsControls = new AutoCraftSettingsControls(this, preferences, () -> {
             if (relayRunning) startService(new Intent(this, RelayService.class).setAction(RelayService.ACTION_APPLY_SETTINGS));
         });
-        craftCard.addView(autoCraftSettingsControls);
-        content.addView(craftCard, margins(-1, -2, 0, 0, 0, dp(8)));
-        addModule(content, "Разгружать хотбар", "Включая шалкеры в нижних 9 слотах", RelayService.KEY_SHULKER_DEPOSIT_HOTBAR, false);
-        addModule(content, "Кнопка разгрузки", "Не скрывается в сундуках · перетаскивается", RelayService.KEY_SHULKER_DEPOSIT_BUTTON, true);
-        addDepositSpeed(content);
-        addModule(content, "Удержание чанков", "Больше загруженного мира · расход памяти", RelayService.KEY_CHUNK_RETENTION, false);
+        craft.addView(autoCraftSettingsControls);
+        Button craftStart = primaryButton("Старт / стоп");
+        craftStart.setOnClickListener(v -> {
+            if (!relayRunning) { toast("Сначала подключись к миру"); return; }
+            uiWorker.execute(() -> {
+                String message;
+                try { NativeBridge.toggleAutoCraftStore(); message = "Команда крафта отправлена"; }
+                catch (Throwable error) { message = "Не удалось изменить состояние крафта"; }
+                final String reply = message;
+                handler.post(() -> { if (!isDestroyed()) toast(reply); });
+            });
+        });
+        craft.addView(craftStart, margins(-1, -2, 0, dp(14), 0, 0));
+        moduleCatalog.addModule("craft", "Автокрафт", "Отдельный запуск и настройки темпа", craft);
+        simpleModule("chunks", "Удержание чанков", "Больше загруженного мира · расход памяти", RelayService.KEY_CHUNK_RETENTION, false);
+        moduleCatalog.addModule("library", "Библиотека NBT", "Схемы, шалкеры и папки", buildLibraryModule());
+        moduleCatalog.addModule("textures", "Текстуры", "Оформление HUD и схем", buildTexturesModule());
+        return moduleCatalog;
+    }
+
+    private void simpleModule(String id, String title, String description, String key, boolean fallback) {
+        LinearLayout content = column();
+        addModule(content, "Включить", description, key, fallback);
+        moduleCatalog.addModule(id, title, description, content);
+    }
+
+    private LinearLayout buildSettingsPage() {
+        LinearLayout content = column();
+        content.addView(text("Настройки", 25, true), margins(-1, -2, 0, 0, 0, dp(14)));
+        addModule(content, "Плавающие кнопки", "По умолчанию скрыты. Не меняет работу самих модулей.", InterfaceSettings.FLOATING, false);
+        addModule(content, "Меню CPE", "Быстрый доступ к подробным настройкам в игре", InterfaceSettings.MENU, true);
+        addModule(content, "Разгрузка", "Отдельная кнопка поверх сундука", InterfaceSettings.DEPOSIT, true);
+        addModule(content, "Автокрафт", "Быстрый старт и остановка", InterfaceSettings.CRAFT, true);
+        addModule(content, "Карты ZIP", "Кнопка крафта, не загрузки изображений", InterfaceSettings.ZIP, true);
+        addModule(content, "Заполнение", "Быстрый запуск области по точкам", InterfaceSettings.FILL, true);
+        TextView note = text("Сначала включи «Плавающие кнопки», затем выбери нужные. Загрузка изображений карт работает постоянно и не требует кнопок.", 13, false);
+        note.setTextColor(RelayUi.MUTED);
+        content.addView(note, margins(-1, -2, 0, dp(12), 0, 0));
+        return scrollPage(content);
+    }
+
+    private LinearLayout buildLibraryModule() {
         LinearLayout schematics = card();
         schematics.addView(sectionLabel("СХЕМЫ И NBT"));
         schematics.addView(text("Библиотека построек и шалкеров", 18, true));
@@ -450,7 +511,10 @@ public final class MainActivity extends Activity {
         );
         folder.setOnClickListener(view -> openSchematicFolderPicker());
         schematics.addView(folder, margins(-1, -2, 0, 0, 0, 0));
-        content.addView(schematics, margins(-1, -2, 0, dp(8), 0, dp(12)));
+        return schematics;
+    }
+
+    private LinearLayout buildTexturesModule() {
         LinearLayout texturesCard = card();
         TextView texturesTitle = text("ТЕКСТУРЫ HUD И СХЕМ", 12, true);
         texturesTitle.setTextColor(0xffc79aff);
@@ -512,11 +576,9 @@ public final class MainActivity extends Activity {
         );
         textureNote.setTextColor(0xff78889b);
         texturesCard.addView(textureNote);
-        content.addView(texturesCard, margins(-1, -2, 0, 0, 0, dp(10)));
+
         refreshTexturePackStatus();
-
-
-        return scrollPage(content);
+        return texturesCard;
     }
 
     private void addModule(LinearLayout content, String title, String description,
@@ -701,10 +763,10 @@ public final class MainActivity extends Activity {
     }
 
     private void showMainPage(int page) {
-        selectedPage = Math.max(0, Math.min(2, page));
+        selectedPage = Math.max(0, Math.min(3, page));
         logVisible = selectedPage == 2;
-        View[] pages = {connectionPage, modulesPage, logsPage};
-        TextView[] tabs = {connectionTab, modulesTab, logsTab};
+        View[] pages = {connectionPage, modulesPage, logsPage, settingsPage};
+        TextView[] tabs = {connectionTab, modulesTab, logsTab, settingsTab};
         for (int index = 0; index < pages.length; index++) {
             pages[index].setVisibility(index == selectedPage ? View.VISIBLE : View.GONE);
             tabs[index].setBackground(tabBackground(index == selectedPage));
@@ -1378,6 +1440,7 @@ public final class MainActivity extends Activity {
 
     private TextView tab(String value) {
         TextView tab = text(value, 11, true);
+        tab.setTag("main-tab-" + value);
         tab.setGravity(Gravity.CENTER);
         tab.setClickable(true);
         return tab;

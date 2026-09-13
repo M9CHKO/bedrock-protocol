@@ -84,7 +84,8 @@ final class ShulkerDepositOverlayController {
     }
 
     void configure() {
-        if ((!mapQueue||mapLoaded) && shouldShow(sessionVisible, preferences.getBoolean(
+        if (InterfaceSettings.visible(preferences, mapQueue ? InterfaceSettings.ZIP : autoCraft ? InterfaceSettings.CRAFT : InterfaceSettings.DEPOSIT)
+            && (!mapQueue||mapLoaded) && shouldShow(sessionVisible, preferences.getBoolean(
                 mapQueue ? "map_queue_button" : autoCraft ? RelayService.KEY_AUTO_CRAFT_STORE_BUTTON : RelayService.KEY_SHULKER_DEPOSIT_BUTTON, true))) addWindow();
         else removeWindow();
         refreshText();
@@ -94,13 +95,11 @@ final class ShulkerDepositOverlayController {
 
     private void addWindow() {
         if (button != null || !Settings.canDrawOverlays(context)) return;
-        button = new TextView(context);
-        button.setTextColor(Color.WHITE);
-        button.setTextSize(11);
+        button = RelayUi.text(context, "", 12, true);
         button.setGravity(Gravity.CENTER);
         button.setMinWidth(dp(96));
-        button.setMinHeight(dp(46));
-        button.setPadding(dp(8), dp(6), dp(8), dp(6));
+        button.setMinHeight(dp(48));
+        button.setPadding(dp(12), dp(8), dp(12), dp(8));
         button.setElevation(dp(7));
         button.setOnClickListener(view -> {
             if (autoCraft) {
@@ -184,19 +183,17 @@ final class ShulkerDepositOverlayController {
     private void refreshText() {
         if (button == null) return;
         boolean enabled = autoCraft ? running : preferences.getBoolean(RelayService.KEY_SHULKER_DEPOSIT_ENABLED, false);
-        String label = autoCraft ? (busy ? (running ? "Авто 2: СТОП" : "Авто 2: завершение") +
-            "\nКрафт: " + crafted + " · В сундук: " + sent : "Авто 2: СТАРТ") :
+        String label = autoCraft ? (busy ? (running ? "Крафт · СТОП" : "Крафт · завершение") +
+            "\nКрафт: " + crafted + " · В сундук: " + sent : "Крафт · СТАРТ") :
             enabled ? "Разгрузка: ВКЛ\nОтправлено: " + sent : "Разгрузка: ВЫКЛ";
         if(mapQueue)label=(busy?"Карты ZIP: СТОП":"Карты ZIP: СТАРТ")+"\n"+sent+" / "+mapTotal+" · Карт: "+crafted;
         if (label.contentEquals(button.getText())) return;
         button.setText(label);
         button.setContentDescription(label + (autoCraft ? ". NBT: " + template : "") +
             ". Нажмите для переключения; удерживайте для статуса; перетащите для перемещения.");
-        GradientDrawable background = new GradientDrawable();
-        background.setColor(enabled ? 0xe6256547 : 0xe62c3443);
-        background.setCornerRadius(dp(12));
-        background.setStroke(dp(1), enabled ? 0xff78d59d : 0xff92a1b7);
-        button.setBackground(background);
+        button.setTextColor(enabled ? RelayUi.ACCENT : RelayUi.TEXT);
+        button.setBackground(RelayUi.action(context, RelayUi.SURFACE, 14,
+            enabled ? RelayUi.ACCENT : RelayUi.BORDER));
     }
 
     private void removeWindow() {

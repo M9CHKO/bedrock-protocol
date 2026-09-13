@@ -19,7 +19,14 @@ android/relay-app/
     │   │   ├── MainActivity.java     launcher, SAF pickers, status and auth UI
     │   │   ├── RelayService.java     foreground relay and module coordinator
     │   │   ├── RelayOverlayController.java
-    │   │   │                         categorized in-game settings drawer
+    │   │   │                         fixed header + one selected in-game module
+    │   │   ├── OverlayModuleCatalog.java
+    │   │   │                         compact two-column in-game navigation
+    │   │   ├── ModuleCatalogView.java
+    │   │   │                         separate launcher module screens
+    │   │   ├── InterfaceSettings.java
+    │   │   │                         visibility migration, independent of features
+    │   │   ├── RelayUi.java          common launcher/overlay visual language
     │   │   ├── *OverlayController.java
     │   │   │                         independent draggable HUD windows
     │   │   ├── ThreatAnalyzer.java   packet-only combat risk model
@@ -48,12 +55,26 @@ storage and are not committed to the repository.
 - `RelayOverlayController.java` — categorized in-game settings menu.
 - `DiagnosticsLog.java` — opt-in diagnostics storage.
 
-The launcher uses Connection, Modules and Journal tabs with a persistent
-launch/stop action row. `RelayUi.java` supplies shared surfaces, contrast and
+The launcher uses Connection, Modules, Journal and Settings tabs with a persistent
+launch/stop action row on Connection. `RelayUi.java` supplies shared surfaces, contrast and
 touch-target styling. Launcher JNI snapshots and log reads are coalesced on
 a background worker; schematic service actions also check native state off
 the input thread. Native start/stop use one serialized command worker with
 service ownership so delayed teardown cannot stop a newer instance.
+
+`ModuleCatalogView` only attaches the selected screen. `OverlayModuleCatalog`
+only navigates: `RelayOverlayController` lazily builds one module at a time.
+Platform/ZIP/craft controls are shared with the launcher, not duplicated native
+implementations. The drawer header remains outside the scrolling content;
+height is bounded for landscape. ZIP timing fields collapse without discarding
+values. `InterfaceSettings` performs a one-time opt-in migration for floating
+controls while preserving feature and server preferences. Legacy map-hide
+preferences are cleared, and JNI also ignores that legacy argument.
+
+`ModuleScreensTest` and `OverlayModuleScreensTest` render actual Android views
+with Robolectric native graphics into `app/build/module-previews/` and check
+module isolation, navigation, state persistence, touch targets and landscape
+bounds. They are not an Android-device/Minecraft integration test.
 
 Ordinary diagnostic writes use a bounded 64-entry queue; fatal records take
 the synchronous durable path. Journal segments are bounded to 256 KiB each,
@@ -85,6 +106,16 @@ inventory, or chat UI is open.
   and defensive reductions.
 
 ## Native relay
+
+Android CMake links the repository's `BedrockProtocol::bedrock_protocol` target.
+There is no Android-only copy of the scheduler: `MapDeliveryQueue`,
+`MapImageCodec`, `MapSpoolPages`, `MapRequestQueue` and `NoRender` belong
+to the [shared C++ modules](../../include/bedrock/relay/README.md).
+Maps are mandatory intercepted plaintext, rebuilt by a disk worker, then
+released by the downstream timer through its existing compression/encryption
+lock. Configured delivery is 8/s and **512 KiB/s**, max 4000 IDs, 8 MiB queue
+budget, 512 MiB disk. Java never stores or forwards image payloads.
+See [full invariants and recovery limits](../../docs/map-delivery.md).
 
 - `NativeBridge.java` — typed JNI surface used by Java.
 - `src/main/cpp/native_bridge.cpp` — version-aware Bedrock packet tracking,

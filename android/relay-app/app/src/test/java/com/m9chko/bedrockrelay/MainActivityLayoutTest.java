@@ -63,9 +63,12 @@ public class MainActivityLayoutTest {
                 navBounds.bottom <= height);
             modules.performClick();
             assertTrue(find(root, "Инструменты мира").getVisibility() == View.VISIBLE);
+            root.findViewWithTag("module-craft").performClick();
             assertNotNull(root.findViewWithTag(AutoCraftSettings.CRAFT.key));
             assertNotNull(root.findViewWithTag(AutoCraftSettings.WINDOW.key));
-            View row = (View) find(root, "Авто-тотем").getParent().getParent();
+            root.findViewWithTag("modules-back").performClick();
+            root.findViewWithTag("module-totem").performClick();
+            View row = (View) find(root, "Включить").getParent().getParent();
             row.performClick();
             assertTrue(activity.getSharedPreferences(RelayService.PREFERENCES, Context.MODE_PRIVATE)
                 .getBoolean(RelayService.KEY_AUTO_TOTEM, false));

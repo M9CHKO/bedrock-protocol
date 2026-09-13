@@ -235,6 +235,7 @@ public final class RelayService extends Service {
     public void onCreate() {
         super.onCreate();
         preferences = getSharedPreferences(PREFERENCES, MODE_PRIVATE);
+        InterfaceSettings.upgrade(preferences);
         overlayController = new RelayOverlayController(
             this,
             preferences,
@@ -381,7 +382,7 @@ public final class RelayService extends Service {
             this,
             "INFO",
             "service",
-            "Start requested: local=127.0.0.1:19132 destination=" +
+            "Start requested: local=0.0.0.0:19132 destination=" +
                 host + ":" + port
                 + " version=" + version
         );
@@ -1587,6 +1588,12 @@ public final class RelayService extends Service {
             }
             if (depositOverlayController != null) depositOverlayController.configure();
             if (autoCraftOverlayController != null) autoCraftOverlayController.configure();
+            if (mapQueueOverlayController != null) mapQueueOverlayController.configure();
+            if (overlayController != null) {
+                if (overlayShouldBeVisible && !minecraftUiBlocked && !serviceStopping
+                    && InterfaceSettings.visible(preferences, InterfaceSettings.MENU)) overlayController.show();
+                else overlayController.hide();
+            }
         });
         try {
             commandExecutor.execute(() -> {
@@ -1596,6 +1603,11 @@ public final class RelayService extends Service {
                         detailedLogs,
                         retainChunks,
                         radiusChunks
+                    );
+                    boolean noRender = preferences.getBoolean("no_render_enabled", false);
+                    NativeBridge.configureNoRender(
+                        false, // Map images always pass through the bounded scheduler.
+                        noRender
                     );
                     NativeBridge.configureGameplayFeatures(
                         autoArmor,

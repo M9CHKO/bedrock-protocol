@@ -89,7 +89,7 @@ final class AreaFillOverlayController {
     }
 
     private void reconcile() {
-        if (sessionVisible && enabled && !uiBlocked) addWindow();
+        if (sessionVisible && enabled && !uiBlocked && InterfaceSettings.visible(preferences, InterfaceSettings.FILL)) addWindow();
         else removeWindow();
     }
 
@@ -98,13 +98,13 @@ final class AreaFillOverlayController {
         button = new TextView(context);
         button.setGravity(Gravity.CENTER);
         button.setTextColor(Color.WHITE);
-        button.setTextSize(10f * scalePercent / 100f);
+        button.setTextSize(Math.max(11f, 12f * scalePercent / 100f));
         button.setTypeface(
             android.graphics.Typeface.DEFAULT,
             android.graphics.Typeface.BOLD
         );
         button.setMinWidth(sdp(76));
-        button.setMinHeight(sdp(44));
+        button.setMinHeight(Math.max(dp(48), sdp(48)));
         button.setPadding(sdp(8), sdp(5), sdp(8), sdp(5));
         button.setElevation(sdp(9));
         button.setClickable(true);
@@ -228,7 +228,7 @@ final class AreaFillOverlayController {
         String symbol = running ? "■" : "▶";
         button.setText("ЗАЛИВКА  " + symbol + "\n" + progress);
         button.setTextColor(
-            waitingForBlocks ? 0xffffcf72 : running ? 0xff8ff0ad : Color.WHITE
+            waitingForBlocks ? RelayUi.WARNING : running ? RelayUi.ACCENT : RelayUi.TEXT
         );
         button.setBackground(background());
         button.setContentDescription(
@@ -239,11 +239,11 @@ final class AreaFillOverlayController {
 
     private GradientDrawable background() {
         GradientDrawable drawable = new GradientDrawable();
-        drawable.setColor(running ? 0xee153c2a : 0xe6111822);
+        drawable.setColor(RelayUi.SURFACE);
         drawable.setCornerRadius(sdp(11));
         drawable.setStroke(
             Math.max(1, sdp(1)),
-            waitingForBlocks ? 0xaaffb52e : running ? 0xaa36d67e : 0x884fd5ff
+            waitingForBlocks ? RelayUi.WARNING : running ? RelayUi.ACCENT : RelayUi.BORDER
         );
         return drawable;
     }

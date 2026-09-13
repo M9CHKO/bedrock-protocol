@@ -21,6 +21,7 @@ public final class NativeBridge {
     public static native String mapQueueCommand(String json);
 
     public static native void stopRelay();
+    public static native void configureNoRender(boolean hideMaps, boolean hideEntities);
     public static native void refreshAreaFillMarkers();
 
     /** Selects one saved NBT file for every following manual shulker craft. */

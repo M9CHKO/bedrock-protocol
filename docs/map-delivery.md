@@ -57,7 +57,7 @@ not a claim that Minecraft ran out of memory.
 
 ## Frontends, No Render and failure behavior
 
-Windows 1.3.8 and Android 1.5.2-Modules always configure maps as visible.
+Windows 1.3.9 and Android 1.5.2-Modules always configure maps as visible.
 The old map visibility control is removed from both frontends; their native
 configuration entry points also ignore the legacy map-hide parameter. Entity
 No Render is separate and cannot pause map demand or delivery. The library

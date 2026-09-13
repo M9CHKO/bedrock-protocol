@@ -20,17 +20,25 @@ final class MapQueueControls extends LinearLayout {
     private final Handler handler=new Handler(Looper.getMainLooper());
     private final Runnable refresh=new Runnable(){public void run(){if(attached){command("snapshot");handler.postDelayed(this,1500);}}};
     MapQueueControls(Context context,SharedPreferences preferences){super(context);this.preferences=preferences;setOrientation(VERTICAL);
-        addView(RelayUi.text(context,"Карты из ZIP · отдельный модуль",17,true));
-        addView(RelayUi.text(context,"ZIP с .qznbt загружается отдельно. Один шалкер за цикл. Одна карта в ячейке, непосредственно внутри шалкера. Освободите слот хотбара и уберите остальные шалкеры. Поиск — 6 блоков, клик — 4,25. После перезапуска или импорта очередь начинается сначала.",12,false));
-        Button zip=RelayUi.button(context,"Загрузить отдельный ZIP с картами",true);
-        zip.setOnClickListener(v->{Intent intent=new Intent(context,MainActivity.class).setAction(MainActivity.ACTION_IMPORT_MAP_ZIP).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK|Intent.FLAG_ACTIVITY_SINGLE_TOP);context.startActivity(intent);});addView(zip);
-        status=RelayUi.text(context,"Сначала загрузите ZIP",12,false);addView(status);
-        for(String op:new String[]{"toggle","stop","configure"}){Button b=RelayUi.button(context,op.equals("toggle")?"Старт / стоп карт":op.equals("stop")?"Остановить":"Сохранить темп",false);b.setOnClickListener(v->command(op));addView(b);}
+        TextView hint=RelayUi.text(context,"Крафт карт из .qznbt — не загрузка изображений мира. Один шалкер за цикл. Освободите слот хотбара и уберите остальные шалкеры.",12,false);
+        hint.setTextColor(RelayUi.MUTED);addView(hint,spaced(0,12));
+        Button zip=RelayUi.button(context,"Загрузить ZIP",false);
+        zip.setOnClickListener(v->{Intent intent=new Intent(context,MainActivity.class).setAction(MainActivity.ACTION_IMPORT_MAP_ZIP).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK|Intent.FLAG_ACTIVITY_SINGLE_TOP);context.startActivity(intent);});addView(zip,spaced(0,8));
+        status=RelayUi.text(context,"Сначала загрузите ZIP",12,false);
+        status.setPadding(dp(12),dp(12),dp(12),dp(12));status.setBackground(RelayUi.surface(context,RelayUi.SURFACE,12,RelayUi.BORDER));addView(status,spaced(0,10));
+        for(String op:new String[]{"toggle","stop","clear"}){Button b=RelayUi.button(context,op.equals("toggle")?"Старт / стоп карт":op.equals("stop")?"Остановить / сбросить":"Удалить ZIP из очереди",op.equals("toggle"));b.setOnClickListener(v->command(op));addView(b,spaced(0,8));}
+        LinearLayout timing=new LinearLayout(context);timing.setOrientation(VERTICAL);timing.setVisibility(GONE);timing.setTag("zip-timing");
+        Button timingToggle=RelayUi.button(context,"Паузы крафта  ›",false);timingToggle.setTag("zip-timing-toggle");
+        timingToggle.setOnClickListener(v->{boolean open=timing.getVisibility()!=VISIBLE;timing.setVisibility(open?VISIBLE:GONE);timingToggle.setText(open?"Паузы крафта  ‹":"Паузы крафта  ›");});
+        addView(timingToggle,spaced(6,8));addView(timing);
         String[] keys={"craft","open","close","place","transfer","hold","break","pickup","store","next","timeout"};
         String[] titles={"Крафт","Открытие окна","После закрытия","После установки","Перенос карты (от 500)","Карта в правой руке (от 300)","Разрушение (от 3000)","Подбор","В сундук","Между файлами","Таймаут (10000–120000)"};
         int[] defaults={1000,700,700,500,600,1500,3500,1000,700,1000,30000};JSONObject saved=new JSONObject();try{saved=new JSONObject(preferences.getString(TIMING,"{}"));}catch(Exception ignored){}
-        for(int i=0;i<keys.length;i++){addView(RelayUi.text(context,titles[i]+", мс",12,false));EditText f=new EditText(context);f.setInputType(InputType.TYPE_CLASS_NUMBER);f.setSingleLine(true);f.setText(Integer.toString(clamp(keys[i],saved.optInt(keys[i],defaults[i]))));fields.put(keys[i],f);addView(f);}
+        for(int i=0;i<keys.length;i++){timing.addView(RelayUi.text(context,titles[i]+", мс",12,false),spaced(8,6));EditText f=new EditText(context);f.setInputType(InputType.TYPE_CLASS_NUMBER);f.setSingleLine(true);f.setText(Integer.toString(clamp(keys[i],saved.optInt(keys[i],defaults[i]))));f.setTextColor(RelayUi.TEXT);f.setBackground(RelayUi.surface(context,RelayUi.SURFACE,10,RelayUi.BORDER));f.setPadding(dp(12),dp(8),dp(12),dp(8));f.setContentDescription(titles[i]+", миллисекунды");f.setMinimumHeight(dp(48));fields.put(keys[i],f);timing.addView(f,spaced(0,4));}
+        Button save=RelayUi.button(context,"Сохранить темп",false);save.setOnClickListener(v->command("configure"));timing.addView(save,spaced(8,0));
     }
+    private int dp(int value){return RelayUi.dp(getContext(),value);}
+    private LayoutParams spaced(int top,int bottom){LayoutParams result=new LayoutParams(-1,-2);result.setMargins(0,dp(top),0,dp(bottom));return result;}
     static int clamp(String key,int value){int min=key.equals("break")?3000:key.equals("timeout")?10000:key.equals("transfer")?500:key.equals("hold")?300:100;
         int max=key.equals("timeout")?120000:key.equals("break")?15000:10000;return Math.max(min,Math.min(max,value));}
     static void apply(SharedPreferences preferences,boolean load){try{
@@ -55,9 +63,15 @@ final class MapQueueControls extends LinearLayout {
         });
     }
     private void command(String op){if(pending)return;JSONObject config=new JSONObject();
-        try{if(!op.equals("snapshot")&&!op.equals("stop")){for(String key:fields.keySet()){int value=clamp(key,Integer.parseInt(fields.get(key).getText().toString()));config.put(key,value);fields.get(key).setText(Integer.toString(value));}config.put("op","configure");preferences.edit().putString(TIMING,config.toString()).apply();}}
+        try{if(!op.equals("snapshot")&&!op.equals("stop")&&!op.equals("clear")){for(String key:fields.keySet()){int value=clamp(key,Integer.parseInt(fields.get(key).getText().toString()));config.put(key,value);fields.get(key).setText(Integer.toString(value));}config.put("op","configure");preferences.edit().putString(TIMING,config.toString()).apply();}}
         catch(Exception e){status.setText("Проверьте задержки в миллисекундах");return;}
-        pending=true;WORKER.execute(()->{String response;try{if(config.length()>0)NativeBridge.mapQueueCommand(config.toString());response=NativeBridge.mapQueueCommand(new JSONObject().put("op",op).toString());}catch(Exception e){response="{}";}
+        pending=true;WORKER.execute(()->{String response;try{if(config.length()>0)NativeBridge.mapQueueCommand(config.toString());response=NativeBridge.mapQueueCommand(new JSONObject().put("op",op).toString());
+                JSONObject result=new JSONObject(response);
+                if(op.equals("clear")&&result.optString("error").equals("Сначала запустите реле")){
+                    result=new JSONObject().put("busy",false).put("loaded",false).put("total",0).put("completed",0).put("maps",0).put("file","").put("status","ZIP удалён из очереди. Файл на диске сохранён");response=result.toString();
+                }
+                if(op.equals("clear")&&!result.has("error")&&result.has("loaded")&&!result.optBoolean("loaded"))preferences.edit().remove(ARCHIVE).apply();
+            }catch(Exception e){response="{}";}
             final String reply=response;handler.post(()->{pending=false;if(!attached)return;try{JSONObject q=new JSONObject(reply);status.setText(q.optString("error",q.optString("status","Нет реле"))+"\n"+q.optString("file")+" · "+q.optInt("completed")+" / "+q.optInt("total")+" · Карт: "+q.optInt("maps"));}catch(Exception ignored){}});
         });}
     @Override protected void onAttachedToWindow(){super.onAttachedToWindow();attached=true;handler.post(refresh);}

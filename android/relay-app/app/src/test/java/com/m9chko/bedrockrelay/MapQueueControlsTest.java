@@ -4,6 +4,8 @@ import android.app.Application;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.widget.EditText;
+import android.view.View;
+import android.view.ViewGroup;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.robolectric.RobolectricTestRunner;
@@ -28,9 +30,17 @@ public class MapQueueControlsTest {
         SharedPreferences prefs=context.getSharedPreferences("map-controls-test",Context.MODE_PRIVATE);
         prefs.edit().clear().putString(MapQueueControls.TIMING,"{\"hold\":2222}").commit();
         MapQueueControls card=new MapQueueControls(context,prefs);
+        ViewGroup timing=card.findViewWithTag("zip-timing");
+        assertNotNull(timing);
+        assertEquals(View.GONE,timing.getVisibility());
+        card.findViewWithTag("zip-timing-toggle").performClick();
+        assertEquals(View.VISIBLE,timing.getVisibility());
         int count=0;boolean held=false;
-        for(int i=0;i<card.getChildCount();i++)if(card.getChildAt(i) instanceof EditText){++count;held|=((EditText)card.getChildAt(i)).getText().toString().equals("2222");}
+        for(int i=0;i<timing.getChildCount();i++)if(timing.getChildAt(i) instanceof EditText){++count;held|=((EditText)timing.getChildAt(i)).getText().toString().equals("2222");}
         assertEquals(11,count);assertTrue(held);
+        card.findViewWithTag("zip-timing-toggle").performClick();
+        assertEquals(View.GONE,timing.getVisibility());
+        assertEquals("{\"hold\":2222}",prefs.getString(MapQueueControls.TIMING,""));
         assertFalse(prefs.contains(MapQueueControls.ARCHIVE));
     }
 }

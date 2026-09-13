@@ -11,13 +11,13 @@ import android.widget.TextView;
 
 /** Shared visual language for the launcher and the in-game controls. */
 final class RelayUi {
-    static final int BACKGROUND = 0xff0c1018;
-    static final int SURFACE = 0xff151c28;
-    static final int RAISED = 0xff202b3b;
-    static final int BORDER = 0xff2c394b;
+    static final int BACKGROUND = 0xff101218;
+    static final int SURFACE = 0xff191d28;
+    static final int RAISED = 0xff252a3a;
+    static final int BORDER = 0xff343b50;
     static final int TEXT = 0xffeff4fc;
     static final int MUTED = 0xffa4b2c6;
-    static final int ACCENT = 0xff93b6ff;
+    static final int ACCENT = 0xffb1a2ff;
     static final int SUCCESS = 0xff83dfb8;
     static final int WARNING = 0xffffcf83;
     static final int DANGER = 0xffffa6b3;

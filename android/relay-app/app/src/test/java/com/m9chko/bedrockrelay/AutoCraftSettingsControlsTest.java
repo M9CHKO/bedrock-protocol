@@ -47,12 +47,12 @@ public class AutoCraftSettingsControlsTest {
         assertTrue(slider.getHeight()>=48);
     }
 
-    @Test public void inGameAutomationPageContainsBothSettings() throws Exception {
+    @Test public void separateInGameCraftPageContainsBothTimingSettings() throws Exception {
         Context context=RuntimeEnvironment.getApplication();
         SharedPreferences prefs=context.getSharedPreferences("craft-overlay-test",Context.MODE_PRIVATE);
         RelayOverlayController controller=new RelayOverlayController(context,prefs,()->{},(x,y,z)->{});
         try {
-            Method build=RelayOverlayController.class.getDeclaredMethod("buildAutomationPage",LinearLayout.class);
+            Method build=RelayOverlayController.class.getDeclaredMethod("buildCraftPage",LinearLayout.class);
             build.setAccessible(true);
             LinearLayout root=new LinearLayout(context); build.invoke(controller,root);
             assertNotNull(root.findViewWithTag(AutoCraftSettings.CRAFT.key));
