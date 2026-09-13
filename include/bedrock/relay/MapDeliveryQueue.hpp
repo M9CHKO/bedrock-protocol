@@ -27,7 +27,7 @@ class MapSendBudget {
 public:
     using Clock = std::chrono::steady_clock;
     using Time = Clock::time_point;
-    static constexpr size_t PacketsPerSecond = 8, BytesPerSecond = 640 * 1024;
+    static constexpr size_t PacketsPerSecond = 8, BytesPerSecond = 512 * 1024;
     static constexpr auto MinimumGap = std::chrono::milliseconds(125);
 private:
     std::deque<std::pair<Time, size_t>> sent_;

@@ -1,4 +1,4 @@
-# Bounded map delivery (Windows 1.3.8 test build)
+# Bounded map delivery (Windows 1.3.9 / Android 1.5.2-Modules)
 
 The September 13 request adds a mandatory map scheduler to the rolled-back
 relay baseline. This does not establish a cause for previous crashes and is
@@ -27,7 +27,7 @@ not a claim that Minecraft ran out of memory.
 
 ## Resource and delivery limits
 
-- At most eight rebuilt packets and 640 KiB plaintext per rolling second.
+- At most eight rebuilt packets and 512 KiB plaintext per rolling second.
   Byte charging includes the full packet header and a conservative 5-byte batch
   length prefix. There is at least a 125 ms gap after each actual submission;
   no catch-up credit after a long pause. Large maps may mean fewer than 8/s.

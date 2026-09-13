@@ -10591,7 +10591,7 @@ public:
                 ) +
                 " nativeBuild=" + std::string(NativeBuildType) +
                 " rawUnhandledPackets=true itemNbt=binary_cache compressionLevel=1" +
-                " mapPayload=intercept-only mapRate=8/s mapBytesPerSecond=655360 mapBurst=1 mapRamMiB=8 mapDiskMiB=512 mapStorage=paged" +
+                " mapPayload=intercept-only mapRate=8/s mapBytesPerSecond=524288 mapBurst=1 mapRamMiB=8 mapDiskMiB=512 mapStorage=paged" +
                 " mapRequests=scheduled mapRequestRate=8/s mapRequestsInFlight=2 mapRequestsHidden=paused mapRequestCapacity=4000 mapCapacity=4000" +
                 " compilerOptimized=" +
                 (NativeCompilerOptimized ? "true" : "false"),
