@@ -4,6 +4,19 @@ The September 13 request adds a mandatory map scheduler to the rolled-back
 relay baseline. This does not establish a cause for previous crashes and is
 not a claim that Minecraft ran out of memory.
 
+## Shared library and published branches
+
+The implementation is included in `main` and `android-relay-app`. Applications
+link the same `BedrockProtocol::bedrock_protocol` target; a plain C++ consumer
+of `BedrockLiveRelay` receives these gates by default without enabling No Render.
+`BedrockNetworkClient` on its own has no downstream Minecraft connection and
+does not implicitly install the relay scheduler. Its remote-close lifetime and
+simultaneous-close fixes are shared by relay and standalone client integrations.
+
+The Android APK is attached to the `android-v1.5.2-modules` GitHub release.
+Its source tag is immutable; later publication/documentation commits do not
+change the APK or silently replace its native library.
+
 ## Invariants
 
 - Every decoded `clientbound_map_item_data` is consumed before normal relay
@@ -134,8 +147,9 @@ wire-ID interception, rolling byte/count limits and no catch-up.
 mixed batches, all public output paths, malformed maps and a map flood while
 ordinary clientbound/serverbound actions continue.
 
-Windows controls: Modules → No Render. Both checkboxes default off. The
-scheduler still runs with both off. Logs: `%LOCALAPPDATA%/CPE Relay Windows/relay.log`
+Windows controls: Modules → No Render controls actors only and defaults off.
+Map delivery is automatic and has no visibility checkbox in the current apps.
+Logs: `%LOCALAPPDATA%/CPE Relay Windows/relay.log`
 and its `.previous` rotation. Real Minecraft/server testing is a separate step;
 automated transport tests cannot verify rendering or resolve a remote timeout.
 
@@ -159,3 +173,19 @@ preceding remote server disconnect has been resolved.
 Scheduler health no longer depends on item/NBT diagnostics. The Windows log
 retains critical events ahead of debug tails and uses original timestamps.
 Background worker death is reported explicitly and retained in the UI status.
+
+## Reproducing the library regressions
+
+Build and test the library without enabling either application bridge:
+
+```sh
+cmake -S . -B build-core -DBUILD_TESTING=ON -DBEDROCK_PROTOCOL_CPP_BUILD_TOOLS=ON -DBEDROCK_PROTOCOL_CPP_BUILD_WINDOWS_APP=OFF -DBEDROCK_PROTOCOL_CPP_BUILD_BOT=OFF -DBEDROCK_PROTOCOL_CPP_BUILD_EXAMPLES=OFF
+cmake --build build-core --parallel 2 --target no-render-smoke map-capacity-smoke map-request-queue-smoke live-relay-remote-close-smoke network-client-smoke live-relay-smoke server-outbound-queue-smoke
+ctest --test-dir build-core --output-on-failure --timeout 300 -R "^(no-render-smoke|no-render-live-smoke|map-capacity-smoke|map-request-queue-smoke|map-request-queue-live-smoke|live-relay-remote-close-smoke|network-client-smoke|live-relay-smoke|server-outbound-queue-smoke)$"
+```
+
+The host toolchain needs C++20, OpenSSL and zlib. These nine checks cover the
+shared code, including 4000-map pixel restoration, overflow/malformed rejection,
+mixed traffic and callback teardown. They do not prove that every public server
+or Minecraft client will remain connected; testing the APK on a phone remains
+a separate verification step.

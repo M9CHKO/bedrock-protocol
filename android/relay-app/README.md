@@ -13,6 +13,13 @@ UDP-порту `19132` и подключает его к серверу, кот�
 - [SHA-256 APK](apk/CPE-Relay-Android-1.5.2-Modules-arm64-v8a.apk.sha256)
 - [Предыдущие сборки](https://github.com/M9CHKO/bedrock-protocol/releases)
 
+APK находится во вложениях релиза (**Assets**), а не среди новых файлов исходников.
+Актуальные код и README доступны в ветках
+[`android-relay-app`](https://github.com/M9CHKO/bedrock-protocol/tree/android-relay-app/android/relay-app)
+и [`main`](https://github.com/M9CHKO/bedrock-protocol/tree/main/android/relay-app).
+Общая защита карт находится в [C++-библиотеке в `main`](https://github.com/M9CHKO/bedrock-protocol/tree/main/include/bedrock/relay),
+а не только в интерфейсе приложения.
+
 Минимальная версия — Android 8.0 (API 26), целевая — Android 16
 (API 36). APK содержит только `arm64-v8a`. Сборка подписана тем же debug-
 сертификатом, что и предыдущие тестовые APK, поэтому устанавливается поверх

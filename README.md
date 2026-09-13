@@ -10,6 +10,13 @@ Current builds:
 - [Windows 1.3.9 — standalone x64 EXE](https://github.com/M9CHKO/bedrock-protocol/releases/tag/windows-v1.3.9-modules), modular UI and automatic map delivery. [Instructions](windows/relay-app/README.txt).
 - [Android 1.5.2-Modules — arm64 APK](https://github.com/M9CHKO/bedrock-protocol/releases/tag/android-v1.5.2-modules), Android 8+; optimized Release, debug-signed. [Install and usage](android/relay-app/README.md).
 
+[Download Android APK directly](https://github.com/M9CHKO/bedrock-protocol/releases/download/android-v1.5.2-modules/CPE-Relay-Android-1.5.2-Modules-arm64-v8a.apk).
+The APK is a **release asset**, not a newly committed binary in the source tree.
+The shared library and map-safety changes are published in
+[`main`](https://github.com/M9CHKO/bedrock-protocol/tree/main/include/bedrock/relay);
+the Android application and its current documentation are also published in
+[`android-relay-app`](https://github.com/M9CHKO/bedrock-protocol/tree/android-relay-app/android/relay-app).
+
 ### Automatic delivery of large map walls
 
 Both applications build the **same C++ relay library**, not separate map-path
@@ -19,6 +26,14 @@ bounded scheduler: up to **4000 maps, 8 updates/s, 512 KiB/s**, one at a time.
 The byte rate is the restored setting, not the withdrawn 640 KiB/s experiment.
 Ordinary gameplay has priority; overload and parse errors never permit direct
 map-payload forwarding. A separate bounded request queue also paces map demand.
+
+This protection is built into `BedrockLiveRelay` by default, not implemented
+only in the Android/Windows menus. The shared client also retains callback
+owners during remote-close cleanup and handles simultaneous local/remote
+disconnects without joining a worker that is waiting on that same close.
+These address specific reproduced native teardown failures; a remote backend
+can still terminate a connection. A standalone `BedrockNetworkClient` remains
+a packet client, not a relay with a Minecraft-facing map-delivery scheduler.
 
 The apps always load maps automatically. Entity No Render is independent;
 turning it off restores cached actors. Chest/shulker-box block-entity packets
