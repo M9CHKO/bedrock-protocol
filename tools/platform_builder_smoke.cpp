@@ -48,7 +48,31 @@ int main(){try{
         PlatformBuilder::Camera c{.5,181.62,.5,0,0,100,10,true};
         // Initial row preserves existing floor, the next row is built in air.
         for(int x=-3;x<=3;++x)blocks[{x,179,0}]=x==0?2:1;
+        // PlayerAuthInput normally gives an eye position, but some relays
+        // provide the feet/base position.  The builder must discover the
+        // same known-safe column and retain that height for the route.
+        PlatformBuilder basePosition;basePosition.version(modern?"1.21.100":"1.21.2");
+        basePosition.palette({{1,"minecraft:quartz_block"},{2,"minecraft:glowstone"},{3,"minecraft:chest"},{4,"minecraft:crafting_table"}});
+        basePosition.inventory(inventory(0,items,modern),true,1);
+        auto baseCamera=PlatformBuilder::Camera{.5,180,.5,0,0,100,10,true};
+        basePosition.start(baseCamera,world,100);require(basePosition.busy(),"start builder from base-position camera");
+        basePosition.stop();
         b.settings.chunks=1;b.start(c,world,100);require(b.busy(),"start builder");
+
+        // Minecraft does not keep the camera at the centre of a block.  After
+        // the initial existing row is skipped, the next Row goal is the same
+        // block under the player.  That must advance immediately rather than
+        // becoming a one-cell "path unavailable" timeout.
+        PlatformBuilder offCentre;offCentre.version(modern?"1.21.100":"1.21.2");
+        offCentre.palette({{1,"minecraft:quartz_block"},{2,"minecraft:glowstone"},{3,"minecraft:chest"},{4,"minecraft:crafting_table"}});
+        offCentre.inventory(inventory(0,items,modern),true,1);
+        auto offCentreCamera=PlatformBuilder::Camera{.12,181.62,.12,0,0,100,10,true};
+        offCentre.settings.chunks=1;offCentre.start(offCentreCamera,world,100);
+        offCentre.poll(offCentreCamera,world,100);
+        require(offCentre.stage==PlatformBuilder::Stage::Row,"initial row schedules next row");
+        offCentre.poll(offCentreCamera,world,150);
+        require(offCentre.stage!=PlatformBuilder::Stage::Row && offCentre.stage!=PlatformBuilder::Stage::Paused,
+            "off-centre player advances from existing initial row");
         for(uint64_t now=100;now<3000;now+=50){auto out=b.poll(c,world,now);
             if(out.move){c.x=out.x;c.y=out.y;c.z=out.z;}
             for(auto& p:out.packets)if(p.name=="inventory_transaction"){

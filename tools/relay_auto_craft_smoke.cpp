@@ -306,9 +306,12 @@ static void verifyPlatformIntegration() {
     for(const auto& version:{std::string("1.21.2"),std::string("1.21.100")}) {
         RelayState state;state.version=version;state.loadBlockRegistry("data/minecraft-data/bedrock/1.21.100");state.configureBlockRuntimeIds(false);
         state.itemProtocolVariables->setVariable("ShieldItemID",513);
-        const auto air=state.actualAirRuntimeId(),quartz=*state.schematicRuntimeId("minecraft:quartz_block"),glow=*state.schematicRuntimeId("minecraft:glowstone");
+        const auto air=state.actualAirRuntimeId(),quartz=*state.schematicRuntimeId("minecraft:quartz_block"),glow=*state.schematicRuntimeId("minecraft:glowstone"),obsidian=*state.schematicRuntimeId("minecraft:obsidian");
         for(int x=-4;x<=4;++x)for(int y=61;y<=67;++y)for(int z=-4;z<=4;++z)
-            state.schematicBlockOverrides[{0,x,y,z}]={y==62?(x==0?glow:quartz):air,0,0};
+            // Obsidian is deliberately not a builder material and was absent
+            // from the old name allow-list. Its full collision shape is a
+            // valid platform floor for the production world adapter.
+            state.schematicBlockOverrides[{0,x,y,z}]={y==62?(x==0&&z==0?obsidian:(x==0?glow:quartz)):air,0,0};
         bedrock::ProtoDefWriter seed;seed.varuint64(123);seed.f32le(.5f);seed.f32le(64.62f);seed.f32le(.5f);seed.f32le(0);seed.f32le(0);seed.f32le(0);
         auto codec=bedrock::VersionedPacketCodec::forVersion(version);
         state.entityPositions.observeServerbound(codec.makePacketByName("move_player",seed.take()));
@@ -335,7 +338,30 @@ static void verifyPlatformIntegration() {
             for(auto& p:event.replacements)bedrock::ProtoDefPacketDecoder(version,state.itemProtocolVariables).validatePacketStrict(p.name,p.payload);
             for(auto& p:state.platformClientPackets) {
                 bedrock::ProtoDefPacketDecoder(version,state.itemProtocolVariables).validatePacketStrict(p.name,p.payload);
-                if(p.name=="move_player")moved=true;
+                if(p.name=="move_player") {
+                    bedrock::BedrockRelayPacketEvent localEvent;localEvent.packet=p;
+                    bedrock::RelayPacketEvent localMove(version,localEvent,state.itemProtocolVariables,true);
+                    bedrock::BedrockRelayPacketEvent upstreamEvent;upstreamEvent.packet=event.replacements.front();
+                    bedrock::RelayPacketEvent upstreamMove(version,upstreamEvent,state.itemProtocolVariables,true);
+                    require(localMove.getString("mode")=="normal","local camera follows builder without teleport mode");
+                    require(std::abs(localMove.getDouble("position.x")-upstreamMove.getDouble("position.x"))<.001 &&
+                        std::abs(localMove.getDouble("position.y")-upstreamMove.getDouble("position.y"))<.001 &&
+                        std::abs(localMove.getDouble("position.z")-upstreamMove.getDouble("position.z"))<.001,
+                        "local camera and serverbound PlayerAuthInput use identical coordinates");
+                    require(std::abs(localMove.getDouble("pitch")-upstreamMove.getDouble("pitch"))<.001 &&
+                        std::abs(localMove.getDouble("yaw")-upstreamMove.getDouble("yaw"))<.001 &&
+                        std::abs(localMove.getDouble("head_yaw")-upstreamMove.getDouble("head_yaw"))<.001,
+                        "local movement and PlayerAuthInput use identical head rotation");
+                    if(version=="1.21.100") {
+                        const double yaw=upstreamMove.getDouble("yaw")*3.141592653589793/180.0;
+                        const double pitch=upstreamMove.getDouble("pitch")*3.141592653589793/180.0;
+                        require(std::abs(upstreamMove.getDouble("camera_orientation.x")+std::sin(yaw)*std::cos(pitch))<.001 &&
+                            std::abs(upstreamMove.getDouble("camera_orientation.y")+std::sin(pitch))<.001 &&
+                            std::abs(upstreamMove.getDouble("camera_orientation.z")-std::cos(yaw)*std::cos(pitch))<.001,
+                            "Camera Orientation follows the same yaw and pitch as the moving bot head");
+                    }
+                    moved=true;
+                }
             }
             state.platformClientPackets.clear();
         }

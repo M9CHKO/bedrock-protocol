@@ -26,7 +26,7 @@ internal static class SelfTest
             Require(AppSettings.ValidSlot("Weathertop_End_Nested") && !AppSettings.ValidSlot("../test") && !AppSettings.ValidSlot(new string('x', 33)), "Safe NBT slot names");
             AutoCraftUiTests.Run(output, Require);
             MapQueueUiTests.Run(output, Require);
-            ModuleUiTests.Run(Require);
+            ModuleUiTests.Run(output, Require);
             using (var form = new MainForm(preview: true))
             {
                 form.StartPosition = FormStartPosition.Manual; form.Location = new Point(-15000, -15000);

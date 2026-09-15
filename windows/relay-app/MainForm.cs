@@ -15,6 +15,7 @@ internal sealed class MainForm : Form
     private readonly FloatingDepositForm floatingMaps = new(maps:true);
     private readonly FloatingDepositForm floating = new();
     private readonly FloatingDepositForm floatingAuto2 = new(autoCraft: true);
+    private readonly FloatingPlatformForm floatingPlatform = new();
     private readonly System.Windows.Forms.Timer pollTimer = new() { Interval = 500 };
     private readonly System.Windows.Forms.Timer configTimer = new() { Interval = 250 };
     private readonly System.Windows.Forms.Timer overlayTimer = new() { Interval = 250 };
@@ -39,6 +40,7 @@ internal sealed class MainForm : Form
     private readonly CheckBox floatingDepositEnabled = Check("Разгрузка шалкеров");
     private readonly CheckBox floatingAutoCraftEnabled = Check("Авто 2 · крафт и разгрузка");
     private readonly CheckBox floatingMapsEnabled = Check("Крафт карт из ZIP");
+    private readonly CheckBox floatingPlatformEnabled = Check("Строительство");
     private readonly CheckBox detailed = Check("Подробный журнал");
     private readonly CheckBox hideEntities = Check("Скрывать игроков, мобов и лежащие предметы");
     private readonly CheckBox auto2 = Check("Включить Авто 2 · крафт с NBT и разгрузка в сундуки");
@@ -79,7 +81,7 @@ internal sealed class MainForm : Form
         platformPanel = new PlatformPanel(backend, settings);
         mapPanel = new MapQueuePanel(backend,settings);
         modules = new ModuleCatalogPanel(BuildModuleList());
-        Text = "CPE Relay — Windows 1.3.9 · Модули";
+        Text = "CPE Relay — Windows 1.3.10 · Модули";
         AutoScaleMode = AutoScaleMode.Dpi;
         Font = new Font("Segoe UI", 10);
         Size = new Size(1080, 790); MinimumSize = new Size(860, 700);
@@ -96,7 +98,7 @@ internal sealed class MainForm : Form
             var button = new RelayButton { Text = names[i], Navigation = true, Width = 194, Height = 51, Margin = new Padding(0, 0, 0, 7) };
             button.Click += (_, _) => SelectPage(page); navigation.Add(button); nav.Controls.Add(button);
         }
-        var signature = new Label { Text = "LOCAL RELAY\nWindows x64  /  1.3.9", Dock = DockStyle.Bottom, Height = 52, ForeColor = Theme.Muted, Padding = new Padding(13, 8, 0, 0), Font = new Font("Segoe UI", 9) };
+        var signature = new Label { Text = "LOCAL RELAY\nWindows x64  /  1.3.10", Dock = DockStyle.Bottom, Height = 52, ForeColor = Theme.Muted, Padding = new Padding(13, 8, 0, 0), Font = new Font("Segoe UI", 9) };
         sidebar.Controls.Add(nav); sidebar.Controls.Add(signature); sidebar.Controls.Add(brand);
         var footer = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 77, Padding = new Padding(26, 12, 0, 0), BackColor = Theme.Sidebar, WrapContents = false };
         footer.Controls.AddRange([start, stop, status, memory]);
@@ -117,6 +119,7 @@ internal sealed class MainForm : Form
         floatingDepositEnabled.Checked = settings.FloatingDeposit;
         floatingAutoCraftEnabled.Checked = settings.FloatingAutoCraft;
         floatingMapsEnabled.Checked = settings.FloatingMaps;
+        floatingPlatformEnabled.Checked = settings.FloatingPlatform;
         craftSpeed.Value = (5000 - AppSettings.ClampCraftInterval(settings.CraftIntervalMs)) / 50;
         windowSpeed.Value = (3000 - AppSettings.ClampWindowPause(settings.WindowPauseMs)) / 100;
         UpdateCraftSpeed();
@@ -126,13 +129,14 @@ internal sealed class MainForm : Form
         UpdateSpeed();
         speed.ValueChanged += (_, _) => { UpdateSpeed(); ScheduleConfig(); };
         foreach (var check in new[] { deposit, hotbar, armor, totem, detailed, floatingEnabled,
-            floatingDepositEnabled, floatingAutoCraftEnabled, floatingMapsEnabled, auto2, hideEntities })
+            floatingDepositEnabled, floatingAutoCraftEnabled, floatingMapsEnabled, floatingPlatformEnabled, auto2, hideEntities })
             check.CheckedChanged += (_, _) => { UpdateFloatingPanels(); ScheduleConfig(); };
         start.Click += async (_, _) => await StartRelay();
         stop.Click += async (_, _) => await StopRelay();
         floating.Toggle = () => deposit.Checked = !deposit.Checked;
         floatingAuto2.Toggle = async () => await ToggleAuto2();
         floatingMaps.Toggle = async () => await mapPanel.Command("toggle");
+        floatingPlatform.Command = CommandPlatform;
         mapPanel.CommandFailed = floatingMaps.ShowError;
         auto2Toggle.Click += async (_, _) => await ToggleAuto2();
         configTimer.Tick += async (_, _) => { configTimer.Stop(); await ApplySettings(); };
@@ -141,7 +145,7 @@ internal sealed class MainForm : Form
         if (!preview) overlayTimer.Start();
         Shown += async (_, _) => { if (!preview) await Initialize(); };
         FormClosing += OnClosing;
-        FormClosed += (_, _) => { pollTimer.Dispose(); configTimer.Dispose(); overlayTimer.Dispose(); floating.Dispose(); floatingAuto2.Dispose(); floatingMaps.Dispose(); backend.Dispose(); };
+        FormClosed += (_, _) => { pollTimer.Dispose(); configTimer.Dispose(); overlayTimer.Dispose(); floating.Dispose(); floatingAuto2.Dispose(); floatingMaps.Dispose(); floatingPlatform.Dispose(); backend.Dispose(); };
         RefreshFiles(); SetBusy(false);
     }
 
@@ -161,6 +165,7 @@ internal sealed class MainForm : Form
         floating.UpdateVisibility(active, floatingEnabled.Checked && floatingDepositEnabled.Checked);
         floatingAuto2.UpdateVisibility(active, floatingEnabled.Checked && floatingAutoCraftEnabled.Checked && (auto2.Checked || auto2Busy));
         floatingMaps.UpdateVisibility(active, floatingEnabled.Checked && floatingMapsEnabled.Checked && mapPanel.Loaded);
+        floatingPlatform.UpdateVisibility(active, floatingEnabled.Checked && floatingPlatformEnabled.Checked);
     }
     private static CheckBox Check(string text) => new ToggleCheckBox { Text = text, Margin = new Padding(0, 5, 0, 5) };
     private static Label Label(string text) => new() { Text = text, AutoSize = true, ForeColor = Theme.Muted, MaximumSize = new Size(748, 0), Margin = new Padding(0, 5, 0, 7) };
@@ -312,7 +317,7 @@ internal sealed class MainForm : Form
         Heading(body, "Настройки", "Только нужные элементы поверх игры. Остальное — внутри своих модулей.");
         Card(body, Section("ПЛАВАЮЩИЕ ПАНЕЛИ"), floatingEnabled,
             Label("По умолчанию скрыты. Включение панелей не запускает модули и не меняет загрузку карт."),
-            floatingDepositEnabled, floatingAutoCraftEnabled, floatingMapsEnabled,
+            floatingDepositEnabled, floatingAutoCraftEnabled, floatingMapsEnabled, floatingPlatformEnabled,
             Label("Выберите нужные панели. Перемещайте их за верхнюю полоску.\nРаботают в оконном и безрамочном Minecraft, включая открытый сундук."));
         Card(body, Section("КАРТЫ С СЕРВЕРА"), Label("Постепенная загрузка включена всегда. Максимум 4000 карт.\nСтарое состояние кнопки «Скрыть карты» больше не приостанавливает очередь."));
         return tab;
@@ -364,6 +369,7 @@ internal sealed class MainForm : Form
         settings.FloatingDeposit = floatingDepositEnabled.Checked;
         settings.FloatingAutoCraft = floatingAutoCraftEnabled.Checked;
         settings.FloatingMaps = floatingMapsEnabled.Checked;
+        settings.FloatingPlatform = floatingPlatformEnabled.Checked;
         settings.FloatingButton = floatingEnabled.Checked; settings.IntervalMs = 3000 - speed.Value * 10;
         settings.Auto2 = auto2.Checked; settings.CraftIntervalMs = 5000 - craftSpeed.Value * 50;
         settings.WindowPauseMs = 3000 - windowSpeed.Value * 100;
@@ -410,6 +416,12 @@ internal sealed class MainForm : Form
             if (!closing && !IsDisposed) { floatingAuto2.SetCommandPending(false); SetBusy(busy); await Poll(); }
         }
     }
+    private async Task CommandPlatform(string operation)
+    {
+        if (closing || stopping || !running) return;
+        await platformPanel.Command(operation);
+        if (!closing && !stopping) await Poll();
+    }
     private void UpdateAuto2(JsonElement value)
     {
         auto2Busy = value.Flag("busy");
@@ -446,7 +458,7 @@ internal sealed class MainForm : Form
     {
         if (closing || stopping) return;
         ++lifecycle; stopping = true;
-        pollTimer.Stop(); configTimer.Stop(); floating.Hide(); floatingAuto2.Hide(); floatingMaps.Hide();
+        pollTimer.Stop(); configTimer.Stop(); floating.Hide(); floatingAuto2.Hide(); floatingMaps.Hide(); floatingPlatform.Hide();
         SetBusy(true); status.Text = "Остановка…";
         try
         {
@@ -501,6 +513,7 @@ internal sealed class MainForm : Form
         floating.UpdateIndicators(state, deposit.Checked);
         UpdateAuto2(state.TryGetProperty("autoCraftStore", out var craft) ? craft : default);
         platformPanel.Update(state.TryGetProperty("platformBuilder", out var platform) ? platform : default);
+        floatingPlatform.UpdateIndicators(state.TryGetProperty("platformBuilder", out platform) ? platform : default, upstreamReady);
         mapPanel.Update(state.TryGetProperty("mapQueue",out var maps)?maps:default);
         floatingMaps.UpdateIndicators(state,true);
         floatingAuto2.UpdateIndicators(state, auto2.Checked);
@@ -610,7 +623,7 @@ internal sealed class MainForm : Form
         if ((preview && !lifecycleTest) || closeAllowed) return;
         e.Cancel = true;
         if (closing) return;
-        closing = true; ++lifecycle; pollTimer.Stop(); configTimer.Stop(); floating.Hide(); floatingAuto2.Hide(); floatingMaps.Hide(); Hide(); Enabled = false;
+        closing = true; ++lifecycle; pollTimer.Stop(); configTimer.Stop(); floating.Hide(); floatingAuto2.Hide(); floatingMaps.Hide(); floatingPlatform.Hide(); Hide(); Enabled = false;
         // A failed settings write must never skip shutdown, nor keep a window open.
         Task save = Task.CompletedTask;
         if (!preview)

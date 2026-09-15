@@ -7,6 +7,24 @@ uint64_t platformSavedRevision=0;
 std::vector<bedrock::VersionedGamePacket> platformClientPackets;
 bedrock::AutoCraftStore::Target platformWindowTarget{};
 
+static const char* platformStageLabel(bedrock::PlatformBuilder::Stage stage) {
+    using Stage = bedrock::PlatformBuilder::Stage;
+    switch (stage) {
+        case Stage::Idle: return "idle";
+        case Stage::Build: return "build";
+        case Stage::Place: return "place";
+        case Stage::Row: return "row";
+        case Stage::Supply: return "supply";
+        case Stage::Open: return "open";
+        case Stage::Take: return "take";
+        case Stage::Transfer: return "transfer";
+        case Stage::Close: return "close";
+        case Stage::Return: return "return";
+        case Stage::Paused: return "paused";
+    }
+    return "unknown";
+}
+
 bedrock::PlatformBuilder::Camera platformCamera() const {
     auto c=entityPositions.cameraSnapshot();
     return {c.x,c.y,c.z,c.yaw,c.pitch,c.runtimeId,c.inputTick,c.known};
@@ -20,11 +38,72 @@ bedrock::PlatformBuilder::Block platformBlock(bedrock::platform::Pos p) const {
     const auto* block=blockRegistry?blockRegistry->blockByRuntimeId(s.runtimeId):nullptr;
     if(block) b.name=block->name;
     if(b.name.starts_with("minecraft:")) b.name.erase(0,10);
-    b.safeFloor=b.name=="quartz_block" || b.name=="glowstone" || b.name=="stone" ||
-        b.name=="cobblestone" || b.name=="dirt" || b.name=="grass" || b.name=="end_stone";
+    // worldBlockSample has already checked the state collision shape covers
+    // the whole footprint. Do not replace it with a short name allow-list:
+    // that made normal full blocks such as obsidian appear unsafe on Windows
+    // (and also failed when a registry exposed a state but no base name).
+    b.safeFloor=s.solid && !s.hazardous;
     return b;
 }
 bool platformBusy() const { std::lock_guard lock(platformMutex);return platformBuilder.busy(); }
+
+// A small, coordinate-free snapshot of the exact world data used by the
+// builder's safety check.  It is deliberately kept in the local UI/event log:
+// do not turn this into a Minecraft chat/command message.
+bedrock::JsRuntimeValue platformWorldDiagnostics(
+    const bedrock::PlatformBuilder::Camera& camera
+) const {
+    using J = bedrock::JsRuntimeValue;
+    std::size_t columns = 0, queued = 0;
+    {
+        std::lock_guard lock(miniMapMutex);
+        columns = schematicColumns.size();
+        queued = miniMapJobs.size();
+    }
+    const auto classify = [](const WorldBlockSample& sample) {
+        if (!sample.known) return std::string("неизвестно");
+        if (sample.air) return std::string("воздух");
+        if (sample.hazardous) return std::string("опасно");
+        if (sample.solid) return std::string("твёрдый");
+        return std::string("без опоры");
+    };
+    std::string footing = "нет позиции";
+    std::string clearance = "нет позиции";
+    std::string validHeight = "нет";
+    if (camera.known) {
+        const int x = static_cast<int>(std::floor(camera.x));
+        const int baseY = static_cast<int>(std::floor(camera.y - 1.62 + .01));
+        const int z = static_cast<int>(std::floor(camera.z));
+        const auto floor = worldBlockSample(x, baseY - 1, z);
+        const auto body = worldBlockSample(x, baseY, z);
+        footing = classify(floor);
+        clearance = classify(body);
+        for (const int offset : {0, 1, 2, -1, -2}) {
+            const auto candidateFloor = worldBlockSample(x, baseY + offset - 1, z);
+            bool clear = candidateFloor.known && candidateFloor.solid &&
+                !candidateFloor.hazardous;
+            for (int height = 0; clear && height < 3; ++height) {
+                const auto cell = worldBlockSample(x, baseY + offset + height, z);
+                clear = cell.known && cell.air;
+            }
+            if (clear) {
+                validHeight = offset == 0 ? "обычная" : "автопоправка";
+                break;
+            }
+        }
+    }
+    return J::object({
+        {"columns", J::number(static_cast<double>(columns))},
+        {"queued", J::number(static_cast<double>(queued))},
+        {"decoded", J::number(static_cast<double>(miniMapDecodedChunks.load(std::memory_order_relaxed)))},
+        {"failures", J::number(static_cast<double>(miniMapDecodeFailures.load(std::memory_order_relaxed)))},
+        {"cachedSkipped", J::number(static_cast<double>(miniMapCachedChunksSkipped.load(std::memory_order_relaxed)))},
+        {"sectionFallbacks", J::number(static_cast<double>(miniMapLevelChunkSectionFallbacks.load(std::memory_order_relaxed)))},
+        {"footing", J::string(std::move(footing))},
+        {"clearance", J::string(std::move(clearance))},
+        {"validHeight", J::string(std::move(validHeight))}
+    });
+}
 
 // Called by UI/command workers, not the packet receive hook. Bounded text-only
 // database, isolated by server, port and dimension; never stores chest contents.
@@ -68,8 +147,10 @@ bedrock::JsRuntimeValue platformSnapshotLocked() const {
     for(auto p:platformBuilder.supplies)chests.push(J::object({{"x",J::number(p.x)},{"y",J::number(p.y)},{"z",J::number(p.z)}}));
     return J::object({{"running",J::boolean(platformBuilder.busy())},{"status",J::string(platformBuilder.status)},
         {"placed",J::number(platformBuilder.placed)},{"row",J::number(platformBuilder.rowIndex)},
+        {"stage",J::string(platformStageLabel(platformBuilder.stage))},
         {"checked",J::number(platformBuilder.checked)},{"recording",J::boolean(platformBuilder.recording)},
-        {"chests",std::move(chests)},{"cacheBytes",J::number(platformBuilder.retainedBytes())}});
+        {"chests",std::move(chests)},{"cacheBytes",J::number(platformBuilder.retainedBytes())},
+        {"world",platformWorldDiagnostics(platformCamera())}});
 }
 bedrock::JsRuntimeValue platformSnapshot() {
     std::lock_guard lock(platformMutex);
@@ -99,7 +180,20 @@ bedrock::JsRuntimeValue platformCommand(const bedrock::JsRuntimeValue& request) 
     } else if(op=="stop")platformBuilder.stop();
     else if(op=="record")platformBuilder.record();
     else if(op=="remove")platformBuilder.removeSupply(integer("index",-1));
-    platformStorageLocked();return platformSnapshotLocked();
+    platformStorageLocked();
+    auto snapshot = platformSnapshotLocked();
+    const auto* world = snapshot.get("world");
+    push(
+        "platform_command",
+        "op=" + op + " status=" + platformBuilder.status +
+            " stage=" + platformStageLabel(platformBuilder.stage) +
+            " placed=" + std::to_string(platformBuilder.placed) +
+            " row=" + std::to_string(platformBuilder.rowIndex) +
+            " world=" + (world ? jsonString(*world) : "{}"),
+        "INFO",
+        "platform"
+    );
+    return snapshot;
 }
 void observePlatform(bedrock::BedrockRelayPacketEvent& event,bool serverbound) noexcept {
     try {
@@ -120,12 +214,26 @@ void observePlatform(bedrock::BedrockRelayPacketEvent& event,bool serverbound) n
         }
         if(!serverbound && name=="change_dimension") {b.reset();return;}
         if(!serverbound && (name=="inventory_content" || name=="inventory_slot")) {b.inventory(packet.payload,name=="inventory_content",now);return;}
-        if(name=="container_close" && !packet.payload.empty()) {b.closed(packet.payload.front(),serverbound,now);return;}
+        if(name=="container_close" && !packet.payload.empty()) {
+            const auto before = b.stage;
+            b.closed(packet.payload.front(),serverbound,now);
+            if (before != b.stage) push("platform_container_close",
+                "direction=" + std::string(serverbound ? "minecraft" : "server") +
+                " stage=" + platformStageLabel(b.stage) +
+                " status=" + b.status, "INFO", "platform");
+            return;
+        }
         if(!serverbound && name=="container_open") {
             bedrock::PacketFieldCursor c(packet.payload);bedrock::ProtoDefReader r(c);
             const int id=r.u8(),type=r.u8();const int x=r.zigzag32(),y=int(r.varuint32()),z=r.zigzag32();
             if(type==1) {auto block=platformBlock({x,y,z});platformWindowTarget={x,y,z,block.runtime,1,false,0,now};}
-            b.opened(id,type,{x,y,z},now);return;
+            const auto before = b.stage;
+            b.opened(id,type,{x,y,z},now);
+            if (before != b.stage) push("platform_container_open",
+                "type=" + std::to_string(type) + " stage=" +
+                platformStageLabel(b.stage) + " status=" + b.status,
+                "INFO", "platform");
+            return;
         }
         if(!serverbound && (name=="update_block" || name=="update_block_synced")) {
             bedrock::PacketFieldCursor c(packet.payload);bedrock::ProtoDefReader r(c);
@@ -167,6 +275,9 @@ bool injectPlatform(bedrock::BedrockRelayPacketEvent& event) noexcept {
                 platformBuilder.manualInventory();return true;
             }
         }
+        const auto previousStage = platformBuilder.stage;
+        const auto previousStatus = platformBuilder.status;
+        const auto previousPlaced = platformBuilder.placed;
         auto output=platformBuilder.poll(c,[this](auto p){return platformBlock(p);},steadyMilliseconds());
         if(!output.control && output.packets.empty())return false;
         auto codec=bedrock::VersionedMcpeCodec::forVersion(version);
@@ -176,7 +287,7 @@ bool injectPlatform(bedrock::BedrockRelayPacketEvent& event) noexcept {
             // actions belong to the player and must not interleave transfers.
             decoded.set("position.x",output.x);decoded.set("position.y",output.y);decoded.set("position.z",output.z);
             decoded.set("delta.x",output.dx);decoded.set("delta.y",0.0);decoded.set("delta.z",output.dz);
-            decoded.set("yaw",double(output.yaw));decoded.set("head_yaw",double(output.yaw));
+            decoded.set("pitch",double(c.pitch));decoded.set("yaw",double(output.yaw));decoded.set("head_yaw",double(output.yaw));
             const double yaw=output.yaw*3.141592653589793/180.0,pitch=c.pitch*3.141592653589793/180.0;
             decoded.set("camera_orientation.x",-std::sin(yaw)*std::cos(pitch));
             decoded.set("camera_orientation.y",-std::sin(pitch));
@@ -197,7 +308,10 @@ bool injectPlatform(bedrock::BedrockRelayPacketEvent& event) noexcept {
             movement=codec.packetCodec().makePacketByName("player_auth_input",encoder.encodePacket("player_auth_input",bedrock::ProtoDefValue::object(decoded.decodedParams())));
         }
         std::vector<bedrock::VersionedGamePacket> packets{std::move(movement)};
+        std::string emitted;
         for(auto& p:output.packets) {
+            if(!emitted.empty()) emitted += ',';
+            emitted += p.name;
             auto packet=codec.packetCodec().makePacketByName(p.name,p.payload);
             if(p.client)platformClientPackets.push_back(std::move(packet));else packets.push_back(std::move(packet));
         }
@@ -206,10 +320,24 @@ bool injectPlatform(bedrock::BedrockRelayPacketEvent& event) noexcept {
             platformClientPackets.push_back(makeAreaProtocolPacket(version,"move_player",V::object({
                 {"runtime_id",V::uinteger(c.runtime)},{"position",areaVec3(output.x,output.y,output.z)},
                 {"pitch",V::floating(c.pitch)},{"yaw",V::floating(output.yaw)},{"head_yaw",V::floating(output.yaw)},
-                {"mode",V::string("teleport")},{"on_ground",V::boolean(true)},{"ridden_runtime_id",V::uinteger(0)},
-                {"teleport",V::object({{"cause",V::string("behavior")},{"source_entity_type",V::string("player")}})},
+                // Mirror the coordinates written to PlayerAuthInput as normal
+                // local movement. Teleport/reset mode makes the camera jump
+                // back to the synthetic route when the player presses a key.
+                {"mode",V::string("normal")},{"on_ground",V::boolean(true)},{"ridden_runtime_id",V::uinteger(0)},
                 {"tick",V::uinteger(c.tick)}})));
         }
-        event.replace(std::move(packets));return true;
+        event.replace(std::move(packets));
+        if (!emitted.empty() || previousStage != platformBuilder.stage ||
+            previousStatus != platformBuilder.status ||
+            previousPlaced != platformBuilder.placed) {
+            push("platform_action",
+                "from=" + std::string(platformStageLabel(previousStage)) +
+                " to=" + platformStageLabel(platformBuilder.stage) +
+                " packets=" + (emitted.empty() ? "none" : emitted) +
+                " placed=" + std::to_string(platformBuilder.placed) +
+                " status=" + platformBuilder.status,
+                "INFO", "platform");
+        }
+        return true;
     } catch(const std::exception& e) {std::lock_guard lock(platformMutex);platformBuilder.pause("Ошибка стройки: "+safeMessage(e.what()));return true;}
 }

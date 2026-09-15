@@ -26,6 +26,7 @@ internal sealed class AppSettings
     public bool FloatingDeposit { get; set; } = true;
     public bool FloatingAutoCraft { get; set; } = true;
     public bool FloatingMaps { get; set; } = true;
+    public bool FloatingPlatform { get; set; } = true;
     public bool Auto2 { get; set; } = true;
     public Dictionary<string, decimal> Platform { get; set; } = new();
     public Dictionary<string, int> MapTiming { get; set; } = new();

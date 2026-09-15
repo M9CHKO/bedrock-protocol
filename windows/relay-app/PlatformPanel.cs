@@ -27,7 +27,7 @@ internal sealed class PlatformPanel : FlowLayoutPanel
         AddNumber("refillMs", "Пауза переноса, мс", 350, 150, 2000);
         AddNumber("refillStacks", "Запас материала, стаков", 3, 1, 6);
         var row = new FlowLayoutPanel { AutoSize = true, Width = 730 };
-        foreach (var (title, op) in new[] { ("Старт", "start"), ("Продолжить", "resume"), ("Стоп", "stop"), ("Настройки", "configure"), ("Записать сундук", "record") })
+        foreach (var (title, op) in new[] { ("Старт", "start"), ("Продолжить", "resume"), ("Стоп", "stop"), ("Записать сундук", "record") })
         {
             var button = new RelayButton { Text = title, AutoSize = true, Height = 40, MinimumSize = new Size(100,40),
                 Padding = new Padding(12,5,12,5), Margin = new Padding(0,3,8,6), Primary = op == "start" };
@@ -56,7 +56,7 @@ internal sealed class PlatformPanel : FlowLayoutPanel
         request["action"] = "platform"; request["op"] = "configure";
         await backend.Call(request);
     }
-    private async Task Command(string op, int index = 0)
+    internal async Task Command(string op, int index = 0)
     {
         if (pending) return; pending = true;
         try
@@ -70,7 +70,7 @@ internal sealed class PlatformPanel : FlowLayoutPanel
     internal void Update(JsonElement value)
     {
         if (IsDisposed) return;
-        state.Text = value.Text("status", "Подключитесь к Minecraft") + " · Блоков: " + Number(value,"placed");
+        state.Text = value.Text("status", "Подключитесь к Minecraft") + " · Блоков: " + Number(value,"placed") + WorldDiagnostics(value);
         if (value.ValueKind != JsonValueKind.Object || !value.TryGetProperty("chests", out var list) || list.GetRawText() == lastChests) return;
         lastChests = list.GetRawText(); int selected = chests.SelectedIndex;
         chests.Items.Clear(); int index = 0;
@@ -79,4 +79,10 @@ internal sealed class PlatformPanel : FlowLayoutPanel
     }
     private static long Number(JsonElement value,string name) => value.ValueKind==JsonValueKind.Object &&
         value.TryGetProperty(name,out var n) && n.TryGetInt64(out var number)?number:0;
+    private static string WorldDiagnostics(JsonElement value)
+    {
+        if (value.ValueKind != JsonValueKind.Object || !value.TryGetProperty("world", out var world) ||
+            world.ValueKind != JsonValueKind.Object) return "";
+        return $"\nМир: колонок {Number(world,"columns")}, декодировано {Number(world,"decoded")}, ошибок {Number(world,"failures")}, кэш-пропусков {Number(world,"cachedSkipped")}; опора: {world.Text("footing","?")}, место: {world.Text("clearance","?")}, высота: {world.Text("validHeight","?")}";
+    }
 }

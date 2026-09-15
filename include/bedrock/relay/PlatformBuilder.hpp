@@ -59,7 +59,7 @@ public:
         player={}; chest.clear(); inventoryReady=false; window=-1; heldSlot=0;
         recording=false; synthetic=false; sneaking=false; search.reset(); route.clear();
         pending.reset(); watched.reset(); queued.clear(); screenWindow=-1;
-        memory.clear();
+        memory.clear(); feetYAdjustment=0; placementAck=false;
     }
     void stop(std::string why="Остановлено") {
         status=std::move(why); recording=false; route.clear(); search.reset(); synthetic=false;
@@ -77,7 +77,22 @@ public:
         if (!supported || authoritative) { status="Нужны 1.21.2/1.21.100 и legacy InventoryTransaction"; return; }
         if (!c.known || !inventoryReady) { status="Жду инвентарь игрока; переоткройте его"; return; }
         if (std::any_of(ids.begin(),ids.end(),[](int id){return id==0;})) { status="Сервер ещё не прислал ID материалов"; return; }
+        if (!resume) feetYAdjustment=0;
         auto f=feet(c);
+        if (!walkable(f,world)) {
+            // StartGame/MovePlayer carry the eye position, while a few
+            // serverbound position sources expose the player's base.  Keep
+            // the normal eye-height conversion first, then accept another
+            // height only when the complete player column is known-safe.
+            // The selected adjustment is retained for routing as well.
+            for (const int adjustment : {1, 2, -1, -2}) {
+                const Pos candidate {f.x, f.y + adjustment, f.z};
+                if (!walkable(candidate, world)) continue;
+                feetYAdjustment += adjustment;
+                f=candidate;
+                break;
+            }
+        }
         if (!walkable(f,world)) { status="Встаньте на ровную площадку с безопасной опорой"; return; }
         settings.clamp(); synthetic=false; recording=false; visited.clear(); checked=0;
         pending.reset(); watched.reset(); closeRequested=false; window=-1;
@@ -309,6 +324,7 @@ private:
     int screenWindow=-1,screenType=0,window=-1,heldSlot=0,needed=0,placedSlot=0,placedCount=0,placedId=0;
     uint64_t nextAt=0,deadline=0,lastProgress=0;
     double x=0,y=0,z=0;
+    int feetYAdjustment=0;
     platform::Plan plan{}; std::vector<platform::Task> tasks; size_t taskIndex=0;
     Pos target{},goal{},returnPos{}; std::set<Pos> visited;
     std::vector<Pos> route; size_t routeIndex=0; std::optional<platform::Search> search;
@@ -318,7 +334,7 @@ private:
     struct Transfer { int window,source,destination; Slot item; uint64_t at; platform::TransferBarrier barrier; };
     std::optional<Transfer> pending,watched;
     std::vector<Packet> queued;
-    static Pos feet(const Camera& c) { return {int(std::floor(c.x)),int(std::floor(c.y-1.62+.01)),int(std::floor(c.z))}; }
+    Pos feet(const Camera& c) const { return {int(std::floor(c.x)),int(std::floor(c.y-1.62+.01))+feetYAdjustment,int(std::floor(c.z))}; }
     static bool inReach(const Camera& c,Pos p) { return std::hypot(std::hypot(p.x+.5-c.x,p.z+.5-c.z),p.y+.5-c.y)<=4.25; }
     static bool walkable(Pos p,const World& world) {
         auto floor=world({p.x,p.y-1,p.z}); if(!floor.known || !floor.safeFloor) return false;
@@ -391,6 +407,12 @@ private:
             // Stop at a reachable safe approach, not on/in the chest.
             if(walkable(feet(c),world)) return true;
         }
+        // A player can stand anywhere inside the current block.  The old
+        // centre-point check below treated a route from a block to itself as
+        // a failed one-cell path when the player was not near its centre.
+        // Row zero then waited for 30 seconds and paused before construction
+        // could ever advance to the first new row.
+        if(feet(c)==goal) return true;
         if(std::hypot(goal.x+.5-c.x,goal.z+.5-c.z)<.12 && feet(c).y==goal.y) return true;
         auto canWalk=[&](Pos p){return walkable(p,world);};
         if(routeIndex>=route.size()) {
