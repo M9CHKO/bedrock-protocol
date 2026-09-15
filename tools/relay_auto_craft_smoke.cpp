@@ -343,7 +343,10 @@ static void verifyPlatformIntegration() {
                     bedrock::RelayPacketEvent localMove(version,localEvent,state.itemProtocolVariables,true);
                     bedrock::BedrockRelayPacketEvent upstreamEvent;upstreamEvent.packet=event.replacements.front();
                     bedrock::RelayPacketEvent upstreamMove(version,upstreamEvent,state.itemProtocolVariables,true);
-                    require(localMove.getString("mode")=="reset","local camera follows every builder step through correction mode");
+                    require(localMove.getString("mode")=="teleport","local camera follows every builder step through local teleport mode");
+                    require(localMove.getString("teleport.cause")=="behavior" &&
+                        localMove.getString("teleport.source_entity_type")=="player",
+                        "local camera movement includes the required teleport metadata");
                     require(std::abs(localMove.getDouble("position.x")-upstreamMove.getDouble("position.x"))<.001 &&
                         std::abs(localMove.getDouble("position.y")-upstreamMove.getDouble("position.y"))<.001 &&
                         std::abs(localMove.getDouble("position.z")-upstreamMove.getDouble("position.z"))<.001,
@@ -394,7 +397,10 @@ static void verifyPlatformIntegration() {
             state.schematicPublisherChunkZ=-20;
             state.schematicColumns[{0,10,-20}].column=std::make_shared<bedrock::BedrockChunkColumn>(10,-20,0);
         }
-        const auto camera=state.platformCamera();
+        const auto rawCamera=state.platformCamera();
+        require(std::abs(rawCamera.x-16.5)<.001 && std::abs(rawCamera.z-16.5)<.001,
+            "active platform movement never snaps back to a stale server publisher centre");
+        const auto camera=state.platformCamera(true);
         require(std::abs(camera.x-160.5)<.001 && std::abs(camera.z+319.5)<.001,
             "platform validation follows a covered server publisher centre when the client camera column is stale");
     }

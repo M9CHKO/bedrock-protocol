@@ -25,14 +25,14 @@ static const char* platformStageLabel(bedrock::PlatformBuilder::Stage stage) {
     return "unknown";
 }
 
-bedrock::PlatformBuilder::Camera platformCamera() const {
+bedrock::PlatformBuilder::Camera platformCamera(bool publisherFallback=false) const {
     auto c=entityPositions.cameraSnapshot();
     // The server's publisher centre is the authoritative place around which
     // its LevelChunks are valid. Some servers update that centre before the
     // local PlayerAuthInput tracker catches up (notably after a teleport).
     // If the camera column is absent but the publisher column is present, use
     // the server centre for X/Z while retaining the real eye height/rotation.
-    if(c.known) {
+    if(publisherFallback && c.known) {
         std::lock_guard lock(miniMapMutex);
         const int32_t dimension=miniMapDimension.load(std::memory_order_relaxed);
         const MiniMapKey cameraKey{dimension,blockToChunkCoordinate(int32_t(std::floor(c.x))),blockToChunkCoordinate(int32_t(std::floor(c.z)))};
@@ -179,7 +179,7 @@ bedrock::JsRuntimeValue platformCommand(const bedrock::JsRuntimeValue& request) 
     bool other=false;
     {std::lock_guard lock(mutex);other=areaFillRunning || pendingAutomationRequestId!=0;}
     other=other || autoCraftBusy() || mapBusy();
-    auto camera=platformCamera();
+    auto camera=platformCamera(op=="start" || op=="resume");
     std::lock_guard lock(platformMutex);
     platformStorageLocked();platformBuilder.version(version);
     const auto integer=[&](const char* name,int fallback) {const auto* v=request.get(name);
@@ -344,10 +344,14 @@ bool injectPlatform(bedrock::BedrockRelayPacketEvent& event) noexcept {
                 {"runtime_id",V::uinteger(c.runtime)},{"position",areaVec3(output.x,output.y,output.z)},
                 {"pitch",V::floating(c.pitch)},{"yaw",V::floating(output.yaw)},{"head_yaw",V::floating(output.yaw)},
                 // Mirror every small PlayerAuthInput step to the local player.
-                // Bedrock ignores normal MovePlayer updates for its own actor;
-                // reset is the client correction mode and avoids waiting for a
-                // later input/server correction that produces one large jump.
-                {"mode",V::string("reset")},{"on_ground",V::boolean(true)},{"ridden_runtime_id",V::uinteger(0)},
+                // Bedrock ignores normal/reset MovePlayer updates for its own
+                // actor on retail Windows. Small teleport corrections are
+                // applied immediately, so the camera follows without a later
+                // single large jump.
+                {"mode",V::string("teleport")},{"on_ground",V::boolean(true)},{"ridden_runtime_id",V::uinteger(0)},
+                {"teleport",V::object({
+                    {"cause",V::string("behavior")},{"source_entity_type",V::string("player")}
+                })},
                 {"tick",V::uinteger(c.tick)}})));
         }
         event.replace(std::move(packets));

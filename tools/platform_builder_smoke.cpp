@@ -56,6 +56,10 @@ int main(){try{
         basePosition.inventory(inventory(0,items,modern),true,1);
         auto baseCamera=PlatformBuilder::Camera{.5,180,.5,0,0,100,10,true};
         basePosition.start(baseCamera,world,100);require(basePosition.busy(),"start builder from base-position camera");
+        auto staleCamera=baseCamera;staleCamera.x=160.5;staleCamera.z=-319.5;
+        auto anchored=basePosition.poll(staleCamera,world,100);
+        require(std::abs(anchored.x-baseCamera.x)<.001 && std::abs(anchored.z-baseCamera.z)<.001,
+            "builder retains the validated start position until rewritten input catches up");
         basePosition.stop();
         b.settings.chunks=1;b.start(c,world,100);require(b.busy(),"start builder");
 

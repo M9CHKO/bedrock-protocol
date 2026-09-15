@@ -94,7 +94,8 @@ public:
             }
         }
         if (!walkable(f,world)) { status="Встаньте на ровную площадку с безопасной опорой"; return; }
-        settings.clamp(); synthetic=false; recording=false; visited.clear(); checked=0;
+        settings.clamp(); synthetic=true; x=c.x; y=c.y; z=c.z;
+        recording=false; visited.clear(); checked=0;
         pending.reset(); watched.reset(); closeRequested=false; window=-1;
         if (!resume || tasks.empty()) {
             plan={{f.x,f.y-1,f.z},platform::direction(c.yaw),settings.side,settings.chunks};
