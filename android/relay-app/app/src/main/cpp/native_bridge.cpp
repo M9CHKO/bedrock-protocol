@@ -1000,11 +1000,6 @@ struct RelayState {
         std::shared_ptr<bedrock::BedrockChunkColumn> column;
         std::set<int32_t> knownSections;
         bool completeBlockColumn = false;
-        // Conversion from game Y to the section indices used by this packet.
-        // Some IGN/Nukkit LevelChunks keep their legacy 0..255 payload while
-        // reporting modern world coordinates (-64 origin), so their blocks
-        // live 64 cells above the world Y requested by automation.
-        int32_t storedYBias = 0;
         uint64_t revision = 0;
         uint64_t packetSequence = 0;
     };
@@ -1439,28 +1434,28 @@ struct RelayState {
         return chunk;
     }
 
-    // The vertical conversion belongs to each decoded column, not to its
-    // allocated bounds: the recovery decoder deliberately allocates modern
-    // -64..319 bounds even while retaining a legacy 0..255 payload.
+    // IGN/Nukkit may expose a legacy 0..255 internal column while world
+    // coordinates still use the modern Overworld -64 origin. This matches
+    // the proven weathertop compatibility rule without shifting normal
+    // modern (-64..319) columns or Nether/End columns.
     static int32_t storedBlockY(
-        int32_t worldY,
-        int32_t storedYBias
+        const bedrock::BedrockChunkColumn& column,
+        int32_t dimension,
+        int32_t worldY
     ) noexcept {
-        return worldY + storedYBias;
+        return column.minY() < 0 || dimension != 0
+            ? worldY
+            : worldY + 64;
     }
 
     static int32_t worldBlockY(
-        int32_t storedY,
-        int32_t storedYBias
-    ) noexcept {
-        return storedY - storedYBias;
-    }
-
-    static int32_t normalStoredYBias(
         const bedrock::BedrockChunkColumn& column,
-        int32_t dimension
+        int32_t dimension,
+        int32_t storedY
     ) noexcept {
-        return column.minY() < 0 || dimension != 0 ? 0 : 64;
+        return column.minY() < 0 || dimension != 0
+            ? storedY
+            : storedY - 64;
     }
 
     static std::string normalizedBaseBlockName(std::string_view name) {
@@ -2245,7 +2240,6 @@ struct RelayState {
         std::shared_ptr<bedrock::BedrockChunkColumn> column,
         std::set<int32_t> knownSections,
         bool completeBlockColumn,
-        int32_t storedYBias,
         bool cameraKnown,
         int32_t cameraChunkX,
         int32_t cameraChunkZ,
@@ -2279,7 +2273,11 @@ struct RelayState {
                 ++current;
                 continue;
             }
-            const int32_t storedY = storedBlockY(position.y, storedYBias);
+            const int32_t storedY = storedBlockY(
+                *column,
+                key.dimension,
+                position.y
+            );
             if (storedY < column->minY() || storedY >= column->maxY()) {
                 ++current;
                 continue;
@@ -2314,7 +2312,6 @@ struct RelayState {
                 std::move(column),
                 std::move(knownSections),
                 completeBlockColumn,
-                storedYBias,
                 revision,
                 packetSequence
             }
@@ -2490,8 +2487,9 @@ struct RelayState {
                     if (cached != schematicColumns.end() &&
                         cached->second.column) {
                         const int32_t storedY = storedBlockY(
-                            change.y,
-                            cached->second.storedYBias
+                            *cached->second.column,
+                            dimension,
+                            change.y
                         );
                         if (storedY >= cached->second.column->minY() &&
                             storedY < cached->second.column->maxY()) {
@@ -2659,7 +2657,11 @@ struct RelayState {
                         return {};
                     }
                     const auto& entry = cached->second;
-                    const int32_t storedY = storedBlockY(y, entry.storedYBias);
+                    const int32_t storedY = storedBlockY(
+                        *entry.column,
+                        dimension,
+                        y
+                    );
                     const int32_t sectionY = blockToChunkCoordinate(storedY);
                     if (storedY < entry.column->minY() ||
                         storedY >= entry.column->maxY() ||
@@ -3240,7 +3242,11 @@ struct RelayState {
                     continue;
                 }
                 const auto& entry = cached->second;
-                const int32_t storedY = storedBlockY(y, entry.storedYBias);
+                const int32_t storedY = storedBlockY(
+                    *entry.column,
+                    dimension,
+                    y
+                );
                 const int32_t sectionY = blockToChunkCoordinate(storedY);
                 if (storedY < entry.column->minY() ||
                     storedY >= entry.column->maxY() ||
@@ -3495,8 +3501,7 @@ struct RelayState {
         const MiniMapKey& key,
         const bedrock::BedrockChunkColumn& column,
         const std::set<int32_t>& knownSections,
-        bool completeBlockColumn,
-        int32_t storedYBias
+        bool completeBlockColumn
     ) {
         MiniMapTile tile;
         tile.key = key;
@@ -3541,8 +3546,9 @@ struct RelayState {
                             if (appearance.air) continue;
                             const int32_t storedY = sectionY * 16 + localY;
                             const int32_t worldY = worldBlockY(
-                                storedY,
-                                storedYBias
+                                column,
+                                key.dimension,
+                                storedY
                             );
                             if (!surfaceFound) {
                                 surfaceFound = true;
@@ -3633,7 +3639,6 @@ struct RelayState {
             std::shared_ptr<bedrock::BedrockChunkColumn> column;
             std::set<int32_t> knownSections;
             bool completeBlockColumn = false;
-            int32_t storedYBias = 0;
             uint64_t sourceRevision = 0;
             uint64_t generation = 0;
             {
@@ -3655,7 +3660,6 @@ struct RelayState {
                 );
                 knownSections = cached->second.knownSections;
                 completeBlockColumn = cached->second.completeBlockColumn;
-                storedYBias = cached->second.storedYBias;
                 sourceRevision = cached->second.revision;
             }
 
@@ -3663,8 +3667,7 @@ struct RelayState {
                 key,
                 *column,
                 knownSections,
-                completeBlockColumn,
-                storedYBias
+                completeBlockColumn
             );
             {
                 std::lock_guard lock(miniMapMutex);
@@ -3876,7 +3879,6 @@ struct RelayState {
             std::shared_ptr<bedrock::BedrockChunkColumn> column;
             std::set<int32_t> knownSections;
             bool completeBlockColumn = false;
-            int32_t storedYBias = 0;
             const auto existing = schematicColumns.find(key);
             if (existing != schematicColumns.end() &&
                 existing->second.column) {
@@ -3885,7 +3887,6 @@ struct RelayState {
                 );
                 knownSections = existing->second.knownSections;
                 completeBlockColumn = existing->second.completeBlockColumn;
-                storedYBias = existing->second.storedYBias;
             } else {
                 column = std::make_shared<bedrock::BedrockChunkColumn>(
                     chunkX,
@@ -3906,7 +3907,6 @@ struct RelayState {
                 std::move(column),
                 std::move(knownSections),
                 completeBlockColumn,
-                storedYBias,
                 camera.known,
                 cameraChunkX,
                 cameraChunkZ,
@@ -4085,10 +4085,12 @@ struct RelayState {
                 }
                 const int32_t airRuntimeId = actualAirRuntimeId();
                 std::shared_ptr<bedrock::BedrockChunkColumn> column;
-                bool usedSectionFallback = false;
                 try {
                     column = std::make_shared<bedrock::BedrockChunkColumn>(
-                        bedrock::BedrockLevelChunkCodec::decodeNoCacheColumn(
+                        ((autoCraftWorldTracking.load() || platformWorldTracking.load()) && !schematicEnabled.load() &&
+                         !areaFillEnabled.load() && !miniMapEnabled.load())
+                        ? bedrock::BedrockLevelChunkCodec::decodeNoCacheBlockSectionsFallback(packet, airRuntimeId)
+                        : bedrock::BedrockLevelChunkCodec::decodeNoCacheColumn(
                             packet,
                             versionAtLeast(job.version, 1, 18, 0),
                             airRuntimeId
@@ -4100,7 +4102,6 @@ struct RelayState {
                         throw;
                     }
                     try {
-                        usedSectionFallback = true;
                         column = std::make_shared<bedrock::BedrockChunkColumn>(
                             bedrock::BedrockLevelChunkCodec::
                                 decodeNoCacheBlockSectionsFallback(
@@ -4138,17 +4139,6 @@ struct RelayState {
                         );
                     }
                 }
-                // CPE's recovered legacy column has 0..255 payload Y while
-                // game coordinates retain the modern -64 origin. The Android
-                // minimap path preserves that world; carry the same +64 map
-                // into PlatformBuilder instead of inferring it from bounds.
-                int32_t storedYBias = normalStoredYBias(
-                    *column,
-                    packet.dimension
-                );
-                if (usedSectionFallback && packet.dimension == 0) {
-                    storedYBias = 64;
-                }
                 const MiniMapKey columnKey {
                     packet.dimension,
                     packet.x,
@@ -4177,7 +4167,6 @@ struct RelayState {
                         {},
                         packet.subChunkCount != -1 &&
                             packet.subChunkCount != -2,
-                        storedYBias,
                         camera.known,
                         cameraChunkX,
                         cameraChunkZ,
@@ -4325,8 +4314,9 @@ struct RelayState {
                     if (!appearance.solid) continue;
                     const int32_t storedY = sectionY * 16 + localY;
                     return static_cast<float>(worldBlockY(
-                        storedY,
-                        entry.storedYBias
+                        column,
+                        dimension,
+                        storedY
                     )) +
                         appearance.collisionTop;
                 }
