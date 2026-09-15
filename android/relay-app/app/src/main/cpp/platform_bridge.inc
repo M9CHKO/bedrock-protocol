@@ -306,6 +306,12 @@ bool injectPlatform(bedrock::BedrockRelayPacketEvent& event) noexcept {
             decoded.set("input_data.stop_sneaking",!output.sneak && wasSneaking);
             bedrock::ProtoDefPacketEncoder encoder(version,itemProtocolVariables);
             movement=codec.packetCodec().makePacketByName("player_auth_input",encoder.encodePacket("player_auth_input",bedrock::ProtoDefValue::object(decoded.decodedParams())));
+            // The packet observer saw the original stationary client input
+            // before PlatformBuilder replaced it. Track the exact packet that
+            // will reach the server so subsequent LevelChunk filtering follows
+            // the synthetic player instead of discarding the next chunk as
+            // being far away from the old camera position.
+            entityPositions.observeServerbound(movement);
         }
         std::vector<bedrock::VersionedGamePacket> packets{std::move(movement)};
         std::string emitted;
@@ -320,10 +326,11 @@ bool injectPlatform(bedrock::BedrockRelayPacketEvent& event) noexcept {
             platformClientPackets.push_back(makeAreaProtocolPacket(version,"move_player",V::object({
                 {"runtime_id",V::uinteger(c.runtime)},{"position",areaVec3(output.x,output.y,output.z)},
                 {"pitch",V::floating(c.pitch)},{"yaw",V::floating(output.yaw)},{"head_yaw",V::floating(output.yaw)},
-                // Mirror the coordinates written to PlayerAuthInput as normal
-                // local movement. Teleport/reset mode makes the camera jump
-                // back to the synthetic route when the player presses a key.
-                {"mode",V::string("normal")},{"on_ground",V::boolean(true)},{"ridden_runtime_id",V::uinteger(0)},
+                // Mirror every small PlayerAuthInput step to the local player.
+                // Bedrock ignores normal MovePlayer updates for its own actor;
+                // reset is the client correction mode and avoids waiting for a
+                // later input/server correction that produces one large jump.
+                {"mode",V::string("reset")},{"on_ground",V::boolean(true)},{"ridden_runtime_id",V::uinteger(0)},
                 {"tick",V::uinteger(c.tick)}})));
         }
         event.replace(std::move(packets));

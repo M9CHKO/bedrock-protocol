@@ -343,7 +343,7 @@ static void verifyPlatformIntegration() {
                     bedrock::RelayPacketEvent localMove(version,localEvent,state.itemProtocolVariables,true);
                     bedrock::BedrockRelayPacketEvent upstreamEvent;upstreamEvent.packet=event.replacements.front();
                     bedrock::RelayPacketEvent upstreamMove(version,upstreamEvent,state.itemProtocolVariables,true);
-                    require(localMove.getString("mode")=="normal","local camera follows builder without teleport mode");
+                    require(localMove.getString("mode")=="reset","local camera follows every builder step through correction mode");
                     require(std::abs(localMove.getDouble("position.x")-upstreamMove.getDouble("position.x"))<.001 &&
                         std::abs(localMove.getDouble("position.y")-upstreamMove.getDouble("position.y"))<.001 &&
                         std::abs(localMove.getDouble("position.z")-upstreamMove.getDouble("position.z"))<.001,
@@ -362,6 +362,15 @@ static void verifyPlatformIntegration() {
                     }
                     moved=true;
                 }
+            }
+            if(moved) {
+                bedrock::BedrockRelayPacketEvent upstreamEvent;upstreamEvent.packet=event.replacements.front();
+                bedrock::RelayPacketEvent upstreamMove(version,upstreamEvent,state.itemProtocolVariables,true);
+                const auto tracked=state.platformCamera();
+                require(std::abs(tracked.x-upstreamMove.getDouble("position.x"))<.001 &&
+                    std::abs(tracked.y-upstreamMove.getDouble("position.y"))<.001 &&
+                    std::abs(tracked.z-upstreamMove.getDouble("position.z"))<.001,
+                    "chunk filter tracks the rewritten synthetic PlayerAuthInput position");
             }
             state.platformClientPackets.clear();
         }
