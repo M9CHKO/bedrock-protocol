@@ -81,7 +81,7 @@ internal sealed class MainForm : Form
         platformPanel = new PlatformPanel(backend, settings);
         mapPanel = new MapQueuePanel(backend,settings);
         modules = new ModuleCatalogPanel(BuildModuleList());
-        Text = "CPE Relay — Windows 1.3.12 · Модули";
+        Text = "CPE Relay — Windows 1.3.13 · Модули";
         AutoScaleMode = AutoScaleMode.Dpi;
         Font = new Font("Segoe UI", 10);
         Size = new Size(1080, 790); MinimumSize = new Size(860, 700);
@@ -98,7 +98,7 @@ internal sealed class MainForm : Form
             var button = new RelayButton { Text = names[i], Navigation = true, Width = 194, Height = 51, Margin = new Padding(0, 0, 0, 7) };
             button.Click += (_, _) => SelectPage(page); navigation.Add(button); nav.Controls.Add(button);
         }
-        var signature = new Label { Text = "LOCAL RELAY\nWindows x64  /  1.3.12", Dock = DockStyle.Bottom, Height = 52, ForeColor = Theme.Muted, Padding = new Padding(13, 8, 0, 0), Font = new Font("Segoe UI", 9) };
+        var signature = new Label { Text = "LOCAL RELAY\nWindows x64  /  1.3.13", Dock = DockStyle.Bottom, Height = 52, ForeColor = Theme.Muted, Padding = new Padding(13, 8, 0, 0), Font = new Font("Segoe UI", 9) };
         sidebar.Controls.Add(nav); sidebar.Controls.Add(signature); sidebar.Controls.Add(brand);
         var footer = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 77, Padding = new Padding(26, 12, 0, 0), BackColor = Theme.Sidebar, WrapContents = false };
         footer.Controls.AddRange([start, stop, status, memory]);

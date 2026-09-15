@@ -27,6 +27,23 @@ static const char* platformStageLabel(bedrock::PlatformBuilder::Stage stage) {
 
 bedrock::PlatformBuilder::Camera platformCamera() const {
     auto c=entityPositions.cameraSnapshot();
+    // The server's publisher centre is the authoritative place around which
+    // its LevelChunks are valid. Some servers update that centre before the
+    // local PlayerAuthInput tracker catches up (notably after a teleport).
+    // If the camera column is absent but the publisher column is present, use
+    // the server centre for X/Z while retaining the real eye height/rotation.
+    if(c.known) {
+        std::lock_guard lock(miniMapMutex);
+        const int32_t dimension=miniMapDimension.load(std::memory_order_relaxed);
+        const MiniMapKey cameraKey{dimension,blockToChunkCoordinate(int32_t(std::floor(c.x))),blockToChunkCoordinate(int32_t(std::floor(c.z)))};
+        const MiniMapKey publisherKey{dimension,schematicPublisherChunkX,schematicPublisherChunkZ};
+        const bool cameraCovered=schematicColumns.contains(cameraKey);
+        const bool publisherCovered=schematicPublisherKnown && schematicColumns.contains(publisherKey);
+        if(!cameraCovered && publisherCovered) {
+            c.x=double(schematicPublisherBlockX)+.5;
+            c.z=double(schematicPublisherBlockZ)+.5;
+        }
+    }
     return {c.x,c.y,c.z,c.yaw,c.pitch,c.runtimeId,c.inputTick,c.known};
 }
 bedrock::PlatformBuilder::Block platformBlock(bedrock::platform::Pos p) const {

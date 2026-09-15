@@ -380,6 +380,24 @@ static void verifyPlatformIntegration() {
         bedrock::BedrockRelayPacketEvent manual;manual.packet=codec.makePacketByName("player_auth_input",encoder.encodePacket("player_auth_input",input));
         state.injectPlatform(manual);require(!b.busy() && manual.replacements.empty(),"manual action detected before automation poll/send");
     }
+    {
+        RelayState state;
+        state.miniMapDimension=0;
+        bedrock::ProtoDefWriter seed;seed.varuint64(123);seed.f32le(16.5f);seed.f32le(64.62f);seed.f32le(16.5f);seed.f32le(0);seed.f32le(0);seed.f32le(0);
+        state.entityPositions.observeServerbound(bedrock::VersionedPacketCodec::forVersion("1.21.100").makePacketByName("move_player",seed.take()));
+        {
+            std::lock_guard lock(state.miniMapMutex);
+            state.schematicPublisherKnown=true;
+            state.schematicPublisherBlockX=160;
+            state.schematicPublisherBlockZ=-320;
+            state.schematicPublisherChunkX=10;
+            state.schematicPublisherChunkZ=-20;
+            state.schematicColumns[{0,10,-20}].column=std::make_shared<bedrock::BedrockChunkColumn>(10,-20,0);
+        }
+        const auto camera=state.platformCamera();
+        require(std::abs(camera.x-160.5)<.001 && std::abs(camera.z+319.5)<.001,
+            "platform validation follows a covered server publisher centre when the client camera column is stale");
+    }
 }
 // Optional read-only audit of a user archive through the real ZIP/QZNBTF02
 // reader and shared template adapter. The archive is not a test dependency.

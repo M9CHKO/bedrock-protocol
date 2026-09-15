@@ -1351,6 +1351,8 @@ struct RelayState {
     uint64_t miniMapRevision = 0;
     uint64_t schematicRevision = 0;
     bool schematicPublisherKnown = false;
+    int32_t schematicPublisherBlockX = 0;
+    int32_t schematicPublisherBlockZ = 0;
     int32_t schematicPublisherChunkX = 0;
     int32_t schematicPublisherChunkZ = 0;
     int32_t schematicPublisherRadiusChunks = 0;
@@ -1980,6 +1982,8 @@ struct RelayState {
             schematicBlockOverrides.clear();
             schematicBlockOverrideOrder.clear();
             schematicPublisherKnown = false;
+            schematicPublisherBlockX = 0;
+            schematicPublisherBlockZ = 0;
             schematicPublisherChunkX = 0;
             schematicPublisherChunkZ = 0;
             schematicPublisherRadiusChunks = 0;
@@ -2372,6 +2376,8 @@ struct RelayState {
             );
             std::lock_guard lock(miniMapMutex);
             schematicPublisherKnown = true;
+            schematicPublisherBlockX = centerXBlocks;
+            schematicPublisherBlockZ = centerZBlocks;
             schematicPublisherChunkX = centerChunkX;
             schematicPublisherChunkZ = centerChunkZ;
             schematicPublisherRadiusChunks = radiusChunks;
@@ -3365,10 +3371,16 @@ struct RelayState {
         }
         try {
             uint64_t observedGeneration = 0;
+            bool publisherKnown = false;
+            int32_t publisherChunkX = 0;
+            int32_t publisherChunkZ = 0;
             {
                 std::lock_guard lock(miniMapMutex);
                 if (miniMapStopping) return;
                 observedGeneration = miniMapGeneration;
+                publisherKnown = schematicPublisherKnown;
+                publisherChunkX = schematicPublisherChunkX;
+                publisherChunkZ = schematicPublisherChunkZ;
             }
             const auto camera = entityPositions.cameraSnapshot();
             int32_t chunkX = camera.known
@@ -3398,13 +3410,13 @@ struct RelayState {
                 dimension = header.dimension;
             }
             int64_t distanceSquared = 0;
-            if (camera.known) {
-                const int32_t cameraChunkX = static_cast<int32_t>(
-                    std::floor(camera.x / 16.0f)
-                );
-                const int32_t cameraChunkZ = static_cast<int32_t>(
-                    std::floor(camera.z / 16.0f)
-                );
+            if (publisherKnown || camera.known) {
+                const int32_t cameraChunkX = publisherKnown
+                    ? publisherChunkX
+                    : static_cast<int32_t>(std::floor(camera.x / 16.0f));
+                const int32_t cameraChunkZ = publisherKnown
+                    ? publisherChunkZ
+                    : static_cast<int32_t>(std::floor(camera.z / 16.0f));
                 const int64_t dx = static_cast<int64_t>(chunkX) -
                     cameraChunkX;
                 const int64_t dz = static_cast<int64_t>(chunkZ) -
@@ -3425,7 +3437,7 @@ struct RelayState {
             // once the worker observes a real position.
             if ((autoCraftWorldTracking.load() || platformWorldTracking.load()) && !schematicEnabled.load() &&
                 !areaFillEnabled.load() && !miniMapEnabled.load() &&
-                packet.name == "level_chunk" && camera.known && distanceSquared > 2) return;
+                packet.name == "level_chunk" && (publisherKnown || camera.known) && distanceSquared > 2) return;
             MiniMapChunkJob incoming {
                 version,
                 packet.name,
@@ -4146,12 +4158,6 @@ struct RelayState {
                 };
 
                 const auto camera = entityPositions.cameraSnapshot();
-                const int32_t cameraChunkX = static_cast<int32_t>(
-                    std::floor(camera.x / 16.0f)
-                );
-                const int32_t cameraChunkZ = static_cast<int32_t>(
-                    std::floor(camera.z / 16.0f)
-                );
                 {
                     std::lock_guard lock(miniMapMutex);
                     if (job.generation != miniMapGeneration || miniMapStopping) {
@@ -4167,9 +4173,13 @@ struct RelayState {
                         {},
                         packet.subChunkCount != -1 &&
                             packet.subChunkCount != -2,
-                        camera.known,
-                        cameraChunkX,
-                        cameraChunkZ,
+                        schematicPublisherKnown || camera.known,
+                        schematicPublisherKnown
+                            ? schematicPublisherChunkX
+                            : static_cast<int32_t>(std::floor(camera.x / 16.0f)),
+                        schematicPublisherKnown
+                            ? schematicPublisherChunkZ
+                            : static_cast<int32_t>(std::floor(camera.z / 16.0f)),
                         job.packetSequence
                     );
                 }
