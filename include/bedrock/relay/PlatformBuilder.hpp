@@ -98,6 +98,7 @@ public:
         recording=false; visited.clear(); checked=0;
         pending.reset(); watched.reset(); closeRequested=false; window=-1;
         if (!resume || tasks.empty()) {
+            memory.clear();route.clear();routeIndex=0;search.reset();
             plan={{f.x,f.y-1,f.z},platform::direction(c.yaw),settings.side,settings.chunks};
             plan.lanes=settings.lanes;plan.gapChunks=settings.gapChunks;plan.turnSide=settings.turnSide;
             rowIndex=0; taskIndex=0; placed=0; tasks=plan.row(0); stage=Stage::Build;

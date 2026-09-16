@@ -2328,7 +2328,8 @@ struct RelayState {
         // minimap tiles preserve already-rendered surroundings.
         const bool autoCraftOnly = (autoCraftWorldTracking.load() || platformWorldTracking.load()) &&
             !schematicEnabled.load() && !areaFillEnabled.load() && !miniMapEnabled.load();
-        while (schematicColumns.size() > (autoCraftOnly ? 9u : MaximumDecodedWorldColumns)) {
+        const size_t workingColumns=platformWorldTracking.load()?81u:9u;
+        while (schematicColumns.size() > (autoCraftOnly ? workingColumns : MaximumDecodedWorldColumns)) {
             auto farthest = schematicColumns.begin();
             int64_t farthestDistance = -1;
             uint64_t oldestRevision = std::numeric_limits<uint64_t>::max();
@@ -3428,14 +3429,15 @@ struct RelayState {
                     distanceSquared += 1'000'000;
                 }
             }
-            // PlatformBuilder and Auto 2 only need the 3x3 nearby columns.
+            // Stationary Auto 2 needs only the 3x3 nearby columns. Moving
+            // PlatformBuilder must keep the wider bounded decoded cache.
             // A LevelChunk burst often arrives before the first
             // PlayerAuthInput, however.  Dropping that burst while the camera
             // is unknown leaves the local world permanently empty: servers do
             // not necessarily resend the floor when the player then moves.
             // Retain the bounded startup queue and prune it by camera distance
             // once the worker observes a real position.
-            if ((autoCraftWorldTracking.load() || platformWorldTracking.load()) && !schematicEnabled.load() &&
+            if (autoCraftWorldTracking.load() && !platformWorldTracking.load() && !schematicEnabled.load() &&
                 !areaFillEnabled.load() && !miniMapEnabled.load() &&
                 packet.name == "level_chunk" && (publisherKnown || camera.known) && distanceSquared > 2) return;
             MiniMapChunkJob incoming {
@@ -3816,7 +3818,7 @@ struct RelayState {
             const int32_t chunkZ = packet.originZ + entry.dz;
             // The envelope origin need not be inside the nearby 3x3 area:
             // relative entry offsets may still point to the player's chunk.
-            if ((autoCraftWorldTracking.load() || platformWorldTracking.load()) && !schematicEnabled.load() &&
+            if (autoCraftWorldTracking.load() && !platformWorldTracking.load() && !schematicEnabled.load() &&
                 !areaFillEnabled.load() && !miniMapEnabled.load() &&
                 (!camera.known || packet.dimension != miniMapDimension.load() ||
                  std::abs(int64_t(chunkX)-cameraChunkX)>1 ||
@@ -11214,6 +11216,7 @@ public:
         relay->live().onForwarded([state, liveRelay](
             const bedrock::BedrockRelayPacketEvent& event
         ) {
+            state->logPlatformForwarded(event);
             if (isResourcePackTransportPacket(event.packet.name)) {
                 const auto sampleIndex =
                     state->resourcePackPacketsForwarded.fetch_add(
@@ -12537,7 +12540,11 @@ private:
             }
         } catch(const std::exception& e) {
             if(maps){std::lock_guard lock(state_->mapQueueMutex);state_->mapQueue.pause(safeMessage(e.what()));}
-            else {std::lock_guard lock(state_->platformMutex);state_->platformBuilder.pause(safeMessage(e.what()));}
+            else {
+                std::lock_guard lock(state_->platformMutex);
+                state_->platformPendingMovement.reset();state_->platformBuilder.pause(safeMessage(e.what()));
+                state_->push("platform_downstream_error",safeMessage(e.what()),"ERROR","platform");
+            }
         }
     }
 

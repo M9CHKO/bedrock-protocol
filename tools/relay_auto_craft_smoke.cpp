@@ -249,7 +249,7 @@ static void verifyNativeIntegration() {
     { std::lock_guard lock(state.miniMapMutex); state.miniMapStopping=true; }
     state.miniMapCondition.notify_all(); state.miniMapWorker.join();
     state.miniMapStopping=false; state.resetMiniMapWorld(0);
-    state.autoCraftWorldTracking=true; state.schematicWorldTrackingActive=true;
+    state.autoCraftWorldTracking=true; state.platformWorldTracking=false; state.schematicWorldTrackingActive=true;
     state.schematicEnabled=false; state.areaFillEnabled=false; state.miniMapEnabled=false;
     bedrock::BedrockSubChunkPacket sub;
     sub.originX=3; sub.originY=4;
@@ -344,6 +344,7 @@ static void verifyPlatformIntegration() {
                     bedrock::BedrockRelayPacketEvent upstreamEvent;upstreamEvent.packet=event.replacements.front();
                     bedrock::RelayPacketEvent upstreamMove(version,upstreamEvent,state.itemProtocolVariables,true);
                     require(localMove.getString("mode")=="teleport","local camera follows every builder step through local teleport mode");
+                    require(localMove.getUInt("tick")==100,"camera sync uses input tick even in 1.21.2 without camera_orientation");
                     require(localMove.getString("teleport.cause")=="behavior" &&
                         localMove.getString("teleport.source_entity_type")=="player",
                         "local camera movement includes the required teleport metadata");
@@ -370,18 +371,83 @@ static void verifyPlatformIntegration() {
                 bedrock::BedrockRelayPacketEvent upstreamEvent;upstreamEvent.packet=event.replacements.front();
                 bedrock::RelayPacketEvent upstreamMove(version,upstreamEvent,state.itemProtocolVariables,true);
                 const auto tracked=state.platformCamera();
-                require(std::abs(tracked.x-upstreamMove.getDouble("position.x"))<.001 &&
-                    std::abs(tracked.y-upstreamMove.getDouble("position.y"))<.001 &&
-                    std::abs(tracked.z-upstreamMove.getDouble("position.z"))<.001,
-                    "chunk filter tracks the rewritten synthetic PlayerAuthInput position");
+                require(std::abs(tracked.x-.5)<.001 && std::abs(tracked.z-.5)<.001,
+                    "outgoing synthetic input cannot overwrite the actual Minecraft position");
             }
             state.platformClientPackets.clear();
         }
         require(moved && b.busy(),"native walking emits valid local camera sync in both protocols");
+        const auto pending=state.platformPendingMovement;
+        require(pending.has_value(),"step remains unconfirmed until received Minecraft input reports it");
+        const auto rowBefore=b.rowIndex;
+        const auto placedBefore=b.placed;
+        bedrock::BedrockRelayPacketEvent still;still.packet=packet;
+        state.injectPlatform(still);
+        require(state.platformPendingMovement.has_value() && state.platformMovementAcks==0 &&
+            b.rowIndex==rowBefore && b.placed==placedBefore,
+            "stationary client input cannot authorize further walking or placement");
+        auto echo=input;
+        echo.objectValue["position"]=RelayState::areaVec3(pending->x,pending->y,pending->z);
+        echo.objectValue["tick"]=V::uinteger(101);
+        bedrock::BedrockRelayPacketEvent echoed;echoed.packet=codec.makePacketByName("player_auth_input",encoder.encodePacket("player_auth_input",echo));
+        state.entityPositions.observeServerbound(echoed.packet);state.injectPlatform(echoed);
+        require(state.platformMovementAcks==1,"real client position echo acknowledges exactly one step");
+        state.platformMovementAuthority="server_with_rewind";
+        state.platformPendingMovement=pending;state.platformMovementRetryAt=0;
+        state.platformMovementSentAt=steadyMilliseconds();state.platformClientPackets.clear();
+        bedrock::BedrockRelayPacketEvent retry;retry.packet=packet;state.injectPlatform(retry);
+        bool correction=false;
+        for(const auto& p:state.platformClientPackets)if(p.name=="correct_player_move_prediction") {
+            bedrock::ProtoDefPacketDecoder(version,state.itemProtocolVariables).validatePacketStrict(p.name,p.payload);
+            bedrock::BedrockRelayPacketEvent e;e.packet=p;bedrock::RelayPacketEvent d(version,e,state.itemProtocolVariables,true);
+            require(d.getUInt("tick")==100 && d.getString("prediction_type")=="player","rewind correction targets current input tick");
+            require(std::abs(d.getDouble("delta.x")-(pending->x-.5))<.001 &&
+                std::abs(d.getDouble("delta.z")-(pending->z-.5))<.001,
+                "retry correction delta remains relative to actual client position, not zeroed walking input");
+            correction=true;
+        }
+        require(correction,("server-with-rewind emits the dedicated prediction correction ("+version+", "+b.status+")").c_str());
+        state.platformMovementSentAt=steadyMilliseconds()-5001;
+        bedrock::BedrockRelayPacketEvent timeout;timeout.packet=packet;state.injectPlatform(timeout);
+        require(!b.busy() && b.stage==bedrock::PlatformBuilder::Stage::Paused && b.placed==placedBefore,
+            "missing movement echo pauses without building at invented coordinates");
+        b.start(state.platformCamera(),[&](auto p){return state.platformBlock(p);},steadyMilliseconds());
+        require(b.busy(),"new start uses the actual received position after motion timeout");
+        state.platformMovementAuthority="client";
+        bedrock::BedrockRelayPacketEvent legacyAuth;legacyAuth.packet=packet;state.injectPlatform(legacyAuth);
+        bool legacyMove=false;
+        for(const auto& p:legacyAuth.replacements)if(p.name=="move_player") {
+            bedrock::ProtoDefPacketDecoder(version,state.itemProtocolVariables).validatePacketStrict(p.name,p.payload);
+            bedrock::BedrockRelayPacketEvent e;e.packet=p;bedrock::RelayPacketEvent d(version,e,state.itemProtocolVariables,true);
+            require(d.getString("mode")=="normal" && d.getUInt("tick")==100,
+                "client-authoritative server receives normal MovePlayer with current input tick");
+            legacyMove=true;
+        }
+        require(legacyMove,"client-authoritative mode mirrors auth input into legacy movement");
+        auto legacyPacket=state.makeAreaProtocolPacket(version,"move_player",V::object({
+            {"runtime_id",V::uinteger(123)},{"position",RelayState::areaVec3(.5,64.62,.5)},
+            {"pitch",V::floating(0)},{"yaw",V::floating(0)},{"head_yaw",V::floating(0)},
+            {"mode",V::string("normal")},{"on_ground",V::boolean(true)},
+            {"ridden_runtime_id",V::uinteger(0)},{"tick",V::uinteger(102)}
+        }));
+        bedrock::BedrockRelayPacketEvent legacyOnly;legacyOnly.packet=legacyPacket;
+        require(state.injectPlatform(legacyOnly) && !legacyOnly.replacements.empty(),
+            "client-authoritative movement also handles MovePlayer without PlayerAuthInput");
+        for(const auto& p:legacyOnly.replacements)
+            bedrock::ProtoDefPacketDecoder(version,state.itemProtocolVariables).validatePacketStrict(p.name,p.payload);
         input.objectValue["input_data"].objectValue["block_action"]=V::boolean(true);
         input.objectValue["block_action"]=V::array({});
         bedrock::BedrockRelayPacketEvent manual;manual.packet=codec.makePacketByName("player_auth_input",encoder.encodePacket("player_auth_input",input));
         state.injectPlatform(manual);require(!b.busy() && manual.replacements.empty(),"manual action detected before automation poll/send");
+        // Walk to a different loaded column, then start a fresh route.
+        for(int x=60;x<=68;++x)for(int y=61;y<=67;++y)for(int z=-4;z<=4;++z)
+            state.schematicBlockOverrides[{0,x,y,z}]={y==62?quartz:air,0,0};
+        auto relocated=input;relocated.objectValue["position"]=RelayState::areaVec3(64.5,64.62,.5);
+        const auto relocation=codec.makePacketByName("player_auth_input",encoder.encodePacket("player_auth_input",relocated));
+        state.entityPositions.observeServerbound(relocation);
+        b.start(state.platformCamera(),[&](auto p){return state.platformBlock(p);},steadyMilliseconds());
+        require(b.busy() && b.planView().origin.x==64 && b.rowIndex==0 && b.placed==0,
+            "fresh Start after relocation builds from received coordinates and resets previous route progress");
     }
     {
         RelayState state;
@@ -400,9 +466,12 @@ static void verifyPlatformIntegration() {
         const auto rawCamera=state.platformCamera();
         require(std::abs(rawCamera.x-16.5)<.001 && std::abs(rawCamera.z-16.5)<.001,
             "active platform movement never snaps back to a stale server publisher centre");
-        const auto camera=state.platformCamera(true);
-        require(std::abs(camera.x-160.5)<.001 && std::abs(camera.z+319.5)<.001,
-            "platform validation follows a covered server publisher centre when the client camera column is stale");
+        state.schematicPublisherKnown=false;state.schematicColumns.clear();
+        state.platformWorldTracking=true;
+        for(int cx=-4;cx<=4;++cx)for(int cz=-4;cz<=4;++cz)
+            state.cacheSchematicColumnLocked({0,cx,cz},std::make_shared<bedrock::BedrockChunkColumn>(cx,cz,0),{},true,true,0,0,1);
+        require(state.schematicColumns.size()==81 && state.schematicColumns.contains({0,3,3}),
+            "platform retains received columns outside the old 3x3 area for subsequent movement and restart");
     }
 }
 // Optional read-only audit of a user archive through the real ZIP/QZNBTF02
