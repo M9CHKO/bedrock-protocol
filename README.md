@@ -7,7 +7,7 @@ installable arm64 APK: [Android relay app](android/relay-app/README.md).
 
 Current builds:
 
-- [Windows 1.3.9 — standalone x64 EXE](https://github.com/M9CHKO/bedrock-protocol/releases/tag/windows-v1.3.9-modules), modular UI and automatic map delivery. [Instructions](windows/relay-app/README.txt).
+- [Windows 1.3.21 — standalone x64 EXE](https://github.com/M9CHKO/bedrock-protocol/releases/tag/windows-v1.3.21-saved-modules), with persistent module switches, floating controls, platform building, and automatic map delivery. [Windows relay source](https://github.com/M9CHKO/bedrock-protocol/tree/windows-relay-app/windows/relay-app).
 - [Android 1.5.2-Modules — arm64 APK](https://github.com/M9CHKO/bedrock-protocol/releases/tag/android-v1.5.2-modules), Android 8+; optimized Release, debug-signed. [Install and usage](android/relay-app/README.md).
 
 [Download Android APK directly](https://github.com/M9CHKO/bedrock-protocol/releases/download/android-v1.5.2-modules/CPE-Relay-Android-1.5.2-Modules-arm64-v8a.apk).
