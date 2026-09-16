@@ -330,7 +330,7 @@ static void verifyPlatformIntegration() {
             {"analogue_move_vector",vec2(0,0)},{"camera_orientation",RelayState::areaVec3(-1,0,0)},{"raw_move_vector",vec2(0,0)}});
         bedrock::ProtoDefPacketEncoder encoder(version,state.itemProtocolVariables);
         const auto packet=codec.makePacketByName("player_auth_input",encoder.encodePacket("player_auth_input",input));
-        bool moved=false;
+        bool moved=false,serverCorrection=false;
         for(int i=0;i<10 && !moved;++i) {
             bedrock::BedrockRelayPacketEvent event;event.packet=packet;
             require(state.injectPlatform(event),"platform owns movement while menus may be open");
@@ -338,6 +338,7 @@ static void verifyPlatformIntegration() {
             for(auto& p:event.replacements)bedrock::ProtoDefPacketDecoder(version,state.itemProtocolVariables).validatePacketStrict(p.name,p.payload);
             for(auto& p:state.platformClientPackets) {
                 bedrock::ProtoDefPacketDecoder(version,state.itemProtocolVariables).validatePacketStrict(p.name,p.payload);
+                if(p.name=="correct_player_move_prediction")serverCorrection=true;
                 if(p.name=="move_player") {
                     bedrock::BedrockRelayPacketEvent localEvent;localEvent.packet=p;
                     bedrock::RelayPacketEvent localMove(version,localEvent,state.itemProtocolVariables,true);
@@ -377,6 +378,7 @@ static void verifyPlatformIntegration() {
             state.platformClientPackets.clear();
         }
         require(moved && b.busy(),"native walking emits valid local camera sync in both protocols");
+        require(serverCorrection,"server-authoritative movement corrects the local camera, not only rewind mode");
         const auto pending=state.platformPendingMovement;
         require(pending.has_value(),"step remains unconfirmed until received Minecraft input reports it");
         const auto rowBefore=b.rowIndex;

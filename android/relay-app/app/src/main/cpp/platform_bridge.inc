@@ -391,7 +391,12 @@ bool injectPlatform(bedrock::BedrockRelayPacketEvent& event) noexcept {
                 platformPendingMovement=output;platformPendingMovement->packets.clear();
                 platformMovementSentAt=now;platformMovementRetryAt=now+250;
             }
-            if(platformMovementAuthority=="server_with_rewind") {
+            // Both server-authoritative modes need an explicit prediction
+            // correction for the local Windows client. A clientbound
+            // MovePlayer for the local actor is ignored in movement=server,
+            // which otherwise leaves the camera at the old coordinates and
+            // makes the builder wait forever for its position echo.
+            if(platformMovementAuthority!="client") {
                 platformClientPackets.push_back(makeAreaProtocolPacket(version,"correct_player_move_prediction",V::object({
                     {"prediction_type",V::string("player")},{"position",areaVec3(output.x,output.y,output.z)},
                     {"delta",areaVec3(output.x-c.x,output.y-c.y,output.z-c.z)},
@@ -412,7 +417,8 @@ bool injectPlatform(bedrock::BedrockRelayPacketEvent& event) noexcept {
                 {"tick",V::uinteger(c.tick)}})));
             if(platformMovementAcks==0)push("platform_motion_send",
                 "tick="+std::to_string(c.tick)+" movement="+platformMovementAuthority+
-                " step="+std::to_string(std::hypot(output.dx,output.dz)),"INFO","platform");
+                " correction="+std::string(platformMovementAuthority!="client"?"yes":"no")+
+                " step="+std::to_string(std::hypot(output.x-c.x,output.z-c.z)),"INFO","platform");
         }
         event.replace(std::move(packets));
         if (!emitted.empty() || previousStage != platformBuilder.stage ||
