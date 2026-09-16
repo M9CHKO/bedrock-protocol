@@ -9,6 +9,7 @@ internal sealed class MapQueuePanel : FlowLayoutPanel
     private readonly Dictionary<string,NumericUpDown> fields=[];
     private bool pending;
     private bool busy;
+    internal bool IsRunning => busy;
     internal Action<string>? CommandFailed;
     internal bool Loaded {get;private set;}
     internal MapQueuePanel(RelayBackend backend,AppSettings settings)
@@ -42,8 +43,9 @@ internal sealed class MapQueuePanel : FlowLayoutPanel
             try{Update(await backend.Call(new{action="maps",op="load",path}));}catch(Exception e){status.Text="ZIP сохранён. "+e.Message;}
         }catch(Exception e){status.Text=e.Message;}finally{pending=false;}
     }
+    internal void CaptureSettings(){foreach(var (key,f) in fields)settings.MapTiming[key]=(int)f.Value;}
     internal async Task Configure(bool load=false){
-        foreach(var (key,f) in fields)settings.MapTiming[key]=(int)f.Value;
+        CaptureSettings();
         var command=settings.MapTiming.ToDictionary(p=>p.Key,p=>(object)p.Value);command["action"]="maps";command["op"]="configure";
         await backend.Call(command);
         if(load&&!string.IsNullOrEmpty(settings.MapArchive))Update(await backend.Call(new{action="maps",op="load",path=settings.MapArchive}));
@@ -60,6 +62,6 @@ internal sealed class MapQueuePanel : FlowLayoutPanel
             Update(reply);
         }
         catch(Exception e){if(!IsDisposed){status.Text=e.Message;CommandFailed?.Invoke(e.Message);}}finally{pending=false;}}
-    internal void Update(JsonElement value){if(IsDisposed||value.ValueKind!=JsonValueKind.Object)return;Loaded=value.Flag("loaded");busy=value.Flag("busy");
+    internal void Update(JsonElement value){if(IsDisposed)return;if(value.ValueKind!=JsonValueKind.Object){busy=false;return;}Loaded=value.Flag("loaded");busy=value.Flag("busy");
         status.Text=value.Text("status")+"\n"+value.Text("file")+" · Завершено: "+value.GetProperty("completed")+" / "+value.GetProperty("total")+" · Карт: "+value.GetProperty("maps");}
 }

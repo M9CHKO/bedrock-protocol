@@ -10,7 +10,7 @@ internal sealed class MainForm : Form
     private readonly AppSettings settings;
     private readonly PlatformPanel platformPanel;
     private readonly MapQueuePanel mapPanel;
-    private readonly MapStreamingModule mapStreaming = new();
+    private readonly MapStreamingModule mapStreaming;
     private readonly ModuleCatalogPanel modules;
     private readonly FloatingDepositForm floatingMaps = new(maps:true);
     private readonly FloatingDepositForm floating = new();
@@ -43,6 +43,7 @@ internal sealed class MainForm : Form
     private readonly CheckBox floatingPlatformEnabled = Check("Строительство");
     private readonly CheckBox detailed = Check("Подробный журнал");
     private readonly CheckBox hideEntities = Check("Скрывать игроков, мобов и лежащие предметы");
+    private readonly CheckBox mapStreamingEnabled = Check("Загружать карты с сервера");
     private readonly CheckBox auto2 = Check("Включить Авто 2 · крафт с NBT и разгрузка в сундуки");
     private readonly TrackBar craftSpeed = new() { Minimum = 0, Maximum = 98, TickStyle = TickStyle.None, Width = 734, Height = 48 };
     private readonly TrackBar windowSpeed = new() { Minimum = 0, Maximum = 27, TickStyle = TickStyle.None, Width = 734, Height = 48 };
@@ -62,6 +63,8 @@ internal sealed class MainForm : Form
     private readonly Label auth = Label("При первом входе Minecraft здесь появится код Microsoft.");
     private readonly Button start = Button("▶  Запустить реле", true);
     private readonly Button stop = Button("■  Остановить");
+    private readonly Button saveConfiguration = Button("Сохранить", true);
+    private readonly Label saveFeedback = Label("");
     private readonly Button folderButton = Button("Выбрать папку…");
     private bool initialized, busy, polling, running, closing, closeAllowed, starting, stopping;
     private int lifecycle;
@@ -78,10 +81,11 @@ internal sealed class MainForm : Form
         lifecycleTest = testBackend != null;
         settings = preview ? new AppSettings() : AppSettings.Load();
         settings.UpgradeInterface();
+        mapStreaming = new MapStreamingModule(mapStreamingEnabled);
         platformPanel = new PlatformPanel(backend, settings);
         mapPanel = new MapQueuePanel(backend,settings);
-        modules = new ModuleCatalogPanel(BuildModuleList());
-        Text = "CPE Relay — Windows 1.3.16 · Модули";
+        modules = new ModuleCatalogPanel(BuildModuleList(), ModuleSwitches());
+        Text = "CPE Relay — Windows 1.3.21 · Модули";
         AutoScaleMode = AutoScaleMode.Dpi;
         Font = new Font("Segoe UI", 10);
         Size = new Size(1080, 790); MinimumSize = new Size(860, 700);
@@ -98,13 +102,20 @@ internal sealed class MainForm : Form
             var button = new RelayButton { Text = names[i], Navigation = true, Width = 194, Height = 51, Margin = new Padding(0, 0, 0, 7) };
             button.Click += (_, _) => SelectPage(page); navigation.Add(button); nav.Controls.Add(button);
         }
-        var signature = new Label { Text = "LOCAL RELAY\nWindows x64  /  1.3.16", Dock = DockStyle.Bottom, Height = 52, ForeColor = Theme.Muted, Padding = new Padding(13, 8, 0, 0), Font = new Font("Segoe UI", 9) };
+        var signature = new Label { Text = "LOCAL RELAY\nWindows x64  /  1.3.21", Dock = DockStyle.Bottom, Height = 52, ForeColor = Theme.Muted, Padding = new Padding(13, 8, 0, 0), Font = new Font("Segoe UI", 9) };
         sidebar.Controls.Add(nav); sidebar.Controls.Add(signature); sidebar.Controls.Add(brand);
         var footer = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 77, Padding = new Padding(26, 12, 0, 0), BackColor = Theme.Sidebar, WrapContents = false };
         footer.Controls.AddRange([start, stop, status, memory]);
+        var topBar = new FlowLayoutPanel { Dock = DockStyle.Top, Height = 58, BackColor = Theme.Background,
+            FlowDirection = FlowDirection.RightToLeft, WrapContents = false, Padding = new Padding(0, 7, 26, 0) };
+        saveConfiguration.Width = 145;
+        saveConfiguration.Click += (_, _) => SaveConfiguration();
+        saveFeedback.Margin = new Padding(0, 15, 14, 0);
+        topBar.Controls.Add(saveConfiguration);
+        topBar.Controls.Add(saveFeedback);
         screens.AddRange([BuildConnection(), BuildProfiles(), BuildNbt(), modules, BuildSettings(), BuildLogs()]);
         foreach (var screen in screens) { screen.Dock = DockStyle.Fill; pages.Controls.Add(screen); }
-        var workspace = new Panel { Dock = DockStyle.Fill }; workspace.Controls.Add(pages); workspace.Controls.Add(footer);
+        var workspace = new Panel { Dock = DockStyle.Fill }; workspace.Controls.Add(pages); workspace.Controls.Add(footer); workspace.Controls.Add(topBar);
         Controls.Add(workspace); Controls.Add(sidebar);
         Theme.Inputs(this); SelectPage(0);
         HandleCreated += (_, _) => Theme.DarkTitle(this);
@@ -116,6 +127,7 @@ internal sealed class MainForm : Form
         totem.Checked = settings.Totem; detailed.Checked = settings.Logging; floatingEnabled.Checked = settings.FloatingButton;
         auto2.Checked = settings.Auto2;
         hideEntities.Checked = settings.HideEntities;
+        mapStreamingEnabled.Checked = settings.MapStreaming;
         floatingDepositEnabled.Checked = settings.FloatingDeposit;
         floatingAutoCraftEnabled.Checked = settings.FloatingAutoCraft;
         floatingMapsEnabled.Checked = settings.FloatingMaps;
@@ -129,8 +141,10 @@ internal sealed class MainForm : Form
         UpdateSpeed();
         speed.ValueChanged += (_, _) => { UpdateSpeed(); ScheduleConfig(); };
         foreach (var check in new[] { deposit, hotbar, armor, totem, detailed, floatingEnabled,
-            floatingDepositEnabled, floatingAutoCraftEnabled, floatingMapsEnabled, floatingPlatformEnabled, auto2, hideEntities })
-            check.CheckedChanged += (_, _) => { UpdateFloatingPanels(); ScheduleConfig(); };
+            floatingDepositEnabled, floatingAutoCraftEnabled, floatingMapsEnabled, floatingPlatformEnabled, auto2, hideEntities, mapStreamingEnabled })
+            check.CheckedChanged += (_, _) => { modules.RefreshStates(); ScheduleConfig(); };
+        mapStreamingEnabled.CheckedChanged += (_, _) => mapStreaming.UpdateConnection(running, upstreamReady);
+        modules.RefreshStates();
         start.Click += async (_, _) => await StartRelay();
         stop.Click += async (_, _) => await StopRelay();
         floating.Toggle = () => deposit.Checked = !deposit.Checked;
@@ -161,11 +175,11 @@ internal sealed class MainForm : Form
     internal ModuleCatalogPanel Modules => modules;
     private void UpdateFloatingPanels()
     {
-        bool active = !preview && running && !closing && !stopping;
-        floating.UpdateVisibility(active, floatingEnabled.Checked && floatingDepositEnabled.Checked);
+        bool active = !preview && !closing && !stopping;
+        floating.UpdateVisibility(active, floatingEnabled.Checked && floatingDepositEnabled.Checked && deposit.Checked);
         floatingAuto2.UpdateVisibility(active, floatingEnabled.Checked && floatingAutoCraftEnabled.Checked && (auto2.Checked || auto2Busy));
-        floatingMaps.UpdateVisibility(active, floatingEnabled.Checked && floatingMapsEnabled.Checked && mapPanel.Loaded);
-        floatingPlatform.UpdateVisibility(active, floatingEnabled.Checked && floatingPlatformEnabled.Checked);
+        floatingMaps.UpdateVisibility(active, floatingEnabled.Checked && floatingMapsEnabled.Checked && settings.ZipMapsEnabled);
+        floatingPlatform.UpdateVisibility(active, floatingEnabled.Checked && floatingPlatformEnabled.Checked && settings.PlatformEnabled);
     }
     private static CheckBox Check(string text) => new ToggleCheckBox { Text = text, Margin = new Padding(0, 5, 0, 5) };
     private static Label Label(string text) => new() { Text = text, AutoSize = true, ForeColor = Theme.Muted, MaximumSize = new Size(748, 0), Margin = new Padding(0, 5, 0, 7) };
@@ -319,7 +333,7 @@ internal sealed class MainForm : Form
             Label("По умолчанию скрыты. Включение панелей не запускает модули и не меняет загрузку карт."),
             floatingDepositEnabled, floatingAutoCraftEnabled, floatingMapsEnabled, floatingPlatformEnabled,
             Label("Выберите нужные панели. Перемещайте их за верхнюю полоску.\nРаботают в оконном и безрамочном Minecraft, включая открытый сундук."));
-        Card(body, Section("КАРТЫ С СЕРВЕРА"), Label("Постепенная загрузка включена всегда. Максимум 4000 карт.\nСтарое состояние кнопки «Скрыть карты» больше не приостанавливает очередь."));
+        Card(body, Section("КАРТЫ С СЕРВЕРА"), Label("Включение загрузки карт находится на карточке модуля. Максимум 4000 карт.\nКогда модуль выключен, запросы карт приостановлены."));
         return tab;
     }
     private Panel BuildLogs()
@@ -366,6 +380,7 @@ internal sealed class MainForm : Form
         settings.NbtDirectory = directory.Text; settings.Deposit = deposit.Checked; settings.Hotbar = hotbar.Checked;
         settings.Armor = armor.Checked; settings.Totem = totem.Checked; settings.Logging = detailed.Checked;
         settings.HideMaps = false; settings.HideEntities = hideEntities.Checked;
+        settings.MapStreaming = mapStreamingEnabled.Checked;
         settings.FloatingDeposit = floatingDepositEnabled.Checked;
         settings.FloatingAutoCraft = floatingAutoCraftEnabled.Checked;
         settings.FloatingMaps = floatingMapsEnabled.Checked;
@@ -373,6 +388,23 @@ internal sealed class MainForm : Form
         settings.FloatingButton = floatingEnabled.Checked; settings.IntervalMs = 3000 - speed.Value * 10;
         settings.Auto2 = auto2.Checked; settings.CraftIntervalMs = 5000 - craftSpeed.Value * 50;
         settings.WindowPauseMs = 3000 - windowSpeed.Value * 100;
+    }
+    private void SaveConfiguration()
+    {
+        try
+        {
+            ReadSettings();
+            platformPanel.CaptureSettings();
+            mapPanel.CaptureSettings();
+            if (!preview) settings.Save();
+            saveFeedback.Text = "Настройки сохранены";
+            ScheduleConfig();
+        }
+        catch (Exception error)
+        {
+            saveFeedback.Text = "Не удалось сохранить";
+            ShowError(error);
+        }
     }
     private void ScheduleConfig() { if (!initialized || closing || stopping) return; configTimer.Stop(); configTimer.Start(); }
     private async Task<bool> ApplySettings()
@@ -383,7 +415,7 @@ internal sealed class MainForm : Form
             ReadSettings(); if (!preview) settings.Save();
             await backend.Call(new { action = "configure", deposit = settings.Deposit, hotbar = settings.Hotbar,
                 armor = settings.Armor, totem = settings.Totem, logging = settings.Logging, intervalMs = settings.IntervalMs,
-                hideMaps = false, hideEntities = settings.HideEntities,
+                hideMaps = !settings.MapStreaming, hideEntities = settings.HideEntities,
                 auto2 = settings.Auto2, craftIntervalMs = settings.CraftIntervalMs, windowPauseMs = settings.WindowPauseMs });
             return !closing && !stopping;
         }
@@ -416,6 +448,38 @@ internal sealed class MainForm : Form
             if (!closing && !IsDisposed) { floatingAuto2.SetCommandPending(false); SetBusy(busy); await Poll(); }
         }
     }
+    private IReadOnlyDictionary<string, ModuleCatalogPanel.Switch> ModuleSwitches() =>
+        new Dictionary<string, ModuleCatalogPanel.Switch>
+        {
+            ["map-streaming"] = CheckSwitch(mapStreamingEnabled),
+            ["no-render"] = CheckSwitch(hideEntities),
+            ["deposit"] = CheckSwitch(deposit, floatingDepositEnabled),
+            ["armor"] = CheckSwitch(armor),
+            ["totem"] = CheckSwitch(totem),
+            ["platform"] = PreferenceSwitch(() => settings.PlatformEnabled, on => settings.PlatformEnabled = on, floatingPlatformEnabled),
+            ["zip-maps"] = PreferenceSwitch(() => settings.ZipMapsEnabled, on => settings.ZipMapsEnabled = on, floatingMapsEnabled),
+            ["auto-craft"] = CheckSwitch(auto2, floatingAutoCraftEnabled)
+        };
+    private void EnableModuleOverlay(CheckBox option)
+    {
+        floatingEnabled.Checked = true;
+        option.Checked = true;
+    }
+    private ModuleCatalogPanel.Switch PreferenceSwitch(Func<bool> current, Action<bool> set, CheckBox overlay) =>
+        new(current, on =>
+        {
+            set(on);
+            if (on) EnableModuleOverlay(overlay);
+            ScheduleConfig();
+            return Task.CompletedTask;
+        });
+    private ModuleCatalogPanel.Switch CheckSwitch(CheckBox check, CheckBox? overlay = null) =>
+        new(() => check.Checked, on =>
+        {
+            if (on && overlay != null) EnableModuleOverlay(overlay);
+            check.Checked = on;
+            return Task.CompletedTask;
+        });
     private async Task CommandPlatform(string operation)
     {
         if (closing || stopping || !running) return;
@@ -518,6 +582,7 @@ internal sealed class MainForm : Form
         floatingMaps.UpdateIndicators(state,true);
         floatingAuto2.UpdateIndicators(state, auto2.Checked);
         if (!busy) SetBusy(false);
+        modules.RefreshStates();
     }
     private static string SlotFromFile(string file) => file.EndsWith(".cpenbt.json", StringComparison.OrdinalIgnoreCase)
         ? file[..^12] : Path.GetFileNameWithoutExtension(file);
@@ -629,6 +694,8 @@ internal sealed class MainForm : Form
         if (!preview)
         {
             ReadSettings();
+            platformPanel.CaptureSettings();
+            mapPanel.CaptureSettings();
             save = Task.Run(() => { try { settings.Save(); } catch (Exception error) { LogStore.Append("Настройки: " + error.Message); } });
         }
         try { await backend.StopAsync(); }

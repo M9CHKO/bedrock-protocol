@@ -1193,6 +1193,9 @@ struct RelayState {
     std::atomic<bool> schematicEnabled {false};
     std::atomic<bool> areaFillEnabled {false};
     std::atomic<bool> platformWorldTracking {true};
+    std::atomic<bool> platformFocusKnown {false};
+    std::atomic<int32_t> platformFocusChunkX {0};
+    std::atomic<int32_t> platformFocusChunkZ {0};
     std::atomic<bool> schematicWorldTrackingActive {false};
     std::atomic<uint64_t> schematicTotalBlocks {0};
     std::atomic<uint64_t> schematicCorrectBlocks {0};
@@ -1967,6 +1970,7 @@ struct RelayState {
     }
 
     void resetMiniMapWorld(int32_t dimension) noexcept {
+        platformFocusKnown.store(false, std::memory_order_relaxed);
         { std::lock_guard lock(autoCraftTargetsMutex); autoCraftKnownTargets.clear(); }
         miniMapDimension.store(dimension, std::memory_order_relaxed);
         {
@@ -2249,7 +2253,7 @@ struct RelayState {
         int32_t cameraChunkZ,
         uint64_t packetSequence
     ) {
-        if (schematicPublisherKnown &&
+        if (schematicPublisherKnown && !platformWorldTracking.load(std::memory_order_relaxed) &&
             (key.dimension !=
                 miniMapDimension.load(std::memory_order_relaxed) ||
              std::abs(key.x - schematicPublisherChunkX) >
@@ -2382,6 +2386,9 @@ struct RelayState {
             schematicPublisherChunkX = centerChunkX;
             schematicPublisherChunkZ = centerChunkZ;
             schematicPublisherRadiusChunks = radiusChunks;
+            // The publisher is a delivery window, not the player. While the
+            // builder tracks the world, its explicit focus owns retention.
+            if (platformWorldTracking.load(std::memory_order_relaxed)) return;
             const auto outsideWindow = [&](const MiniMapKey& key) {
                 return key.dimension != dimension ||
                     std::abs(key.x - centerChunkX) > radiusChunks ||
@@ -3411,11 +3418,13 @@ struct RelayState {
                 dimension = header.dimension;
             }
             int64_t distanceSquared = 0;
-            if (publisherKnown || camera.known) {
-                const int32_t cameraChunkX = publisherKnown
+            const bool platformFocus = platformWorldTracking.load(std::memory_order_relaxed) &&
+                platformFocusKnown.load(std::memory_order_relaxed);
+            if (platformFocus || publisherKnown || camera.known) {
+                const int32_t cameraChunkX = platformFocus ? platformFocusChunkX.load(std::memory_order_relaxed) : publisherKnown
                     ? publisherChunkX
                     : static_cast<int32_t>(std::floor(camera.x / 16.0f));
-                const int32_t cameraChunkZ = publisherKnown
+                const int32_t cameraChunkZ = platformFocus ? platformFocusChunkZ.load(std::memory_order_relaxed) : publisherKnown
                     ? publisherChunkZ
                     : static_cast<int32_t>(std::floor(camera.z / 16.0f));
                 const int64_t dx = static_cast<int64_t>(chunkX) -
@@ -3809,6 +3818,12 @@ struct RelayState {
         const int32_t cameraChunkZ = camera.known
             ? static_cast<int32_t>(std::floor(camera.z / 16.0f))
             : 0;
+        const bool platformFocus = platformWorldTracking.load(std::memory_order_relaxed) &&
+            platformFocusKnown.load(std::memory_order_relaxed);
+        const int32_t retentionChunkX = platformFocus
+            ? platformFocusChunkX.load(std::memory_order_relaxed) : cameraChunkX;
+        const int32_t retentionChunkZ = platformFocus
+            ? platformFocusChunkZ.load(std::memory_order_relaxed) : cameraChunkZ;
         std::vector<MiniMapKey> changedColumns;
         changedColumns.reserve(packet.entries.size());
 
@@ -3865,7 +3880,7 @@ struct RelayState {
             if (job.generation != miniMapGeneration || miniMapStopping) {
                 return;
             }
-            if (schematicPublisherKnown &&
+            if (schematicPublisherKnown && !platformWorldTracking.load(std::memory_order_relaxed) &&
                 (key.dimension !=
                     miniMapDimension.load(std::memory_order_relaxed) ||
                  std::abs(key.x - schematicPublisherChunkX) >
@@ -3921,9 +3936,9 @@ struct RelayState {
                 std::move(column),
                 std::move(knownSections),
                 completeBlockColumn,
-                camera.known,
-                cameraChunkX,
-                cameraChunkZ,
+                platformFocus || camera.known,
+                retentionChunkX,
+                retentionChunkZ,
                 job.packetSequence
             );
             changedColumns.push_back(key);
@@ -4160,6 +4175,8 @@ struct RelayState {
                 };
 
                 const auto camera = entityPositions.cameraSnapshot();
+                const bool platformFocus = platformWorldTracking.load(std::memory_order_relaxed) &&
+                    platformFocusKnown.load(std::memory_order_relaxed);
                 {
                     std::lock_guard lock(miniMapMutex);
                     if (job.generation != miniMapGeneration || miniMapStopping) {
@@ -4175,11 +4192,11 @@ struct RelayState {
                         {},
                         packet.subChunkCount != -1 &&
                             packet.subChunkCount != -2,
-                        schematicPublisherKnown || camera.known,
-                        schematicPublisherKnown
+                        platformFocus || schematicPublisherKnown || camera.known,
+                        platformFocus ? platformFocusChunkX.load(std::memory_order_relaxed) : schematicPublisherKnown
                             ? schematicPublisherChunkX
                             : static_cast<int32_t>(std::floor(camera.x / 16.0f)),
-                        schematicPublisherKnown
+                        platformFocus ? platformFocusChunkZ.load(std::memory_order_relaxed) : schematicPublisherKnown
                             ? schematicPublisherChunkZ
                             : static_cast<int32_t>(std::floor(camera.z / 16.0f)),
                         job.packetSequence
@@ -12542,7 +12559,7 @@ private:
             if(maps){std::lock_guard lock(state_->mapQueueMutex);state_->mapQueue.pause(safeMessage(e.what()));}
             else {
                 std::lock_guard lock(state_->platformMutex);
-                state_->platformPendingMovement.reset();state_->platformBuilder.pause(safeMessage(e.what()));
+                state_->platformBuilder.pause(safeMessage(e.what()));
                 state_->push("platform_downstream_error",safeMessage(e.what()),"ERROR","platform");
             }
         }

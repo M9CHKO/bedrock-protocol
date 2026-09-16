@@ -93,7 +93,7 @@ DesktopValue desktopCall(const DesktopValue& request) {
         const bool armor = desktopBool(request, "armor");
         const bool totem = desktopBool(request, "totem");
         const bool logging = desktopBool(request, "logging");
-        const bool hideMaps = false; // Windows always schedules map delivery, including legacy requests.
+        const bool hideMaps = desktopBool(request, "hideMaps");
         const bool hideEntities = desktopBool(request, "hideEntities");
         const bool visualsChanged = configuredNoRenderMaps.load() != hideMaps || configuredNoRenderEntities.load() != hideEntities;
         configuredNoRenderMaps = hideMaps;

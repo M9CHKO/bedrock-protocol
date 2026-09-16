@@ -12,7 +12,7 @@ internal static class AutoCraftUiTests
         require(AppSettings.ClampCraftInterval(-1) == 100 && AppSettings.ClampCraftInterval(9999) == 5000 &&
             AppSettings.ClampWindowPause(-1) == 300 && AppSettings.ClampWindowPause(9999) == 3000, "Auto 2 UI timing bounds");
         var old = JsonSerializer.Deserialize<AppSettings>("{\"Host\":\"localhost\"}")!;
-        require(old.Auto2 && old.CraftIntervalMs == 1000 && old.WindowPauseMs == 700, "Old settings receive Auto 2 defaults without autorun");
+        require(!old.Auto2 && old.CraftIntervalMs == 1000 && old.WindowPauseMs == 700, "Missing Auto 2 preference defaults off");
         var saved = JsonSerializer.Deserialize<AppSettings>(JsonSerializer.Serialize(new AppSettings {
             Auto2 = false, CraftIntervalMs = 350, WindowPauseMs = 1200 }))!;
         require(!saved.Auto2 && saved.CraftIntervalMs == 350 && saved.WindowPauseMs == 1200, "Auto 2 settings serialize independently of runtime state");

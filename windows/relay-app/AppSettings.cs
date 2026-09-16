@@ -23,11 +23,14 @@ internal sealed class AppSettings
     public bool HideEntities { get; set; }
     public int InterfaceVersion { get; set; }
     public bool FloatingButton { get; set; }
-    public bool FloatingDeposit { get; set; } = true;
-    public bool FloatingAutoCraft { get; set; } = true;
-    public bool FloatingMaps { get; set; } = true;
-    public bool FloatingPlatform { get; set; } = true;
-    public bool Auto2 { get; set; } = true;
+    public bool FloatingDeposit { get; set; }
+    public bool FloatingAutoCraft { get; set; }
+    public bool FloatingMaps { get; set; }
+    public bool FloatingPlatform { get; set; }
+    public bool PlatformEnabled { get; set; }
+    public bool ZipMapsEnabled { get; set; }
+    public bool Auto2 { get; set; }
+    public bool MapStreaming { get; set; }
     public Dictionary<string, decimal> Platform { get; set; } = new();
     public Dictionary<string, int> MapTiming { get; set; } = new();
     public string MapArchive { get; set; } = "";
@@ -40,10 +43,22 @@ internal sealed class AppSettings
     internal static int ClampWindowPause(int value) => Math.Clamp(value, 300, 3000);
     internal void UpgradeInterface()
     {
-        HideMaps = false; // Windows map delivery is automatic, even with old saved settings.
-        if (InterfaceVersion >= 2) return;
-        FloatingButton = false;
-        InterfaceVersion = 2;
+        HideMaps = false; // Obsolete legacy setting; MapStreaming is explicit and defaults off.
+        if (InterfaceVersion < 3)
+        {
+            // Older profiles could restore several always-on-top windows on launch.
+            // Reset only feature/overlay switches; preserve connection and route data.
+            FloatingButton = FloatingDeposit = FloatingAutoCraft = FloatingMaps = FloatingPlatform = false;
+            Deposit = Armor = Totem = Auto2 = HideEntities = MapStreaming = false;
+            InterfaceVersion = 3;
+        }
+        if (InterfaceVersion < 4)
+        {
+            // Version 1.3.20 used overlay flags as the construction/ZIP module switches.
+            PlatformEnabled = FloatingPlatform;
+            ZipMapsEnabled = FloatingMaps;
+            InterfaceVersion = 4;
+        }
     }
     internal static AppSettings Load()
     {

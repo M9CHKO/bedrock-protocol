@@ -331,6 +331,7 @@ static void verifyPlatformIntegration() {
         bedrock::ProtoDefPacketEncoder encoder(version,state.itemProtocolVariables);
         const auto packet=codec.makePacketByName("player_auth_input",encoder.encodePacket("player_auth_input",input));
         bool moved=false,serverCorrection=false;
+        double firstTargetX=.5,firstTargetZ=.5;
         for(int i=0;i<10 && !moved;++i) {
             bedrock::BedrockRelayPacketEvent event;event.packet=packet;
             require(state.injectPlatform(event),"platform owns movement while menus may be open");
@@ -357,6 +358,8 @@ static void verifyPlatformIntegration() {
                         std::abs(localMove.getDouble("yaw")-upstreamMove.getDouble("yaw"))<.001 &&
                         std::abs(localMove.getDouble("head_yaw")-upstreamMove.getDouble("head_yaw"))<.001,
                         "local movement and PlayerAuthInput use identical head rotation");
+                    firstTargetX=localMove.getDouble("position.x");
+                    firstTargetZ=localMove.getDouble("position.z");
                     if(version=="1.21.100") {
                         const double yaw=upstreamMove.getDouble("yaw")*3.141592653589793/180.0;
                         const double pitch=upstreamMove.getDouble("pitch")*3.141592653589793/180.0;
@@ -379,42 +382,36 @@ static void verifyPlatformIntegration() {
         }
         require(moved && b.busy(),"native walking emits valid local camera sync in both protocols");
         require(serverCorrection,"server-authoritative movement corrects the local camera, not only rewind mode");
-        const auto pending=state.platformPendingMovement;
-        require(pending.has_value(),"step remains unconfirmed until received Minecraft input reports it");
         const auto rowBefore=b.rowIndex;
         const auto placedBefore=b.placed;
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
         bedrock::BedrockRelayPacketEvent still;still.packet=packet;
-        state.injectPlatform(still);
-        require(state.platformPendingMovement.has_value() && state.platformMovementAcks==0 &&
-            b.rowIndex==rowBefore && b.placed==placedBefore,
-            "stationary client input cannot authorize further walking or placement");
-        auto echo=input;
-        echo.objectValue["position"]=RelayState::areaVec3(pending->x,pending->y,pending->z);
-        echo.objectValue["tick"]=V::uinteger(101);
-        bedrock::BedrockRelayPacketEvent echoed;echoed.packet=codec.makePacketByName("player_auth_input",encoder.encodePacket("player_auth_input",echo));
-        state.entityPositions.observeServerbound(echoed.packet);state.injectPlatform(echoed);
-        require(state.platformMovementAcks==1,"real client position echo acknowledges exactly one step");
+        require(state.injectPlatform(still) && !still.replacements.empty(),
+            "builder keeps controlling server movement when retail client camera stays still");
+        bedrock::BedrockRelayPacketEvent continuedEvent;continuedEvent.packet=still.replacements.front();
+        bedrock::RelayPacketEvent continued(version,continuedEvent,state.itemProtocolVariables,true);
+        require(std::hypot(continued.getDouble("position.x")-firstTargetX,
+                    continued.getDouble("position.z")-firstTargetZ)>.05 &&
+                b.busy() && b.stage!=bedrock::PlatformBuilder::Stage::Paused &&
+                b.rowIndex==rowBefore && b.placed==placedBefore,
+            "missing local camera echo cannot pause the proven synthetic route");
         state.platformMovementAuthority="server_with_rewind";
-        state.platformPendingMovement=pending;state.platformMovementRetryAt=0;
-        state.platformMovementSentAt=steadyMilliseconds();state.platformClientPackets.clear();
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));state.platformClientPackets.clear();
         bedrock::BedrockRelayPacketEvent retry;retry.packet=packet;state.injectPlatform(retry);
         bool correction=false;
         for(const auto& p:state.platformClientPackets)if(p.name=="correct_player_move_prediction") {
             bedrock::ProtoDefPacketDecoder(version,state.itemProtocolVariables).validatePacketStrict(p.name,p.payload);
             bedrock::BedrockRelayPacketEvent e;e.packet=p;bedrock::RelayPacketEvent d(version,e,state.itemProtocolVariables,true);
             require(d.getUInt("tick")==100 && d.getString("prediction_type")=="player","rewind correction targets current input tick");
-            require(std::abs(d.getDouble("delta.x")-(pending->x-.5))<.001 &&
-                std::abs(d.getDouble("delta.z")-(pending->z-.5))<.001,
-                "retry correction delta remains relative to actual client position, not zeroed walking input");
+            require(std::abs(d.getDouble("position.x")-d.getDouble("delta.x")-.5)<.001 &&
+                std::abs(d.getDouble("position.z")-d.getDouble("delta.z")-.5)<.001,
+                "camera correction delta remains relative to actual client position");
             correction=true;
         }
         require(correction,("server-with-rewind emits the dedicated prediction correction ("+version+", "+b.status+")").c_str());
-        state.platformMovementSentAt=steadyMilliseconds()-5001;
-        bedrock::BedrockRelayPacketEvent timeout;timeout.packet=packet;state.injectPlatform(timeout);
-        require(!b.busy() && b.stage==bedrock::PlatformBuilder::Stage::Paused && b.placed==placedBefore,
-            "missing movement echo pauses without building at invented coordinates");
+        b.stop();
         b.start(state.platformCamera(),[&](auto p){return state.platformBlock(p);},steadyMilliseconds());
-        require(b.busy(),"new start uses the actual received position after motion timeout");
+        require(b.busy(),"new start uses the actual received position after stop");
         state.platformMovementAuthority="client";
         bedrock::BedrockRelayPacketEvent legacyAuth;legacyAuth.packet=packet;state.injectPlatform(legacyAuth);
         bool legacyMove=false;
@@ -447,6 +444,10 @@ static void verifyPlatformIntegration() {
         auto relocated=input;relocated.objectValue["position"]=RelayState::areaVec3(64.5,64.62,.5);
         const auto relocation=codec.makePacketByName("player_auth_input",encoder.encodePacket("player_auth_input",relocated));
         state.entityPositions.observeServerbound(relocation);
+        bedrock::BedrockRelayPacketEvent idleMove;idleMove.packet=relocation;
+        state.injectPlatform(idleMove);
+        require(state.platformFocusKnown && state.platformFocusChunkX==4 && state.platformFocusChunkZ==0,
+            "stopped builder follows received manual movement before a new Start");
         b.start(state.platformCamera(),[&](auto p){return state.platformBlock(p);},steadyMilliseconds());
         require(b.busy() && b.planView().origin.x==64 && b.rowIndex==0 && b.placed==0,
             "fresh Start after relocation builds from received coordinates and resets previous route progress");
@@ -474,6 +475,15 @@ static void verifyPlatformIntegration() {
             state.cacheSchematicColumnLocked({0,cx,cz},std::make_shared<bedrock::BedrockChunkColumn>(cx,cz,0),{},true,true,0,0,1);
         require(state.schematicColumns.size()==81 && state.schematicColumns.contains({0,3,3}),
             "platform retains received columns outside the old 3x3 area for subsequent movement and restart");
+        state.setPlatformWorldFocus(1024.5,.5);
+        state.observeSchematicPublisherWindow(160,-320,64);
+        state.cacheSchematicColumnLocked({0,64,0},std::make_shared<bedrock::BedrockChunkColumn>(64,0,0),{},true,true,64,0,2);
+        require(state.schematicColumns.size()==81 && state.schematicColumns.contains({0,64,0}) &&
+            state.schematicColumns.contains({0,3,3}),
+            "stale publisher cannot reject a relocated column or evict the new platform focus");
+        state.observeSchematicPublisherWindow(160,-320,64);
+        require(state.schematicColumns.contains({0,64,0}),
+            "stale publisher update cannot erase the relocated player's decoded world");
     }
 }
 // Optional read-only audit of a user archive through the real ZIP/QZNBTF02

@@ -6,10 +6,12 @@ internal sealed class MapStreamingModule : RelayModule
     private readonly Label state = Note("Ожидание подключения Minecraft.");
     private readonly Label progress = Note("Статистика появится при загрузке карт.");
     private bool connected;
-    internal MapStreamingModule() : base("map-streaming", "Загрузка карт", "Постепенная загрузка с сервера. Всегда включена.")
+    private readonly CheckBox enabled;
+    internal MapStreamingModule(CheckBox enabled) : base("map-streaming", "Загрузка карт", "Постепенная загрузка карт с сервера.")
     {
-        Card(Caption("РАБОТАЕТ БЕЗ КНОПКИ"), state,
-            Note("После входа карты загружаются автоматически. Ничего включать вручную не нужно.\nОбычные игровые пакеты имеют приоритет; карты поступают по одной."));
+        this.enabled = enabled;
+        Card(Caption("УПРАВЛЕНИЕ"), enabled, state,
+            Note("Включите загрузку, чтобы получать карты с сервера. В выключенном состоянии запросы карт приостановлены.\nОбычные игровые пакеты имеют приоритет; карты поступают по одной."));
         Card(Caption("ДО 4000 КАРТ"), progress,
             Note("Темп: до 8 обновлений и 512 КиБ в секунду до сжатия.\nПамять очереди: до 8 МиБ. Временное хранилище: до 512 МиБ."),
             Note("Отправлено — это обновления, переданные реле, а не подтверждение отрисовки.\nСкорость зависит от размера карт, сети и ответов сервера."));
@@ -19,8 +21,8 @@ internal sealed class MapStreamingModule : RelayModule
     {
         if (connected && !ready) progress.Text = "Сеанс завершён. При следующем входе начнётся новая очередь.";
         connected = ready;
-        state.Text = ready ? "Подключено · автоматическая загрузка активна" : running ? "Реле запущено · ожидание Minecraft" : "Реле остановлено · загрузка начнётся после подключения";
-        state.ForeColor = ready ? Theme.Green : Theme.Muted;
+        state.Text = !enabled.Checked ? "Загрузка карт выключена" : ready ? "Подключено · загрузка активна" : running ? "Реле запущено · ожидание Minecraft" : "Реле остановлено · загрузка начнётся после подключения";
+        state.ForeColor = ready && enabled.Checked ? Theme.Green : Theme.Muted;
     }
     internal void Observe(string line)
     {
